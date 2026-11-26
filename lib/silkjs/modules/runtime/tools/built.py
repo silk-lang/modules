@@ -8,7 +8,7 @@ import sys
 import tomllib
 from pathlib import Path
 
-REQUESTS = Path(__file__).resolve().parents[3] / 'build/requests'
+REQUESTS = Path(__file__).resolve().parents[5] / 'build/requests'
 
 
 def built(package, release=False):

@@ -74,7 +74,7 @@ def expected(wasm, files):
 
 
 def build(name, package, manifest_name):
-    version = tomllib.loads((ROOT.parents[3] / 'silk.toml').read_text())['workspace']['silk-version']
+    version = tomllib.loads((ROOT.parents[2] / 'silk.toml').read_text())['workspace']['silk-version']
     directory = ROOT / 'build' / name
     directory.mkdir(parents=True, exist_ok=True)
     environment = {**os.environ, 'SILKJS_CLANG_BUILD': str(directory)}

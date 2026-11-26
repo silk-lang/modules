@@ -11,7 +11,7 @@ Unified Silk workspace containing the official Silk libraries and UI frameworks.
 | `lib/fonts` | Font parsing, shaping, outlining, rasterization, and web fonts |
 | `lib/graphics` | 2D vector graphics, geometry, codecs, atlas, GPU scene, and UI renderer |
 | `lib/native` | Native platform windowing, WebGPU (Dawn / browser), and Metal bindings |
-| `lib/silkjs` | SilkJS JavaScript engine, runtime, CLI, and native codecs/crypto |
+| `silkjs` | SilkJS JavaScript engine, runtime, CLI, and native codecs/crypto |
 | `lib/sqlite` | SQLite bindings (`db-sqlite`) |
 | `lib/svg` | SVG parsing, filters, text, CPU/GPU rasterization, and Wasm renderer |
 | `loom` | Loom UI framework, components, navigation, DOM bridge, devtools, and Ghostty terminal |

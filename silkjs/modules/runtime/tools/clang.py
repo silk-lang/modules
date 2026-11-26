@@ -15,7 +15,7 @@ arguments = sys.argv[1:]
 compiler = os.environ.get('SILK_CLANG') or shutil.which('clang-22') or 'clang'
 # Compilation, inspection, preprocessing, and relocatable links do not produce
 # the executable whose Mach-O header the injector extends.
-non_final = {'-c', '-S', '-E', '-r', '--version', '-v', '-###', '-dumpmachine', '-dumpversion'}
+non_final = {'-c', '-S', '-E', '-r', '-M', '-MM', '-MD', '-MMD', '-MF', '--version', '-v', '-###', '-dumpmachine', '-dumpversion'}
 if arguments and not non_final.intersection(arguments):
     if sys.platform == 'darwin':
         # Addons resolve Node-API against the executable, so keep its exports visible.

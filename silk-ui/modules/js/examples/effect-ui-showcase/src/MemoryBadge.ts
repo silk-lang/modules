@@ -74,13 +74,31 @@ export const MemoryBadge = Html.component({
       ),
     ),
   ],
-  view: (h, model) =>
-    h.div.class("studio-mem-pill").children(
-      h.span.class("studio-beacon"),
-      h.span.children(model.mb !== null ? `${model.mb.toFixed(1)} MB` : "native"),
-      h.span.attr("style", "color: var(--fg-subtle)").children("·"),
-      h.span
-        .attr("style", "color: var(--fg-muted)")
-        .children(`${model.fps} fps`),
-    ),
+  view: (h, model) => {
+    const memText = model.mb !== null ? `${model.mb.toFixed(1)}\u00a0MB` : "native";
+    const fpsText = `${model.fps}\u00a0fps`;
+    const ariaLabel =
+      model.mb !== null
+        ? `Memory usage ${model.mb.toFixed(1)} megabytes, frame rate ${model.fps} frames per second`
+        : `Native runtime, frame rate ${model.fps} frames per second`;
+
+    return h.div
+      .class("studio-mem-pill")
+      .attr("role", "group")
+      .attr("aria-live", "off")
+      .attr("aria-label", ariaLabel)
+      .children(
+        h.span.class("studio-beacon shrink-0").attr("aria-hidden", "true"),
+        h.span.class("whitespace-nowrap shrink-0").children(memText),
+        h.span
+          .class("whitespace-nowrap shrink-0")
+          .attr("aria-hidden", "true")
+          .attr("style", "color: var(--fg-subtle)")
+          .children("·"),
+        h.span
+          .class("whitespace-nowrap shrink-0")
+          .attr("style", "color: var(--fg-muted)")
+          .children(fpsText),
+      );
+  },
 });

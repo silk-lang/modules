@@ -1520,11 +1520,12 @@ export class Input extends Node {
   #files = [];
   _customValidity = "";
   _userInteracted = false;
+  _spacePressed = false;
 
   constructor(type = "text") {
     super("input");
     this._inputType = canonicalInputType(type);
-    this._keep("input", "selectionchange", "focus", "blur", "keydown");
+    this._keep("input", "selectionchange", "focus", "blur", "keydown", "keyup");
   }
 
   /** The text the selection offsets index into. */
@@ -1548,6 +1549,11 @@ export class Input extends Node {
     const next = canonicalInputType(value);
     this._inputType = next;
     super.setAttribute("type", String(value));
+    if (next === "checkbox" || next === "radio") {
+      native.attribute(this.nodeId, "role", next);
+    } else if (next === "button" || next === "submit" || next === "reset" || next === "image") {
+      native.attribute(this.nodeId, "role", "button");
+    }
     syncValidationState(this);
   }
 
@@ -1786,11 +1792,38 @@ export class Input extends Node {
     this.#committedValue = this.#value;
   }
 
+  _activate() {
+    if (isControlDisabled(this)) return true;
+    const t = this.type;
+    if (t === "checkbox" || t === "radio") {
+      if (t === "radio" && this.#checked) return true;
+      this._userInteracted = true;
+      if (t === "checkbox" && this.#indeterminate) this.indeterminate = false;
+      this.checked = t === "radio" ? true : !this.#checked;
+      const input = new Event("input", this);
+      input.bubbles = true;
+      dispatchEvent(input);
+      const change = new Event("change", this);
+      change.bubbles = true;
+      dispatchEvent(change);
+      return true;
+    }
+    if (t === "submit" || t === "image" || t === "reset") {
+      const form = formOwnerOf(this);
+      if (!form) return false;
+      if (t === "reset") form.reset();
+      else form.requestSubmit(this);
+      return true;
+    }
+    return false;
+  }
+
   _handleFocus() {
     this.#committedValue = this.#value;
   }
 
   _handleBlur() {
+    this._spacePressed = false;
     if (this.#value !== this.#committedValue) {
       this.#committedValue = this.#value;
       this._userInteracted = true;
@@ -1803,6 +1836,34 @@ export class Input extends Node {
 
   _handleKey(event) {
     if (isControlDisabled(this)) return false;
+    const t = this.type;
+    if (this._tag === "input" && (t === "checkbox" || t === "radio")) {
+      if (event.key === " " && !event.ctrlKey && !event.altKey && !event.metaKey) {
+        event.preventDefault();
+        this._spacePressed = true;
+        return true;
+      }
+      if (event.key === "Enter" && !event.ctrlKey && !event.altKey && !event.metaKey) {
+        event.preventDefault();
+        implicitFormSubmit(this);
+        return true;
+      }
+      return false;
+    }
+    if (this._tag === "input" && (t === "button" || t === "submit" || t === "reset" || t === "image")) {
+      if (event.ctrlKey || event.altKey || event.metaKey) return false;
+      if (event.key === "Enter") {
+        event.preventDefault();
+        if (!event.repeat) syntheticClick(this);
+        return true;
+      }
+      if (event.key === " ") {
+        event.preventDefault();
+        this._spacePressed = true;
+        return true;
+      }
+      return false;
+    }
     if (this._tag === "input" && event.key === "Enter") {
       event.preventDefault();
       if (this.#value !== this.#committedValue) {
@@ -1815,7 +1876,7 @@ export class Input extends Node {
       implicitFormSubmit(this);
       return true;
     }
-    if (this._tag === "input" && this.type === "number" && !this.readOnly && (event.key === "ArrowUp" || event.key === "ArrowDown")) {
+    if (this._tag === "input" && t === "number" && !this.readOnly && (event.key === "ArrowUp" || event.key === "ArrowDown")) {
       event.preventDefault();
       const before = this.#value;
       try {
@@ -1836,6 +1897,21 @@ export class Input extends Node {
     return false;
   }
 
+  _handleKeyUp(event) {
+    if (this._tag !== "input" || event.key !== " ") return false;
+    const t = this.type;
+    if (t !== "checkbox" && t !== "radio" && t !== "button" && t !== "submit" && t !== "reset" && t !== "image") {
+      return false;
+    }
+    const pressed = this._spacePressed;
+    this._spacePressed = false;
+    event.preventDefault();
+    if (pressed && !isControlDisabled(this) && !event.ctrlKey && !event.altKey && !event.metaKey) {
+      syntheticClick(this);
+    }
+    return true;
+  }
+
   setAttribute(name, value) {
     const lower = String(name).toLowerCase();
     if (lower === "value" && this._tag !== "textarea") {
@@ -1845,7 +1921,13 @@ export class Input extends Node {
       return;
     }
     if (lower === "type" && this._tag !== "textarea") {
-      this._inputType = canonicalInputType(value);
+      const next = canonicalInputType(value);
+      this._inputType = next;
+      if (next === "checkbox" || next === "radio") {
+        native.attribute(this.nodeId, "role", next);
+      } else if (next === "button" || next === "submit" || next === "reset" || next === "image") {
+        native.attribute(this.nodeId, "role", "button");
+      }
     }
     super.setAttribute(name, value);
     if (VALIDATION_ATTRS.has(lower)) syncValidationState(this);
@@ -4140,6 +4222,7 @@ export class CheckInput extends Node {
   #value = null;
   _customValidity = "";
   _userInteracted = false;
+  _spacePressed = false;
 
   constructor(type = "checkbox") {
     super("box");
@@ -4149,7 +4232,7 @@ export class CheckInput extends Node {
     native.attribute(this.nodeId, "type", this._inputType);
     native.attribute(this.nodeId, "role", this._inputType === "radio" ? "radio" : "checkbox");
     native.attribute(this.nodeId, "tabIndex", 0);
-    this._keep("focus", "blur", "keydown");
+    this._keep("focus", "blur", "keydown", "keyup");
     this._relisten();
     syncValidationState(this);
   }
@@ -4284,13 +4367,18 @@ export class CheckInput extends Node {
     return true;
   }
 
+  _handleBlur() {
+    this._spacePressed = false;
+  }
+
   _handleKey(event) {
     if (isControlDisabled(this)) return false;
-    if (event.key === " ") {
+    if (event.key === " " && !event.ctrlKey && !event.altKey && !event.metaKey) {
       event.preventDefault();
-      return this._activate();
+      this._spacePressed = true;
+      return true;
     }
-    if (event.key === "Enter") {
+    if (event.key === "Enter" && !event.ctrlKey && !event.altKey && !event.metaKey) {
       event.preventDefault();
       implicitFormSubmit(this);
       return true;
@@ -4308,6 +4396,17 @@ export class CheckInput extends Node {
       return true;
     }
     return false;
+  }
+
+  _handleKeyUp(event) {
+    if (event.key !== " ") return false;
+    const pressed = this._spacePressed;
+    this._spacePressed = false;
+    event.preventDefault();
+    if (pressed && !isControlDisabled(this) && !event.ctrlKey && !event.altKey && !event.metaKey) {
+      syntheticClick(this);
+    }
+    return true;
   }
 }
 
@@ -4739,6 +4838,7 @@ export class FileInput extends Node {
  */
 export class ButtonInput extends Node {
   _customValidity = "";
+  _spacePressed = false;
 
   constructor(type = "button") {
     super("box");
@@ -4748,7 +4848,7 @@ export class ButtonInput extends Node {
     native.attribute(this.nodeId, "type", this._inputType);
     native.attribute(this.nodeId, "role", "button");
     native.attribute(this.nodeId, "tabIndex", 0);
-    this._keep("focus", "blur", "keydown");
+    this._keep("focus", "blur", "keydown", "keyup");
     this._relisten();
   }
 
@@ -4804,14 +4904,34 @@ export class ButtonInput extends Node {
     return false;
   }
 
+  _handleBlur() {
+    this._spacePressed = false;
+  }
+
   _handleKey(event) {
-    if (isControlDisabled(this)) return false;
-    if (event.key === "Enter" || event.key === " ") {
+    if (isControlDisabled(this) || event.ctrlKey || event.altKey || event.metaKey) return false;
+    if (event.key === "Enter") {
       event.preventDefault();
-      this.click?.() ?? this._activate();
+      if (!event.repeat) syntheticClick(this);
+      return true;
+    }
+    if (event.key === " ") {
+      event.preventDefault();
+      this._spacePressed = true;
       return true;
     }
     return false;
+  }
+
+  _handleKeyUp(event) {
+    if (event.key !== " ") return false;
+    const pressed = this._spacePressed;
+    this._spacePressed = false;
+    event.preventDefault();
+    if (pressed && !isControlDisabled(this) && !event.ctrlKey && !event.altKey && !event.metaKey) {
+      syntheticClick(this);
+    }
+    return true;
   }
 }
 
@@ -5391,13 +5511,14 @@ export class SelectElement extends Node {
  */
 export class ButtonElement extends Node {
   _customValidity = "";
+  _spacePressed = false;
 
   constructor() {
     super("box");
     this._tag = "button";
     native.attribute(this.nodeId, "element", "button");
     native.attribute(this.nodeId, "tabIndex", 0);
-    this._keep("focus", "blur", "keydown");
+    this._keep("focus", "blur", "keydown", "keyup");
     this._relisten();
   }
 
@@ -5449,15 +5570,34 @@ export class ButtonElement extends Node {
     return true;
   }
 
+  _handleBlur() {
+    this._spacePressed = false;
+  }
+
   _handleKey(event) {
-    if (isControlDisabled(this)) return false;
-    if (event.key === "Enter" || event.key === " ") {
+    if (isControlDisabled(this) || event.ctrlKey || event.altKey || event.metaKey) return false;
+    if (event.key === "Enter") {
       event.preventDefault();
-      if (typeof this.click === "function") this.click();
-      else this._activate();
+      if (!event.repeat) syntheticClick(this);
+      return true;
+    }
+    if (event.key === " ") {
+      event.preventDefault();
+      this._spacePressed = true;
       return true;
     }
     return false;
+  }
+
+  _handleKeyUp(event) {
+    if (event.key !== " ") return false;
+    const pressed = this._spacePressed;
+    this._spacePressed = false;
+    event.preventDefault();
+    if (pressed && !isControlDisabled(this) && !event.ctrlKey && !event.altKey && !event.metaKey) {
+      syntheticClick(this);
+    }
+    return true;
   }
 }
 
@@ -7641,6 +7781,10 @@ native.dispatch = function (kind, id, a, b, modifiers, d, e, first, second, thir
   if (!prevented) {
     if ((kind === 0 || kind === 1 || kind === 3 || kind === 14) && target._handlePointer) target._handlePointer(kind, event);
     else if (kind === 7 && target._handleKey) target._handleKey(event);
+    else if (kind === 8 && target._handleKeyUp) target._handleKeyUp(event);
+    if (event.defaultPrevented) prevented = true;
+  } else if (kind === 8 && event.key === " " && target._spacePressed) {
+    target._spacePressed = false;
   }
   if (kind !== CLICK && isPointerKind(kind)) {
     // A prevented mousedown keeps focus and the selection where they are, as on the web.
@@ -16944,6 +17088,18 @@ function caretInto(target) {
   if (range && target.contains(range.startContainer) && target.contains(range.endContainer)) return;
   const [node, offset] = startIn(target);
   selection.collapse(node, offset);
+}
+
+// Keyboard activation click for HTML controls (`<button>`, `<input type="button|checkbox|radio">`).
+function syntheticClick(node) {
+  if (typeof node.click === "function") {
+    node.click();
+    return;
+  }
+  const event = new Event("click", node);
+  event.bubbles = true;
+  dispatchEvent(event);
+  if (!event.defaultPrevented && typeof node._activate === "function") node._activate();
 }
 
 // HTML defaults of a click: a checkbox or radio checks, a label passes the click on to its

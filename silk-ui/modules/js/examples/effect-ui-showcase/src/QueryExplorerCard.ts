@@ -92,84 +92,108 @@ export const QueryExplorerCard = Html.component({
       Picked: ($, { q }) => $.evolve({ q }),
     },
     view: (h, model) =>
-      h.section.class("studio-card p-4 flex flex-col gap-3").children(
-        h.div.class("flex items-center gap-2.5").children(
-          h.input
-            .class("studio-input flex-1")
-            .attr("placeholder", "Filter stack… (debounced 120ms)")
-            .value(model.q)
-            .on("input", ({ value }) => ExplorerMessage.Typed({ q: value })),
-          h.div.class("flex items-center gap-1.5 shrink-0").children(
-            ...([
-              ["", "All"],
-              ["@effect/ui", "Effect UI"],
-              ["@silkui/core", "Silk UI"],
-            ] as const).map(([q, label]) =>
-              h.button
-                .key(q || "all")
-                .class(
-                  "studio-btn py-1.5 px-2.5 text-xs",
-                  model.q === q ? "studio-btn-active" : "",
-                )
-                .on("click", ExplorerMessage.Picked({ q }))
-                .children(label),
-            ),
-          ),
-          AsyncResult.match(h.queries.results, {
-            onInitial: () =>
-              h.span
-                .class("studio-chip")
-                .attr("style", "background-color: var(--amber-soft); color: var(--amber)")
-                .children("Fetching…"),
-            onFailure: () =>
-              h.span
-                .class("studio-chip")
-                .attr("style", "background-color: var(--rose-soft); color: var(--rose)")
-                .children("Error"),
-            onSuccess: ({ value, waiting }) =>
-              h.span
-                .class("studio-chip")
-                .attr(
-                  "style",
-                  waiting
-                    ? "background-color: var(--amber-soft); color: var(--amber)"
-                    : "background-color: var(--emerald-soft); color: var(--emerald)",
-                )
-                .children(waiting ? "Syncing" : `Cache #${value.fetchId}`),
-          }),
-        ),
-        AsyncResult.match(h.queries.results, {
-          onInitial: () => h.div.class("h-14"),
-          onFailure: () => h.div,
-          onSuccess: ({ value }) =>
-            h.div.class("grid grid-cols-4 gap-2.5").children(
-              ...value.items.map((item) =>
-                h.div
-                  .key(item.id)
-                  .class("p-3 rounded-xl flex flex-col gap-1")
+      h.section
+        .class("studio-card p-4 flex flex-col gap-3")
+        .attr("role", "region")
+        .attr("aria-label", "Stack catalog search")
+        .children(
+          h.div.class("flex items-center gap-2.5").children(
+            h.input
+              .class("studio-input flex-1")
+              .attr("aria-label", "Filter stack items")
+              .attr("placeholder", "Filter stack… (debounced 120ms)")
+              .value(model.q)
+              .on("input", ({ value }) => ExplorerMessage.Typed({ q: value })),
+            h.div
+              .class("flex items-center gap-1.5 shrink-0")
+              .attr("role", "group")
+              .attr("aria-label", "Quick stack filters")
+              .children(
+                ...([
+                  ["", "All", "Show all stack items"],
+                  ["@effect/ui", "Effect UI", "Filter by Effect UI"],
+                  ["@silkui/core", "Silk UI", "Filter by Silk UI"],
+                ] as const).map(([q, label, ariaLabel]) =>
+                  h.button
+                    .key(q || "all")
+                    .class(
+                      "studio-btn py-1.5 px-2.5 text-xs",
+                      model.q === q ? "studio-btn-active" : "",
+                    )
+                    .attr("aria-pressed", String(model.q === q))
+                    .attr("aria-label", ariaLabel)
+                    .on("click", ExplorerMessage.Picked({ q }))
+                    .children(label),
+                ),
+              ),
+            AsyncResult.match(h.queries.results, {
+              onInitial: () =>
+                h.span
+                  .class("studio-chip")
+                  .attr("aria-label", "Query status: Fetching")
+                  .attr("style", "background-color: var(--amber-soft); color: var(--amber)")
+                  .children("Fetching…"),
+              onFailure: () =>
+                h.span
+                  .class("studio-chip")
+                  .attr("aria-label", "Query status: Error")
+                  .attr("style", "background-color: var(--rose-soft); color: var(--rose)")
+                  .children("Error"),
+              onSuccess: ({ value, waiting }) =>
+                h.span
+                  .class("studio-chip")
+                  .attr(
+                    "aria-label",
+                    waiting
+                      ? "Query status: Syncing"
+                      : `Query status: Cached result number ${value.fetchId}`,
+                  )
                   .attr(
                     "style",
-                    "background-color: var(--surface-2); border: 1px solid var(--border)",
+                    waiting
+                      ? "background-color: var(--amber-soft); color: var(--amber)"
+                      : "background-color: var(--emerald-soft); color: var(--emerald)",
                   )
-                  .children(
-                    h.span
-                      .class("studio-mono text-[10px]")
+                  .children(waiting ? "Syncing" : `Cache #${value.fetchId}`),
+            }),
+          ),
+          AsyncResult.match(h.queries.results, {
+            onInitial: () => h.div.class("h-14"),
+            onFailure: () => h.div,
+            onSuccess: ({ value }) =>
+              h.div
+                .class("grid grid-cols-4 gap-2.5")
+                .attr("role", "list")
+                .attr("aria-label", "Matching stack items")
+                .children(
+                  ...value.items.map((item) =>
+                    h.div
+                      .key(item.id)
+                      .class("p-3 rounded-xl flex flex-col gap-1")
+                      .attr("role", "listitem")
                       .attr(
                         "style",
-                        item.tag === "@silkui/core"
-                          ? "color: var(--cyan)"
-                          : "color: var(--accent-bright)",
+                        "background-color: var(--surface-2); border: 1px solid var(--border)",
                       )
-                      .children(item.tag),
-                    h.span.class("text-xs font-semibold").children(item.title),
-                    h.span
-                      .class("text-[11px]")
-                      .attr("style", "color: var(--fg-muted)")
-                      .children(item.note),
+                      .children(
+                        h.span
+                          .class("studio-mono text-[10px]")
+                          .attr(
+                            "style",
+                            item.tag === "@silkui/core"
+                              ? "color: var(--emerald)"
+                              : "color: var(--accent-bright)",
+                          )
+                          .children(item.tag),
+                        h.span.class("text-xs font-semibold").children(item.title),
+                        h.span
+                          .class("text-[11px]")
+                          .attr("style", "color: var(--fg-muted)")
+                          .children(item.note),
+                      ),
                   ),
-              ),
-            ),
-        }),
-      ),
+                ),
+          }),
+        ),
   })
   .pipe(Component.provide(SearchCatalog.layer));

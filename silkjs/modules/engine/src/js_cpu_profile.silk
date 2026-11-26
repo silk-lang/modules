@@ -1,8 +1,19 @@
 //! Owner-thread cooperative CPU sampling. Only observed safepoints (and the
 //! current stack on request, see sampleCurrentStack) are samples;
-//! elapsed intervals are never expanded into synthetic samples. Native/idle/GC
-//! states require an explicit observe call. Stop transfers all native storage,
-//! containing copied metadata and no JS roots, into a read-only profile.
+//! elapsed intervals are never expanded into one synthetic sample per tick.
+//!
+//! A stretch in which no safepoint ran (a native call, a collection, the host
+//! between two entries) is one observation too: the first observation after it
+//! records one sample stamped with the stretch's start, so that a reader, which
+//! gives a sample the time up to the next one, charges the stretch to what it was
+//! and not to the last JavaScript sample before it. Under the function that was
+//! and still is running it is (native); otherwise it is (program) at the root,
+//! or the state an explicit observe call names.
+//!
+//! Stacks are kept as a calling-context tree built while sampling, so storage
+//! grows with the distinct stacks seen, not with the samples. Stop transfers all
+//! native storage, containing copied metadata and no JS roots, into a read-only
+//! profile.
 import silk.collections.list { List }
 import silk.collections.slice { Slice }
 import silk.core.option { Option }
@@ -11,6 +22,8 @@ import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.mem.pointer { Pointer }
 import js_os_events_platform as platform
 import silk.num.usize
+import silk.num.u8
+import silk.num.u64
 import js_heap { HeapCell, HeapHeader }
 import js_value { ValueBits }
 import js_core_types { RuntimeState, StackFrame, FunctionBytecode, FunctionDebugInfo, NO_PC, refreshObservation }
@@ -20,11 +33,19 @@ pub const JAVASCRIPT: u8 = 0
 pub const NATIVE: u8 = 1
 pub const IDLE: u8 = 2
 pub const GC: u8 = 3
+/// Time outside JavaScript that no explicit state names: V8's (program).
+pub const PROGRAM: u8 = 4
 pub const NO_FUNCTION: usize = usize.MAX
 pub const MAX_DEPTH: usize = 256
+pub const NO_NODE: usize = usize.MAX
+/// The shortest stretch without a safepoint that is recorded as its own sample,
+/// whatever the interval: below it, consecutive instructions are just slow.
+const STRETCH_MINIMUM: i64 = 50
 
+/// node is the sample's leaf in Profile.nodes: for a state sample (kind other than
+/// JAVASCRIPT) a node of that kind under the stack the state was observed on.
 pub struct Sample {
-  pub timestampMicroseconds: i64, pub firstFrame: usize, pub frameCount: usize,
+  pub timestampMicroseconds: i64, pub node: usize,
   pub kind: u8, pub truncatedStack: bool
 }
 impl Copy for Sample {}
@@ -36,6 +57,10 @@ pub struct Frame {
   pub line: i32, pub column: i32
 }
 impl Copy for Frame {}
+/// One calling context: frame called from parent's. Node 0 is the root, whose
+/// parent is NO_NODE; a parent's index is always below its children's.
+pub struct Node { pub parent: usize, pub frame: Frame }
+impl Copy for Node {}
 pub struct Function {
   pub address: usize, pub scriptId: u64,
   nameUnits: [u16; 128], urlUnits: [u16; 512], nameLength: usize, urlLength: usize
@@ -48,22 +73,23 @@ impl Function {
   pub fn urlTruncated(self: &Self) -> bool { return self.urlLength > 512 }
 }
 /// Accessors expose only populated prefixes; backing capacity is never a count.
-/// Frame order is leaf first. Coordinates are zero based, -1 when unavailable.
+/// Coordinates are zero based, -1 when unavailable.
 pub struct Profile {
   start: i64, end: i64, interval: i64,
-  sampleStorage: List<Sample>, frameStorage: List<Frame>, functionStorage: List<Function>,
-  sampleCount: usize, frameCount: usize, functionCount: usize,
+  sampleStorage: List<Sample>, nodeStorage: List<Node>, slotStorage: List<usize>, functionStorage: List<Function>,
+  sampleCount: usize, nodeCount: usize, functionCount: usize,
   dropped: u64
 }
 impl Profile {
   fn make() -> Self { return Self { start: 0, end: 0, interval: 0,
-    sampleStorage: List<Sample>.make(), frameStorage: List<Frame>.make(), functionStorage: List<Function>.make(),
-    sampleCount: 0, frameCount: 0, functionCount: 0, dropped: 0 } }
+    sampleStorage: List<Sample>.make(), nodeStorage: List<Node>.make(), slotStorage: List<usize>.make(),
+    functionStorage: List<Function>.make(), sampleCount: 0, nodeCount: 0, functionCount: 0, dropped: 0 } }
   pub fn startMicroseconds(self: &Self) -> i64 { return self.start }
   pub fn endMicroseconds(self: &Self) -> i64 { return self.end }
   pub fn intervalMicroseconds(self: &Self) -> i64 { return self.interval }
   pub fn samples(self: &Self) -> &[Sample] { return Slice.view<Sample>(self.sampleStorage.asSlice(), 0, self.sampleCount) }
-  pub fn frames(self: &Self) -> &[Frame] { return Slice.view<Frame>(self.frameStorage.asSlice(), 0, self.frameCount) }
+  /// The calling-context tree, root first.
+  pub fn nodes(self: &Self) -> &[Node] { return Slice.view<Node>(self.nodeStorage.asSlice(), 0, self.nodeCount) }
   pub fn functions(self: &Self) -> &[Function] { return Slice.view<Function>(self.functionStorage.asSlice(), 0, self.functionCount) }
   /// Due observations rejected by full sample storage, not estimated missed ticks.
   pub fn droppedObservations(self: &Self) -> u64 { return self.dropped }
@@ -71,9 +97,14 @@ impl Profile {
 /// One profile sharing the recorder (startShared): the samples from `since` on.
 pub struct Window { id: u64, since: i64 }
 impl Copy for Window {}
-pub struct State { pub enabled: bool, last: i64, profile: Profile, windows: List<Window>, nextWindow: u64 }
+/// last is the time of the last interval sample; seen is the time of the last
+/// observation of any kind, sampled or not, and seenFrame and seenCode the stack
+/// frame and code a safepoint saw then (0 for any other observation).
+pub struct State { pub enabled: bool, last: i64, seen: i64, seenFrame: usize, seenCode: usize,
+  profile: Profile, windows: List<Window>, nextWindow: u64 }
 impl State {
-  pub fn make() -> Self { return Self { enabled: false, last: 0, profile: Profile.make(), windows: List<Window>.make(), nextWindow: 1 } }
+  pub fn make() -> Self { return Self { enabled: false, last: 0, seen: 0, seenFrame: 0, seenCode: 0,
+    profile: Profile.make(), windows: List<Window>.make(), nextWindow: 1 } }
   /// The recording in progress, read only.
   pub fn live(self: &Self) -> &Profile { return &self.profile }
 }
@@ -84,11 +115,12 @@ pub union SharedStart { Started { pub id: u64 }, Busy, TooMany }
 pub effect fn nowMicroseconds() -> i64 {
   return platform.nowNanoseconds() / 1000
 }
-fn emptyFrame() -> Frame { return Frame { kind: NATIVE, functionIndex: NO_FUNCTION,
+fn emptyFrame(kind: u8) -> Frame { return Frame { kind: kind, functionIndex: NO_FUNCTION,
   functionAddress: 0, scriptId: 0, pc: Option<usize>.none(), pcIsReturnAddress: false, line: -1, column: -1 } }
 /// False means already running or invalid bounds, with no state change. Allocation
 /// failure also leaves state unchanged. Interval must be positive; capacity limits
 /// bound observer memory independently of the program being profiled.
+/// frameCapacity bounds the calling-context tree: the distinct stacks kept.
 pub unsafe effect fn start(runtime: *mut HeapHeader, intervalMicroseconds: i64,
   sampleCapacity: usize, frameCapacity: usize, functionCapacity: usize) -> bool
   ! OutOfMemoryError ? &mut Allocator {
@@ -98,19 +130,25 @@ pub unsafe effect fn start(runtime: *mut HeapHeader, intervalMicroseconds: i64,
     frameCapacity == 0 || frameCapacity > 1048576 || functionCapacity == 0 || functionCapacity > 16384 { return false }
   let mut profile = Profile.make()
   run profile.sampleStorage.reserveExact(sampleCapacity)
-  run profile.frameStorage.reserveExact(frameCapacity)
+  run profile.nodeStorage.reserveExact(frameCapacity + 1)
+  run profile.slotStorage.reserveExact(frameCapacity * 2)
   run profile.functionStorage.reserveExact(functionCapacity)
   let mut i: usize = 0
   while i < sampleCapacity { run profile.sampleStorage.append(Sample { timestampMicroseconds: 0,
-    firstFrame: 0, frameCount: 0, kind: JAVASCRIPT, truncatedStack: false }) i = i + 1 }
+    node: 0, kind: JAVASCRIPT, truncatedStack: false }) i = i + 1 }
   i = 0
-  while i < frameCapacity { run profile.frameStorage.append(emptyFrame()) i = i + 1 }
+  // The root, then one node per kept context.
+  while i < frameCapacity + 1 { run profile.nodeStorage.append(Node { parent: NO_NODE, frame: emptyFrame(JAVASCRIPT) }) i = i + 1 }
+  profile.nodeCount = 1
+  i = 0
+  while i < frameCapacity * 2 { run profile.slotStorage.append(NO_NODE) i = i + 1 }
   i = 0
   while i < functionCapacity { run profile.functionStorage.append(Function.make()) i = i + 1 }
   profile.interval = intervalMicroseconds profile.start = run nowMicroseconds()
   let last = profile.start
   let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
   state.cpuProfile.enabled = true state.cpuProfile.last = last state.cpuProfile.profile = move profile
+  state.cpuProfile.seen = last state.cpuProfile.seenFrame = 0 state.cpuProfile.seenCode = 0
   refreshObservation(&mut state)
   return true
 }
@@ -222,55 +260,140 @@ unsafe fn capture(state: &mut RuntimeState, bytecode: *mut HeapHeader, pc: Optio
   }
   return result
 }
-unsafe fn record(runtime: *mut HeapHeader, kind: u8, bytecode: ?*mut HeapHeader, pc: usize, force: bool) -> () {
-  let mut anchor = () let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
-  if !state.cpuProfile.enabled { return }
-  let now = platform.nowNanoseconds() / 1000
-  if !force && now - state.cpuProfile.last < state.cpuProfile.profile.interval { return }
-  // Schedule from the actual observation, never from a missed deadline.
-  state.cpuProfile.last = now
+fn slotOf(parent: usize, kind: u8, address: usize, scriptId: u64, pc: usize, capacity: usize) -> usize {
+  let mut value = u64.wrappingMultiply(usize.toU64(parent) + 1, 11400714819323198485)
+  value = u64.wrappingMultiply(value ^ usize.toU64(address), 1099511628211)
+  value = u64.wrappingMultiply(value ^ scriptId ^ u8.toU64(kind), 1099511628211)
+  value = u64.wrappingMultiply(value ^ usize.toU64(pc), 1099511628211)
+  return u64.toUsize((value ^ u64.shiftRight(value, 29)) % usize.toU64(capacity))
+}
+fn pcKey(pc: Option<usize>) -> usize { return match pc { Option<usize>.Some { value } => value _ => usize.MAX } }
+/// The node for a context under parent, made when it is new: NO_NODE once the
+/// tree is full. bytecode is the frame's code when it is a JavaScript frame.
+unsafe fn child(state: &mut RuntimeState, parent: usize, kind: u8, address: usize, scriptId: u64,
+  bytecode: ?*mut HeapHeader, pc: Option<usize>, returnAddress: bool) -> usize {
+  let capacity = state.cpuProfile.profile.slotStorage.length()
+  if capacity == 0 { return NO_NODE }
+  let key = pcKey(pc)
+  let mut slot = slotOf(parent, kind, address, scriptId, key, capacity)
+  while true {
+    let index = state.cpuProfile.profile.slotStorage.get(slot)
+    if index == NO_NODE { break }
+    let node = state.cpuProfile.profile.nodeStorage.get(index)
+    if node.parent == parent && node.frame.kind == kind && node.frame.functionAddress == address &&
+      node.frame.scriptId == scriptId && pcKey(node.frame.pc) == key && node.frame.pcIsReturnAddress == returnAddress { return index }
+    slot = slot + 1 if slot == capacity { slot = 0 }
+  }
+  let index = state.cpuProfile.profile.nodeCount
+  if index == state.cpuProfile.profile.nodeStorage.length() { return NO_NODE }
+  let mut frame = emptyFrame(kind)
+  frame.functionAddress = address frame.pcIsReturnAddress = returnAddress
+  if let Option<*mut HeapHeader>.Some { value } = Pointer.nonNullMut<HeapHeader>(bytecode) { frame = unsafe capture(&mut state, value, pc, returnAddress) }
+  state.cpuProfile.profile.nodeStorage.set(index, Node { parent: parent, frame: frame })
+  state.cpuProfile.profile.slotStorage.set(slot, index)
+  state.cpuProfile.profile.nodeCount = index + 1
+  return index
+}
+/// Writes one sample stamped at: the stack as it stands when stack is set (with
+/// bytecode and pc as its executing leaf, when given), and a leaf of kind for a
+/// state sample. A full sample store counts one dropped observation.
+unsafe fn write(state: &mut RuntimeState, at: i64, kind: u8, stack: bool, bytecode: ?*mut HeapHeader, pc: usize) -> () {
   if state.cpuProfile.profile.sampleCount == state.cpuProfile.profile.sampleStorage.length() {
     if state.cpuProfile.profile.dropped != 18446744073709551615 { state.cpuProfile.profile.dropped = state.cpuProfile.profile.dropped + 1 }
     return
   }
-  let first = state.cpuProfile.profile.frameCount
-  // An idle embedder waits outside JavaScript: the frames still on the stack are
-  // the host loop's, so V8's (idle) node hangs from the root.
-  let mut current = if kind == IDLE { Pointer.null<StackFrame>() } else { state.currentStackFrame } let mut depth: usize = 0
-  let mut top = true
-  while !Pointer.isNull<StackFrame>(current) || (top && !Pointer.isNull<HeapHeader>(bytecode)) {
-    if depth == MAX_DEPTH || state.cpuProfile.profile.frameCount == state.cpuProfile.profile.frameStorage.length() { break }
-    let mut row = emptyFrame()
-    let mut resolved = Option<*mut HeapHeader>.none() let mut location = Option<usize>.none()
-    let mut returnAddress = true
+  // Leaf first, as the frames link; the tree is then entered root first.
+  let mut walked: [?*mut StackFrame; 256] = [Pointer.null<StackFrame>(); 256]
+  let mut depth: usize = 0
+  let mut current = if stack { state.currentStackFrame } else { Pointer.null<StackFrame>() }
+  let leafOnly = stack && Pointer.isNull<StackFrame>(current) && !Pointer.isNull<HeapHeader>(bytecode)
+  if leafOnly { depth = 1 }
+  while !Pointer.isNull<StackFrame>(current) && depth < MAX_DEPTH {
+    walked[depth] = current depth = depth + 1
     if let Option<*mut StackFrame>.Some { value: pointer } = Pointer.nonNullMut<StackFrame>(current) {
       let frameAnchor = () let frame = unsafe Pointer.borrow<(), StackFrame>(&frameAnchor, pointer)
-      match frame.currentFunction {
-        ValueBits.Object { reference } => { row.functionAddress = Pointer.address<HeapHeader>(reference) }
-        // A known local function (js_compiler_known) runs as its FunctionBytecode.
-        ValueBits.FunctionBytecode { reference } => { row.functionAddress = Pointer.address<HeapHeader>(reference) }
-        _ => ()
-      }
-      resolved = unsafe backtrace.bytecode(frame.currentFunction)
-      // Suspended callers publish the resume PC; native frames publish NO_PC.
-      if frame.currentPc != NO_PC { location = Option<usize>.some(frame.currentPc) }
       current = frame.previous
     }
-    if top {
+  }
+  let mut truncated = !Pointer.isNull<StackFrame>(current)
+  let mut node: usize = 0
+  let mut i = depth
+  while i != 0 {
+    i = i - 1
+    let mut address: usize = 0
+    let mut resolved = Pointer.null<HeapHeader>() let mut location = Option<usize>.none()
+    let mut returnAddress = true
+    if let Option<*mut StackFrame>.Some { value: pointer } = Pointer.nonNullMut<StackFrame>(walked[i]) {
+      let frameAnchor = () let frame = unsafe Pointer.borrow<(), StackFrame>(&frameAnchor, pointer)
+      match frame.currentFunction {
+        ValueBits.Object { reference } => { address = Pointer.address<HeapHeader>(reference) }
+        // A known local function (js_compiler_known) runs as its FunctionBytecode.
+        ValueBits.FunctionBytecode { reference } => { address = Pointer.address<HeapHeader>(reference) }
+        _ => ()
+      }
+      if let Option<*mut HeapHeader>.Some { value } = unsafe backtrace.bytecode(frame.currentFunction) { resolved = value }
+      // Suspended callers publish the resume PC; native frames publish NO_PC.
+      if frame.currentPc != NO_PC { location = Option<usize>.some(frame.currentPc) }
+    }
+    if i == 0 {
       if let Option<*mut HeapHeader>.Some { value } = Pointer.nonNullMut<HeapHeader>(bytecode) {
-        resolved = Option<*mut HeapHeader>.some(value) location = Option<usize>.some(pc)
+        resolved = value location = Option<usize>.some(pc)
         returnAddress = false
       }
     }
-    if let Option<*mut HeapHeader>.Some { value } = resolved { row = unsafe capture(&mut state, value, location, returnAddress) }
-    let index = state.cpuProfile.profile.frameCount
-    state.cpuProfile.profile.frameStorage.set(index, row) state.cpuProfile.profile.frameCount = index + 1
-    depth = depth + 1 top = false
+    let mut frameKind = NATIVE let mut scriptId: u64 = 0
+    if let Option<*mut HeapHeader>.Some { value } = Pointer.nonNullMut<HeapHeader>(resolved) {
+      let codeAnchor = () let code = unsafe HeapCell.payload<FunctionBytecode, ()>(&codeAnchor, value)
+      frameKind = JAVASCRIPT scriptId = code.scriptId address = Pointer.address<HeapHeader>(value)
+    } else { returnAddress = false location = Option<usize>.none() }
+    let next = unsafe child(&mut state, node, frameKind, address, scriptId, resolved, location, returnAddress)
+    if next == NO_NODE { truncated = true break }
+    node = next
+  }
+  if kind != JAVASCRIPT {
+    let next = unsafe child(&mut state, node, kind, 0, 0, Pointer.null<HeapHeader>(), Option<usize>.none(), false)
+    if next == NO_NODE { truncated = true } else { node = next }
   }
   let index = state.cpuProfile.profile.sampleCount
-  state.cpuProfile.profile.sampleStorage.set(index, Sample { timestampMicroseconds: now, firstFrame: first,
-    frameCount: depth, kind: kind, truncatedStack: !Pointer.isNull<StackFrame>(current) || (top && !Pointer.isNull<HeapHeader>(bytecode)) })
+  state.cpuProfile.profile.sampleStorage.set(index, Sample { timestampMicroseconds: at, node: node, kind: kind, truncatedStack: truncated })
   state.cpuProfile.profile.sampleCount = index + 1
+}
+unsafe fn record(runtime: *mut HeapHeader, kind: u8, bytecode: ?*mut HeapHeader, pc: usize, force: bool) -> () {
+  let mut anchor = () let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  if !state.cpuProfile.enabled { return }
+  let now = platform.nowNanoseconds() / 1000
+  let interval = state.cpuProfile.profile.interval
+  let seen = state.cpuProfile.seen
+  let safepoint = kind == JAVASCRIPT && !force
+  let frameAddress = if safepoint { Pointer.address<StackFrame>(state.currentStackFrame) } else { 0 }
+  let codeAddress = if safepoint { Pointer.address<HeapHeader>(bytecode) } else { 0 }
+  let resumed = safepoint && frameAddress == state.cpuProfile.seenFrame && codeAddress == state.cpuProfile.seenCode
+  state.cpuProfile.seen = now state.cpuProfile.seenFrame = frameAddress state.cpuProfile.seenCode = codeAddress
+  let stretch = now - seen
+  if stretch >= interval && stretch >= STRETCH_MINIMUM && !force {
+    // No safepoint ran since seen: one sample for the stretch, stamped at its start.
+    if safepoint {
+      // The function that was running still is: it called out. Otherwise JavaScript
+      // was left and entered again, and what ran between is the embedder's.
+      if resumed { unsafe write(&mut state, seen, NATIVE, true, bytecode, pc) }
+      else { unsafe write(&mut state, seen, PROGRAM, false, Pointer.null<HeapHeader>(), 0) }
+      state.cpuProfile.last = now
+      unsafe write(&mut state, now, JAVASCRIPT, true, bytecode, pc)
+      return
+    }
+    // The state the caller names lasted the stretch; the next safepoint is due.
+    state.cpuProfile.last = seen
+    unsafe write(&mut state, seen, kind, kind != IDLE && kind != PROGRAM, Pointer.null<HeapHeader>(), 0)
+    return
+  }
+  // PROGRAM only ends a stretch: a short one stays with the sample before it.
+  if kind == PROGRAM { return }
+  if !force && now - state.cpuProfile.last < interval { return }
+  // Schedule from the actual observation, never from a missed deadline.
+  state.cpuProfile.last = now
+  // An idle embedder waits outside JavaScript: the frames still on the stack are
+  // the host loop's, so V8's (idle) node hangs from the root.
+  unsafe write(&mut state, now, kind, kind != IDLE && kind != PROGRAM, bytecode, pc)
 }
 /// Call before dispatch with the actual executing bytecode and opcode offset.
 /// Disabled execution reads only the flag, never the clock or stack. Enabled
@@ -278,15 +401,17 @@ unsafe fn record(runtime: *mut HeapHeader, kind: u8, bytecode: ?*mut HeapHeader,
 pub unsafe effect fn safepoint(runtime: *mut HeapHeader, bytecode: *mut HeapHeader, pc: usize) -> () {
   unsafe record(runtime, JAVASCRIPT, bytecode, pc, false)
 }
-/// Call only while the named state is actually observed, on the runtime's owner
-/// thread. No background thread reads VM frames. Other kinds are ignored.
+/// Call when the named state ends (and, for a short one, while it is observed), on
+/// the runtime's owner thread: a stretch without safepoints that ends here is
+/// recorded as that state. PROGRAM ends a stretch of embedder work, as before an
+/// idle wait. No background thread reads VM frames. Other kinds are ignored.
 pub unsafe effect fn observe(runtime: *mut HeapHeader, kind: u8) -> () {
   unsafe observeNow(runtime, kind)
 }
 /// Non-effect owner-thread entry for GC lifecycle and other native callbacks.
 /// Uses the same monotonic clock and preallocated recorder as VM safepoints.
 pub unsafe fn observeNow(runtime: *mut HeapHeader, kind: u8) -> () {
-  if kind != NATIVE && kind != IDLE && kind != GC { return }
+  if kind != NATIVE && kind != IDLE && kind != GC && kind != PROGRAM { return }
   unsafe record(runtime, kind, Pointer.null<HeapHeader>(), 0, false)
 }
 /// One sample of the stack as it stands, whatever the interval: V8's CpuProfiler

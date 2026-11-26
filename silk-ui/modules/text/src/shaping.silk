@@ -1,0 +1,1768 @@
+//! `TextMeasure.shape`: one candidate line in logical order.
+//!
+//! Text tokens with the same font key and bidi level are shaped together, across word and
+//! space tokens and across inline boxes that are not shaping barriers, as browsers shape a
+//! whole text item. Each such segment is itemized by script and, per cluster, by the face that
+//! has its first character (font fallback). Glyphs then go back to the tokens they came from:
+//! a `TextRun` never crosses a token, a level change, or a font change.
+import properties.census { Census }
+import layout.lib { WritingMode, TextOrientation }
+import silk.text.vertical_text { Orientation, OrientationRun }
+import silk.text.vertical_text
+import fonts { FontState, RawGlyph, Treatment }
+import transform
+import properties.computed { TextTransform }
+import glyphs { GlyphStore, PositionedGlyph }
+import analysis { tokenLength }
+import layout.lib { TextToken, TextTokenKind, TextCursor, TextShapeRequest, TextRun, TextError, TextJustify }
+import font_collection.lib { Selection, continuesCluster }
+import set { Link }
+import silk.text.script_itemization
+import silk.text.script_itemization { ScriptRun }
+import silk.text.unicode_script { Script }
+import silk.num.u64
+import silk.text.unicode_properties { BidiClass }
+import silk.text.string { String }
+import silk.text.utf8_scan
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.i32
+import silk.num.f32
+import silk.num.u32
+import silk.num.usize
+
+enum PieceKind {
+  Text,
+  Zero,
+  Object,
+}
+
+// A level-uniform part of one token on the line.
+struct Piece {
+  kind: PieceKind,
+  unit: usize,
+  start: usize,
+  end: usize,
+  level: u8,
+  fontKey: usize,
+  // Pieces with the same segment number are shaped as one text.
+  segment: usize,
+  // Offset of `start` in the segment text.
+  segmentStart: usize,
+}
+
+impl Copy for Piece {}
+
+// A shaped item of a segment: one script, one face.
+struct Item {
+  upright: bool,
+  start: usize,
+  end: usize,
+  key: usize,
+  glyphStart: usize,
+  glyphEnd: usize,
+  // How the glyphs' clusters run: 1 never falling, -1 never rising, 0 neither.
+  order: i8,
+  // The script the item was shaped as.
+  script: u32,
+  // Whether the item's glyphs may differ when text comes before it (`FontState.leans`).
+  leans: bool,
+}
+
+impl Copy for Item {}
+
+// A run before it is interned, with its glyphs in `Shaping.glyphs`.
+struct Pending {
+  kind: PieceKind,
+  unit: usize,
+  start: usize,
+  end: usize,
+  level: u8,
+  key: usize,
+  rtl: bool,
+  glyphStart: usize,
+  glyphEnd: usize,
+  leftSpacing: f32,
+  rightSpacing: f32,
+  // Whether a line that starts where this run starts may not take the runs on either side
+  // of that cut from the shaping of the whole text (`TextRun.Text.unsafeBefore`).
+  unsafeBefore: bool,
+}
+
+impl Copy for Pending {}
+
+// One remembered face choice; `style` is usize.MAX in an empty slot.
+struct Choice {
+  style: usize,
+  script: u32,
+  scalar: u32,
+  selection: Selection,
+}
+
+impl Copy for Choice {}
+
+const CHOICES: usize = 512
+
+// A segment shaped before, kept so that a segment cut from its text (a line of the paragraph)
+// or one that continues it (text being appended to) takes its glyphs instead of shaping again.
+struct Source {
+  text: String,
+  fontKey: usize,
+  rtl: bool,
+  // The font set generation the faces were chosen at.
+  generation: u64,
+  // Whether text cut from the segment may take its glyphs: no item has an AAT face.
+  cuts: bool,
+  scripts: List<ScriptRun>,
+  items: List<Item>,
+  raw: List<RawGlyph>,
+  // The pieces the segment was made of, in order: where each token's text is in `text`.
+  pieces: List<Piece>,
+}
+
+// The segments kept. A paragraph has a few (one per font and direction), and its lines follow
+// it at once, so a handful is enough; the oldest is replaced.
+const SOURCES: usize = 8
+
+// Shorter segments are not kept: a label that fits its line is shaped once, and keeping it
+// would cost more than the rare short text that wraps saves.
+const SOURCE_BYTES: usize = 32
+
+/// Reusable storage for [`shapeLine`].
+pub struct Shaping {
+  pieces: List<Piece>,
+  segment: String,
+  scripts: List<ScriptRun>,
+  orientations: List<OrientationRun>,
+  chain: List<Link>,
+  /// The font set generation `choices` were made at.
+  generation: u64,
+  items: List<Item>,
+  raw: List<RawGlyph>,
+  pending: List<Pending>,
+  glyphs: List<PositionedGlyph>,
+  // Per glyph in `glyphs`: whether justification may widen it.
+  opportunities: List<bool>,
+  // Faces chosen before, in a direct-mapped table keyed by style, script and character. The
+  // choice is a pure function of the three, and text asks for the same few over and over.
+  choices: List<Choice>,
+  sources: List<Source>,
+  // The source to replace next.
+  oldest: usize,
+  // The items and glyphs of a segment's new end while they are joined to a source's.
+  tailItems: List<Item>,
+  tailRaw: List<RawGlyph>,
+  // Per item of the segment being emitted: where its last piece's glyphs ended.
+  hints: List<usize>,
+  /// Per run the last `shapeLine` appended: its `unsafeBefore`.
+  pub unsafeRuns: List<bool>,
+  // Whether the request being shaped is a whole paragraph, whose cuts are worth judging.
+  wantSafety: bool,
+  // Whether every item of the segment being emitted has a face (`Source.cuts`).
+  segmentCuts: bool,
+  /// Take glyphs from segments shaped before where that gives what shaping would. Off, every
+  /// segment is shaped, for checking that the two agree.
+  pub reuse: bool,
+  /// Segments that took their glyphs from a segment shaped before: whole or cut from it, and
+  /// continuing it.
+  pub taken: usize,
+  pub continued: usize,
+}
+
+impl Shaping {
+  pub effect fn census(self: &Self, out: &mut Census) -> () ! OutOfMemoryError ? &mut Allocator {
+    let used = self.pieces.length() * Intrinsic.layoutOf<Piece>().bytes + self.items.length() * Intrinsic.layoutOf<Item>().bytes
+      + self.raw.length() * Intrinsic.layoutOf<RawGlyph>().bytes + self.pending.length() * Intrinsic.layoutOf<Pending>().bytes
+      + self.glyphs.length() * Intrinsic.layoutOf<PositionedGlyph>().bytes + self.opportunities.length()
+    let room = self.pieces.capacity() * Intrinsic.layoutOf<Piece>().bytes + self.items.capacity() * Intrinsic.layoutOf<Item>().bytes
+      + self.raw.capacity() * Intrinsic.layoutOf<RawGlyph>().bytes + self.pending.capacity() * Intrinsic.layoutOf<Pending>().bytes
+      + self.glyphs.capacity() * Intrinsic.layoutOf<PositionedGlyph>().bytes + self.opportunities.capacity()
+      + self.segment.capacity()
+    run out.bytes("text.shaping.scratch", used, room)
+    run out.held("text.shaping.face-choices", self.choices.length(), self.choices.capacity(), Intrinsic.layoutOf<Choice>().bytes)
+  }
+
+  pub fn make() -> Shaping {
+    return Shaping {
+      pieces: List<Piece>.make(),
+      segment: String.make(),
+      scripts: List<ScriptRun>.make(),
+      orientations: List<OrientationRun>.make(),
+      chain: List<Link>.make(),
+      generation: 0,
+      items: List<Item>.make(),
+      raw: List<RawGlyph>.make(),
+      pending: List<Pending>.make(),
+      glyphs: List<PositionedGlyph>.make(),
+      opportunities: List<bool>.make(),
+      choices: List<Choice>.make(),
+      sources: List<Source>.make(),
+      oldest: 0,
+      tailItems: List<Item>.make(),
+      tailRaw: List<RawGlyph>.make(),
+      hints: List<usize>.make(),
+      unsafeRuns: List<bool>.make(),
+      wantSafety: false,
+      segmentCuts: false,
+      reuse: true,
+      taken: 0,
+      continued: 0,
+    }
+  }
+}
+
+fn resettable(cp: u32) -> bool {
+  let kind = BidiClass.of(cp)
+  return kind == BidiClass.WS || kind == BidiClass.S || kind == BidiClass.B || kind == BidiClass.BN
+    || kind == BidiClass.LRE
+    || kind == BidiClass.RLE
+    || kind == BidiClass.LRO
+    || kind == BidiClass.RLO
+    || kind == BidiClass.PDF
+    || kind == BidiClass.LRI
+    || kind == BidiClass.RLI
+    || kind == BidiClass.FSI
+    || kind == BidiClass.PDI
+}
+
+fn separatorClass(cp: u32) -> bool {
+  let kind = BidiClass.of(cp)
+  return kind == BidiClass.S || kind == BidiClass.B
+}
+
+/// CSS Text 3 §7.1 word-separator characters.
+// The character before `offset` in token `unit`, looking back into the token before it, for
+// `text-transform: capitalize`; 0 where a word starts.
+fn before(tokens: &[TextToken<'_>], unit: usize, offset: usize) -> u32 {
+  let mut token = unit
+  let mut at = offset
+  while true {
+    let kind = tokens[token].kind
+    if kind != TextTokenKind.Text && token != unit {
+      return 0
+    }
+    if at > 0 {
+      let bytes = String.utf8Bytes(tokens[token].text)
+      let mut start = at - 1
+      while start > 0 && (bytes[start] & 0xC0) == 0x80 {
+        start = start - 1
+      }
+      return utf8_scan.decode(bytes, start).scalar
+    }
+    if token == 0 {
+      return 0
+    }
+    token = token - 1
+    at = String.byteLength(tokens[token].text)
+  }
+  return 0
+}
+
+fn wordSeparator(cp: u32) -> bool {
+  return cp == 0x20 || cp == 0xA0 || cp == 0x1361 || cp == 0x10100 || cp == 0x10101 || cp == 0x1039F
+    || cp == 0x1091F
+}
+
+fn textKind(kind: TextTokenKind) -> bool {
+  return kind == TextTokenKind.Text || kind == TextTokenKind.Space
+    || kind == TextTokenKind.PreservedSpace
+}
+
+fn includedEnd(request: &TextShapeRequest<'_, '_>, unit: usize) -> usize {
+  if unit == request.end.unit {
+    return request.end.offset
+  }
+  return tokenLength(&request.context.tokens[unit])
+}
+
+fn includedStart(request: &TextShapeRequest<'_, '_>, unit: usize) -> usize {
+  if unit == request.start.unit {
+    return request.start.offset
+  }
+  return 0
+}
+
+fn hanging(request: &TextShapeRequest<'_, '_>, cursor: TextCursor) -> bool {
+  let mut index: usize = 0
+  while index < request.hangingRanges.length {
+    let range = request.hangingRanges[index]
+    if !cursor.before(range.start) && cursor.before(range.end) {
+      return true
+    }
+    index = index + 1
+  }
+  return false
+}
+
+fn wordMethod(method: TextJustify) -> bool {
+  return method == TextJustify.Auto || method == TextJustify.InterWord
+}
+
+// UAX #9 L1: the cursor after the last character that a line end does not reset.
+fn trailingOf(request: &TextShapeRequest<'_, '_>) -> TextCursor {
+  let tokens = request.context.tokens
+  let mut trailing = request.start
+  let mut unit = request.start.unit
+  while unit < tokens.length && unit <= request.end.unit {
+    let token = &tokens[unit]
+    let start = includedStart(request, unit)
+    let end = includedEnd(request, unit)
+    if start < end {
+      if token.kind == TextTokenKind.Atomic {
+        trailing = TextCursor { unit: unit, offset: end }
+      } else if token.kind == TextTokenKind.Text || token.kind == TextTokenKind.PreservedSpace {
+        let bytes = String.utf8Bytes(token.text)
+        let mut at = start
+        while at < end {
+          let decoded = utf8_scan.decode(bytes, at)
+          if !resettable(decoded.scalar) {
+            trailing = TextCursor { unit: unit, offset: decoded.next }
+          }
+          at = decoded.next
+        }
+      }
+    }
+    unit = unit + 1
+  }
+  return trailing
+}
+
+effect fn collectPieces(
+  state: &mut Shaping,
+  request: &TextShapeRequest<'_, '_>,
+  trailing: TextCursor,
+) -> ()
+  ! OutOfMemoryError | TextError
+  ? &mut Allocator {
+  let tokens = request.context.tokens
+  let analysis = request.analysis
+  state.pieces.clear()
+  let mut segment: usize = 0
+  let mut open = false
+  let mut unit = request.start.unit
+  while unit < tokens.length && unit <= request.end.unit {
+    let token = &tokens[unit]
+    let mut start = includedStart(request, unit)
+    let end = includedEnd(request, unit)
+    if token.kind == TextTokenKind.Open || token.kind == TextTokenKind.Close {
+      if token.shapingBarrier {
+        open = false
+      }
+    } else if !textKind(token.kind) {
+      open = false
+    }
+    if start < end {
+      let cursor = TextCursor { unit: unit, offset: start }
+      let paragraph = analysis.paragraphAt(cursor)
+      if token.kind == TextTokenKind.Atomic {
+        run state.pieces.append(
+          Piece {
+            kind: PieceKind.Object,
+            unit: unit,
+            start: start,
+            end: end,
+            level: analysis.levelAt(cursor),
+            fontKey: token.fontKey,
+            segment: usize.MAX,
+            segmentStart: 0,
+          },
+        )
+      } else if token.kind == TextTokenKind.Tab || token.kind == TextTokenKind.SegmentBreak {
+        run state.pieces.append(
+          Piece {
+            kind: PieceKind.Zero,
+            unit: unit,
+            start: start,
+            end: end,
+            level: paragraph.level,
+            fontKey: token.fontKey,
+            segment: usize.MAX,
+            segmentStart: 0,
+          },
+        )
+      } else if textKind(token.kind) {
+        let text = token.text
+        let bytes = String.utf8Bytes(text)
+        while start < end {
+          let at = TextCursor { unit: unit, offset: start }
+          let local = analysis.paragraphAt(at)
+          let boundary = analysis.boundaryAfter(at)
+          let mut limit = end
+          if boundary.unit == unit && boundary.offset < limit && boundary.offset > start {
+            limit = boundary.offset
+          }
+          let first = utf8_scan.decode(bytes, start)
+          let base = analysis.unwrappedLevelAt(at)
+          let mut level = base
+          if separatorClass(first.scalar) || (!at.before(trailing) && resettable(first.scalar)) {
+            level = local.level
+          }
+          let mut stop = first.next
+          while stop < limit {
+            let decoded = utf8_scan.decode(bytes, stop)
+            let position = TextCursor { unit: unit, offset: stop }
+            let mut resolved = base
+            if separatorClass(decoded.scalar)
+              || (!position.before(trailing) && resettable(decoded.scalar)) {
+              resolved = local.level
+            }
+            if resolved != level {
+              break
+            }
+            stop = decoded.next
+          }
+          if stop > limit {
+            stop = limit
+          }
+
+          // Join the previous text piece's segment when nothing separates them.
+          let mut joined = false
+          if open && state.pieces.length() > 0 {
+            let last = state.pieces.get(state.pieces.length() - 1)
+            if last.kind == PieceKind.Text && last.fontKey == token.fontKey && last.level == level
+              && tokens[last.unit].writingMode == token.writingMode
+              && tokens[last.unit].textOrientation == token.textOrientation {
+              joined = true
+            }
+          }
+          if !joined {
+            segment = segment + 1
+          }
+          run state.pieces.append(
+            Piece {
+              kind: PieceKind.Text,
+              unit: unit,
+              start: start,
+              end: stop,
+              level: level,
+              fontKey: token.fontKey,
+              segment: segment,
+              segmentStart: 0,
+            },
+          )
+          open = true
+          start = stop
+        }
+      }
+    }
+    unit = unit + 1
+  }
+}
+
+// The text of `segment` from byte `from` on.
+fn textFrom(segment: &String, from: usize) -> string {
+  return String.slice(segment.view(), from, String.byteLength(segment.view()) - from)
+}
+
+effect fn itemize<'a>(
+  state: &mut Shaping,
+  fonts: &mut FontState<'a>,
+  styleKey: usize,
+  rtl: bool,
+  mode: WritingMode,
+  orientation: TextOrientation,
+  from: usize,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  state.items.clear()
+  state.raw.clear()
+  state.scripts.clear()
+  state.orientations.clear()
+  let sideways = mode == WritingMode.VerticalRl || mode == WritingMode.VerticalLr
+
+  // The segment from `from` on is itemized and shaped as a text of its own.
+
+  // Only vertical text asks which characters stand upright.
+  if sideways {
+    run vertical_text.orientations(textFrom(&state.segment, from), &mut state.orientations)
+  }
+  run script_itemization.scripts(textFrom(&state.segment, from), &mut state.scripts)
+  if fonts.key(styleKey).instance == usize.MAX {
+    return
+  }
+  let style = fonts.key(styleKey).style
+  let request = fonts.request(style)
+  state.chain.clear()
+  run state.chain.appendSlice(fonts.chain(style))
+  if state.generation != fonts.set.generation {
+    // Faces were added or declared: a face chosen before may no longer be the one.
+    state.choices.clear()
+    state.generation = fonts.set.generation
+  }
+  let primary = match fonts.primary(style) {
+    Option<Selection>.Some { value } => value
+    Option<Selection>.None => {
+      return
+    }
+  }
+  let mut runIndex: usize = 0
+  while runIndex < state.scripts.length() {
+    let scriptRun = state.scripts.get(runIndex)
+    let mut at = scriptRun.start
+    let mut itemStart = at
+    let mut face = usize.MAX
+    let mut upright = false
+    let mut orientationIndex: usize = 0
+    let mut selection = primary
+    while at < scriptRun.end {
+      let decoded = utf8_scan.decode(String.utf8Bytes(textFrom(&state.segment, from)), at)
+      while orientationIndex + 1 < state.orientations.length()
+        && state.orientations.get(orientationIndex).end <= at {
+        orientationIndex = orientationIndex + 1
+      }
+      let nextUpright = sideways
+        && (orientation == TextOrientation.Upright
+          || orientation == TextOrientation.Mixed
+            && state.orientations.get(orientationIndex).orientation == Orientation.Upright)
+      // Nothing below U+0300 continues a cluster.
+      if face == usize.MAX || decoded.scalar < 0x300 || !continuesCluster(decoded.scalar) {
+        let mut chosen = selection
+        if state.choices.length() == 0 {
+          let mut fill: usize = 0
+          while fill < CHOICES {
+            run state.choices.append(
+              Choice { style: usize.MAX, script: 0, scalar: 0, selection: selection },
+            )
+            fill = fill + 1
+          }
+        }
+        let script = scriptRun.script.value
+        // In u64 with wrapping products: a script tag times 31 does not fit a 32-bit usize.
+        let mixed = u64.wrappingAdd(
+          u64.wrappingAdd(
+            u32.toU64(decoded.scalar),
+            u64.wrappingMultiply(usize.toU64(style), 131),
+          ),
+          u64.wrappingMultiply(u32.toU64(script), 31),
+        )
+        let slot = u64.toUsize(mixed % 512)
+        let kept = state.choices.get(slot)
+        if kept.style == style && kept.script == script && kept.scalar == decoded.scalar {
+          chosen = kept.selection
+        } else if let Option<Selection>.Some { value } = run fonts.set.select(
+          state.chain.asSlice(),
+          request,
+          decoded.scalar,
+          scriptRun.script,
+        ) {
+          chosen = value
+          state.choices.set(
+            slot,
+            Choice { style: style, script: script, scalar: decoded.scalar, selection: value },
+          )
+        }
+        if face != usize.MAX && (chosen.face != face || nextUpright != upright) {
+          run shapeItem(
+            &mut state,
+            &mut fonts,
+            style,
+            selection,
+            from,
+            itemStart,
+            at,
+            rtl,
+            scriptRun.script,
+            upright,
+          )
+          itemStart = at
+        }
+        upright = nextUpright
+        face = chosen.face
+        selection = chosen
+      }
+      at = decoded.next
+    }
+    if itemStart < scriptRun.end {
+      run shapeItem(
+        &mut state,
+        &mut fonts,
+        style,
+        selection,
+        from,
+        itemStart,
+        scriptRun.end,
+        rtl,
+        scriptRun.script,
+        upright,
+      )
+    }
+    runIndex = runIndex + 1
+  }
+}
+
+effect fn shapeItem<'a>(
+  state: &mut Shaping,
+  fonts: &mut FontState<'a>,
+  style: usize,
+  selection: Selection,
+  from: usize,
+  start: usize,
+  end: usize,
+  rtl: bool,
+  script: Script,
+  upright: bool,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let key = run fonts.keyFor(style, selection)
+  let glyphStart = state.raw.length()
+  let instance = fonts.instanceOf(key)
+  let features = fonts.treatment(key).features
+
+  // The shaper reads the text around an item only to join letters to their neighbours. An
+  // item that has none to join is shaped as a text of its own, which the next line or
+  // paragraph with the same word then finds already shaped.
+  let mut shift = from
+  if alone(String.utf8Bytes(textFrom(&state.segment, from)), start, end, script.value) {
+    shift = from + start
+    run fonts.shapeTextOriented(
+      instance,
+      String.slice(state.segment.view(), from + start, end - start),
+      0,
+      end - start,
+      rtl,
+      script,
+      upright,
+      &features,
+      &mut state.raw,
+    )
+  } else {
+    run fonts.shapeTextOriented(
+      instance,
+      textFrom(&state.segment, from),
+      start,
+      end,
+      rtl,
+      script,
+      upright,
+      &features,
+      &mut state.raw,
+    )
+  }
+  let leans = fonts.leans
+  let glyphEnd = state.raw.length()
+  if shift != 0 {
+    let mut index = glyphStart
+    while index < glyphEnd {
+      let mut glyph = state.raw.get(index)
+      glyph.cluster = glyph.cluster + usize.toU32(shift)
+      state.raw.set(index, glyph)
+      index = index + 1
+    }
+  }
+  run state.items.append(
+    Item {
+      upright: upright,
+      start: from + start,
+      end: from + end,
+      key: key,
+      glyphStart: glyphStart,
+      glyphEnd: glyphEnd,
+      order: orderOf(state.raw.asSlice(), glyphStart, glyphEnd),
+      script: script.value,
+      leans: leans,
+    },
+  )
+}
+
+// How the clusters of `raw[start..end)` run: 1 never falling, -1 never rising, 0 neither.
+fn orderOf(raw: &[RawGlyph], start: usize, end: usize) -> i8 {
+  let mut rising = true
+  let mut falling = true
+  let mut index = start + 1
+  while index < end {
+    let before = raw[index - 1].cluster
+    let cluster = raw[index].cluster
+    if cluster < before {
+      rising = false
+    }
+    if cluster > before {
+      falling = false
+    }
+    index = index + 1
+  }
+  if rising {
+    return 1
+  }
+  if falling {
+    return -1
+  }
+  return 0
+}
+
+// The first glyph of `item` in `raw` whose cluster is at or past `cluster` in the item's
+// cluster order (at or before it when the clusters fall). Needs `item.order != 0`.
+fn firstAt(raw: &[RawGlyph], item: Item, cluster: usize) -> usize {
+  let mut low = item.glyphStart
+  let mut high = item.glyphEnd
+  while low < high {
+    let middle = low + (high - low) / 2
+    let at = u32.toUsize(raw[middle].cluster)
+    let mut earlier = at < cluster
+    if item.order < 0 {
+      earlier = at > cluster
+    }
+    if earlier {
+      low = middle + 1
+    } else {
+      high = middle
+    }
+  }
+  return low
+}
+
+fn sameBytes(text: &[u8], at: usize, part: &[u8]) -> bool {
+  if at > text.length || part.length > text.length - at {
+    return false
+  }
+  let mut index: usize = 0
+  while index < part.length {
+    if text[at + index] != part[index] {
+      return false
+    }
+    index = index + 1
+  }
+  return true
+}
+
+// Scripts whose shaper reads the text around an item (font-shape's `arabic.usesScript`: the
+// joining forms at the item's ends depend on the neighbouring characters).
+fn joins(script: u32) -> bool {
+  return script == 0x41726162 || script == 0x53797263 || script == 0x4d6f6e67
+    || script == 0x4e6b6f6f
+    || script == 0x50686167
+    || script == 0x4d616e64
+    || script == 0x4d616e69
+    || script == 0x50686c70
+    || script == 0x41646c6d
+    || script == 0x526f6867
+    || script == 0x536f6764
+    || script == 0x4f756772
+}
+
+// Whether the item `bytes[start..end)` shapes the same with and without the text around it:
+// its script does not join, or at each end either the item's own character or the one next
+// to it joins nothing (a space between two words, a word between two spaces).
+fn alone(bytes: &[u8], start: usize, end: usize, script: u32) -> bool {
+  if !joins(script) || start >= end {
+    return true
+  }
+  return (start == 0 || inertBefore(bytes, start) || inert(utf8_scan.decode(bytes, start).scalar))
+    && (end >= bytes.length || inert(utf8_scan.decode(bytes, end).scalar)
+      || inertBefore(bytes, end))
+}
+
+// Whether the character before `at` joins nothing and is not skipped when looking for a
+// neighbour, so an item next to it shapes as it does at the edge of a text. Basic Latin and
+// its supplements up to U+02FF qualify, but for the soft hyphen.
+fn inertBefore(bytes: &[u8], at: usize) -> bool {
+  let mut start = at
+  while start > 0 {
+    start = start - 1
+    if (bytes[start] & 0xc0) != 0x80 {
+      break
+    }
+  }
+  return inert(utf8_scan.decode(bytes, start).scalar)
+}
+
+fn inert(scalar: u32) -> bool {
+  return scalar < 0x300 && scalar != 0xad
+}
+
+fn asciiLetter(bytes: &[u8]) -> bool {
+  let mut index: usize = 0
+  while index < bytes.length {
+    let byte = bytes[index] | 0x20
+    if byte >= 0x61 && byte <= 0x7a {
+      return true
+    }
+    index = index + 1
+  }
+  return false
+}
+
+// Whether `raw` has a glyph of `item` whose cluster starts at `cluster` and is safe to cut at.
+fn cuttable(raw: &[RawGlyph], item: Item, cluster: usize) -> bool {
+  if item.order == 0 {
+    return false
+  }
+  let at = firstAt(raw, item, cluster)
+  return at < item.glyphEnd && u32.toUsize(raw[at].cluster) == cluster && raw[at].safe
+}
+
+// Fills the items and glyphs of the segment from source `index`, whose text has the segment's
+// at `start`. False, with nothing to keep, when shaping the segment could give other glyphs.
+effect fn takeCut(state: &mut Shaping, index: usize, start: usize) -> bool
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  state.items.clear()
+  state.raw.clear()
+  let source = &state.sources.asSlice()[index]
+  let bytes = String.utf8Bytes(state.segment.view())
+  let all = String.utf8Bytes(source.text.view())
+  let end = start + bytes.length
+  let whole = start == 0 && end == all.length
+  let raw = source.raw.asSlice()
+  if !whole {
+    if !source.cuts || bytes.length == 0 {
+      return false
+    }
+
+    // The segment must itemize as it did inside the source: the same script runs, and no
+    // first character that would have taken its face from the one before it.
+    let first = utf8_scan.decode(bytes, 0).scalar
+    if first >= 0x300 && continuesCluster(first) {
+      return false
+    }
+    let latin = source.scripts.length() == 1 && source.scripts.get(0).script.value == 0x4c61746e
+    if !latin || !asciiLetter(bytes) {
+      state.scripts.clear()
+      run script_itemization.scripts(state.segment.view(), &mut state.scripts)
+      let mut matched: usize = 0
+      let mut runIndex: usize = 0
+      while runIndex < source.scripts.length() {
+        let scriptRun = source.scripts.get(runIndex)
+        runIndex = runIndex + 1
+        if scriptRun.end <= start || scriptRun.start >= end {
+          continue
+        }
+        let mut low = scriptRun.start
+        if low < start {
+          low = start
+        }
+        let mut high = scriptRun.end
+        if high > end {
+          high = end
+        }
+        if matched >= state.scripts.length() {
+          return false
+        }
+        let own = state.scripts.get(matched)
+        if own.start != low - start || own.end != high - start
+          || own.script.value != scriptRun.script.value {
+          return false
+        }
+        matched = matched + 1
+      }
+      if matched != state.scripts.length() {
+        return false
+      }
+    }
+  }
+  let mut at: usize = 0
+  while at < source.items.length() {
+    let item = source.items.get(at)
+    at = at + 1
+    if item.end <= start || item.start >= end {
+      continue
+    }
+    let mut low = item.start
+    if low < start {
+      low = start
+    }
+    let mut high = item.end
+    if high > end {
+      high = end
+    }
+    let mut glyphStart = item.glyphStart
+    let mut glyphEnd = item.glyphEnd
+    if !whole {
+      if item.upright {
+        return false
+      }
+      if low != item.start {
+        if !cuttable(raw, item, low) {
+          return false
+        }
+      } else if joins(item.script) && low > 0 && !inertBefore(all, low) {
+        return false
+      }
+      if high != item.end {
+        if !cuttable(raw, item, high) {
+          return false
+        }
+      } else if joins(item.script) && high < all.length
+        && !inert(utf8_scan.decode(all, high).scalar) {
+        return false
+      }
+      if low != item.start || high != item.end {
+        if item.order > 0 {
+          glyphStart = firstAt(raw, item, low)
+          glyphEnd = firstAt(raw, item, high)
+        } else {
+          glyphStart = firstAt(raw, item, high - 1)
+          if low > 0 {
+            glyphEnd = firstAt(raw, item, low - 1)
+          }
+        }
+      }
+    }
+    let first = state.raw.length()
+    let mut glyph = glyphStart
+    while glyph < glyphEnd {
+      let mut value = raw[glyph]
+      value.cluster = value.cluster - usize.toU32(start)
+      run state.raw.append(value)
+      glyph = glyph + 1
+    }
+    run state.items.append(
+      Item {
+        upright: item.upright,
+        start: low - start,
+        end: high - start,
+        key: item.key,
+        glyphStart: first,
+        glyphEnd: state.raw.length(),
+        order: item.order,
+        script: item.script,
+        leans: item.leans,
+      },
+    )
+  }
+  return true
+}
+
+// Where byte `offset` of token `unit` is in the text of the segment made of `pieces`, or
+// usize.MAX when the segment has no piece there.
+fn startIn(pieces: &[Piece], unit: usize, offset: usize) -> usize {
+  let mut low: usize = 0
+  let mut high = pieces.length
+  while low < high {
+    let middle = low + (high - low) / 2
+    if pieces[middle].unit < unit || (pieces[middle].unit == unit && pieces[middle].end <= offset) {
+      low = middle + 1
+    } else {
+      high = middle
+    }
+  }
+  if low < pieces.length && pieces[low].unit == unit && pieces[low].start <= offset {
+    return pieces[low].segmentStart + offset - pieces[low].start
+  }
+  return usize.MAX
+}
+
+// Finds a source the segment can take its glyphs from, and takes them. The segment starts at
+// byte `offset` of token `unit`.
+effect fn take(
+  state: &mut Shaping,
+  generation: u64,
+  fontKey: usize,
+  rtl: bool,
+  unit: usize,
+  offset: usize,
+) -> bool
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let length = String.byteLength(state.segment.view())
+  let mut index: usize = 0
+  while index < state.sources.length() {
+    let source = &state.sources.asSlice()[index]
+    let all = String.utf8Bytes(source.text.view())
+    if source.fontKey != fontKey || source.rtl != rtl || source.generation != generation
+      || all.length < length {
+      index = index + 1
+      continue
+    }
+
+    // A line starts in one of the paragraph's tokens: the piece of that token says where.
+    // Text that is not from the same tokens can still be the source's own text.
+    let bytes = String.utf8Bytes(state.segment.view())
+    let mut found = startIn(source.pieces.asSlice(), unit, offset)
+    if found == usize.MAX || !sameBytes(all, found, bytes) {
+      found = usize.MAX
+      if all.length == length && sameBytes(all, 0, bytes) {
+        found = 0
+      }
+    }
+    if found != usize.MAX && run takeCut(&mut state, index, found) {
+      state.taken = state.taken + 1
+      return true
+    }
+    index = index + 1
+  }
+  return false
+}
+
+// Where the glyphs of `source` end that stay when text is added after it: its last safe cut
+// before its last word, which may still change with what follows it. 0 when there is none.
+fn tailCut(source: &Source) -> usize {
+  let all = String.utf8Bytes(source.text.view())
+
+  // One script, read left to right, by a shaper that does not look past an item's ends.
+  if !source.cuts || source.rtl || source.scripts.length() != 1 || source.items.length() == 0 {
+    return 0
+  }
+  let last = source.items.get(source.items.length() - 1)
+  if joins(source.scripts.get(0).script.value) || last.order != 1 || last.upright
+    || last.end != all.length {
+    return 0
+  }
+  let mut limit = all.length
+  while limit > 0 && all[limit - 1] != 32 {
+    limit = limit - 1
+  }
+  let raw = source.raw.asSlice()
+  let mut glyph = last.glyphEnd
+  while glyph > last.glyphStart {
+    glyph = glyph - 1
+    let cluster = u32.toUsize(raw[glyph].cluster)
+    if cluster <= limit && cluster > last.start && raw[glyph].safe {
+      return cluster
+    }
+  }
+  return 0
+}
+
+// Whether `bytes` starts with the text of `source` and goes on, in the same font and direction.
+fn continues(source: &Source, bytes: &[u8], fontKey: usize, rtl: bool, generation: u64) -> bool {
+  let all = String.utf8Bytes(source.text.view())
+  return source.fontKey == fontKey && source.rtl == rtl && source.generation == generation
+    && all.length < bytes.length
+    && all.length != 0
+    && sameBytes(bytes, 0, all)
+}
+
+// Shapes only the end of a segment that continues source `index`: the source's glyphs up to
+// its last safe cut before its last word stay, and the text from there on is shaped and
+// joined to them. False when that cannot be shown to give what shaping the whole would; the
+// items and glyphs are then to be made again.
+effect fn takeTail<'a>(
+  state: &mut Shaping,
+  fonts: &mut FontState<'a>,
+  index: usize,
+  styleKey: usize,
+  mode: WritingMode,
+  orientation: TextOrientation,
+) -> bool
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let cut = tailCut(&state.sources.asSlice()[index])
+  if cut == 0 {
+    return false
+  }
+  let script = state.sources.asSlice()[index].scripts.get(0).script.value
+  let key = state.sources.asSlice()[index].items.get(
+    state.sources.asSlice()[index].items.length() - 1,
+  ).key
+  run itemize(&mut state, &mut fonts, styleKey, false, mode, orientation, cut)
+  if state.scripts.length() != 1 || state.scripts.get(0).script.value != script
+    || state.items.length() == 0 {
+    return false
+  }
+  // The cut is safe in the source's text; the new words must not reach back over it either.
+  let first = state.items.get(0)
+  if first.start != cut || first.key != key || first.upright || first.leans {
+    return false
+  }
+  state.tailItems.clear()
+  run state.tailItems.appendSlice(state.items.asSlice())
+  state.tailRaw.clear()
+  run state.tailRaw.appendSlice(state.raw.asSlice())
+  state.items.clear()
+  state.raw.clear()
+  let source = &state.sources.asSlice()[index]
+  let raw = source.raw.asSlice()
+  let last = source.items.get(source.items.length() - 1)
+  let kept = firstAt(raw, last, cut)
+  run state.raw.appendSlice(Slice.view(raw, 0, kept))
+  run state.items.appendSlice(Slice.view(source.items.asSlice(), 0, source.items.length() - 1))
+  let shift = kept - first.glyphStart
+  run state.raw.appendSlice(state.tailRaw.asSlice())
+  let mut item: usize = 0
+  while item < state.tailItems.length() {
+    let mut value = state.tailItems.get(item)
+    value.glyphStart = value.glyphStart + shift
+    value.glyphEnd = value.glyphEnd + shift
+    if item == 0 {
+      // The source's last item and the first of the new end are one item of the whole.
+      value.start = last.start
+      value.glyphStart = last.glyphStart
+      if value.order != 1 {
+        value.order = 0
+      }
+    }
+    run state.items.append(value)
+    item = item + 1
+  }
+  return true
+}
+
+// Looks for a source the segment's text starts with, and shapes only what follows it.
+effect fn continueSource<'a>(
+  state: &mut Shaping,
+  fonts: &mut FontState<'a>,
+  styleKey: usize,
+  rtl: bool,
+  mode: WritingMode,
+  orientation: TextOrientation,
+) -> usize
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let generation = fonts.set.generation
+  let mut index: usize = 0
+  while index < state.sources.length() {
+    let fits = continues(
+      &state.sources.asSlice()[index],
+      String.utf8Bytes(state.segment.view()),
+      styleKey,
+      rtl,
+      generation,
+    )
+    if fits {
+      if run takeTail(&mut state, &mut fonts, index, styleKey, mode, orientation) {
+        state.continued = state.continued + 1
+        return index
+      }
+      return usize.MAX
+    }
+    index = index + 1
+  }
+  return usize.MAX
+}
+
+// Keeps the segment just shaped as a source, in slot `slot` or in place of the oldest.
+effect fn keep<'a>(
+  state: &mut Shaping,
+  fonts: &FontState<'a>,
+  fontKey: usize,
+  rtl: bool,
+  slot: usize,
+  firstPiece: usize,
+  pieceCount: usize,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut at = slot
+  if at == usize.MAX {
+    at = state.oldest
+    state.oldest = (state.oldest + 1) % SOURCES
+    if at >= state.sources.length() {
+      at = state.sources.length()
+      run state.sources.append(
+        Source {
+          text: String.make(),
+          fontKey: 0,
+          rtl: false,
+          generation: 0,
+          cuts: false,
+          scripts: List<ScriptRun>.make(),
+          items: List<Item>.make(),
+          raw: List<RawGlyph>.make(),
+          pieces: List<Piece>.make(),
+        },
+      )
+    }
+  }
+  let mut cuts = true
+  let mut item: usize = 0
+  while item < state.items.length() {
+    if !fonts.sliceable(state.items.get(item).key) {
+      cuts = false
+    }
+    item = item + 1
+  }
+  let mut source = &mut state.sources.asMutSlice()[at]
+  source.text.clear()
+  run source.text.append(state.segment.view())
+  source.fontKey = fontKey
+  source.rtl = rtl
+  source.generation = fonts.set.generation
+  source.cuts = cuts
+  source.scripts.clear()
+  run source.scripts.appendSlice(state.scripts.asSlice())
+  source.items.clear()
+  run source.items.appendSlice(state.items.asSlice())
+  source.raw.clear()
+  run source.raw.appendSlice(state.raw.asSlice())
+  source.pieces.clear()
+  run source.pieces.appendSlice(Slice.view(state.pieces.asSlice(), firstPiece, pieceCount))
+}
+
+fn firstGlyphAt(state: &Shaping, item: Item, cluster: usize) -> usize {
+  return firstAt(state.raw.asSlice(), item, cluster)
+}
+
+// The letter-spacing and word-spacing after raw glyph `index`: letter-spacing follows the last
+// glyph of each cluster, and word-spacing follows a word separator's.
+fn spacing(state: &Shaping, bytes: &[u8], treatment: Treatment, index: usize, end: usize, rawCluster: u32, cluster: usize) -> f32 {
+  if index + 1 < end && state.raw.get(index + 1).cluster == rawCluster {
+    return 0.0
+  }
+  let mut extra = treatment.letterSpacing
+  if treatment.wordSpacing != 0.0 && cluster < bytes.length && wordSeparator(utf8_scan.decode(bytes, cluster).scalar) {
+    extra = extra + treatment.wordSpacing
+  }
+  return extra
+}
+
+// Whether a token's text has a character of a script of its own, so that a line starting
+// with it itemizes as the whole text did around it.
+fn strong(bytes: &[u8]) -> bool {
+  if asciiLetter(bytes) {
+    return true
+  }
+  let mut at: usize = 0
+  while at < bytes.length {
+    let decoded = utf8_scan.decode(bytes, at)
+    let script = Script.of(decoded.scalar).value
+    if script != Script.common().value && script != Script.inherited().value && script != Script.unknown().value {
+      return true
+    }
+    at = decoded.next
+  }
+  return false
+}
+
+// Whether the word next to byte `at` of `bytes` (after it, or before it with `before`),
+// skipping spaces, has no character of a script of its own. True when there is no such word.
+fn weakWord(bytes: &[u8], at: usize, before: bool) -> bool {
+  let mut low = at
+  let mut high = at
+  if before {
+    while low > 0 && bytes[low - 1] == 32 { low = low - 1 }
+    high = low
+    while low > 0 && bytes[low - 1] != 32 { low = low - 1 }
+  } else {
+    while low < bytes.length && bytes[low] == 32 { low = low + 1 }
+    high = low
+    while high < bytes.length && bytes[high] != 32 { high = high + 1 }
+  }
+  if low == high {
+    return true
+  }
+  return !strong(Slice.view(bytes, low, high - low))
+}
+
+// Whether a line cut at byte `at` of the segment being emitted (a line starting there, or the
+// one ending there) could get other glyphs on either side of the cut than the segment has.
+// The rules are `takeCut`'s, so where this is false a line cut there takes the segment's glyphs
+// unchanged. Segments are shaped apart, so a cut at a segment's start is one of its edges.
+fn unsafeAt<'a>(state: &Shaping, fonts: &FontState<'a>, piece: Piece, at: usize) -> bool {
+  // Right-to-left text and text of several scripts are not cut (not checked yet).
+  if !state.segmentCuts || fonts.treatment(piece.fontKey).transform != TextTransform.None || state.scripts.length() != 1
+    || piece.level % 2 == 1 {
+    return true
+  }
+  let bytes = String.utf8Bytes(state.segment.view())
+  if at >= bytes.length {
+    return false
+  }
+  // Each side of the cut must keep a character of the segment's script, so that the line
+  // itemizes as the segment did: no word without one next to the cut.
+  let script = state.scripts.get(0).script.value
+  if script != Script.common().value && script != Script.inherited().value
+    && (weakWord(bytes, at, false) || (at > 0 && weakWord(bytes, at, true))) {
+    return true
+  }
+  if at == 0 {
+    return false
+  }
+  let first = utf8_scan.decode(bytes, at).scalar
+  if first >= 0x300 && continuesCluster(first) {
+    return true
+  }
+  let raw = state.raw.asSlice()
+  let mut index: usize = 0
+  while index < state.items.length() {
+    let item = state.items.get(index)
+    index = index + 1
+    if item.start > at {
+      break
+    }
+    if item.end < at {
+      continue
+    }
+    if item.start < at && at < item.end {
+      if item.upright || !cuttable(raw, item, at) {
+        return true
+      }
+    } else if item.start == at {
+      if joins(item.script) && !inertBefore(bytes, at) {
+        return true
+      }
+    } else if item.end == at {
+      if joins(item.script) && !inert(first) {
+        return true
+      }
+    }
+  }
+  return false
+}
+
+// The first glyph from `from` on of a rising item whose cluster is at or past `cluster`.
+fn scanTo(raw: &[RawGlyph], from: usize, end: usize, cluster: usize) -> usize {
+  let mut index = from
+  while index < end && u32.toUsize(raw[index].cluster) < cluster {
+    index = index + 1
+  }
+  return index
+}
+
+// Moves the glyphs of `piece` that item `item` shaped into a pending run. `hint` is where the
+// glyphs of the item's previous piece ended (a rising item's pieces come in cluster order), so
+// the piece's glyphs are found by walking on from there; returns where this piece's end.
+effect fn emit<'a>(
+  state: &mut Shaping,
+  fonts: &FontState<'a>,
+  request: &TextShapeRequest<'_, '_>,
+  trailing: TextCursor,
+  piece: Piece,
+  item: Item,
+  characterJustify: bool,
+  hint: usize,
+) -> usize
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let pieceEnd = piece.segmentStart + piece.end - piece.start
+  let mut low = item.start
+  if low < piece.segmentStart {
+    low = piece.segmentStart
+  }
+  let mut high = item.end
+  if high > pieceEnd {
+    high = pieceEnd
+  }
+  if low >= high {
+    return hint
+  }
+  let token = &request.context.tokens[piece.unit]
+  let scale = fonts.scale(item.key)
+  let treatment = fonts.treatment(item.key)
+  let spaced = treatment.letterSpacing != 0.0 || treatment.wordSpacing != 0.0
+  let bytes = String.utf8Bytes(state.segment.view())
+  let glyphStart = state.glyphs.length()
+  let mut pen: f32 = 0.0
+  let mut previous = u32.MAX
+  // A segment has a piece per word, so each piece finds its own glyphs instead of reading them all.
+  let mut index = item.glyphStart
+  let mut glyphEnd = item.glyphEnd
+  if item.order > 0 {
+    let raw = state.raw.asSlice()
+    let mut from = hint
+    if from < item.glyphStart || from > item.glyphEnd || (from > item.glyphStart && u32.toUsize(raw[from - 1].cluster) >= low) {
+      from = item.glyphStart
+    }
+    index = scanTo(raw, from, item.glyphEnd, low)
+    glyphEnd = scanTo(raw, index, item.glyphEnd, high)
+  } else if item.order < 0 {
+    // Falling clusters: those below `high` start after the last one at or above it.
+    index = firstGlyphAt(&state, item, high - 1)
+    glyphEnd = item.glyphEnd
+    if low > 0 {
+      glyphEnd = firstGlyphAt(&state, item, low - 1)
+    }
+  }
+  let cutUnsafe = !state.wantSafety || unsafeAt(&state, fonts, piece, low)
+  while index < glyphEnd {
+    let raw = state.raw.get(index)
+    let cluster = u32.toUsize(raw.cluster)
+    if cluster >= low && cluster < high {
+      let mut advance = i32.toF32(
+        if item.upright {
+          -raw.yAdvance
+        } else {
+          raw.xAdvance
+        },
+      )
+        * scale
+      if spaced {
+        advance = advance + spacing(&state, bytes, treatment, index, item.glyphEnd, raw.cluster, cluster)
+      }
+      let offset = piece.start + cluster - piece.segmentStart
+      run state.glyphs.append(
+        PositionedGlyph {
+          glyph: raw.glyph,
+          // From the start of the run's own text, so that equal words share one run.
+          cluster: usize.toU32(cluster - low),
+          upright: item.upright,
+          x: pen
+            + i32.toF32(
+              if item.upright {
+                -raw.yOffset
+              } else {
+                raw.xOffset
+              },
+            )
+              * scale,
+          y: i32.toF32(
+            if item.upright {
+              raw.xOffset
+            } else {
+              -raw.yOffset
+            },
+          )
+            * scale,
+          advance: advance,
+        },
+      )
+      let cursor = TextCursor { unit: piece.unit, offset: offset }
+      let mut widen = false
+      if raw.cluster != previous && cursor.before(trailing) && !hanging(request, cursor) {
+        let character = utf8_scan.decode(bytes, cluster).scalar
+        if characterJustify || token.textJustify == TextJustify.InterCharacter {
+          widen = !continuesCluster(character)
+        } else if wordMethod(token.textJustify) {
+          widen = wordSeparator(character)
+        }
+      }
+      run state.opportunities.append(widen)
+      previous = raw.cluster
+      pen = pen + advance
+    }
+    index = index + 1
+  }
+  run state.pending.append(
+    Pending {
+      kind: PieceKind.Text,
+      unit: piece.unit,
+      start: piece.start + low - piece.segmentStart,
+      end: piece.start + high - piece.segmentStart,
+      level: piece.level,
+      key: item.key,
+      rtl: piece.level % 2 == 1,
+      glyphStart: glyphStart,
+      glyphEnd: state.glyphs.length(),
+      leftSpacing: 0.0,
+      rightSpacing: 0.0,
+      unsafeBefore: cutUnsafe,
+    },
+  )
+  return glyphEnd
+}
+
+effect fn shapeSegments<'a>(
+  state: &mut Shaping,
+  fonts: &mut FontState<'a>,
+  request: &TextShapeRequest<'_, '_>,
+  trailing: TextCursor,
+  characterJustify: bool,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let tokens = request.context.tokens
+  state.pending.clear()
+  state.glyphs.clear()
+  state.opportunities.clear()
+  let mut index: usize = 0
+  while index < state.pieces.length() {
+    let piece = state.pieces.get(index)
+    if piece.kind != PieceKind.Text {
+      run state.pending.append(
+        Pending {
+          kind: piece.kind,
+          unit: piece.unit,
+          start: piece.start,
+          end: piece.end,
+          level: piece.level,
+          key: piece.fontKey,
+          rtl: piece.level % 2 == 1,
+          glyphStart: state.glyphs.length(),
+          glyphEnd: state.glyphs.length(),
+          leftSpacing: 0.0,
+          rightSpacing: 0.0,
+          unsafeBefore: false,
+        },
+      )
+      index = index + 1
+      continue
+    }
+
+    // Gather the segment.
+    let mut last = index
+    state.segment.clear()
+    let change = fonts.treatment(piece.fontKey).transform
+    let mut previous: u32 = 0
+    if change != TextTransform.None {
+      previous = before(tokens, piece.unit, piece.start)
+    }
+    while last < state.pieces.length() && state.pieces.get(last).segment == piece.segment {
+      let mut member = state.pieces.get(last)
+      member.segmentStart = String.byteLength(state.segment.view())
+      state.pieces.set(last, member)
+      let text = tokens[member.unit].text
+      let part = String.slice(text, member.start, member.end - member.start)
+      if change == TextTransform.None {
+        run state.segment.append(part)
+      } else {
+        previous = run transform.append(&mut state.segment, part, change, previous)
+      }
+      last = last + 1
+    }
+    let rtl = piece.level % 2 == 1
+    let mode = tokens[piece.unit].writingMode
+    let orientation = tokens[piece.unit].textOrientation
+
+    // Vertical text is always shaped: which characters stand upright depends on the whole.
+    let reuse = state.reuse && mode != WritingMode.VerticalRl && mode != WritingMode.VerticalLr
+    if !reuse {
+      run itemize(&mut state, &mut fonts, piece.fontKey, rtl, mode, orientation, 0)
+    } else if !run take(
+      &mut state,
+      fonts.set.generation,
+      piece.fontKey,
+      rtl,
+      piece.unit,
+      piece.start,
+    ) {
+      let slot = run continueSource(&mut state, &mut fonts, piece.fontKey, rtl, mode, orientation)
+      if slot == usize.MAX {
+        run itemize(&mut state, &mut fonts, piece.fontKey, rtl, mode, orientation, 0)
+      } else {
+        // The scripts of the whole: one run, as the source had.
+        let whole = ScriptRun {
+          start: 0,
+          end: String.byteLength(state.segment.view()),
+          script: state.scripts.get(0).script,
+        }
+        state.scripts.clear()
+        run state.scripts.append(whole)
+      }
+      if String.byteLength(state.segment.view()) >= SOURCE_BYTES {
+        run keep(&mut state, &fonts, piece.fontKey, rtl, slot, index, last - index)
+      }
+    }
+    state.hints.clear()
+    state.segmentCuts = true
+    let mut item: usize = 0
+    while item < state.items.length() {
+      run state.hints.append(state.items.get(item).glyphStart)
+      if state.wantSafety && !fonts.sliceable(state.items.get(item).key) {
+        state.segmentCuts = false
+      }
+      item = item + 1
+    }
+    let mut member = index
+    while member < last {
+      let current = state.pieces.get(member)
+      item = 0
+      while item < state.items.length() {
+        let shaped = state.items.get(item)
+        let hint = state.hints.get(item)
+        let next = run emit(&mut state, &fonts, request, trailing, current, shaped, characterJustify, hint)
+        state.hints.set(item, next)
+        item = item + 1
+      }
+      member = member + 1
+    }
+    index = last
+  }
+}
+
+fn justify(state: &mut Shaping, space: f32, characterJustify: bool) -> () {
+  if space <= 0.0 {
+    return
+  }
+  let mut count: usize = 0
+  let mut lastMarked = usize.MAX
+  let mut index: usize = 0
+  while index < state.opportunities.length() {
+    if state.opportunities.get(index) {
+      count = count + 1
+      lastMarked = index
+    }
+    index = index + 1
+  }
+
+  // Inter-character spacing goes between clusters, not after the last one.
+  if characterJustify && count > 0 {
+    state.opportunities.set(lastMarked, false)
+    count = count - 1
+  }
+  if count == 0 {
+    return
+  }
+  let extra = space / usize.toF32(count)
+  let mut runIndex: usize = 0
+  while runIndex < state.pending.length() {
+    let pending = state.pending.get(runIndex)
+    let mut shift: f32 = 0.0
+    let mut glyph = pending.glyphStart
+    while glyph < pending.glyphEnd {
+      let mut value = state.glyphs.get(glyph)
+      value.x = value.x + shift
+      if state.opportunities.get(glyph) {
+        value.advance = value.advance + extra
+        shift = shift + extra
+      }
+      state.glyphs.set(glyph, value)
+      glyph = glyph + 1
+    }
+    runIndex = runIndex + 1
+  }
+}
+
+/// Appends `mark` (or `fallback` where the font has no glyph for it) after the logical end
+/// of the last text run: the hyphen of a hyphenated line, or the ellipsis of a cut one.
+effect fn appendMark<'a>(state: &mut Shaping, fonts: &mut FontState<'a>, mark: string, fallback: string) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut index = state.pending.length()
+  while index > 0 {
+    index = index - 1
+    let pending = state.pending.get(index)
+    if pending.kind == PieceKind.Text && pending.key != usize.MAX
+      && fonts.key(pending.key).instance != usize.MAX {
+      let instance = fonts.instanceOf(pending.key)
+      let scale = fonts.scale(pending.key)
+      state.raw.clear()
+      run fonts.shapeText(instance, mark, 0, String.byteLength(mark), false, Script.common(), &mut state.raw)
+      if state.raw.length() == 0 || state.raw.get(0).glyph == 0 {
+        state.raw.clear()
+        run fonts.shapeText(instance, fallback, 0, String.byteLength(fallback), false, Script.common(), &mut state.raw)
+      }
+
+      // Rebuild the run's glyphs with the hyphen after its logical end.
+      let mut cluster: u32 = 0
+      if pending.glyphEnd > pending.glyphStart {
+        cluster = state.glyphs.get(pending.glyphEnd - 1).cluster
+      }
+      let mut extra = List<PositionedGlyph>.make()
+      let mut pen: f32 = 0.0
+      let mut glyph: usize = 0
+      while glyph < state.raw.length() {
+        let raw = state.raw.get(glyph)
+        let advance = i32.toF32(raw.xAdvance) * scale
+        run extra.append(
+          PositionedGlyph {
+            upright: false,
+            glyph: raw.glyph,
+            cluster: cluster,
+            x: pen + i32.toF32(raw.xOffset) * scale,
+            y: -i32.toF32(raw.yOffset) * scale,
+            advance: advance,
+          },
+        )
+        pen = pen + advance
+        glyph = glyph + 1
+      }
+      let mut combined = List<PositionedGlyph>.make()
+      let mut width: f32 = 0.0
+      glyph = pending.glyphStart
+      while glyph < pending.glyphEnd {
+        width = width + state.glyphs.get(glyph).advance
+        glyph = glyph + 1
+      }
+      if pending.rtl {
+        run combined.appendSlice(extra.asSlice())
+        glyph = pending.glyphStart
+        while glyph < pending.glyphEnd {
+          let mut value = state.glyphs.get(glyph)
+          value.x = value.x + pen
+          run combined.append(value)
+          glyph = glyph + 1
+        }
+      } else {
+        glyph = pending.glyphStart
+        while glyph < pending.glyphEnd {
+          run combined.append(state.glyphs.get(glyph))
+          glyph = glyph + 1
+        }
+        let mut hyphen: usize = 0
+        while hyphen < extra.length() {
+          let mut value = extra.get(hyphen)
+          value.x = value.x + width
+          run combined.append(value)
+          hyphen = hyphen + 1
+        }
+      }
+
+      // Move the run to the end of the glyph list.
+      let mut updated = pending
+      updated.glyphStart = state.glyphs.length()
+      run state.glyphs.appendSlice(combined.asSlice())
+      updated.glyphEnd = state.glyphs.length()
+      glyph = 0
+      while glyph < combined.length() {
+        run state.opportunities.append(false)
+        glyph = glyph + 1
+      }
+      state.pending.set(index, updated)
+      return
+    }
+  }
+}
+
+/// Shapes the candidate line of `request` and appends its runs to `output`.
+pub effect fn shapeLine<'a>(
+  state: &mut Shaping,
+  fonts: &mut FontState<'a>,
+  store: &mut GlyphStore,
+  request: TextShapeRequest<'_, '_>,
+  output: &mut List<TextRun>,
+) -> ()
+  ! OutOfMemoryError | TextError
+  ? &mut Allocator {
+  if request.end.before(request.start) {
+    fail TextError { source: usize.MAX, message: "ui-text: the shape range is reversed" }
+  }
+  let trailing = trailingOf(&request)
+  state.unsafeRuns.clear()
+  // Layout reads the flags of a shaping of a whole paragraph only.
+  state.wantSafety = request.start.unit == 0 && request.start.offset == 0
+    && !request.end.before(request.analysis.paragraph.end)
+  let mut characterJustify = false
+  if request.justificationSpace > 0.0 {
+    characterJustify = request.context.textJustify == TextJustify.InterCharacter
+  }
+  run collectPieces(&mut state, &request, trailing)
+  run shapeSegments(&mut state, &mut fonts, &request, trailing, characterJustify)
+  if request.justificationSpace > 0.0 {
+    justify(&mut state, request.justificationSpace, characterJustify)
+  }
+  if request.hyphenated {
+    run appendMark(&mut state, &mut fonts, "\u{2010}", "-")
+  }
+  if request.ellipsis {
+    run appendMark(&mut state, &mut fonts, "\u{2026}", "...")
+  }
+  let mut index: usize = 0
+  while index < state.pending.length() {
+    let pending = state.pending.get(index)
+    run state.unsafeRuns.append(pending.unsafeBefore)
+    if pending.kind == PieceKind.Object {
+      run output.append(
+        TextRun.Object {
+          unit: pending.unit,
+          bidiLevel: pending.level,
+          lineLeftSpacing: pending.leftSpacing,
+          lineRightSpacing: pending.rightSpacing,
+        },
+      )
+    } else {
+      let mut face = usize.MAX
+      let mut size: f32 = 0.0
+      let mut key = pending.key
+      if key < fonts.keyCount() {
+        let info = fonts.key(key)
+        face = info.face
+        size = info.size
+      } else {
+        key = 0
+      }
+      let glyphs = Slice.view(
+        state.glyphs.asSlice(),
+        pending.glyphStart,
+        pending.glyphEnd - pending.glyphStart,
+      )
+      let shapeKey = run store.intern(key, face, size, pending.rtl, glyphs)
+      run output.append(
+        TextRun.Text {
+          unit: pending.unit,
+          start: pending.start,
+          end: pending.end,
+          advance: store.glyphRun(shapeKey).advance,
+          fontKey: key,
+          bidiLevel: pending.level,
+          shapeKey: shapeKey,
+          unsafeBefore: pending.unsafeBefore,
+        },
+      )
+    }
+    index = index + 1
+  }
+}

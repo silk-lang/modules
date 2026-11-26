@@ -1,0 +1,358 @@
+//! Computed styles held once: a node holds a handle to its `Computed`, and nodes whose values
+//! are equal hold one allocation. Most nodes of a long document have one of a few hundred
+//! styles, and a `Computed` is about 1.8 KB.
+//!
+//! Two styles are one when their keys are the same bytes. A key is the style's memory with what
+//! carries no value left out: the padding between the fields of a struct, and in a union
+//! everything but the active variant's fields, which a number for the variant stands in for.
+//! Padding holds whatever the stack held when the style was built, so the plain bytes of two
+//! equal styles differ. Only types read in full are taken apart: a struct whose fields are all
+//! `pub`, and the unions named in `openUnion`; any other value is keyed by all its bytes, which
+//! can keep two equal styles apart and never joins two different ones.
+//!
+//! A handle is never written through: a node's style changes by taking another handle
+//! (`UiTree.setComputed`).
+import properties.census { Census }
+import style { Computed }
+import silk.collections.hash { Hash, HashSeed }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.core.option { Option }
+import silk.core.reflect { Reflect, namedKind, unionKind }
+import silk.core.static_text { StaticText }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.mem.frozen { Frozen }
+import silk.mem.layout { Layout }
+import silk.mem.pointer { Pointer }
+import silk.num.u8
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+
+/// Styles the pool holds before it first looks for ones no node holds any more.
+const FIRST_SWEEP: usize = 64
+
+/// Unions a key can tell the variants of: a style has far fewer.
+const ORDINALS: usize = 64
+
+// A struct the key takes apart: every field is listed, so the bytes between them are padding.
+static fn openStruct<T>() -> bool {
+  return Reflect.typeKind(Reflect.typeOf<T>()) == namedKind && StaticText.byteLength(Reflect.privateField<T>()) == usize.ZERO
+}
+
+// A union the key takes apart. Reflection lists a variant's `pub` fields only and cannot say
+// whether it has others, so these are named: each declares every variant field `pub`.
+static fn openUnion<T>() -> bool {
+  if Reflect.typeKind(Reflect.typeOf<T>()) != unionKind { return false }
+  let name = Reflect.typeName<T>()
+  return name == "TabSize" || name == "LineHeight" || name == "Display" || name == "Fill"
+    || name == "Option<f32>" || name == "Option<Cursor>"
+}
+
+fn addressOf<V>(value: &V) -> usize { return Pointer.address<V>(Pointer.fromRef<V>(value)) }
+
+// The memory of `value`, padding included.
+fn bytesOf<V>(value: &V) -> &[u8] {
+  let size = Layout.of<V>().bytes
+  unsafe {
+    let first = Intrinsic.pointerReinterpret<*const V, *const u8>(Pointer.fromRef<V>(value))
+    return Pointer.borrowMany<V, u8>(value, Pointer.assumeMany<u8>(first), size)
+  }
+}
+
+// A key being written: the style's bytes at their own offsets, then a byte for each union met.
+// Bytes no write reaches stay zero from one key to the next.
+struct Image {
+  words: List<u64>,
+  // Bytes of a `Computed`.
+  size: usize,
+  ordinals: usize,
+}
+
+impl Image {
+  fn put(self: &mut Self, at: usize, bytes: &[u8]) -> () {
+    Slice.copyInto<u8>(Slice.asMutBytes<u64>(self.words.asMutSlice()), at, bytes)
+  }
+
+  fn clear(self: &mut Self, at: usize, length: usize) -> () {
+    let bytes = Slice.asMutBytes<u64>(self.words.asMutSlice())
+    let mut i: usize = 0
+    while i < length {
+      bytes[at + i] = 0
+      i = i + 1
+    }
+  }
+
+  fn ordinal(self: &mut Self, value: u8) -> () {
+    if self.ordinals >= ORDINALS { Intrinsic.trap("ui-tree: a computed style holds more unions than its key has room for") }
+    let at = self.size + self.ordinals
+    let bytes = Slice.asMutBytes<u64>(self.words.asMutSlice())
+    bytes[at] = value
+    self.ordinals = self.ordinals + 1
+  }
+}
+
+// Writes the part of the key that `value`, a part of the style at address `base`, gives.
+fn emit<T>(value: &T, base: usize, out: &mut Image) -> () {
+  static if openStruct<T>() {
+    static for field in Reflect.fields<T>() {
+      emit(Reflect.borrowField(value, field), base, &mut out.*)
+    }
+  } else {
+    static if openUnion<T>() {
+      out.clear(addressOf(value) - base, Layout.of<T>().bytes)
+      let mut ordinal: u8 = 0
+      static for variant in Reflect.variants<T>() {
+        ordinal = ordinal + 1
+        if Reflect.isVariant(value, variant) {
+          out.ordinal(ordinal)
+          static for field in Reflect.variantFields(variant) {
+            emitVariantField(value, variant, field, base, &mut out.*)
+          }
+        }
+      }
+    } else {
+      out.put(addressOf(value) - base, bytesOf(value))
+    }
+  }
+}
+
+fn emitVariantField<U, V>(owner: &U, static variant: Intrinsic.Variant<U>, static field: Intrinsic.Field<U, V>, base: usize, out: &mut Image) -> () {
+  emit(Reflect.borrowVariantField<U, V>(owner, variant, field), base, &mut out.*)
+}
+
+// Whether a `Computed` is a whole number of aligned 64-bit words, as `words` reads it.
+fn wordy() -> bool {
+  let layout = Layout.of<Computed>()
+  return layout.bytes % 8 == 0 && layout.alignment % 8 == 0
+}
+
+// The memory of `value` as 64-bit words; `wordy()` must hold.
+fn words(value: &Computed) -> &[u64] {
+  let count = Layout.of<Computed>().bytes / 8
+  unsafe {
+    let first = Intrinsic.pointerReinterpret<*const Computed, *const u64>(Pointer.fromRef<Computed>(value))
+    return Pointer.borrowMany<Computed, u64>(value, Pointer.assumeMany<u64>(first), count)
+  }
+}
+
+fn hashOf(seed: &HashSeed, view: &[u64]) -> u64 {
+  // Four chains, so one word's multiply does not wait for the last one's.
+  let mut a = Hash.mix(seed, usize.toU64(view.length))
+  let mut b: u64 = 1
+  let mut c: u64 = 2
+  let mut d: u64 = 3
+  let mut i: usize = 0
+  while i + 3 < view.length {
+    a = Hash.combine(a, view[i])
+    b = Hash.combine(b, view[i + 1])
+    c = Hash.combine(c, view[i + 2])
+    d = Hash.combine(d, view[i + 3])
+    i = i + 4
+  }
+  while i < view.length {
+    a = Hash.combine(a, view[i])
+    i = i + 1
+  }
+  return Hash.combine(Hash.combine(a, b), Hash.combine(c, d))
+}
+
+fn sameBytes(left: &[u8], right: &[u8]) -> bool {
+  let mut i: usize = 0
+  while i < left.length {
+    if left[i] != right[i] { return false }
+    i = i + 1
+  }
+  return true
+}
+
+// Whether `left` and `right` have the same canonical value: equal field bytes and equal active
+// union variants, skipping struct padding and inactive union bytes just as `emit` does.
+fn sameCanonical<T>(left: &T, right: &T) -> bool {
+  static if openStruct<T>() {
+    static for field in Reflect.fields<T>() {
+      if !sameCanonical(Reflect.borrowField(left, field), Reflect.borrowField(right, field)) { return false }
+    }
+    return true
+  } else {
+    static if openUnion<T>() {
+      static for variant in Reflect.variants<T>() {
+        let l = Reflect.isVariant(left, variant)
+        let r = Reflect.isVariant(right, variant)
+        if l != r { return false }
+        if l {
+          static for field in Reflect.variantFields(variant) {
+            if !sameVariantField(left, right, variant, field) { return false }
+          }
+          return true
+        }
+      }
+      return true
+    } else {
+      return sameBytes(bytesOf(left), bytesOf(right))
+    }
+  }
+}
+
+fn sameVariantField<U, V>(left: &U, right: &U, static variant: Intrinsic.Variant<U>, static field: Intrinsic.Field<U, V>) -> bool {
+  return sameCanonical(Reflect.borrowVariantField<U, V>(left, variant, field), Reflect.borrowVariantField<U, V>(right, variant, field))
+}
+
+fn sameWords(left: &[u64], right: &[u64]) -> bool {
+  let mut i: usize = 0
+  while i < left.length {
+    if left[i] != right[i] { return false }
+    i = i + 1
+  }
+  return true
+}
+
+/// Whether `left` and `right` are the same bytes, which equal styles need not be.
+pub fn same(left: &Computed, right: &Computed) -> bool {
+  if !wordy() { return false }
+  return sameWords(words(left), words(right))
+}
+
+/// The styles nodes hold, each once.
+pub struct StylePool {
+  seed: HashSeed,
+  /// Open addressing over `held`: zero is empty, else an index into it plus one. Its length is
+  /// zero or a power of two, at least twice `held`'s.
+  places: List<u32>,
+  hashes: List<u64>,
+  held: List<Frozen<Computed>>,
+  stride: usize,
+  /// Scratch canonical image of the style being hashed.
+  image: Image,
+  /// `held`'s length at which the pool next drops the styles only it holds.
+  sweepAt: usize,
+}
+
+impl StylePool {
+  pub effect fn census(self: &Self, out: &mut Census) -> () ! OutOfMemoryError ? &mut Allocator {
+    run out.held("tree.style-pool.styles(Computed)", self.held.length(), self.held.capacity(), Layout.of<Computed>().bytes + 16)
+    run out.held("tree.style-pool.index", self.held.length(), self.places.capacity() / 2 + self.hashes.capacity(), 8)
+  }
+
+  pub fn make() -> StylePool {
+    let size = Layout.of<Computed>().bytes
+    return StylePool {
+      seed: Hash.seed(0x7374796c65),
+      places: List<u32>.make(),
+      hashes: List<u64>.make(),
+      held: List<Frozen<Computed>>.make(),
+      stride: (size + ORDINALS + 7) / 8,
+      image: Image { words: List<u64>.make(), size: size, ordinals: 0 },
+      sweepAt: FIRST_SWEEP,
+    }
+  }
+
+  /// Distinct styles held, for tests and inspectors.
+  pub fn length(self: &Self) -> usize { return self.held.length() }
+
+  /// A handle to `value`: the one the pool holds when it holds an equal style, else a new one.
+  pub effect fn share(self: &mut Self, value: &Computed) -> Frozen<Computed> ! OutOfMemoryError ? &mut Allocator {
+    if self.image.words.length() == 0 { run self.image.words.appendRepeated(0, self.stride) }
+    let used = self.image.ordinals
+    let end = self.image.size
+    self.image.clear(end, used)
+    self.image.ordinals = 0
+    emit(value, addressOf(value), &mut self.image)
+    let hash = hashOf(&self.seed, self.image.words.asSlice())
+    let found = self.find(hash, value)
+    if found != usize.MAX { return self.held.asSlice()[found].clone() }
+    if self.held.length() >= self.sweepAt { run self.sweep() }
+    let made = run Frozen<Computed>.make(value.*)
+    run self.hashes.append(hash)
+    run self.held.append(made.clone())
+    if self.held.length() * 2 > self.places.length() {
+      run self.index()
+    } else {
+      let added = self.held.length() - 1
+      self.place(added)
+    }
+    return move made
+  }
+
+  // The index in `held` of the style equal to `value`, which hashes to `hash`.
+  fn find(self: &Self, hash: u64, value: &Computed) -> usize {
+    let size = self.places.length()
+    if size == 0 { return usize.MAX }
+    let mask = size - 1
+    let mut at = usize.bitAnd(u64.wrappingToUsize(hash), mask)
+    while true {
+      let place = self.places.get(at)
+      if place == 0 { return usize.MAX }
+      let index = u32.toUsize(place) - 1
+      if self.hashes.get(index) == hash && sameCanonical(self.held.asSlice()[index].get(), value) { return index }
+      at = usize.bitAnd(at + 1, mask)
+    }
+    return usize.MAX
+  }
+
+  // Enters `held[index]` in `places`, which has room.
+  fn place(self: &mut Self, index: usize) -> () {
+    let mask = self.places.length() - 1
+    let mut at = usize.bitAnd(u64.wrappingToUsize(self.hashes.get(index)), mask)
+    while self.places.get(at) != 0 { at = usize.bitAnd(at + 1, mask) }
+    self.places.set(at, usize.toU32(index + 1))
+  }
+
+  // Builds `places` again for what `held` holds now, with room to double.
+  effect fn index(self: &mut Self) -> () ! OutOfMemoryError ? &mut Allocator {
+    let mut size: usize = 64
+    while size < self.held.length() * 4 { size = size * 2 }
+    self.places.clear()
+    run self.places.appendRepeated(0, size)
+    let mut i: usize = 0
+    while i < self.held.length() {
+      self.place(i)
+      i = i + 1
+    }
+  }
+
+  // Drops the styles no node holds.
+  effect fn sweep(self: &mut Self) -> () ! OutOfMemoryError ? &mut Allocator {
+    let mut styles = Intrinsic.replace(self.held, List<Frozen<Computed>>.make())
+    let hashes = Intrinsic.replace(self.hashes, List<u64>.make())
+    while styles.length() != 0 {
+      let last = styles.length() - 1
+      if let Option<Frozen<Computed>>.Some { value: style } = move styles.pop() {
+        if style.count() > 1 {
+          run self.hashes.append(hashes.get(last))
+          run self.held.append(move style)
+        }
+      }
+    }
+    run self.index()
+    self.sweepAt = if self.held.length() * 2 > FIRST_SWEEP { self.held.length() * 2 } else { FIRST_SWEEP }
+  }
+}
+
+/// Hashes values of another type the way the pool keys a `Computed`: padding and the inactive
+/// parts of the open unions are left out, so equal values hash the same however they were built
+/// (see the module docs). Each hasher takes values of the one type it was made for.
+pub struct KeyHasher {
+  seed: HashSeed,
+  image: Image,
+  stride: usize,
+}
+
+impl KeyHasher {
+  pub fn make<T>(seed: HashSeed) -> KeyHasher {
+    let size = Layout.of<T>().bytes
+    return KeyHasher { seed: seed, image: Image { words: List<u64>.make(), size: size, ordinals: 0 }, stride: (size + ORDINALS + 7) / 8 }
+  }
+
+  /// The hash of `value`, a value of the hasher's type.
+  pub effect fn hash<T>(self: &mut Self, value: &T) -> u64 ! OutOfMemoryError ? &mut Allocator {
+    if Layout.of<T>().bytes != self.image.size { Intrinsic.trap("ui-tree: a key hasher took a value of another type") }
+    if self.image.words.length() == 0 { run self.image.words.appendRepeated(0, self.stride) }
+    let used = self.image.ordinals
+    let end = self.image.size
+    self.image.clear(end, used)
+    self.image.ordinals = 0
+    emit(value, addressOf(value), &mut self.image)
+    return hashOf(&self.seed, self.image.words.asSlice())
+  }
+}

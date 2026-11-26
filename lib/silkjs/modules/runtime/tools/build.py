@@ -1,0 +1,354 @@
+#!/usr/bin/env python3
+"""Compile the native Silk engine and embedded Node runtime as one executable."""
+from pathlib import Path
+import argparse
+import json
+import os
+import platform
+import shutil
+import struct
+import subprocess
+from built import built
+import sys
+import tempfile
+import tomllib
+from embed import ROOT, cache_build_identity, sources
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--release', action='store_true')
+    parser.add_argument('--output', type=Path, default=ROOT / 'build/silkjs')
+    args = parser.parse_args()
+    manifest = tomllib.loads((ROOT / 'silk.toml').read_text())
+    version = manifest['package']['silk-version']
+    environment = os.environ.copy()
+    if platform.system() == 'Darwin' and 'SDKROOT' not in environment:
+        # Keep the build SDK compatible with the compiler's deployment target.
+        # SDK 27 no longer supports the macOS 11 baseline.
+        candidate = Path('/Library/Developer/CommandLineTools/SDKs/MacOSX15.5.sdk')
+        if candidate.is_dir():
+            environment['SDKROOT'] = str(candidate)
+        else:
+            raise SystemExit('Set SDKROOT to a macOS SDK supporting the pinned compiler\'s macOS 11 deployment target.')
+    if not shutil.which('silk'):
+        raise SystemExit('Install the Silk launcher and run silk use in this repository.')
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    identity = cache_build_identity(not args.release, environment)
+    # tools/clang.py links this object into the executable: the identity the built-ins'
+    # bytecode and the heap image are tied to (src/ext/builtin_cache.c).
+    identified = build_cache_object(environment, identity)
+    named = ROOT / 'build/link-object'
+    named.write_text(str(identified))
+    # The package build: build.silk's native plan and the dependencies come from the package.
+    command = ['silk', '+' + version, 'build',
+               '--debug', str(not args.release).lower(),
+               '--clang', str(ROOT / 'tools/clang.py')]
+    if args.release:
+        command += ['--optimization', 'speed']
+    try:
+        subprocess.run(command, cwd=ROOT / "cli/silkjs", env=environment, check=True)
+    finally:
+        named.unlink(missing_ok=True)
+    shutil.copy2(built_executable(args.release), args.output.resolve())
+    embed_builtin_cache(args.output.resolve(), environment, identity, identified)
+    embed_heap_image(args.output.resolve())
+
+
+def built_executable(release):
+    """The executable the package build just wrote (tools/built.py)."""
+    return built('silkjs', release)
+
+
+def build_cache_object(environment, identity, cache=None):
+    """src/ext/builtin_cache.c with the build identity, and the built-ins' bytecode when given."""
+    directory = ROOT / 'build/builtin-cache'
+    directory.mkdir(parents=True, exist_ok=True)
+    # #embed needs a C23 compiler: the Clang the Silk build itself requires.
+    compiler = [environment.get('SILK_CLANG', 'clang')]
+    flags = ['-std=gnu23', '-fPIC', '-O2', f'-DSILK_BUILD_IDENTITY="{identity}"']
+    if cache is not None:
+        flags.append('-DSILK_BUILTIN_CACHE_FILE="' + str(cache) + '"')
+    if platform.system() == 'Darwin':
+        flags += ['-isysroot', environment['SDKROOT'], '-mmacosx-version-min=11.0']
+    destination = directory / ('builtin_cache.o' if cache is not None else 'identity.o')
+    subprocess.run(compiler + flags + ['-c', str(ROOT / 'src/ext/builtin_cache.c'), '-o', str(destination)],
+                   env=environment, check=True)
+    return destination
+
+
+def embed_builtin_cache(output, environment, identity, identified):
+    """Link again with the built-ins' bytecode, which the first link's executable writes.
+
+    Without it the runtime still works: built-ins compile from source at startup. That is
+    what a build for another machine gets, since its executable cannot run here.
+    """
+    record = ROOT / 'build/link-command.json'
+    cache = ROOT / 'build/builtin-cache/builtins.bin'
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with open(cache, 'wb') as destination:
+            subprocess.run([str(output), '--silk-write-builtin-cache'], stdout=destination, env=environment, check=True)
+    except (OSError, subprocess.CalledProcessError) as error:
+        print(f'Built-in bytecode not embedded ({error}); built-ins will compile at startup')
+        return
+    order_builtin_cache(cache)
+    cached = build_cache_object(environment, identity, cache)
+    link = json.loads(record.read_text())
+    arguments = link['arguments']
+    arguments[arguments.index('-o') + 1] = str(output)
+    arguments[arguments.index(str(identified))] = str(cached)
+    arguments += startup_order(arguments)
+    subprocess.run([link['compiler'], *arguments], cwd=link['directory'], env=environment, check=True)
+    print(f'Embedded {cache.stat().st_size} bytes of built-in bytecode')
+
+
+def order_builtin_cache(cache):
+    """Move the built-ins a start or a server reads to the front of the bytecode cache.
+
+    The executable writes the entries in index order, and a server reads under 3 MB of
+    the 22 MB: spread out, those reads kept 7 MB of the cache resident, since the kernel
+    maps the file pages around each one. tools/builtin-order.txt names the modules
+    (tools/builtin_order.py writes it); a name that no longer exists is skipped, and
+    modules it does not name follow in index order. Only the entries move: the table at
+    the front still gives entry i for built-in i (src/ext/builtin_cache.silk).
+    """
+    data = cache.read_bytes()
+    header = 80
+    count = struct.unpack_from('<Q', data, 72)[0]
+    table = [struct.unpack_from('<QQ', data, header + index * 16) for index in range(count)]
+    names = [name for name, _ in sources()] + ['internal/bootstrap/silk']
+    if len(names) != count:
+        raise SystemExit(f'The built-in bytecode has {count} entries for {len(names)} built-ins')
+    index = {name: position for position, name in enumerate(names)}
+    listed = [index[name] for name in (ROOT / 'tools/builtin-order.txt').read_text().split() if name in index]
+    listed = list(dict.fromkeys(listed))
+    first = set(listed)
+    payload = bytearray()
+    placed = [(0, 0)] * count
+    start = header + count * 16
+    for position in listed + [position for position in range(count) if position not in first]:
+        offset, length = table[position]
+        if length == 0:
+            continue
+        placed[position] = (start + len(payload), length)
+        payload += data[offset:offset + length]
+    cache.write_bytes(data[:header] + b''.join(struct.pack('<QQ', *entry) for entry in placed) + bytes(payload))
+
+
+def startup_order(arguments):
+    """Linker flags that place the functions a start and a server run next to each other.
+
+    A start runs under 3 MB of a 27 MB text section, and an HTTP or HTTPS server about
+    3 MB more. Left where the compiler put them, these functions touch several times as
+    many pages as they fill: each page is a fault, and the kernel maps file pages 64 KB
+    at a time, so a server's resident text was 22 MB. tools/startup-order.txt lists a
+    start's functions and tools/server-order.txt the rest a server runs (tools/startup_order.py
+    writes both); a name that no longer exists is skipped. lld takes the list on Linux; on macOS
+    the Mach-O linker takes it as an order file.
+    """
+    names = (ROOT / 'tools/startup-order.txt').read_text() + (ROOT / 'tools/server-order.txt').read_text()
+    if platform.system() == 'Darwin':
+        # The Mach-O linkers (ld64, ld64.lld) take the same list as an order file, each C-level name
+        # with Mach-O's leading underscore; objects are laid out by symbol (subsections via symbols),
+        # so no per-function sections are needed. A name the executable lacks is skipped.
+        order = ROOT / 'build/function-order-macho.txt'
+        order.write_text(''.join('_' + name + '\n' for name in names.split()))
+        return ['-Wl,-order_file,' + str(order)]
+    if platform.system() != 'Linux' or not any(a.startswith('--ld-path=') and 'lld' in a for a in arguments):
+        return []
+    order = ROOT / 'build/function-order.txt'
+    order.write_text(names)
+    return ['-Wl,--symbol-ordering-file=' + str(order), '-Wl,--no-warn-symbol-ordering']
+
+
+HEAP_IMAGE_MAGIC = int.from_bytes(b'SILKIMG2', 'little')
+# Starts whose writes lay out the heap image (lay_out_heap_image).
+HEAP_IMAGE_STARTS = ROOT / 'tools/heap-image-starts'
+
+
+def embed_heap_image(output):
+    """Append the bootstrapped runtime's heap to the executable (src/ext/heap_image.silk).
+
+    The executable writes the image itself, with no environment, so the image depends on
+    the executable alone; with address randomization off where the host allows it, so
+    that the bytes no start reads are the same in every build too. Without an image the
+    runtime still works: each start runs the bootstrap. That is what an executable that
+    cannot run here gets. Stripping the executable afterwards removes the image.
+
+    An executable that runs but fails to write its image, or a layout start that fails,
+    is a bug in the runtime (a bootstrap that reads the environment while the image
+    warms, a start that throws): the build fails, rather than ship an executable whose
+    every start runs the bootstrap.
+
+    A start copies each image page it writes, so the image is laid out by the pages
+    starts write (lay_out_heap_image).
+    """
+    if platform.system() != 'Linux':
+        return
+    image = ROOT / 'build/heap-image.bin'
+    try:
+        work = Path(tempfile.mkdtemp(prefix='heap-image-', dir=ROOT / 'build'))
+        try:
+            layout = lay_out_heap_image(output, work)
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
+        write_heap_image(output, image, layout)
+    except subprocess.CalledProcessError as error:
+        sys.exit(f'Heap image not built ({error}); see the error above')
+    except OSError as error:
+        print(f'Heap image not embedded: the executable cannot run here ({error}); every start will run the bootstrap')
+        return
+    data = image.read_bytes()
+    append_heap_image(output, data)
+    ranges = written_page_ranges(output)
+    append_heap_image_ranges(output, ranges)
+    print(f'Embedded a heap image of {len(data)} bytes; a start copies in {sum(n for _, n in ranges)} of its pages at once')
+
+
+def write_heap_image(executable, image, layout=None):
+    """Has executable write its heap image to image, laid out by layout: None, or the
+    (ids, mode) of RuntimeAllocator.placeForImage."""
+    command = [str(executable), '--silk-write-heap-image', str(image)]
+    if layout is not None:
+        ids, mode = layout
+        words = image.with_suffix('.layout')
+        words.write_bytes(b''.join(struct.pack('<Q', id) for id in sorted(ids)))
+        command += [str(words), mode]
+    fixed = ['setarch', platform.machine(), '-R', *command]
+    if not shutil.which('setarch') or subprocess.run(fixed, env={}, cwd='/').returncode != 0:
+        subprocess.run(command, env={}, cwd='/', check=True)
+
+
+# Runs of at least this many zero pages are left out of the file and mapped as fresh
+# memory (heap_image.silk, holes): the bootstrap's region is never reused, so freed
+# blocks leave long runs of zeros behind.
+HEAP_IMAGE_HOLE_PAGES = 16
+MAX_HOLES = 1024
+
+
+def heap_image_holes(data):
+    """The (first page, count) runs of zero pages to leave out of data, after its first page."""
+    zero = bytes(4096)
+    holes = []
+    for page in range(1, len(data) // 4096):
+        if data[page * 4096:(page + 1) * 4096] != zero:
+            continue
+        if holes and holes[-1][0] + holes[-1][1] == page:
+            holes[-1][1] += 1
+        else:
+            holes.append([page, 1])
+    holes = [hole for hole in holes if hole[1] >= HEAP_IMAGE_HOLE_PAGES]
+    return sorted(sorted(holes, key=lambda hole: -hole[1])[:MAX_HOLES])
+
+
+def append_heap_image(executable, data):
+    holes = heap_image_holes(data)
+    kept, page = [], 0
+    for first, count in holes:
+        kept.append(data[page * 4096:first * 4096])
+        page = first + count
+    kept.append(data[page * 4096:])
+    with open(executable, 'ab') as handle:
+        handle.write(bytes(-handle.tell() % 4096))
+        offset = handle.tell()
+        handle.write(b''.join(kept))
+        handle.write(b''.join(struct.pack('<Q', (first << RANGE_PAGE_BITS) | count) for first, count in holes))
+        handle.write(struct.pack('<QQQQQ', offset, len(data), 0, len(holes), HEAP_IMAGE_MAGIC))
+
+
+# heap_image.silk: a range word is its first page above RANGE_PAGE_BITS and its page
+# count below; the loader reads at most MAX_RANGES of them.
+RANGE_PAGE_BITS = 24
+MAX_RANGES = 1024
+
+
+def written_page_ranges(executable):
+    """The image pages every start in tools/heap-image-starts writes, as (first page,
+    count) runs. A start from the image has the kernel copy these in at once
+    (heap_image.load), which costs less than the read fault and then the
+    copy-on-write fault each would take; only pages every start writes are listed,
+    so no start copies a page it would have left alone."""
+    common = None
+    with tempfile.TemporaryDirectory(dir=ROOT / 'build') as directory:
+        profile = Path(directory) / 'pages'
+        for start in sorted(HEAP_IMAGE_STARTS.iterdir()):
+            if start.suffix not in ('.js', '.cjs', '.mjs'):
+                continue
+            for output_to in (subprocess.DEVNULL, subprocess.PIPE):
+                subprocess.run([str(executable), start.name], cwd=HEAP_IMAGE_STARTS, check=True,
+                               env={'SILKJS_HEAP_IMAGE_PAGES': str(profile)},
+                               stdin=subprocess.DEVNULL, stdout=output_to, stderr=subprocess.DEVNULL)
+                data = profile.read_bytes()
+                pages = set(struct.unpack(f'<{len(data) // 8}Q', data))
+                common = pages if common is None else common & pages
+    ranges = []
+    for page in sorted(common or ()):
+        if ranges and ranges[-1][0] + ranges[-1][1] == page:
+            ranges[-1][1] += 1
+        else:
+            ranges.append([page, 1])
+    # Past the loader's limit, join the runs closest together.
+    while len(ranges) > MAX_RANGES:
+        gaps = [ranges[i + 1][0] - ranges[i][0] - ranges[i][1] for i in range(len(ranges) - 1)]
+        i = gaps.index(min(gaps))
+        ranges[i][1] = ranges[i + 1][0] + ranges[i + 1][1] - ranges[i][0]
+        del ranges[i + 1]
+    return [(first, count) for first, count in ranges]
+
+
+def append_heap_image_ranges(executable, ranges):
+    """Puts ranges between the executable's image and its trailer."""
+    with open(executable, 'r+b') as handle:
+        handle.seek(-40, 2)
+        offset, length, _, holes, magic = struct.unpack('<QQQQQ', handle.read(40))
+        handle.seek(-40 - 8 * holes, 2)
+        hole_words = handle.read(8 * holes)
+        handle.seek(-40 - 8 * holes, 2)
+        handle.truncate()
+        handle.write(b''.join(struct.pack('<Q', (first << RANGE_PAGE_BITS) | count) for first, count in ranges))
+        handle.write(hole_words)
+        handle.write(struct.pack('<QQQQQ', offset, length, len(ranges), holes, magic))
+
+
+def lay_out_heap_image(output, work):
+    """The layout for output's heap image: the small blocks that the starts in
+    tools/heap-image-starts write go to arenas of their own, packed into as few pages
+    as their bytes need. Every block is named by its placed allocation id: its
+    requested size and how many blocks of that size came before it, which each build
+    of the image hands out the same even where a cache or a collection makes a build
+    allocate a little more or less elsewhere. A first image keeps every block where the
+    bootstrap puts it, and the pages its starts write name the candidates; a second
+    puts each candidate alone on its pages, and the pages written then name the
+    blocks."""
+    def written(layout, name):
+        image = work / (name + '.bin')
+        write_heap_image(output, image, layout)
+        executable = work / name
+        shutil.copyfile(output, executable)
+        shutil.copymode(output, executable)
+        append_heap_image(executable, image.read_bytes())
+        ids = set()
+        for start in sorted(HEAP_IMAGE_STARTS.iterdir()):
+            if start.suffix not in ('.js', '.cjs', '.mjs'):
+                continue
+            # Output to a file and to a pipe take different paths.
+            for output_to in (subprocess.DEVNULL, subprocess.PIPE):
+                profile = work / (name + '.ids')
+                result = subprocess.run([str(executable), start.name], cwd=HEAP_IMAGE_STARTS,
+                                        env={'SILKJS_HEAP_IMAGE_PROFILE': str(profile)},
+                                        stdin=subprocess.DEVNULL, stdout=output_to, stderr=subprocess.PIPE)
+                if result.returncode != 0:
+                    sys.stderr.buffer.write(result.stderr)
+                    raise subprocess.CalledProcessError(result.returncode, result.args)
+                data = profile.read_bytes()
+                ids.update(struct.unpack(f'<{len(data) // 8}Q', data))
+        return ids
+    candidates = written((set(), 'pack'), 'plain')
+    written_ids = written((candidates, 'probe'), 'probe') & candidates
+    print(f'Heap image: {len(written_ids)} of {len(candidates)} candidate blocks written by a start')
+    return written_ids, 'pack'
+
+
+if __name__ == '__main__':
+    main()

@@ -1,0 +1,290 @@
+//! Unsafe primitive-only QuickJS coercion kernels. Every input MUST be a live
+//! non-object ValueBits; object ToPrimitive belongs to the caller, never a fallback.
+//! Free entry points consume on every success/failure; borrowed entry points
+//! return a new ownership. HeapHooks performs actual internal-tag destruction.
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.effect { Effect }
+import silk.core.result { Result }
+import silk.core.option { Option }
+import silk.collections.slice { Slice }
+import silk.num.f64
+import silk.num.u8
+import silk.num.u64
+import dtoa { Dtoa, JS_ATOD_INT_ONLY }
+import js_value { ValueBits }
+import js_heap { HeapCell, HeapHeader }
+import js_gc { HeapHooks }
+import js_gc as gc
+import js_owned_value { Value }
+import js_realm { RuntimeRef }
+import js_atoms { AtomTable }
+import js_atom_data as atoms
+import js_strings { Strings }
+import js_string_types { StringOwner, StringLengthError, FlatString, stringReference, latin1Bytes }
+import js_bigint { BigInt, BigIntError }
+import js_bigint_text { BigIntText }
+import utf8 { Utf8, Decoded }
+import unicode_case { UnicodeCase }
+
+pub enum NumberHint { Number, Numeric }
+pub enum CoercionError { BigIntToNumber, SymbolToNumber, SymbolToString }
+impl CoercionError {
+  pub fn message(self: &Self) -> &'static [u8] {
+    return match self.* {
+      CoercionError.BigIntToNumber => b"Cannot convert a BigInt value to a number"
+      CoercionError.SymbolToNumber => b"Cannot convert a Symbol value to a number"
+      CoercionError.SymbolToString => b"Cannot convert a Symbol value to a string"
+    }
+  }
+}
+fn primitiveRequired(value: ValueBits) -> () { if value.isObject() { invalidPrimitive() } }
+fn invalidPrimitive() -> never { return Intrinsic.trap("QuickJS invariant violated") }
+fn nan() -> ValueBits { return ValueBits.Float64 { value: f64.fromBits(0x7ff8000000000000) } }
+fn byte(input: &[u8], at: usize) -> u32 {
+  if at >= input.length { return 0 }
+  return u8.toU32(input[at])
+}
+fn digit(value: u32) -> u32 {
+  if value >= 48 && value <= 57 { return value - 48 }
+  if value >= 65 && value <= 90 { return value - 55 }
+  if value >= 97 && value <= 122 { return value - 87 }
+  return 36
+}
+fn spaces(input: &[u8], start: usize) -> usize {
+  let mut at = start
+  while at < input.length {
+    match Utf8.decode(Slice.view(input, at, input.length - at)) {
+      Option<Decoded>.None => { return at }
+      Option<Decoded>.Some { value } => {
+        if !UnicodeCase.isSpace(value.codePoint) { return at }
+        at = at + value.length
+      }
+    }
+  }
+  return at
+}
+// js_atof's grammar, NOT js_atod's extended radix floats or lexer token grammar.
+// Scanning first lets the allocation-free dtoa kernel consume exactly the source
+// token, with prefixes removed and no separators. Embedded NUL is trailing junk.
+/// Plain decimal text of at most 15 digits with at most one point ("12345",
+/// "007", "12345.6", ".5"): an Int when it has no point and fits, otherwise the
+/// exact digits divided by an exact power of ten, which IEEE division rounds
+/// correctly. Undefined for anything else (signs, spaces, exponents, prefixes),
+/// which the scanner and the dtoa kernel then take.
+@inlineAlways
+fn shortDecimal(input: &[u8]) -> ValueBits {
+  if input.length == 0 || input.length > 16 { return ValueBits.Undefined }
+  let mut mantissa: u64 = 0 let mut index: usize = 0 let mut point = input.length
+  while index < input.length {
+    let unit = input[index]
+    // At most 16 digits, so the mantissa stays below 10^16: no overflow checks.
+    if unit >= 48 && unit <= 57 { mantissa = u64.wrappingAdd(u64.wrappingMultiply(mantissa, 10), u8.toU64(unit - 48)) }
+    else if unit == 46 && point == input.length { point = index }
+    else { return ValueBits.Undefined }
+    index = index + 1
+  }
+  if point == input.length {
+    if input.length <= 9 { return ValueBits.Int { value: u64.toI32(mantissa) } }
+    if input.length > 15 { return ValueBits.Undefined }
+    return ValueBits.number(u64.toF64(mantissa))
+  }
+  // A lone point is NaN, for the full path to say.
+  if input.length == 1 { return ValueBits.Undefined }
+  let mut fraction = input.length - point - 1
+  let mut scale: f64 = 1.0
+  while fraction > 0 { scale = scale * 10.0 fraction = fraction - 1 }
+  return ValueBits.number(u64.toF64(mantissa) / scale)
+}
+fn parseNumber(input: &[u8]) -> ValueBits {
+  let quick = shortDecimal(input)
+  match quick { ValueBits.Undefined => () _ => { return quick } }
+  let start = spaces(input, 0)
+  if start == input.length { return ValueBits.Int { value: 0 } }
+  let mut at = start
+  let signed = byte(input, at) == 43 || byte(input, at) == 45
+  if signed { at = at + 1 }
+  let mut radix: u32 = 10
+  let mut token = start
+  if !signed && byte(input, at) == 48 {
+    let next = byte(input, at + 1)
+    if next == 120 || next == 88 { radix = 16 }
+    else if next == 111 || next == 79 { radix = 8 }
+    else if next == 98 || next == 66 { radix = 2 }
+    if radix != 10 {
+      at = at + 2
+      token = at
+      if digit(byte(input, at)) >= radix { return nan() }
+    }
+  }
+  if radix == 10 {
+    let infinity = b"Infinity"
+    let mut i: usize = 0
+    while i < 8 && byte(input, at + i) == u8.toU32(infinity[i]) { i = i + 1 }
+    if i == 8 {
+      if spaces(input, at + 8) != input.length { return nan() }
+      let mut bits: u64 = 0x7ff0000000000000
+      if byte(input, start) == 45 { bits = 0xfff0000000000000 }
+      return ValueBits.Float64 { value: f64.fromBits(bits) }
+    }
+  }
+  let first = at
+  while digit(byte(input, at)) < radix { at = at + 1 }
+  let mut floating = false
+  if radix == 10 {
+    if byte(input, at) == 46 && (at > first || digit(byte(input, at + 1)) < 10) {
+      floating = true
+      at = at + 1
+      while digit(byte(input, at)) < 10 { at = at + 1 }
+    }
+    if at > first && (byte(input, at) == 101 || byte(input, at) == 69) {
+      floating = true
+      let mut exponent = at + 1
+      if byte(input, exponent) == 43 || byte(input, exponent) == 45 { exponent = exponent + 1 }
+      if digit(byte(input, exponent)) < 10 {
+        at = exponent + 1
+        while digit(byte(input, at)) < 10 { at = at + 1 }
+      }
+    }
+  }
+  if at == first || spaces(input, at) != input.length { return nan() }
+  let mut flags = JS_ATOD_INT_ONLY
+  if floating { flags = 0 }
+  return ValueBits.number(Dtoa.parse(Slice.view(input, token, at - token), radix, flags).value)
+}
+/// ToNumber of a flat one-byte ASCII string, borrowed and without allocating:
+/// the same result stringNumberFree gives. Undefined for a rope, a wide string
+/// or any byte of 128 or more, which the caller then hands to the full path.
+pub fn asciiStringNumber(value: ValueBits) -> ValueBits {
+  match value { ValueBits.String { .. } => () _ => { return ValueBits.Undefined } }
+  let anchor = ()
+  let storage = unsafe HeapCell.shortPayload<FlatString, ()>(&anchor, stringReference(value))
+  if storage.wide { return ValueBits.Undefined }
+  let input = Slice.view<u8>(unsafe latin1Bytes(&anchor, stringReference(value)), 0, storage.length())
+  // Short plain decimals ("12345", "12345.6"): parseNumber's first answer,
+  // without the ASCII scan.
+  let quick = shortDecimal(input)
+  match quick { ValueBits.Undefined => () _ => { return quick } }
+  let mut index: usize = 0
+  while index < input.length && input[index] < 128 { index = index + 1 }
+  if index != input.length { return ValueBits.Undefined }
+  return parseNumber(input)
+}
+effect fn stringNumberFree(table: &AtomTable, value: ValueBits) -> ValueBits
+  ! OutOfMemoryError | StringLengthError ? &mut Allocator {
+  let owned = StringOwner.adopt(value)
+  let flat = StringOwner.adopt(run table.flatten(owned.get()))
+  let storage = unsafe HeapCell.shortPayload<FlatString, StringOwner>(&flat, stringReference(flat.get()))
+  if !storage.wide {
+    let input = Slice.view<u8>(unsafe latin1Bytes(&flat, stringReference(flat.get())), 0, storage.length())
+    let mut index: usize = 0
+    while index < input.length && input[index] < 128 { index = index + 1 }
+    // Source JS_ToCString borrows ASCII storage: Number("42") must not require
+    // a temporary UTF8 allocation or fail because that allocation was refused.
+    if index == input.length { return parseNumber(input) }
+  }
+  drop storage
+  let bytes = run Strings.toUtf8(flat.get(), false)
+  drop flat
+  drop owned
+  return parseNumber(bytes.asSlice())
+}
+
+/// Consumes value, including diagnostic and allocation failures. Numeric transfers
+/// either BigInt representation unchanged; Number rejects and releases it.
+pub effect fn toNumberFree<'r, H: HeapHooks>(hooks: &mut H, runtime: RuntimeRef<'r>,
+  value: Value, hint: NumberHint) -> ValueBits
+  ! OutOfMemoryError | StringLengthError | CoercionError ? &mut Allocator {
+  let bits = value.view()
+  primitiveRequired(bits)
+  if bits.isBigInt() {
+    if hint == NumberHint.Numeric { return value.intoBits() }
+    unsafe gc.release(&mut hooks, runtime.raw(), value.intoBits())
+    fail CoercionError.BigIntToNumber
+  }
+  match bits {
+    ValueBits.Int { .. } => { return value.intoBits() }
+    ValueBits.Float64 { .. } => { return value.intoBits() }
+    ValueBits.Exception => { return value.intoBits() }
+    ValueBits.Bool { value: boolean } => {
+      if boolean { return ValueBits.Int { value: 1 } }
+      return ValueBits.Int { value: 0 }
+    }
+    ValueBits.Null => { return ValueBits.Int { value: 0 } }
+    ValueBits.String { .. } => {
+      let anchor = () let state = runtime.state(&anchor)
+      return run stringNumberFree(&state.atoms, value.intoBits())
+    }
+    ValueBits.Rope { .. } => {
+      let anchor = () let state = runtime.state(&anchor)
+      return run stringNumberFree(&state.atoms, value.intoBits())
+    }
+    ValueBits.Symbol { .. } => {
+      unsafe gc.release(&mut hooks, runtime.raw(), value.intoBits())
+      fail CoercionError.SymbolToNumber
+    }
+    _ => { unsafe gc.release(&mut hooks, runtime.raw(), value.intoBits()) return nan() }
+  }
+}
+
+/// Borrowed JS_ToStringInternal. In property-key mode symbols are retained,
+/// never described or interned. String results are flat, including rope aliases.
+pub unsafe effect fn toStringInternal(table: &AtomTable, value: ValueBits, propertyKey: bool) -> ValueBits
+  ! OutOfMemoryError | StringLengthError | BigIntError | CoercionError ? &mut Allocator {
+  primitiveRequired(value)
+  match value {
+    ValueBits.String { .. } => { return unsafe value.retained() }
+    ValueBits.Rope { .. } => { return run table.flatten(value) }
+    ValueBits.Int { value: number } => {
+      let mut bytes: [u8; 32] = [0; 32]
+      let length = Dtoa.i32toa(&mut bytes, number)
+      return run Strings.fromLatin1(Slice.view<u8>(&bytes, 0, length))
+    }
+    ValueBits.ShortBigInt { value: number } => {
+      let mut bytes: [u8; 32] = [0; 32]
+      let length = Dtoa.i64toa(&mut bytes, number)
+      return run Strings.fromLatin1(Slice.view<u8>(&bytes, 0, length))
+    }
+    ValueBits.Float64 { value: number } => {
+      let mut bytes: [u8; 32] = [0; 32]
+      let length = Dtoa.shortest(&mut bytes, number)
+      return run Strings.fromLatin1(Slice.view<u8>(&bytes, 0, length))
+    }
+    ValueBits.Bool { value: boolean } => {
+      if boolean { return run table.toValue(atoms.JS_ATOM_true, true) }
+      return run table.toValue(atoms.JS_ATOM_false, true)
+    }
+    ValueBits.Null => { return run table.toValue(atoms.JS_ATOM_null, true) }
+    ValueBits.Undefined => { return run table.toValue(atoms.JS_ATOM_undefined, true) }
+    ValueBits.Exception => { return ValueBits.Exception }
+    ValueBits.FunctionBytecode { .. } => { return run Strings.fromLatin1(b"[function bytecode]") }
+    ValueBits.Symbol { .. } => {
+      if propertyKey { return unsafe value.retained() }
+      fail CoercionError.SymbolToString
+    }
+    ValueBits.BigInt { reference } => {
+      let anchor = ()
+      let integer = unsafe HeapCell.shortPayload<BigInt, ()>(&anchor, reference)
+      let bytes = run BigIntText.format(integer, 10)
+      return run Strings.fromLatin1(bytes.asSlice())
+    }
+    _ => { return run Strings.fromLatin1(b"[unsupported type]") }
+  }
+}
+pub unsafe effect fn toString(table: &AtomTable, value: ValueBits) -> ValueBits
+  ! OutOfMemoryError | StringLengthError | BigIntError | CoercionError ? &mut Allocator {
+  return run unsafe toStringInternal(table, value, false)
+}
+pub unsafe effect fn toPropertyKey(table: &AtomTable, value: ValueBits) -> ValueBits
+  ! OutOfMemoryError | StringLengthError | BigIntError | CoercionError ? &mut Allocator {
+  return run unsafe toStringInternal(table, value, true)
+}
+pub unsafe effect fn toStringFree<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader,
+  table: &AtomTable, value: ValueBits) -> ValueBits
+  ! OutOfMemoryError | StringLengthError | BigIntError | CoercionError ? &mut Allocator {
+  let result = run Effect.result(unsafe toString(table, value))
+  unsafe gc.release(&mut hooks, runtime, value)
+  return match move result {
+    Result<ValueBits, OutOfMemoryError | StringLengthError | BigIntError | CoercionError>.Success { value: output } => output
+    Result<ValueBits, OutOfMemoryError | StringLengthError | BigIntError | CoercionError>.Failure { error } => { fail move error }
+  }
+}

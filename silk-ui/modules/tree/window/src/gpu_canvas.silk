@@ -1,0 +1,579 @@
+//! GPU canvases: an app draws with WebGPU on a device of its own and the window shows the
+//! result in a canvas node.
+//!
+//! [`CanvasGpu.open`] makes the app's device, apart from the renderer's: the app's shaders,
+//! pipelines and draws never run on the device that draws the window, so a canvas that takes
+//! long to draw does not slow the rest of the interface. [`GpuCanvas.make`] makes a canvas of
+//! a size in pixels: draw into [`GpuCanvas.texture`] with any `webgpu` commands, then call
+//! [`GpuCanvas.present`]. The frame shows in every canvas node that names
+//! [`GpuCanvas.surface`] (`Tree.setCanvasSurface`), at the window's next refresh, without a
+//! frame of the UI thread.
+//!
+//! A present reaches the renderer in one of two ways, picked at [`GpuCanvas.make`]:
+//!
+//! - Zero copy, where both devices import shared images ([`SharedImage`]: an IOSurface on
+//!   macOS) and the canvas is BGRA ([`CANVAS_FORMAT_BGRA`]). The canvas keeps a swap chain of
+//!   three shared images. The app draws into one; a present ends the app's access, which gives
+//!   the fences the renderer waits for before it samples the image, and moves on to an image
+//!   the renderer gave back. The renderer gives an image back when a newer frame replaces it,
+//!   with fences of its own the app waits for before it draws into it again, so the app never
+//!   draws into an image the renderer still samples.
+//!   With `SILK_UI_CANVAS_LAYERS=on`, where the scene allows it (canvas_layer_plan.silk), the
+//!   render thread goes further on macOS: the canvas shows in a compositor layer of its own above
+//!   the window, a frame changes only that layer's contents, and the window is not drawn for it.
+//! - A copy through the CPU everywhere else (RGBA canvases, other systems, adapters without the
+//!   features): the app's device reads the texture back and the renderer uploads it. That works
+//!   on every adapter.
+import canvas_frames {
+  CanvasFrame,
+  CanvasPresenter,
+  ChainImage,
+  ReturnedImage,
+  SharedPicture,
+  SHARING_UNKNOWN,
+  SHARING_YES
+}
+import ui_renderer.readback { copyOut, readbackSize, unpack }
+import webgpu.runtime { Adapter, Device, GpuError, Instance, RequestAdapterOptions }
+import webgpu.runtime as runtime
+import webgpu.resources as resources
+import webgpu.resources { Queue, RenderPipeline, Texture, createTexture, getQueue }
+import webgpu.descriptors {
+  ColorTargetState,
+  DeviceDescriptor,
+  Extent3D,
+  FragmentState,
+  MultisampleState,
+  PrimitiveState,
+  RenderPassColorAttachment,
+  RenderPassDescriptor,
+  RenderPipelineDescriptor,
+  TextureDescriptor,
+  TextureViewDescriptor,
+  VertexState
+}
+import webgpu.shared_texture { BeginAccess, SharedFence, SharedImage, SharedTextureMemory }
+import webgpu.shared_texture as shared
+import webgpu_sys.generated_webgpu as flags
+import silk.collections.list { List }
+import silk.concurrency.sync { Arc }
+import silk.concurrency.thread_native { NativeThread }
+static if Intrinsic.targetArchitecture() != "wasm32" {
+  import silk.system.monotonic_clock { MonotonicClock }
+  import silk.system.monotonic_clock_native { OsMonotonicClock }
+}
+import silk.core.ownership { Copy, Drop }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.u32
+import silk.num.usize
+
+/// The format of a canvas texture unless its maker asks for [`CANVAS_FORMAT_BGRA`]:
+/// premultiplied RGBA.
+pub const CANVAS_FORMAT: u32 = flags.WGPUTextureFormat_RGBA8Unorm
+
+/// The other format a canvas texture can have: premultiplied BGRA.
+pub const CANVAS_FORMAT_BGRA: u32 = flags.WGPUTextureFormat_BGRA8Unorm
+
+/// The app's own GPU: an instance, a device on the default adapter and its queue.
+pub struct CanvasGpu {
+  pub instance: Instance,
+  pub device: Device,
+  pub queue: Queue,
+}
+
+impl CanvasGpu {
+  /// A device on the default adapter, with the features that share canvas images with the
+  /// renderer when the adapter has them.
+  pub effect fn open() -> CanvasGpu
+    ! GpuError | OutOfMemoryError {
+    let instance = run Instance.create()
+    let adapter = run instance.requestAdapter(&RequestAdapterOptions.default())
+    let device = run adapter.requestDevice(&DeviceDescriptor.default().withRequiredFeatures(sharingFeatures(&adapter)))
+    let queue = run getQueue(&device)
+    return CanvasGpu { instance: move instance, device: move device, queue: move queue }
+  }
+}
+
+/// The features a device needs for zero copy canvases ([`SharedImage.features`]) when
+/// `adapter` has every one of them, else none: request them with the device's own.
+pub fn sharingFeatures(adapter: &Adapter) -> &'static [u32] {
+  let features = SharedImage.features()
+  let mut i: usize = 0
+  while i < features.length {
+    if !adapter.hasFeature(features[i]) {
+      return &NO_FEATURES
+    }
+    i = i + 1
+  }
+  return features
+}
+
+const NO_FEATURES: [u32; 0] = []
+
+/// Images in a swap chain: one the app draws, one waiting for the renderer and one shown.
+const CHAIN_LENGTH: u32 = 3
+
+/// How long a present waits for the renderer to give an image back before it fails: 64 yields of
+/// the thread, then sleeps of a quarter of a millisecond, about two seconds in all.
+const RECLAIM_SPINS: u32 = 8064
+
+/// How long [`GpuCanvas.make`] waits for the renderer to say whether it shares images.
+const SHARING_SPINS: u32 = 2000000
+
+/// One image of a swap chain, as the app's device sees it.
+struct AppImage {
+  image: Arc<ChainImage>,
+  memory: SharedTextureMemory,
+  texture: Texture,
+  /// Whether the renderer has nothing of it: it may be drawn once `fences` reached `values`.
+  free: bool,
+  fences: List<SharedFence>,
+  values: List<u64>,
+}
+
+/// A canvas's shared images on the app's device. `current` is the one with access begun.
+struct Chain {
+  number: u32,
+  images: List<AppImage>,
+  current: usize,
+  /// Makes every pixel opaque before a present of an opaque canvas (made at the first).
+  opaquePass: Option<RenderPipeline>,
+}
+
+
+/// One canvas: a texture of the app's device and the surface number its frames show under.
+pub struct GpuCanvas {
+  id: u32,
+  presenter: CanvasPresenter,
+  pixelWidth: u32,
+  pixelHeight: u32,
+  /// Whether presents make every pixel opaque, whatever alpha the app drew.
+  pub opaque: bool,
+  pixelFormat: u32,
+  /// The texture of a canvas that copies through the CPU.
+  target: Option<Texture>,
+  /// The swap chain of a zero copy canvas.
+  chain: Option<Chain>,
+  /// Chains made so far: each has its number, so that images given back for a chain since
+  /// replaced (at a resize) are known.
+  chains: u32,
+}
+
+effect fn makeTarget(device: &Device, width: u32, height: u32, format: u32) -> Texture
+  ! GpuError {
+  let mut size = Extent3D.default()
+  size.setWidth(width)
+  size.setHeight(height)
+  size.setDepthOrArrayLayers(1)
+  let mut descriptor = TextureDescriptor.default().withLabel(b"gpu canvas")
+  descriptor.setSize(size)
+  descriptor.setFormat(format)
+  descriptor.setDimension(flags.WGPUTextureDimension_2D)
+  descriptor.setMipLevelCount(1)
+  descriptor.setSampleCount(1)
+  descriptor.setUsage(
+    flags.WGPUTextureUsage_RenderAttachment | flags.WGPUTextureUsage_CopySrc
+      | flags.WGPUTextureUsage_CopyDst | flags.WGPUTextureUsage_TextureBinding,
+  )
+  return run createTexture(device, &descriptor)
+}
+
+impl GpuCanvas {
+  /// A canvas of `width` by `height` pixels (each at least 1) on `gpu`, whose frames go
+  /// through `presenter`.
+  pub effect fn make(
+    gpu: &CanvasGpu,
+    presenter: &CanvasPresenter,
+    width: u32,
+    height: u32,
+  ) -> GpuCanvas
+    ! GpuError {
+    return run GpuCanvas.makeIn(gpu, presenter, width, height, CANVAS_FORMAT)
+  }
+
+  /// As [`GpuCanvas.make`], with a texture in `format`: [`CANVAS_FORMAT`] or
+  /// [`CANVAS_FORMAT_BGRA`] (any other format gives the first).
+  pub effect fn makeIn(
+    gpu: &CanvasGpu,
+    presenter: &CanvasPresenter,
+    width: u32,
+    height: u32,
+    format: u32,
+  ) -> GpuCanvas
+    ! GpuError {
+    let w = if width == 0 { 1 } else { width }
+    let h = if height == 0 { 1 } else { height }
+    let chosen = if format == CANVAS_FORMAT_BGRA { CANVAS_FORMAT_BGRA } else { CANVAS_FORMAT }
+    let mut canvas = GpuCanvas {
+      id: presenter.open(),
+      presenter: presenter.clone(),
+      pixelWidth: w,
+      pixelHeight: h,
+      opaque: false,
+      pixelFormat: chosen,
+      target: Option<Texture>.None,
+      chain: Option<Chain>.None,
+      chains: 1,
+    }
+    if chosen == CANVAS_FORMAT_BGRA && SharedImage.supported(&gpu.device) && rendererShares(presenter) {
+      let made = run Effect.result(makeChain(&gpu.device, w, h, 1))
+      match move made {
+        Result<Chain, GpuError | OutOfMemoryError>.Success { value } => {
+          canvas.chain = Option<Chain>.some(move value)
+          return move canvas
+        }
+        Result<Chain, GpuError | OutOfMemoryError>.Failure { error } => {
+          drop error
+        }
+      }
+    }
+    canvas.target = Option<Texture>.some(run makeTarget(&gpu.device, w, h, chosen))
+    return move canvas
+  }
+
+  /// Whether presents of this canvas stay on the GPU (see the module's notes).
+  pub fn zeroCopy(self: &Self) -> bool {
+    return self.chain.isSome()
+  }
+
+  /// The format of [`GpuCanvas.texture`].
+  pub fn format(self: &Self) -> u32 {
+    return self.pixelFormat
+  }
+
+  /// The number canvas nodes name this canvas by (`Tree.setCanvasSurface`).
+  pub fn surface(self: &Self) -> u32 {
+    return self.id
+  }
+
+  pub fn width(self: &Self) -> u32 {
+    return self.pixelWidth
+  }
+
+  pub fn height(self: &Self) -> u32 {
+    return self.pixelHeight
+  }
+
+  /// The texture to draw the next frame into, in [`GpuCanvas.format`]. What it holds is not
+  /// the last frame (a zero copy canvas draws into another image of its chain each time): clear
+  /// it in the frame's first pass. Take it again after each present.
+  pub fn texture(self: &Self) -> &Texture {
+    match &self.chain {
+      Option<Chain>.Some { value } => {
+        return &value.images.asSlice()[value.current].texture
+      }
+      Option<Chain>.None => ()
+    }
+    match &self.target {
+      Option<Texture>.Some { value } => {
+        return &value
+      }
+      Option<Texture>.None => Intrinsic.trap("a canvas has a texture or a chain")
+    }
+  }
+
+  /// Gives the canvas a new size in pixels and an empty texture of that size. The window
+  /// keeps showing the last presented frame, stretched, until the next present.
+  pub effect fn resize(self: &mut Self, gpu: &CanvasGpu, width: u32, height: u32) -> ()
+    ! GpuError | OutOfMemoryError {
+    let w = if width == 0 { 1 } else { width }
+    let h = if height == 0 { 1 } else { height }
+    if w == self.pixelWidth && h == self.pixelHeight {
+      return ()
+    }
+    if self.chain.isSome() {
+      // The renderer keeps the old images it imported until the new chain's first frame.
+      let old = Intrinsic.replace(self.chain, Option<Chain>.None)
+      run release(move old)
+      self.chains = self.chains + 1
+      self.chain = Option<Chain>.some(run makeChain(&gpu.device, w, h, self.chains))
+    } else {
+      self.target = Option<Texture>.some(run makeTarget(&gpu.device, w, h, self.pixelFormat))
+    }
+    self.pixelWidth = w
+    self.pixelHeight = h
+  }
+
+  /// Shows what was drawn into [`GpuCanvas.texture`]. A canvas that copies through the CPU
+  /// waits until the app's device finished drawing; a zero copy one does not wait for the GPU,
+  /// only, rarely, for the renderer to give an image back.
+  pub effect fn present(self: &mut Self, gpu: &CanvasGpu) -> ()
+    ! GpuError | OutOfMemoryError {
+    if self.chain.isSome() {
+      run self.presentShared(gpu)
+      run gpu.device.checkErrors()
+      return ()
+    }
+    let mut heap = Allocator.systemAllocatorProvider()
+    let mut pixels = List<u8>.make()
+    if let Option<Texture>.Some { value } = &self.target {
+      pixels = run readPixels(gpu, &value, self.pixelWidth, self.pixelHeight, self.pixelFormat == CANVAS_FORMAT_BGRA)
+        |> Effect.provideMut<Allocator>(&mut heap)
+    }
+    if self.opaque {
+      let values = pixels.asMutSlice()
+      let mut i: usize = 3
+      while i < values.length {
+        values[i] = 255
+        i = i + 4
+      }
+    }
+    run self.presenter.present(
+      CanvasFrame {
+        surface: self.id,
+        width: self.pixelWidth,
+        height: self.pixelHeight,
+        pixels: move pixels,
+        shared: Option<SharedPicture>.None,
+      },
+    )
+    run gpu.device.checkErrors()
+  }
+
+  effect fn presentShared(self: &mut Self, gpu: &CanvasGpu) -> ()
+    ! GpuError | OutOfMemoryError {
+    let frame = Frame {
+      surface: self.id,
+      width: self.pixelWidth,
+      height: self.pixelHeight,
+      opaque: self.opaque,
+    }
+    if let Option<Chain>.Some { value } = &mut self.chain {
+      run presentChain(gpu, &self.presenter, &mut value, frame)
+    }
+  }
+}
+
+/// What a present of a zero copy canvas needs to know of it.
+struct Frame {
+  surface: u32,
+  width: u32,
+  height: u32,
+  opaque: bool,
+}
+
+impl Copy for Frame {}
+
+effect fn presentChain(gpu: &CanvasGpu, presenter: &CanvasPresenter, chain: &mut Chain, frame: Frame) -> ()
+  ! GpuError | OutOfMemoryError {
+    let mut heap = Allocator.systemAllocatorProvider()
+    let width = frame.width
+    let height = frame.height
+    let surface = frame.surface
+    if frame.opaque {
+      run makeOpaque(gpu, &mut chain)
+    }
+    let at = chain.current
+    if presenter.keeps() {
+      // Check mode: the reference image of a frame needs the canvas's pixels.
+      let pixels = run readPixels(gpu, &chain.images.asSlice()[at].texture, width, height, true)
+        |> Effect.provideMut<Allocator>(&mut heap)
+      run presenter.keepPixels(surface, width, height, move pixels)
+    }
+    let drawn = &mut chain.images.asMutSlice()[at]
+    let end = run drawn.memory.endAccess(&drawn.texture, false) |> Effect.provideMut<Allocator>(&mut heap)
+    drawn.free = false
+    run presenter.present(
+      CanvasFrame {
+        surface: surface,
+        width: width,
+        height: height,
+        pixels: List<u8>.make(),
+        shared: Option<SharedPicture>.some(
+          SharedPicture {
+            image: drawn.image.clone(),
+            chain: chain.number,
+            index: usize.toU32(at),
+            fences: move end.fences,
+            values: move end.signaledValues,
+          },
+        ),
+      },
+    )
+    // The next image: one the renderer has nothing of, given back if need be.
+    let mut spins: u32 = 0
+    while true {
+      let back = run presenter.reclaim(surface)
+      run takeBack(gpu, &mut chain, move back) |> Effect.provideMut<Allocator>(&mut heap)
+      let next = freeImage(&chain)
+      if next != usize.MAX {
+        let image = &mut chain.images.asMutSlice()[next]
+        run image.memory.beginAccessAfter(&image.texture, BeginAccess.ready(), image.fences.asSlice(), image.values.asSlice())
+        image.fences = List<SharedFence>.make()
+        image.values = List<u64>.make()
+        chain.current = next
+        return ()
+      }
+      spins = spins + 1
+      if spins > RECLAIM_SPINS {
+        fail GpuError.status(shared.SHARED_TEXTURE_UNAVAILABLE)
+      }
+      // The renderer gives an image back within a frame, or when the window server lets go of one
+      // a layer showed (up to a refresh): after a few turns, sleep instead of spinning.
+      if spins > 64 {
+        run waitAWhile()
+      } else {
+        NativeThread.yieldNow()
+      }
+    }
+}
+
+/// Sleeps a quarter of a millisecond.
+effect fn waitAWhile() -> () {
+  static if Intrinsic.targetArchitecture() == "wasm32" {
+    NativeThread.yieldNow()
+  } else {
+    let mut clock = OsMonotonicClock.make()
+    run Effect.sleep(250000) |> Effect.provideMut<MonotonicClock>(&mut clock)
+  }
+}
+
+/// Whether the renderer's device imports shared images, waiting a little for a renderer that
+/// is still making its device.
+fn rendererShares(presenter: &CanvasPresenter) -> bool {
+  let mut spins: u32 = 0
+  while presenter.sharing() == SHARING_UNKNOWN && spins < SHARING_SPINS {
+    NativeThread.yieldNow()
+    spins = spins + 1
+  }
+  return presenter.sharing() == SHARING_YES
+}
+
+effect fn makeChain(device: &Device, width: u32, height: u32, number: u32) -> Chain
+  ! GpuError | OutOfMemoryError {
+  let mut heap = Allocator.systemAllocatorProvider()
+  let mut images = List<AppImage>.make()
+  let mut i: u32 = 0
+  while i < CHAIN_LENGTH {
+    let image = run SharedImage.create(width, height)
+    let memory = run SharedTextureMemory.importImage(device, b"gpu canvas", &image)
+    let texture = run memory.createTexture(b"gpu canvas")
+    let held = run Arc<ChainImage>.make(ChainImage { image: move image }) |> Effect.provideMut<Allocator>(&mut heap)
+    run images.append(
+      AppImage {
+        image: move held,
+        memory: move memory,
+        texture: move texture,
+        free: true,
+        fences: List<SharedFence>.make(),
+        values: List<u64>.make(),
+      },
+    ) |> Effect.provideMut<Allocator>(&mut heap)
+    i = i + 1
+  }
+  let first = &images.asSlice()[0]
+  let mut access = BeginAccess.ready()
+  access.initialized = false
+  run first.memory.beginAccess(&first.texture, access)
+  return Chain { number: number, images: move images, current: 0, opaquePass: Option<RenderPipeline>.None }
+}
+
+/// Ends the app's access to the chain's current image, so that its memory can go.
+effect fn release(chain: Option<Chain>) -> ()
+  ! GpuError | OutOfMemoryError {
+  if let Option<Chain>.Some { value } = move chain {
+    let mut heap = Allocator.systemAllocatorProvider()
+    let image = &value.images.asSlice()[value.current]
+    drop run image.memory.endAccess(&image.texture, false) |> Effect.provideMut<Allocator>(&mut heap)
+  }
+}
+
+/// Marks the images in `back` of this chain free, with the renderer's fences imported on the
+/// app's device.
+effect fn takeBack(gpu: &CanvasGpu, chain: &mut Chain, back: List<ReturnedImage>) -> ()
+  ! GpuError | OutOfMemoryError
+  ? &mut Allocator {
+  let returned = back.asSlice()
+  let mut r: usize = 0
+  while r < returned.length {
+    let given = &returned[r]
+    let at = u32.toUsize(given.index)
+    if given.chain == chain.number && at < chain.images.length() {
+      let image = &mut chain.images.asMutSlice()[at]
+      image.free = true
+      image.fences = List<SharedFence>.make()
+      image.values = List<u64>.make()
+      let fences = given.fences.asSlice()
+      let mut f: usize = 0
+      while f < fences.length {
+        let info = fences[f].exportInfo()
+        run image.fences.append(run SharedFence.importMtlSharedEvent(&gpu.device, info.handle))
+        run image.values.append(given.values.asSlice()[f])
+        f = f + 1
+      }
+    }
+    r = r + 1
+  }
+}
+
+fn freeImage(chain: &Chain) -> usize {
+  let images = chain.images.asSlice()
+  let mut i: usize = 0
+  while i < images.length {
+    if images[i].free && i != chain.current {
+      return i
+    }
+    i = i + 1
+  }
+  return usize.MAX
+}
+
+const OPAQUE_SHADER: &'static [u8] = b"@vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f {\n  var p = array<vec2f, 3>(vec2f(-1.0, -1.0), vec2f(3.0, -1.0), vec2f(-1.0, 3.0));\n  return vec4f(p[i], 0.0, 1.0);\n}\n@fragment fn fs() -> @location(0) vec4f { return vec4f(0.0, 0.0, 0.0, 1.0); }\n"
+
+/// Sets the alpha of every pixel of the chain's current image to one, as the CPU path does for
+/// an opaque canvas.
+effect fn makeOpaque(gpu: &CanvasGpu, chain: &mut Chain) -> ()
+  ! GpuError {
+  if chain.opaquePass.isNone() {
+    let module = run resources.createShaderModule(&gpu.device, b"gpu canvas opaque", OPAQUE_SHADER)
+    let vertex = VertexState.default().withModule(&module).withEntryPoint(b"vs")
+    let mut target: ColorTargetState = ColorTargetState.default()
+    target.setFormat(CANVAS_FORMAT_BGRA)
+    target.setWriteMask(flags.WGPUColorWriteMask_Alpha)
+    let targets = [target]
+    let fragment = FragmentState.default().withModule(&module).withEntryPoint(b"fs").withTargets(&targets)
+    let mut primitive: PrimitiveState = PrimitiveState.default()
+    primitive.setTopology(flags.WGPUPrimitiveTopology_TriangleList)
+    let mut multisample: MultisampleState = MultisampleState.default()
+    multisample.setCount(1)
+    let mut descriptor = RenderPipelineDescriptor.default().withVertex(vertex).withFragment(&fragment)
+    descriptor.setPrimitive(primitive)
+    descriptor.setMultisample(multisample)
+    chain.opaquePass = Option<RenderPipeline>.some(run resources.createRenderPipeline(&gpu.device, &descriptor))
+  }
+  if let Option<RenderPipeline>.Some { value } = &chain.opaquePass {
+    let view = run chain.images.asSlice()[chain.current].texture.createView(&TextureViewDescriptor.default())
+    let mut attachment = RenderPassColorAttachment.default().withView(&view)
+    attachment.setLoadOp(flags.WGPULoadOp_Load)
+    attachment.setStoreOp(flags.WGPUStoreOp_Store)
+    let attachments = [attachment]
+    let descriptor = RenderPassDescriptor.default().withColorAttachments(&attachments)
+    let mut encoder = run resources.createCommandEncoder(&gpu.device, b"gpu canvas opaque")
+    let mut pass = run encoder.beginRenderPass(&descriptor)
+    pass.setPipeline(&value)
+    pass.draw(3, 1, 0, 0)
+    pass.end()
+    let commands = run encoder.finish(b"gpu canvas opaque")
+    gpu.queue.submit(&[commands.reference()])
+  }
+}
+
+/// `texture`'s pixels as premultiplied RGBA8 rows, read back on the app's device.
+effect fn readPixels(gpu: &CanvasGpu, texture: &Texture, width: u32, height: u32, bgra: bool) -> List<u8>
+  ! GpuError | OutOfMemoryError
+  ? &mut Allocator {
+  let buffer = run copyOut(&gpu.device, &gpu.queue, texture, width, height)
+  let padded = run runtime.mapRead(&gpu.device, &buffer, 0, readbackSize(width, height))
+  return run unpack(padded.asSlice(), width, height, bgra)
+}
+
+impl Drop for GpuCanvas {
+  fn drop(self: &mut Self) -> () {
+    drop run Effect.result(release(Intrinsic.replace(self.chain, Option<Chain>.None)))
+    // Out of memory here leaves the renderer's texture until the window closes.
+    drop run Effect.result(self.presenter.close(self.id))
+  }
+}

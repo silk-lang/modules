@@ -1,0 +1,1148 @@
+//! The multithreaded compressor: a port of `lib/compress/zstdmt_compress.c` of Zstandard 1.5.7,
+//! whose jobs are compressed by native worker threads.
+//!
+//! With `nbWorkers >= 1` the reference cuts the input into jobs of `targetSectionSize` bytes,
+//! each compressed by a worker as a chunk of one frame: the window of a job is primed with the
+//! last `targetPrefixSize` bytes of the previous job, the first job writes the frame header and
+//! the last one ends the frame. Long distance matching and the checksum run serially over the
+//! whole input (the "serial state"). Its bytes depend on the parameters, the input and the calls
+//! of the caller, not on the timing of the threads. This module keeps the round buffer of the
+//! reference (`roundBuff`, the same capacity, the same positions and wrap points: the window of
+//! the serial long distance matcher lives in it), the job table, and the flush of
+//! `ZSTDMT_flushProduced`, one job at a time.
+//!
+//! Threads. The calling thread cuts the jobs, runs the serial state over each job when it is
+//! created (long distance matching into the job's own sequence buffer, then the checksum), and
+//! queues it. Up to `nbWorkers` worker threads, started as the jobs need them and kept until the
+//! context is freed or `nbWorkers` changes, take the jobs in order, each with its own compression
+//! context (the CCtx pool of the reference), and write into the job's output buffer (from a reuse
+//! pool, as the reference's buffer pool). A worker publishes how much of the output is final after
+//! each chunk of `CHUNK_SIZE` bytes, so the oldest job can be flushed while it runs, and the end of
+//! the job. What is shared, and how:
+//! - a job's description (`Task`) is written by the calling thread before it is queued, and only
+//!   read by the worker after it takes it from the queue: the queue's lock orders the two;
+//! - the progress, the result and the state of a job are atomic words; the worker writes its
+//!   output bytes before the release store that publishes them, and the calling thread reads the
+//!   bytes only after the acquire load that sees them;
+//! - the calling thread writes a section of the round buffer only after every queued or running
+//!   job whose prefix or input overlaps it is done (`waitRangeFree`, the reference's
+//!   `ZSTDMT_tryGetInputRange`), and gives a job's buffers back to the pools only once it is done;
+//! - a worker that ended a job touches neither the job nor its buffers again; the shared block
+//!   (queue, words, descriptions) is freed only after every worker is joined.
+//! The calling thread waits (on a futex) only where the reference waits: in the flush, when the
+//! call took no input and the oldest job has nothing new to flush (with `e_continue` too); for a
+//! section of the round buffer; and when a frame is dropped or the context freed. `ZSTD_CCtx_reset`
+//! cancels the queued and running jobs without waiting (`cancelOf`): a running job stops at its
+//! next chunk, and the next frame or the free waits for that. An error of a job surfaces when the
+//! flush reaches it, as in the reference. If no thread can be started (a single-threaded target),
+//! the jobs are compressed on the calling thread when they are created.
+//!
+//! What differs from the reference is only when the bytes come out and how much input a call
+//! takes, never which bytes:
+//! - the reference takes no more input while all its workers are busy and a prepared job waits
+//!   for one (`jobReady`); its input buffer is empty then. This port queues the job instead, and
+//!   takes no more input, empty input buffer, while as many jobs as the job table of the reference
+//!   holds (`nbWorkers + 2` rounded up to a power of 2) are not fully flushed. That bounds the
+//!   memory of the outputs, and never changes where a job is cut: with `e_continue` a job is cut
+//!   when it is full, with `e_flush` and `e_end` when the input of the call is loaded, stalled or
+//!   not. Unlike the reference, a job is never refused for a full table: such a refusal could make
+//!   a full job the last one (no empty last block), which the reference with real threads does
+//!   not do.
+//!
+//! Not supported with `nbWorkers >= 1`, and refused with `parameter_unsupported`: `rsyncable`
+//! (Node does not expose it), and dictionaries and prefixes (the reference gives them to the
+//! first job as a CDict, or as the prefix of the first job).
+import mem
+import errors
+import xxh64
+import xxh64 { Xxh64 }
+import cparams
+import cparams { Params, LdmParams }
+import cstate
+import cctx
+import cctx { CCtx, LdmState }
+import compress
+import zldm
+import zfast
+import cdict
+import silk.mem.pointer { Pointer }
+import silk.mem.layout { Layout }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.effect { Effect }
+import silk.core.result { Result }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.collections.list { List }
+import silk.concurrency.atomic { Atomic, CompareExchange, MemoryOrder }
+import silk.concurrency.thread { Transferable }
+import silk.concurrency.thread_native { NativeThread, JoinHandle, SpawnError }
+import silk.num.i32
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+
+/// The size of the pieces a job is compressed in (`4 * ZSTD_BLOCKSIZE_MAX`).
+const CHUNK_SIZE: usize = 524288
+/// `ZSTDMT_JOBLOG_MAX` on a 64-bit target.
+const JOBLOG_MAX: u32 = 30
+
+// The job table, on the calling thread only (`ZSTDMT_jobDescription` without what the worker
+// needs, which is in its `Task`).
+struct Job {
+  srcSize: usize,
+  /// Where its prefix starts and its input ends in the round buffer, while it reads them.
+  rangeStart: usize,
+  rangeEnd: usize,
+  /// Queued or running: its state word says when it is done.
+  active: bool,
+  dst: ?[*]mut u8,
+  seqs: ?[*]mut u8,
+  /// The size of the output, once the job is done.
+  cSize: usize,
+  dstFlushed: usize,
+  frameChecksumNeeded: bool,
+}
+
+// What a worker needs to compress a job: written before the job is queued, then only read.
+struct Task {
+  params: Params,
+  firstJob: bool,
+  lastJob: bool,
+  src: [*]const u8,
+  srcSize: usize,
+  prefix: [*]const u8,
+  prefixSize: usize,
+  dst: [*]mut u8,
+  dstCapacity: usize,
+  seqs: ?[*]mut u8,
+  nbSeq: usize,
+  pledgedSrcSize: u64,
+}
+impl Copy for Task {}
+
+// The shared block: a header of `u32` words, the queue (a ring of job positions), four `u64`
+// words per job position, and the `Task` of each position. It lives until every worker is joined.
+const H_LOCK: usize = 0
+const H_WORKSEQ: usize = 1
+const H_EVENTS: usize = 2
+const H_STOP: usize = 3
+const H_HEAD: usize = 4
+const H_TAIL: usize = 5
+const H_SLOTS: usize = 6
+const RING_OFFSET: usize = 32
+// The words of a job position: its state, a cancel request, how much of its output is final, and
+// its result (the compressed size or an error).
+const O_STATE: usize = 0
+const O_CANCEL: usize = 1
+const O_PRODUCED: usize = 2
+const O_RESULT: usize = 3
+const S_IDLE: u64 = 0
+const S_QUEUED: u64 = 1
+const S_DONE: u64 = 2
+
+fn outsOffset(nbSlots: u32) -> usize { return (RING_OFFSET + mem.z(nbSlots) * 4 + 7) / 8 * 8 }
+fn tasksOffset(nbSlots: u32) -> usize { return (outsOffset(nbSlots) + mem.z(nbSlots) * 32 + 63) / 64 * 64 }
+fn blockBytes(nbSlots: u32) -> usize { return tasksOffset(nbSlots) + mem.z(nbSlots) * Layout.of<Task>().bytes }
+
+unsafe fn hword(block: [*]mut u8, index: usize) -> *mut u32 {
+  return unsafe Pointer.atMut<u32>(unsafe Intrinsic.pointerReinterpret<[*]mut u8, [*]mut u32>(block), index)
+}
+unsafe fn ringAt(block: [*]mut u8, index: u32) -> *mut u32 {
+  return unsafe Pointer.atMut<u32>(unsafe Intrinsic.pointerReinterpret<[*]mut u8, [*]mut u32>(unsafe mem.add(block, RING_OFFSET)), mem.z(index))
+}
+unsafe fn oword(block: [*]mut u8, slot: u32, which: usize) -> *mut u64 {
+  let outs = unsafe mem.add(block, outsOffset(unsafe Atomic.load<u32>(unsafe hword(block, H_SLOTS), MemoryOrder.Relaxed)))
+  return unsafe Pointer.atMut<u64>(unsafe Intrinsic.pointerReinterpret<[*]mut u8, [*]mut u64>(outs), mem.z(slot) * 4 + which)
+}
+unsafe fn taskAt(block: [*]mut u8, slot: u32) -> *mut Task {
+  let tasks = unsafe mem.add(block, tasksOffset(unsafe Atomic.load<u32>(unsafe hword(block, H_SLOTS), MemoryOrder.Relaxed)))
+  return unsafe Pointer.atMut<Task>(unsafe Intrinsic.pointerReinterpret<[*]mut u8, [*]mut Task>(tasks), mem.z(slot))
+}
+
+// The queue's lock: a futex word, unlocked (0), locked (1), or locked with possible sleepers (2).
+unsafe fn lock(block: [*]mut u8) -> () {
+  let word = unsafe hword(block, H_LOCK)
+  let taken = match unsafe Atomic.compareExchange<u32>(word, 0, 1, MemoryOrder.Acquire, MemoryOrder.Relaxed) {
+    CompareExchange<u32>.Exchanged => true
+    CompareExchange<u32>.Observed {..} => false
+  }
+  if taken { return () }
+  while unsafe Atomic.swap<u32>(word, 2, MemoryOrder.Acquire) != 0 {
+    let _woken = unsafe Atomic.wait(word, 2, Option<u64>.none())
+  }
+}
+unsafe fn unlock(block: [*]mut u8) -> () {
+  let word = unsafe hword(block, H_LOCK)
+  if unsafe Atomic.swap<u32>(word, 0, MemoryOrder.Release) == 2 { unsafe Atomic.notifyOne(word) }
+}
+
+// Tells the calling thread that a job made progress or ended.
+unsafe fn signalEvent(block: [*]mut u8) -> () {
+  let word = unsafe hword(block, H_EVENTS)
+  let _previous = unsafe Atomic.fetchAdd<u32>(word, 1, MemoryOrder.SequentiallyConsistent)
+  unsafe Atomic.notifyAll(word)
+}
+
+unsafe fn isDone(block: [*]mut u8, slot: u32) -> bool {
+  return unsafe Atomic.load<u64>(unsafe oword(block, slot, O_STATE), MemoryOrder.Acquire) == S_DONE
+}
+unsafe fn producedOf(block: [*]mut u8, slot: u32) -> usize {
+  return u64.toUsize(unsafe Atomic.load<u64>(unsafe oword(block, slot, O_PRODUCED), MemoryOrder.Acquire))
+}
+
+// Sleeps until the job at `slot` is done or, if `flushed` is not `usize.MAX`, has more than
+// `flushed` bytes of final output.
+unsafe fn waitJob(block: [*]mut u8, slot: u32, flushed: usize) -> () {
+  let events = unsafe hword(block, H_EVENTS)
+  while true {
+    let seen = unsafe Atomic.load<u32>(events, MemoryOrder.SequentiallyConsistent)
+    if unsafe isDone(block, slot) { return () }
+    if flushed != usize.MAX && unsafe producedOf(block, slot) > flushed { return () }
+    let _woken = unsafe Atomic.wait(events, seen, Option<u64>.none())
+  }
+}
+
+// ---- The workers. ----
+
+// The shared block, given to a worker. The block outlives the worker (it is freed after the
+// join), and the worker touches it only through atomic words, under the lock, or in the `Task`
+// and buffers of a job it took from the queue and has not ended.
+struct WorkerArg { block: [*]mut u8 }
+impl Transferable for WorkerArg {}
+
+fn workerMain(arg: WorkerArg) -> () {
+  unsafe workerLoop(arg.block)
+  return ()
+}
+
+unsafe fn workerLoop(block: [*]mut u8) -> () {
+  // The worker's own compression context (`ZSTDMT_getCCtx`).
+  let jc = unsafe cctx.create()
+  let nbSlots = unsafe Atomic.load<u32>(unsafe hword(block, H_SLOTS), MemoryOrder.Relaxed)
+  while true {
+    unsafe lock(block)
+    let mut slot: u32 = u32.MAX
+    while true {
+      if unsafe Atomic.load<u32>(unsafe hword(block, H_STOP), MemoryOrder.Relaxed) != 0 { break }
+      let head = unsafe Atomic.load<u32>(unsafe hword(block, H_HEAD), MemoryOrder.Relaxed)
+      let tail = unsafe Atomic.load<u32>(unsafe hword(block, H_TAIL), MemoryOrder.Relaxed)
+      if head != tail {
+        slot = unsafe Atomic.load<u32>(unsafe ringAt(block, head & (nbSlots - 1)), MemoryOrder.Relaxed)
+        unsafe Atomic.store<u32>(unsafe hword(block, H_HEAD), mem.a32(head, 1), MemoryOrder.Relaxed)
+        break
+      }
+      let seq = unsafe Atomic.load<u32>(unsafe hword(block, H_WORKSEQ), MemoryOrder.Relaxed)
+      unsafe unlock(block)
+      let _woken = unsafe Atomic.wait(unsafe hword(block, H_WORKSEQ), seq, Option<u64>.none())
+      unsafe lock(block)
+    }
+    unsafe unlock(block)
+    if slot == u32.MAX { break }
+    unsafe runTask(block, slot, jc)
+  }
+  unsafe cctx.destroy(jc)
+}
+
+// Compresses the job at `slot` with the context `jc`, then publishes its result and its end.
+unsafe fn runTask(block: [*]mut u8, slot: u32, jc: ?[*]mut u8) -> () {
+  let task = unsafe Pointer.read<Task>(unsafe taskAt(block, slot))
+  let result = if Pointer.isNullMany<u8>(jc) { errors.err(errors.E_MEMORY_ALLOCATION) } else { unsafe compressTask(block, slot, &task, unsafe mem.nn(jc)) }
+  unsafe Atomic.store<u64>(unsafe oword(block, slot, O_RESULT), usize.toU64(result), MemoryOrder.Relaxed)
+  unsafe Atomic.store<u64>(unsafe oword(block, slot, O_STATE), S_DONE, MemoryOrder.Release)
+  unsafe signalEvent(block)
+}
+
+// Whether the calling thread asked the job at `slot` to stop.
+unsafe fn cancelled(block: [*]mut u8, slot: u32) -> bool {
+  return unsafe Atomic.load<u64>(unsafe oword(block, slot, O_CANCEL), MemoryOrder.Relaxed) != 0
+}
+
+// Publishes that the first `op` bytes of the output of the job at `slot` are final.
+unsafe fn publish(block: [*]mut u8, slot: u32, op: usize) -> () {
+  unsafe Atomic.store<u64>(unsafe oword(block, slot, O_PRODUCED), usize.toU64(op), MemoryOrder.Release)
+  unsafe signalEvent(block)
+}
+
+// `ZSTDMT_compressionJob` without the serial state: compresses `task.src` (primed with
+// `task.prefix`) into `task.dst`, and returns its compressed size or an error.
+unsafe fn compressTask(block: [*]mut u8, slot: u32, task: &Task, jcRaw: [*]mut u8) -> usize {
+  let firstJob = task.firstJob
+  let lastJob = task.lastJob
+  let src = task.src
+  let srcSize = task.srcSize
+  let prefixSize = task.prefixSize
+  let dst = task.dst
+  let dstCapacity = task.dstCapacity
+  if unsafe cancelled(block, slot) { return errors.err(errors.E_GENERIC) }
+  let jobParams = task.params
+  let mut anchor = ()
+  let jc = unsafe cctx.of(&mut anchor, jcRaw)
+  // `ZSTD_compressBegin_advanced_internal` with the prefix as `ZSTD_dct_rawContent`.
+  let e = unsafe cctx.resetInternal(&mut jc, &jobParams, task.pledgedSrcSize, prefixSize, true, false)
+  if errors.isError(e) { return e }
+  if prefixSize >= 8 {
+    // `ZSTD_compress_insertDictionary` of a raw content (`ZSTD_loadDictionaryContent`).
+    unsafe cstate.resetCompressedBlockState(jc.prevCBlock)
+    let applied = jc.appliedParams
+    let le = unsafe cdict.loadDictionaryContent(&mut jc.matchState, &applied, task.prefix, prefixSize, zfast.DTLM_FAST, false)
+    if errors.isError(le) { return le }
+  }
+  jc.dictID = 0
+  jc.dictContentSize = prefixSize
+  // `ZSTDMT_serialState_applySequences`.
+  unsafe zldm.storeInit(jc.externSeqStore, task.seqs, task.nbSeq, task.nbSeq)
+  let mut op: usize = 0
+  if !firstJob {
+    // Writes the frame header in `dst`, where the blocks overwrite it.
+    let hSize = unsafe compress.compressContinueInternal(&mut jc, dst, dstCapacity, src, 0, false)
+    if errors.isError(hSize) { return hSize }
+    // `ZSTD_invalidateRepCodes`.
+    unsafe mem.fillBytes(unsafe mem.add(jc.prevCBlock, cstate.CBS_REP), 0, 12)
+  }
+  // Compress the entire job in pieces.
+  let nbChunks = (srcSize + (CHUNK_SIZE - 1)) / CHUNK_SIZE
+  let mut ip: usize = 0
+  let mut chunkNb: usize = 1
+  while chunkNb < nbChunks {
+    let cSize = unsafe compress.compressContinueInternal(&mut jc, unsafe mem.add(dst, op), dstCapacity - op, unsafe mem.addc(src, ip), CHUNK_SIZE, false)
+    if errors.isError(cSize) { return cSize }
+    ip = ip + CHUNK_SIZE
+    op = op + cSize
+    unsafe publish(block, slot, op)
+    if unsafe cancelled(block, slot) { return errors.err(errors.E_GENERIC) }
+    chunkNb = chunkNb + 1
+  }
+  // The last piece, which must give a last block if this is the last job.
+  if nbChunks > 0 || lastJob {
+    let lastBlockSize1 = srcSize & (CHUNK_SIZE - 1)
+    let lastBlockSize = if lastBlockSize1 == 0 && srcSize >= CHUNK_SIZE { CHUNK_SIZE } else { lastBlockSize1 }
+    let cSize = if lastJob {
+      unsafe compress.compressEnd(&mut jc, unsafe mem.add(dst, op), dstCapacity - op, unsafe mem.addc(src, ip), lastBlockSize)
+    } else {
+      unsafe compress.compressContinueInternal(&mut jc, unsafe mem.add(dst, op), dstCapacity - op, unsafe mem.addc(src, ip), lastBlockSize, false)
+    }
+    if errors.isError(cSize) { return cSize }
+    op = op + cSize
+  }
+  unsafe zldm.storeInit(jc.externSeqStore, mem.nullp(), 0, 0)
+  return op
+}
+
+// Starts one more worker on `block`, and keeps its handle in `threads`.
+effect fn spawnWorker(threads: &mut List<JoinHandle<()>>, arg: WorkerArg) -> () ! OutOfMemoryError | SpawnError ? &mut Allocator {
+  // Room first: a handle that could not be kept would be dropped, which joins a thread that
+  // waits for work.
+  run threads.reserve(1)
+  let handle = run NativeThread.spawn(|| -> () { return workerMain(move arg) })
+  let _kept = threads.appendWithinCapacity(move handle)
+}
+
+/// `ZSTDMT_CCtx` with its serial state.
+pub struct MtCtx {
+  params: Params,
+  /// The `nbWorkers` the job table and the workers are made for (`ZSTDMT_resize`).
+  nbWorkers: i32,
+  jobs: ?[*]mut u8,
+  nbJobs: u32,
+  /// The size of the job table of the reference.
+  tableSize: u32,
+  jobIDMask: u32,
+  /// The shared block of the workers, made with the job table.
+  block: ?[*]mut u8,
+  /// The workers.
+  threads: List<JoinHandle<()>>,
+  /// Whether a thread could not be started: then no more are tried for this job table.
+  spawnFailed: bool,
+  /// The context that compresses the jobs on the calling thread when no worker could start.
+  jobCCtx: ?[*]mut u8,
+  /// The size of the output buffer of a job (`ZSTDMT_setBufferSize`).
+  bufferSize: usize,
+  /// The buffer pools: free output buffers (of `bufferSize + 4` bytes) and free sequence buffers
+  /// (of `seqBytes`), each an array of `nbJobs` pointers.
+  dstFree: ?[*]mut u8,
+  dstFreeCount: u32,
+  seqFree: ?[*]mut u8,
+  seqFreeCount: u32,
+  seqBytes: usize,
+  roundBuff: ?[*]mut u8,
+  roundCapacity: usize,
+  roundPos: usize,
+  /// `inBuff`: whether it has a section of the round buffer, where it starts, how full it is.
+  inBuffActive: bool,
+  inBuffStart: usize,
+  inBuffFilled: usize,
+  /// `inBuff.prefix`, in the round buffer.
+  prefixStart: usize,
+  prefixSize: usize,
+  targetSectionSize: usize,
+  targetPrefixSize: usize,
+  frameContentSize: u64,
+  doneJobID: u32,
+  nextJobID: u32,
+  frameEnded: bool,
+  allJobsCompleted: bool,
+  consumed: u64,
+  produced: u64,
+  // `SerialState`.
+  ldmOn: bool,
+  ldmParams: LdmParams,
+  ldmState: LdmState,
+  ldmHashBytes: usize,
+  ldmBucketBytes: usize,
+  maxNbSeq: usize,
+  checksum: bool,
+  xxh: Xxh64,
+}
+
+unsafe fn slotOf(p: [*]mut u8) -> *mut MtCtx {
+  return unsafe Pointer.atMut<MtCtx>(unsafe Intrinsic.pointerReinterpret<[*]mut u8, [*]mut MtCtx>(p), 0)
+}
+
+unsafe fn of<'a>(anchor: &'a mut (), p: [*]mut u8) -> &'a mut MtCtx {
+  return unsafe Pointer.borrowMut<(), MtCtx>(&mut anchor, unsafe slotOf(p))
+}
+
+unsafe fn jobAt<'a>(anchor: &'a mut (), jobs: ?[*]mut u8, index: u32) -> &'a mut Job {
+  return unsafe Pointer.borrowMut<(), Job>(&mut anchor, unsafe Pointer.atMut<Job>(unsafe Intrinsic.pointerReinterpret<[*]mut u8, [*]mut Job>(unsafe mem.nn(jobs)), mem.z(index)))
+}
+
+unsafe fn ptrAt(array: ?[*]mut u8, index: u32) -> *mut ?[*]mut u8 {
+  return unsafe Pointer.atMut<?[*]mut u8>(unsafe Intrinsic.pointerReinterpret<[*]mut u8, [*]mut ?[*]mut u8>(unsafe mem.nn(array)), mem.z(index))
+}
+
+unsafe fn create() -> ?[*]mut u8 {
+  let raw = unsafe mem.calloc(1, Layout.of<MtCtx>().bytes)
+  if Pointer.isNullMany<u8>(raw) { return raw }
+  unsafe Pointer.put<MtCtx>(unsafe slotOf(unsafe mem.nn(raw)), MtCtx {
+    params: cparams.paramsInit(cparams.CLEVEL_DEFAULT),
+    nbWorkers: 0,
+    jobs: mem.nullp(),
+    nbJobs: 0,
+    tableSize: 0,
+    jobIDMask: 0,
+    block: mem.nullp(),
+    threads: List<JoinHandle<()>>.make(),
+    spawnFailed: false,
+    jobCCtx: mem.nullp(),
+    bufferSize: 0,
+    dstFree: mem.nullp(),
+    dstFreeCount: 0,
+    seqFree: mem.nullp(),
+    seqFreeCount: 0,
+    seqBytes: 0,
+    roundBuff: mem.nullp(),
+    roundCapacity: 0,
+    roundPos: 0,
+    inBuffActive: false,
+    inBuffStart: 0,
+    inBuffFilled: 0,
+    prefixStart: 0,
+    prefixSize: 0,
+    targetSectionSize: 0,
+    targetPrefixSize: 0,
+    frameContentSize: 0,
+    doneJobID: 0,
+    nextJobID: 0,
+    frameEnded: false,
+    allJobsCompleted: true,
+    consumed: 0,
+    produced: 0,
+    ldmOn: false,
+    ldmParams: cparams.paramsInit(0).ldmParams,
+    ldmState: LdmState { window: cstate.windowInit(), hashTable: mem.nullp(), loadedDictEnd: 0, bucketOffsets: mem.nullp() },
+    ldmHashBytes: 0,
+    ldmBucketBytes: 0,
+    maxNbSeq: 0,
+    checksum: false,
+    xxh: xxh64.make(),
+  })
+  return raw
+}
+
+// ---- The buffer pools (`ZSTDMT_bufferPool`). ----
+
+// Frees the buffers of a pool.
+unsafe fn clearPool(array: ?[*]mut u8, count: &mut u32) -> () {
+  while count.* > 0 {
+    count.* = count.* - 1
+    let slot = unsafe ptrAt(array, count.*)
+    unsafe mem.free(unsafe Pointer.read<?[*]mut u8>(slot))
+    unsafe Pointer.write<?[*]mut u8>(slot, mem.nullp())
+  }
+}
+
+// A buffer of `size` bytes, from the pool or new; null if none can be allocated.
+unsafe fn takeBuffer(array: ?[*]mut u8, count: &mut u32, size: usize) -> ?[*]mut u8 {
+  if count.* > 0 {
+    count.* = count.* - 1
+    return unsafe Pointer.read<?[*]mut u8>(unsafe ptrAt(array, count.*))
+  }
+  return unsafe mem.malloc(size)
+}
+
+// Gives `buffer` (or null) back to the pool, which has room for every buffer of the job table.
+unsafe fn giveBuffer(array: ?[*]mut u8, count: &mut u32, buffer: ?[*]mut u8) -> () {
+  if Pointer.isNullMany<u8>(buffer) { return () }
+  unsafe Pointer.write<?[*]mut u8>(unsafe ptrAt(array, count.*), buffer)
+  count.* = count.* + 1
+}
+
+// Gives the buffers of the job at `index` back to the pools.
+unsafe fn releaseJobBuffers(mt: &mut MtCtx, index: u32) -> () {
+  let mut anchor = ()
+  let job = unsafe jobAt(&mut anchor, mt.jobs, index)
+  unsafe giveBuffer(mt.dstFree, &mut mt.dstFreeCount, job.dst)
+  unsafe giveBuffer(mt.seqFree, &mut mt.seqFreeCount, job.seqs)
+  job.dst = mem.nullp()
+  job.seqs = mem.nullp()
+}
+
+// ---- Job control on the calling thread. ----
+
+// Asks every queued or running job to stop, without waiting: queued jobs are taken off the queue
+// and marked done, running ones stop at their next chunk.
+unsafe fn cancelJobs(mt: &mut MtCtx) -> () {
+  if Pointer.isNullMany<u8>(mt.block) { return () }
+  let block = unsafe mem.nn(mt.block)
+  unsafe lock(block)
+  let tail = unsafe Atomic.load<u32>(unsafe hword(block, H_TAIL), MemoryOrder.Relaxed)
+  let mut head = unsafe Atomic.load<u32>(unsafe hword(block, H_HEAD), MemoryOrder.Relaxed)
+  while head != tail {
+    let slot = unsafe Atomic.load<u32>(unsafe ringAt(block, head & (mt.nbJobs - 1)), MemoryOrder.Relaxed)
+    unsafe Atomic.store<u64>(unsafe oword(block, slot, O_RESULT), usize.toU64(errors.err(errors.E_GENERIC)), MemoryOrder.Relaxed)
+    unsafe Atomic.store<u64>(unsafe oword(block, slot, O_STATE), S_DONE, MemoryOrder.Release)
+    head = mem.a32(head, 1)
+  }
+  unsafe Atomic.store<u32>(unsafe hword(block, H_HEAD), tail, MemoryOrder.Relaxed)
+  unsafe unlock(block)
+  let mut id = mt.doneJobID
+  while id != mt.nextJobID {
+    unsafe Atomic.store<u64>(unsafe oword(block, id & mt.jobIDMask, O_CANCEL), 1, MemoryOrder.Relaxed)
+    id = mem.a32(id, 1)
+  }
+}
+
+// `ZSTDMT_waitForAllJobsCompleted` and `ZSTDMT_releaseAllJobResources`, after cancelling them:
+// when this returns, no worker uses a job, the round buffer or a buffer of the pools.
+unsafe fn dropAllJobs(mt: &mut MtCtx) -> () {
+  if Pointer.isNullMany<u8>(mt.jobs) { return () }
+  unsafe cancelJobs(&mut mt)
+  while mt.doneJobID != mt.nextJobID {
+    let index = mt.doneJobID & mt.jobIDMask
+    let mut anchor = ()
+    let job = unsafe jobAt(&mut anchor, mt.jobs, index)
+    if job.active {
+      unsafe waitJob(unsafe mem.nn(mt.block), index, usize.MAX)
+      job.active = false
+    }
+    job.cSize = 0
+    job.dstFlushed = 0
+    job.srcSize = 0
+    job.frameChecksumNeeded = false
+    mt.doneJobID = mem.a32(mt.doneJobID, 1)
+  }
+  // Every position gives its buffers back, also one whose job failed to be made: the pools
+  // then hold every buffer, and are cleared when the sizes change.
+  let mut i: u32 = 0
+  while i < mt.nbJobs {
+    unsafe releaseJobBuffers(&mut mt, i)
+    i = i + 1
+  }
+}
+
+// Stops and joins the workers, then frees the shared block and the job table with its pools.
+// The jobs must have been dropped.
+unsafe fn freeJobs(mt: &mut MtCtx) -> () {
+  if !Pointer.isNullMany<u8>(mt.block) {
+    let block = unsafe mem.nn(mt.block)
+    unsafe lock(block)
+    unsafe Atomic.store<u32>(unsafe hword(block, H_STOP), 1, MemoryOrder.Relaxed)
+    let _seq = unsafe Atomic.fetchAdd<u32>(unsafe hword(block, H_WORKSEQ), 1, MemoryOrder.Relaxed)
+    unsafe unlock(block)
+    unsafe Atomic.notifyAll(unsafe hword(block, H_WORKSEQ))
+    while mt.threads.length() > 0 {
+      let last = mt.threads.length() - 1
+      let thread = mt.threads.remove(last)
+      thread.join()
+    }
+    unsafe mem.free(mt.block)
+    mt.block = mem.nullp()
+  }
+  mt.spawnFailed = false
+  if !Pointer.isNullMany<u8>(mt.jobs) {
+    // The buffers of a job that failed to be made.
+    let mut i: u32 = 0
+    while i < mt.nbJobs {
+      let mut anchor = ()
+      let job = unsafe jobAt(&mut anchor, mt.jobs, i)
+      unsafe mem.free(job.dst)
+      unsafe mem.free(job.seqs)
+      job.dst = mem.nullp()
+      job.seqs = mem.nullp()
+      i = i + 1
+    }
+  }
+  if !Pointer.isNullMany<u8>(mt.dstFree) {
+    unsafe clearPool(mt.dstFree, &mut mt.dstFreeCount)
+    unsafe clearPool(mt.seqFree, &mut mt.seqFreeCount)
+  }
+  unsafe mem.free(mt.dstFree)
+  unsafe mem.free(mt.seqFree)
+  mt.dstFree = mem.nullp()
+  mt.seqFree = mem.nullp()
+  unsafe mem.free(mt.jobs)
+  mt.jobs = mem.nullp()
+  mt.nbJobs = 0
+}
+
+// Queues the job at `slot`, whose `Task` is written, starting a worker if fewer than `nbWorkers`
+// run. Without any worker, compresses it here.
+unsafe fn submit(mt: &mut MtCtx, slot: u32) -> usize {
+  let block = unsafe mem.nn(mt.block)
+  if !mt.spawnFailed && i32.toUsize(mt.nbWorkers) > mt.threads.length() {
+    let mut system = Allocator.systemAllocatorProvider()
+    let arg = WorkerArg { block: block }
+    let made = run Effect.result(spawnWorker(&mut mt.threads, move arg)) |> Effect.provideMut<Allocator>(&mut system)
+    match move made {
+      Result<(), OutOfMemoryError | SpawnError>.Success {..} => ()
+      Result<(), OutOfMemoryError | SpawnError>.Failure { error } => {
+        drop error
+        mt.spawnFailed = true
+      }
+    }
+  }
+  if mt.threads.length() == 0 {
+    if Pointer.isNullMany<u8>(mt.jobCCtx) {
+      mt.jobCCtx = unsafe cctx.create()
+      if Pointer.isNullMany<u8>(mt.jobCCtx) { return errors.err(errors.E_MEMORY_ALLOCATION) }
+    }
+    unsafe runTask(block, slot, mt.jobCCtx)
+    return 0
+  }
+  unsafe lock(block)
+  let tail = unsafe Atomic.load<u32>(unsafe hword(block, H_TAIL), MemoryOrder.Relaxed)
+  unsafe Atomic.store<u32>(unsafe ringAt(block, tail & (mt.nbJobs - 1)), slot, MemoryOrder.Relaxed)
+  unsafe Atomic.store<u32>(unsafe hword(block, H_TAIL), mem.a32(tail, 1), MemoryOrder.Relaxed)
+  let _seq = unsafe Atomic.fetchAdd<u32>(unsafe hword(block, H_WORKSEQ), 1, MemoryOrder.Relaxed)
+  unsafe unlock(block)
+  unsafe Atomic.notifyOne(unsafe hword(block, H_WORKSEQ))
+  return 0
+}
+
+// Waits until no queued or running job reads `[start, end)` of the round buffer (its prefix or
+// its input): the reference's `ZSTDMT_tryGetInputRange` waits for the same.
+unsafe fn waitRangeFree(mt: &mut MtCtx, start: usize, end: usize) -> () {
+  let mut id = mt.doneJobID
+  while id != mt.nextJobID {
+    let index = id & mt.jobIDMask
+    let mut anchor = ()
+    let job = unsafe jobAt(&mut anchor, mt.jobs, index)
+    if job.active && job.rangeStart < end && start < job.rangeEnd {
+      unsafe waitJob(unsafe mem.nn(mt.block), index, usize.MAX)
+    }
+    id = mem.a32(id, 1)
+  }
+}
+
+/// `ZSTDMT_freeCCtx` on the context of `c`, if it has one: for `ZSTD_freeCCtx`. Waits for the
+/// jobs, which are cancelled, and joins the workers.
+pub unsafe fn freeOf(raw: ?[*]mut u8) -> () {
+  if Pointer.isNullMany<u8>(raw) { return () }
+  let mut anchor = ()
+  let c = unsafe cctx.of(&mut anchor, unsafe mem.nn(raw))
+  if Pointer.isNullMany<u8>(c.mtctx) { return () }
+  let mut anchor2 = ()
+  let mt = unsafe of(&mut anchor2, unsafe mem.nn(c.mtctx))
+  unsafe dropAllJobs(&mut mt)
+  unsafe freeJobs(&mut mt)
+  unsafe cctx.destroy(mt.jobCCtx)
+  unsafe mem.free(mt.roundBuff)
+  unsafe mem.free(mt.ldmState.hashTable)
+  unsafe mem.free(mt.ldmState.bucketOffsets)
+  drop mt
+  // Drops the context itself (its list of threads, now empty).
+  let owned = unsafe Pointer.take<MtCtx>(unsafe slotOf(unsafe mem.nn(c.mtctx)))
+  drop owned
+  unsafe mem.free(c.mtctx)
+  c.mtctx = mem.nullp()
+}
+
+/// For `ZSTD_CCtx_reset` with a session reset: cancels the jobs of the frame in progress, if any,
+/// without waiting for them. The next frame, or the free, waits.
+pub unsafe fn cancelOf(c: &mut CCtx) -> () {
+  if Pointer.isNullMany<u8>(c.mtctx) { return () }
+  let mut anchor = ()
+  let mt = unsafe of(&mut anchor, unsafe mem.nn(c.mtctx))
+  unsafe cancelJobs(&mut mt)
+}
+
+// ---- Sizes. ----
+
+// `ZSTDMT_computeTargetJobLog`.
+fn computeTargetJobLog(p: &Params) -> u32 {
+  let mut jobLog: u32 = 0
+  if p.ldmParams.enableLdm == cparams.PS_ENABLE {
+    // In long range mode the windowLog is typically oversized: the job size is based on the
+    // cycleLog instead.
+    let c = cparams.cycleLog(p.cParams.chainLog, p.cParams.strategy) + 3
+    jobLog = if c > 21 { c } else { 21 }
+  } else {
+    let w = p.cParams.windowLog + 2
+    jobLog = if w > 20 { w } else { 20 }
+  }
+  return if jobLog < JOBLOG_MAX { jobLog } else { JOBLOG_MAX }
+}
+
+// `ZSTDMT_overlapLog_default`.
+fn overlapLogDefault(strategy: u32) -> i32 {
+  if strategy == cparams.BTULTRA2 { return 9 }
+  if strategy == cparams.BTULTRA || strategy == cparams.BTOPT { return 8 }
+  if strategy == cparams.BTLAZY2 || strategy == cparams.LAZY2 { return 7 }
+  return 6
+}
+
+// `ZSTDMT_computeOverlapSize`.
+fn computeOverlapSize(p: &Params) -> usize {
+  let ovl: i32 = if p.overlapLog == 0 { overlapLogDefault(p.cParams.strategy) } else { p.overlapLog }
+  let overlapRLog: i32 = 9 - ovl
+  let windowLog = u32.toI32(p.cParams.windowLog)
+  let mut ovLog: i32 = if overlapRLog >= 8 { 0 } else { windowLog - overlapRLog }
+  if p.ldmParams.enableLdm == cparams.PS_ENABLE {
+    // In long range mode the overlap is a fraction of the job size, not of the window size.
+    let j = u32.toI32(computeTargetJobLog(&p)) - 2
+    let m = if windowLog < j { windowLog } else { j }
+    ovLog = m - overlapRLog
+  }
+  if ovLog == 0 { return 0 }
+  return mem.shlz(1, i32.toU32(ovLog))
+}
+
+// ---- The serial state. ----
+
+// `ZSTDMT_serialState_reset`, without a dictionary.
+unsafe fn serialReset(mt: &mut MtCtx, params0: &Params, jobSize: usize) -> usize {
+  let mut params = params0.*
+  if params.ldmParams.enableLdm == cparams.PS_ENABLE {
+    let cp = params.cParams
+    cparams.ldmAdjustParameters(&mut params.ldmParams, &cp)
+  } else {
+    params.ldmParams = cparams.paramsInit(0).ldmParams
+  }
+  mt.checksum = params.checksumFlag != 0
+  if mt.checksum { xxh64.reset(&mut mt.xxh) }
+  mt.ldmOn = params.ldmParams.enableLdm == cparams.PS_ENABLE
+  mt.ldmParams = params.ldmParams
+  if mt.ldmOn {
+    let lp = params.ldmParams
+    let hashBytes = mem.shlz(1, lp.hashLog) * 8
+    let bucketBytes = mem.shlz(1, lp.hashLog - lp.bucketSizeLog)
+    // Size the sequence storage of a job (`ZSTDMT_setNbSeq`): the buffers of the pool are made
+    // again if they are too small.
+    mt.maxNbSeq = zldm.getMaxNbSeq(&lp, jobSize)
+    let seqBytes = mt.maxNbSeq * 12 + 12
+    if mt.seqBytes < seqBytes {
+      unsafe clearPool(mt.seqFree, &mut mt.seqFreeCount)
+      mt.seqBytes = seqBytes
+    }
+    mt.ldmState.window = cstate.windowInit()
+    if Pointer.isNullMany<u8>(mt.ldmState.hashTable) || mt.ldmHashBytes < hashBytes {
+      unsafe mem.free(mt.ldmState.hashTable)
+      mt.ldmState.hashTable = unsafe mem.malloc(hashBytes)
+      mt.ldmHashBytes = hashBytes
+    }
+    if Pointer.isNullMany<u8>(mt.ldmState.bucketOffsets) || mt.ldmBucketBytes < bucketBytes {
+      unsafe mem.free(mt.ldmState.bucketOffsets)
+      mt.ldmState.bucketOffsets = unsafe mem.malloc(bucketBytes)
+      mt.ldmBucketBytes = bucketBytes
+    }
+    if Pointer.isNullMany<u8>(mt.ldmState.hashTable) || Pointer.isNullMany<u8>(mt.ldmState.bucketOffsets) {
+      mt.ldmHashBytes = 0
+      mt.ldmBucketBytes = 0
+      return errors.err(errors.E_MEMORY_ALLOCATION)
+    }
+    unsafe mem.fillBytes(unsafe mem.nn(mt.ldmState.hashTable), 0, hashBytes)
+    unsafe mem.fillBytes(unsafe mem.nn(mt.ldmState.bucketOffsets), 0, bucketBytes)
+    mt.ldmState.loadedDictEnd = 0
+  }
+  return 0
+}
+
+// ---- Initialization. ----
+
+/// The multithreaded branch of `ZSTD_CCtx_init_compressStream2` (`params.nbWorkers > 0`):
+/// `ZSTDMT_initCStream_internal` without a dictionary, then the stage of the context.
+pub unsafe fn initCStream(c: &mut CCtx, params0: &Params, pledgedSrcSize: u64) -> usize {
+  let mut params = params0.*
+  if params.rsyncable != 0 { return errors.err(errors.E_PARAMETER_UNSUPPORTED) }
+  if Pointer.isNullMany<u8>(c.mtctx) {
+    c.mtctx = unsafe create()
+    if Pointer.isNullMany<u8>(c.mtctx) { return errors.err(errors.E_MEMORY_ALLOCATION) }
+  }
+  let mut anchor = ()
+  let mt = unsafe of(&mut anchor, unsafe mem.nn(c.mtctx))
+  // A previous frame that was not finished: its jobs are cancelled and dropped.
+  unsafe dropAllJobs(&mut mt)
+  // `ZSTDMT_resize`: the job table has `nbWorkers + 2` entries, rounded up to a power of 2.
+  if params.nbWorkers != mt.nbWorkers || Pointer.isNullMany<u8>(mt.jobs) {
+    unsafe freeJobs(&mut mt)
+    // This port keeps twice as many positions: it stalls the input at `tableSize` jobs not
+    // flushed, and can then still make a full job and a last empty one.
+    let tableSize = mem.shl32(1, mem.highbit32(i32.toU32(params.nbWorkers) + 2) + 1)
+    let nbJobs = tableSize * 2
+    mt.jobs = unsafe mem.calloc(mem.z(nbJobs), Layout.of<Job>().bytes)
+    mt.dstFree = unsafe mem.calloc(mem.z(nbJobs), Layout.of<?[*]mut u8>().bytes)
+    mt.seqFree = unsafe mem.calloc(mem.z(nbJobs), Layout.of<?[*]mut u8>().bytes)
+    mt.block = unsafe mem.calloc(1, blockBytes(nbJobs))
+    if Pointer.isNullMany<u8>(mt.jobs) || Pointer.isNullMany<u8>(mt.dstFree) || Pointer.isNullMany<u8>(mt.seqFree) || Pointer.isNullMany<u8>(mt.block) {
+      unsafe mem.free(mt.block)
+      mt.block = mem.nullp()
+      unsafe freeJobs(&mut mt)
+      return errors.err(errors.E_MEMORY_ALLOCATION)
+    }
+    unsafe Atomic.store<u32>(unsafe hword(unsafe mem.nn(mt.block), H_SLOTS), nbJobs, MemoryOrder.Relaxed)
+    mt.nbJobs = nbJobs
+    mt.tableSize = tableSize
+    mt.jobIDMask = nbJobs - 1
+    mt.nbWorkers = params.nbWorkers
+  }
+  if params.jobSize != 0 && params.jobSize < i32.toUsize(cparams.JOBSIZE_MIN) { params.jobSize = i32.toUsize(cparams.JOBSIZE_MIN) }
+  if params.jobSize > i32.toUsize(cparams.JOBSIZE_MAX) { params.jobSize = i32.toUsize(cparams.JOBSIZE_MAX) }
+  mt.allJobsCompleted = true
+  mt.params = params
+  mt.frameContentSize = pledgedSrcSize
+  mt.targetPrefixSize = computeOverlapSize(&params)
+  mt.targetSectionSize = params.jobSize
+  if mt.targetSectionSize == 0 { mt.targetSectionSize = mem.shlz(1, computeTargetJobLog(&params)) }
+  // The job size must be at least the overlap size.
+  if mt.targetSectionSize < mt.targetPrefixSize { mt.targetSectionSize = mt.targetPrefixSize }
+  let bufferSize = cparams.compressBound(mt.targetSectionSize)
+  if bufferSize != mt.bufferSize {
+    // The output buffers are made again with the new size, as they are needed.
+    unsafe clearPool(mt.dstFree, &mut mt.dstFreeCount)
+    mt.bufferSize = bufferSize
+  }
+  // With long distance matching the round buffer holds the window. Two sections of slack,
+  // plus one for the overlap if there is one.
+  let windowSize: usize = if params.ldmParams.enableLdm == cparams.PS_ENABLE { mem.shlz(1, params.cParams.windowLog) } else { 0 }
+  let nbSlackBuffers: usize = if mt.targetPrefixSize > 0 { 3 } else { 2 }
+  let slackSize = mt.targetSectionSize * nbSlackBuffers
+  let nbWorkers: usize = if params.nbWorkers > 1 { i32.toUsize(params.nbWorkers) } else { 1 }
+  let sectionsSize = mt.targetSectionSize * nbWorkers
+  let capacity = (if windowSize > sectionsSize { windowSize } else { sectionsSize }) + slackSize
+  if mt.roundCapacity < capacity {
+    unsafe mem.free(mt.roundBuff)
+    mt.roundBuff = unsafe mem.malloc(capacity)
+    if Pointer.isNullMany<u8>(mt.roundBuff) {
+      mt.roundCapacity = 0
+      return errors.err(errors.E_MEMORY_ALLOCATION)
+    }
+    mt.roundCapacity = capacity
+  }
+  mt.roundPos = 0
+  mt.inBuffActive = false
+  mt.inBuffStart = 0
+  mt.inBuffFilled = 0
+  mt.prefixStart = 0
+  mt.prefixSize = 0
+  mt.doneJobID = 0
+  mt.nextJobID = 0
+  mt.frameEnded = false
+  mt.allJobsCompleted = false
+  mt.consumed = 0
+  mt.produced = 0
+  let target = mt.targetSectionSize
+  let e = unsafe serialReset(&mut mt, &params, target)
+  if errors.isError(e) { return e }
+  // The rest of `ZSTD_CCtx_init_compressStream2`.
+  c.dictID = 0
+  c.dictContentSize = 0
+  c.consumedSrcSize = 0
+  c.producedCSize = 0
+  c.streamStage = cctx.ZCSS_LOAD
+  c.appliedParams = params0.*
+  return 0
+}
+
+// ---- A job (`ZSTDMT_createCompressionJob`). ----
+
+// `ZSTDMT_createCompressionJob`: makes a job of the `srcSize` bytes of the input buffer, runs
+// the serial state over it, and queues it. Returns 0 or an error.
+unsafe fn createCompressionJob(mt: &mut MtCtx, srcSize: usize, endOp: i32) -> usize {
+  let endFrame = endOp == compress.E_END
+  let jobNb = mt.nextJobID
+  let index = jobNb & mt.jobIDMask
+  let mut anchor = ()
+  let job = unsafe jobAt(&mut anchor, mt.jobs, index)
+  let srcStart = mt.inBuffStart
+  let prefixStart = mt.prefixStart
+  let prefixSize = mt.prefixSize
+  let mut jobParams = mt.params
+  job.srcSize = srcSize
+  job.cSize = 0
+  job.dstFlushed = 0
+  job.active = false
+  job.frameChecksumNeeded = mt.params.checksumFlag != 0 && endFrame && jobNb > 0
+  // Update the round buffer position and clear the input buffer.
+  mt.roundPos = mt.roundPos + srcSize
+  mt.inBuffActive = false
+  mt.inBuffFilled = 0
+  if !endFrame {
+    // The prefix of the next job.
+    let newPrefixSize = if srcSize < mt.targetPrefixSize { srcSize } else { mt.targetPrefixSize }
+    mt.prefixStart = srcStart + srcSize - newPrefixSize
+    mt.prefixSize = newPrefixSize
+  } else {
+    mt.prefixStart = 0
+    mt.prefixSize = 0
+    mt.frameEnded = true
+    // A single job computes the checksum itself.
+    if jobNb == 0 { mt.params.checksumFlag = 0 }
+  }
+  if Pointer.isNullMany<u8>(job.dst) {
+    job.dst = unsafe takeBuffer(mt.dstFree, &mut mt.dstFreeCount, mt.bufferSize + 4)
+    if Pointer.isNullMany<u8>(job.dst) { return errors.err(errors.E_MEMORY_ALLOCATION) }
+  }
+  let dst = unsafe mem.nn(job.dst)
+  if srcSize == 0 && jobNb > 0 {
+    // `ZSTDMT_writeLastEmptyBlock`: a last empty raw block ends the frame.
+    unsafe mem.w24(dst, 0, 1)
+    job.cSize = cstate.BLOCK_HEADER_SIZE
+    mt.nextJobID = jobNb + 1
+    return 0
+  }
+  let rb = unsafe mem.ro(unsafe mem.nn(mt.roundBuff))
+  let src = unsafe mem.addc(rb, srcStart)
+  // The serial step (`ZSTDMT_serialState_genSequences`), here in the order of the jobs: long
+  // distance matches into the job's own sequence buffer, and the checksum.
+  let mut nbSeq: usize = 0
+  if mt.ldmOn {
+    if Pointer.isNullMany<u8>(job.seqs) {
+      job.seqs = unsafe takeBuffer(mt.seqFree, &mut mt.seqFreeCount, mt.seqBytes)
+      if Pointer.isNullMany<u8>(job.seqs) { return errors.err(errors.E_MEMORY_ALLOCATION) }
+    }
+    let mut storeBytes: [u8; 40] = [0; 40]
+    let store = unsafe mem.nn(Pointer.fromMutSlice<u8>(&mut storeBytes))
+    unsafe zldm.storeInit(store, job.seqs, 0, mt.maxNbSeq)
+    let _w = cstate.windowUpdate(&mut mt.ldmState.window, src, srcSize, false)
+    let lp = mt.ldmParams
+    let e = unsafe zldm.generateSequences(&mut mt.ldmState, store, &lp, src, srcSize)
+    if errors.isError(e) { return e }
+    nbSeq = unsafe zldm.storeSize(store)
+  }
+  if mt.checksum && srcSize > 0 { unsafe xxh64.update(&mut mt.xxh, src, 0, srcSize) }
+  let firstJob = jobNb == 0
+  // The checksum of the frame is computed by the serial step, but the first job writes its
+  // flag in the header.
+  if !firstJob { jobParams.checksumFlag = 0 }
+  // Long distance matching is done by the serial step.
+  jobParams.ldmParams.enableLdm = cparams.PS_DISABLE
+  jobParams.nbWorkers = 0
+  jobParams.forceWindow = if firstJob { 0 } else { 1 }
+  if !firstJob { jobParams.deterministicRefPrefix = 0 }
+  let block = unsafe mem.nn(mt.block)
+  // The position is free: its previous job is done and was flushed or dropped.
+  unsafe Pointer.write<Task>(unsafe taskAt(block, index), Task {
+    params: jobParams,
+    firstJob: firstJob,
+    lastJob: endFrame,
+    src: src,
+    srcSize: srcSize,
+    prefix: unsafe mem.addc(rb, prefixStart),
+    prefixSize: prefixSize,
+    dst: dst,
+    dstCapacity: mt.bufferSize,
+    seqs: job.seqs,
+    nbSeq: nbSeq,
+    pledgedSrcSize: if firstJob { mt.frameContentSize } else { usize.toU64(srcSize) },
+  })
+  unsafe Atomic.store<u64>(unsafe oword(block, index, O_PRODUCED), 0, MemoryOrder.Relaxed)
+  unsafe Atomic.store<u64>(unsafe oword(block, index, O_RESULT), 0, MemoryOrder.Relaxed)
+  unsafe Atomic.store<u64>(unsafe oword(block, index, O_CANCEL), 0, MemoryOrder.Relaxed)
+  unsafe Atomic.store<u64>(unsafe oword(block, index, O_STATE), S_QUEUED, MemoryOrder.Relaxed)
+  job.rangeStart = if prefixSize > 0 { prefixStart } else { srcStart }
+  job.rangeEnd = srcStart + srcSize
+  job.active = true
+  mt.nextJobID = jobNb + 1
+  return unsafe submit(&mut mt, index)
+}
+
+// `ZSTDMT_tryGetInputRange`: takes the next section of the round buffer, after moving the prefix
+// to its start if the section does not fit, once no job reads the space it takes.
+unsafe fn getInputRange(mt: &mut MtCtx) -> () {
+  let spaceLeft = mt.roundCapacity - mt.roundPos
+  let target = mt.targetSectionSize
+  if spaceLeft < target {
+    let prefixSize = mt.prefixSize
+    unsafe waitRangeFree(&mut mt, 0, prefixSize + target)
+    let rb = unsafe mem.nn(mt.roundBuff)
+    unsafe mem.moveBytes(rb, unsafe mem.addc(unsafe mem.ro(rb), mt.prefixStart), prefixSize)
+    mt.prefixStart = 0
+    mt.roundPos = prefixSize
+  } else {
+    let start = mt.roundPos
+    unsafe waitRangeFree(&mut mt, start, start + target)
+  }
+  mt.inBuffStart = mt.roundPos
+  mt.inBuffActive = true
+  mt.inBuffFilled = 0
+}
+
+// `ZSTDMT_flushProduced`: writes what the oldest job not fully flushed produced, waiting for it
+// if `blockToFlush` and it has nothing new. Returns how much of it is left, or 1 if it runs or
+// other jobs or input are pending, or (for `E_END`) whether the frame is not complete; or the
+// error of the job.
+unsafe fn flushProduced(mt: &mut MtCtx, dst: [*]mut u8, dstSize: usize, dstPos: &mut usize, blockToFlush: bool, endOp: i32) -> usize {
+  if mt.doneJobID < mt.nextJobID {
+    let index = mt.doneJobID & mt.jobIDMask
+    let mut anchor = ()
+    let job = unsafe jobAt(&mut anchor, mt.jobs, index)
+    if job.active {
+      let block = unsafe mem.nn(mt.block)
+      // Block when there is room, nothing to flush, but some to come.
+      if blockToFlush && dstPos.* < dstSize { unsafe waitJob(block, index, job.dstFlushed) }
+      if unsafe isDone(block, index) {
+        job.active = false
+        let r = u64.toUsize(unsafe Atomic.load<u64>(unsafe oword(block, index, O_RESULT), MemoryOrder.Relaxed))
+        if errors.isError(r) {
+          drop job
+          unsafe dropAllJobs(&mut mt)
+          return r
+        }
+        job.cSize = r
+      }
+    }
+    let done = !job.active
+    let mut cSize = if done { job.cSize } else { unsafe producedOf(unsafe mem.nn(mt.block), index) }
+    // Add the checksum of the frame (once), when the job is done.
+    if done && job.frameChecksumNeeded {
+      let checksum = u64.wrappingToU32(xxh64.digest(&mt.xxh))
+      unsafe mem.w32(unsafe mem.nn(job.dst), cSize, checksum)
+      cSize = cSize + 4
+      job.cSize = cSize
+      job.frameChecksumNeeded = false
+    }
+    if cSize > 0 {
+      let room = dstSize - dstPos.*
+      let left = cSize - job.dstFlushed
+      let toFlush = if left < room { left } else { room }
+      if toFlush > 0 {
+        unsafe mem.copyBytes(unsafe mem.add(dst, dstPos.*), unsafe mem.addc(unsafe mem.ro(unsafe mem.nn(job.dst)), job.dstFlushed), toFlush)
+      }
+      dstPos.* = dstPos.* + toFlush
+      job.dstFlushed = job.dstFlushed + toFlush
+      if done && job.dstFlushed == cSize {
+        // The job is fully flushed: free its position and its buffers.
+        job.cSize = 0
+        mt.consumed = u64.wrappingAdd(mt.consumed, usize.toU64(job.srcSize))
+        mt.produced = u64.wrappingAdd(mt.produced, usize.toU64(cSize))
+        unsafe releaseJobBuffers(&mut mt, index)
+        mt.doneJobID = mt.doneJobID + 1
+      }
+    }
+    if cSize > job.dstFlushed { return cSize - job.dstFlushed }
+    if !done { return 1 }
+  }
+  if mt.doneJobID < mt.nextJobID { return 1 }
+  if mt.inBuffFilled > 0 { return 1 }
+  mt.allJobsCompleted = mt.frameEnded
+  if endOp == compress.E_END { return if mt.frameEnded { 0 } else { 1 } }
+  return 0
+}
+
+// `ZSTDMT_compressStream_generic`.
+unsafe fn compressStreamGeneric(mt: &mut MtCtx, dst: [*]mut u8, dstSize: usize, dstPos: &mut usize, src: [*]const u8, srcSize: usize, srcPos: &mut usize, endOp0: i32) -> usize {
+  let mut endOp = endOp0
+  let ipos = srcPos.*
+  if mt.frameEnded && endOp == compress.E_CONTINUE {
+    // The frame is being ended: only flush and end are allowed.
+    return errors.err(errors.E_STAGE_WRONG)
+  }
+  // Fill the input buffer, unless it is empty and the outputs of `tableSize` jobs are pending.
+  let stalled = mt.inBuffFilled == 0 && mem.s32(mt.nextJobID, mt.doneJobID) >= mt.tableSize
+  if srcSize > srcPos.* && !stalled {
+    if !mt.inBuffActive { unsafe getInputRange(&mut mt) }
+    let available = srcSize - srcPos.*
+    let room = mt.targetSectionSize - mt.inBuffFilled
+    let toLoad = if available < room { available } else { room }
+    if toLoad > 0 {
+      let rb = unsafe mem.nn(mt.roundBuff)
+      unsafe mem.copyBytes(unsafe mem.add(rb, mt.inBuffStart + mt.inBuffFilled), unsafe mem.addc(src, srcPos.*), toLoad)
+    }
+    srcPos.* = srcPos.* + toLoad
+    mt.inBuffFilled = mt.inBuffFilled + toLoad
+  }
+  // The frame cannot end while the input is not consumed: flush this job.
+  if srcPos.* < srcSize && endOp == compress.E_END { endOp = compress.E_FLUSH }
+  if mt.inBuffFilled >= mt.targetSectionSize
+    || (endOp != compress.E_CONTINUE && mt.inBuffFilled > 0)
+    || (endOp == compress.E_END && !mt.frameEnded) {
+    let jobSize = mt.inBuffFilled
+    let e = unsafe createCompressionJob(&mut mt, jobSize, endOp)
+    if errors.isError(e) { return e }
+  }
+  // Flush what is ready; block for it only when no input was taken.
+  let forwardInputProgress = srcPos.* > ipos
+  let remainingToFlush = unsafe flushProduced(&mut mt, dst, dstSize, &mut dstPos, !forwardInputProgress, endOp)
+  if errors.isError(remainingToFlush) { return remainingToFlush }
+  if srcPos.* < srcSize {
+    // The input is not consumed: the flush is not done.
+    return if remainingToFlush > 1 { remainingToFlush } else { 1 }
+  }
+  return remainingToFlush
+}
+
+// `ZSTDMT_updateCParams_whileCompressing`: a new level for the next jobs, with the same window.
+fn updateCParamsWhileCompressing(mt: &mut MtCtx, requested: &Params) -> () {
+  let savedWindowLog = mt.params.cParams.windowLog
+  mt.params.compressionLevel = requested.compressionLevel
+  let mut cp = cparams.getCParamsFromCCtxParams(&requested, cparams.CONTENTSIZE_UNKNOWN, 0, cparams.CPM_NO_ATTACH_DICT)
+  cp.windowLog = savedWindowLog
+  mt.params.cParams = cp
+}
+
+/// The multithreaded branch of `ZSTD_compressStream2` (`c.appliedParams.nbWorkers > 0`), after
+/// the initialization and the check of the buffers: compresses `src[*srcPos..srcSize]` into
+/// `dst[*dstPos..dstSize]` and returns the minimum left to flush, or an error.
+pub unsafe fn compressStream2(c: &mut CCtx, dst: [*]mut u8, dstSize: usize, dstPos: &mut usize, src: [*]const u8, srcSize: usize, srcPos: &mut usize, endOp: i32) -> usize {
+  let mut anchor = ()
+  let mt = unsafe of(&mut anchor, unsafe mem.nn(c.mtctx))
+  if c.cParamsChanged {
+    let requested = c.requestedParams
+    updateCParamsWhileCompressing(&mut mt, &requested)
+    c.cParamsChanged = false
+  }
+  if c.stableInNotConsumed != 0 {
+    // Some early data was skipped: make it available for consumption.
+    srcPos.* = srcPos.* - c.stableInNotConsumed
+    c.stableInNotConsumed = 0
+  }
+  let mut flushMin: usize = 0
+  while true {
+    let ipos = srcPos.*
+    let opos = dstPos.*
+    flushMin = unsafe compressStreamGeneric(&mut mt, dst, dstSize, &mut dstPos, src, srcSize, &mut srcPos, endOp)
+    c.consumedSrcSize = u64.wrappingAdd(c.consumedSrcSize, usize.toU64(srcPos.* - ipos))
+    c.producedCSize = u64.wrappingAdd(c.producedCSize, usize.toU64(dstPos.* - opos))
+    if errors.isError(flushMin) || (endOp == compress.E_END && flushMin == 0) {
+      // Compression completed: `ZSTD_CCtx_reset(cctx, ZSTD_reset_session_only)`.
+      c.streamStage = cctx.ZCSS_INIT
+      c.pledgedSrcSizePlusOne = 0
+    }
+    if errors.isError(flushMin) { return flushMin }
+    if endOp == compress.E_CONTINUE {
+      // Some progress is enough with `E_CONTINUE`.
+      if srcPos.* != ipos || dstPos.* != opos || srcPos.* == srcSize || dstPos.* == dstSize { break }
+    } else {
+      // Maximal progress: until the flush is complete or the output buffer is full.
+      if flushMin == 0 || dstPos.* == dstSize { break }
+    }
+  }
+  // `ZSTD_setBufferExpectations`.
+  if c.appliedParams.inBufferMode == 1 {
+    c.expectedInSrc = mem.addr(src)
+    c.expectedInSize = srcSize
+    c.expectedInPos = srcPos.*
+  }
+  if c.appliedParams.outBufferMode == 1 { c.expectedOutBufferSize = dstSize - dstPos.* }
+  return flushMin
+}

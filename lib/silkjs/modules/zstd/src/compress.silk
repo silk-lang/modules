@@ -1,0 +1,662 @@
+//! The compressor: the parameter API, the frame writer and the streaming driver. A port of
+//! `ZSTD_CCtx_setParameter`, `ZSTD_CCtx_reset`, `ZSTD_compress_frameChunk`,
+//! `ZSTD_compressContinue`, `ZSTD_compressEnd` and `ZSTD_compressStream2` of
+//! `lib/compress/zstd_compress.c` of Zstandard 1.5.7.
+//!
+//! The functions mirror the C API: a context is an opaque pointer, and a result is a size or an
+//! error of `errors`. Compression runs on the calling thread whatever `nbWorkers` is: with
+//! workers, `zmt` cuts the frame into the jobs of the multithreaded library and compresses them
+//! one after another, which gives its bytes.
+//!
+//! Not ported: `targetCBlockSize`, external sequence producers, static contexts, `ZSTD_CDict`
+//! objects of the public API, and dictionaries together with workers.
+import mem
+import errors
+import xxh64
+import cparams
+import cparams { Params }
+import cstate
+import cstate { MatchState, Cwksp }
+import cctx
+import cctx { CCtx }
+import cdict
+import presplit
+import csplit
+import zmt
+import silk.mem.pointer { Pointer }
+import silk.num.u8
+import silk.num.i32
+import silk.num.u32
+import silk.num.u64
+import silk.num.i64
+import silk.num.usize
+
+/// `ZSTD_e_continue`.
+pub const E_CONTINUE: i32 = 0
+/// `ZSTD_e_flush`.
+pub const E_FLUSH: i32 = 1
+/// `ZSTD_e_end`.
+pub const E_END: i32 = 2
+
+/// `ZSTD_reset_session_only`.
+pub const RESET_SESSION_ONLY: i32 = 1
+/// `ZSTD_reset_parameters`.
+pub const RESET_PARAMETERS: i32 = 2
+/// `ZSTD_reset_session_and_parameters`.
+pub const RESET_SESSION_AND_PARAMETERS: i32 = 3
+
+const MAGICNUMBER: u32 = 0xFD2FB528
+const FRAMEHEADERSIZE_MAX: usize = 18
+
+/// `ZSTD_compressBound`: the largest size that compressing `srcSize` bytes in one call can have.
+pub fn compressBound(srcSize: usize) -> usize { return cparams.compressBound(srcSize) }
+
+/// `ZSTD_createCCtx`: returns a new context, or null.
+pub fn createCCtx() -> ?[*]mut u8 { return unsafe cctx.create() }
+
+/// `ZSTD_freeCCtx`. `c` is a context of [`createCCtx`] that is not used again, or null.
+pub unsafe fn freeCCtx(c: ?[*]mut u8) -> () {
+  unsafe zmt.freeOf(c)
+  unsafe cctx.destroy(c)
+}
+
+fn resetImpl(c: &mut CCtx, directive: i32) -> usize {
+  if directive == RESET_SESSION_ONLY || directive == RESET_SESSION_AND_PARAMETERS {
+    c.streamStage = cctx.ZCSS_INIT
+    c.pledgedSrcSizePlusOne = 0
+  }
+  if directive == RESET_PARAMETERS || directive == RESET_SESSION_AND_PARAMETERS {
+    if c.streamStage != cctx.ZCSS_INIT { return errors.err(errors.E_STAGE_WRONG) }
+    unsafe cctx.clearAllDicts(&mut c)
+    c.requestedParams = cparams.paramsInit(cparams.CLEVEL_DEFAULT)
+  }
+  return 0
+}
+
+/// `ZSTD_CCtx_reset`. `directive` is `RESET_*`.
+pub unsafe fn cctxReset(c: [*]mut u8, directive: i32) -> usize {
+  let mut anchor = ()
+  let ctx = unsafe cctx.of(&mut anchor, c)
+  // The jobs of a frame in progress stop; the next frame or the free waits for them.
+  if directive == RESET_SESSION_ONLY || directive == RESET_SESSION_AND_PARAMETERS { unsafe zmt.cancelOf(&mut ctx) }
+  return resetImpl(&mut ctx, directive)
+}
+
+/// `ZSTD_CCtx_setParameter`. `pid` is a `ZSTD_cParameter` (`cparams.C_*`).
+pub unsafe fn cctxSetParameter(c: [*]mut u8, pid: i32, value: i32) -> usize {
+  let mut anchor = ()
+  let ctx = unsafe cctx.of(&mut anchor, c)
+  if ctx.streamStage != cctx.ZCSS_INIT {
+    if cparams.isUpdateAuthorized(pid) {
+      ctx.cParamsChanged = true
+    } else {
+      return errors.err(errors.E_STAGE_WRONG)
+    }
+  }
+  return cparams.setParameter(&mut ctx.requestedParams, pid, value)
+}
+
+/// `ZSTD_CCtx_setPledgedSrcSize`.
+pub unsafe fn cctxSetPledgedSrcSize(c: [*]mut u8, pledgedSrcSize: u64) -> usize {
+  let mut anchor = ()
+  let ctx = unsafe cctx.of(&mut anchor, c)
+  if ctx.streamStage != cctx.ZCSS_INIT { return errors.err(errors.E_STAGE_WRONG) }
+  ctx.pledgedSrcSizePlusOne = u64.wrappingAdd(pledgedSrcSize, 1)
+  return 0
+}
+
+/// `ZSTD_CCtx_loadDictionary`: the context keeps a copy of `dict[0..dictSize]`, and the next
+/// frames are compressed with it (`cdict.silk`). An empty dictionary clears the dictionaries of
+/// the context.
+pub unsafe fn cctxLoadDictionary(c: [*]mut u8, dict: ?[*]const u8, dictSize: usize) -> usize {
+  let mut anchor = ()
+  let ctx = unsafe cctx.of(&mut anchor, c)
+  if ctx.streamStage != cctx.ZCSS_INIT { return errors.err(errors.E_STAGE_WRONG) }
+  unsafe cctx.clearAllDicts(&mut ctx)
+  if Pointer.isNullMany<u8>(dict) || dictSize == 0 { return 0 }
+  // Copy the dictionary, to own its lifetime.
+  let buffer = unsafe mem.malloc(dictSize)
+  if Pointer.isNullMany<u8>(buffer) { return errors.err(errors.E_MEMORY_ALLOCATION) }
+  unsafe mem.copyBytes(unsafe mem.nn(buffer), unsafe Intrinsic.pointerRequalify<?[*]const u8, [*]const u8>(dict), dictSize)
+  ctx.localDictBuffer = buffer
+  ctx.localDictSize = dictSize
+  return 0
+}
+
+// ---- Frame. ----
+
+// `ZSTD_writeFrameHeader`.
+unsafe fn writeFrameHeader(dst: [*]mut u8, dstCapacity: usize, p: &Params, pledgedSrcSize: u64, dictID: u32) -> usize {
+  let mut dictIDSizeCodeLength: u32 = 0
+  if dictID > 0 { dictIDSizeCodeLength = dictIDSizeCodeLength + 1 }
+  if dictID >= 256 { dictIDSizeCodeLength = dictIDSizeCodeLength + 1 }
+  if dictID >= 65536 { dictIDSizeCodeLength = dictIDSizeCodeLength + 1 }
+  let dictIDSizeCode: u32 = if p.noDictIDFlag != 0 { 0 } else { dictIDSizeCodeLength }
+  let checksumFlag: u32 = if p.checksumFlag > 0 { 1 } else { 0 }
+  let windowSize = mem.shl32(1, p.cParams.windowLog)
+  let singleSegment = p.contentSizeFlag != 0 && u32.toU64(windowSize) >= pledgedSrcSize
+  let windowLogByte = u32.wrappingToU8(u32.shiftLeft(mem.s32(p.cParams.windowLog, cparams.WINDOWLOG_ABSOLUTEMIN), 3))
+  let mut fcsCode: u32 = 0
+  if p.contentSizeFlag != 0 {
+    if pledgedSrcSize >= 256 { fcsCode = fcsCode + 1 }
+    if pledgedSrcSize >= 65536 + 256 { fcsCode = fcsCode + 1 }
+    if pledgedSrcSize >= 0xFFFFFFFF { fcsCode = fcsCode + 1 }
+  }
+  let singleSegmentBit: u32 = if singleSegment { 32 } else { 0 }
+  let frameHeaderDescriptionByte = u32.wrappingToU8(dictIDSizeCode + u32.shiftLeft(checksumFlag, 2) + singleSegmentBit + u32.shiftLeft(fcsCode, 6))
+  let mut pos: usize = 0
+  if dstCapacity < FRAMEHEADERSIZE_MAX { return errors.err(errors.E_DSTSIZE_TOOSMALL) }
+  if p.format == 0 {
+    unsafe mem.w32(dst, 0, MAGICNUMBER)
+    pos = 4
+  }
+  unsafe mem.w8(dst, pos, frameHeaderDescriptionByte) pos = pos + 1
+  if !singleSegment { unsafe mem.w8(dst, pos, windowLogByte) pos = pos + 1 }
+  if dictIDSizeCode == 1 { unsafe mem.w8(dst, pos, u32.wrappingToU8(dictID)) pos = pos + 1 }
+  else if dictIDSizeCode == 2 { unsafe mem.w16(dst, pos, u32.wrappingToU16(dictID)) pos = pos + 2 }
+  else if dictIDSizeCode == 3 { unsafe mem.w32(dst, pos, dictID) pos = pos + 4 }
+  if fcsCode == 0 {
+    if singleSegment { unsafe mem.w8(dst, pos, u64.wrappingToU8(pledgedSrcSize)) pos = pos + 1 }
+  } else if fcsCode == 1 {
+    unsafe mem.w16(dst, pos, u64.wrappingToU16(u64.wrappingSubtract(pledgedSrcSize, 256))) pos = pos + 2
+  } else if fcsCode == 2 {
+    unsafe mem.w32(dst, pos, u64.wrappingToU32(pledgedSrcSize)) pos = pos + 4
+  } else {
+    unsafe mem.w64(dst, pos, pledgedSrcSize) pos = pos + 8
+  }
+  return pos
+}
+
+// `ZSTD_reduceTable_internal`: lowers each index of `table` by `reducerValue`.
+unsafe fn reduceTable(table: [*]mut u8, size: usize, reducerValue: u32, preserveMark: bool) -> () {
+  let reducerThreshold = mem.a32(reducerValue, cstate.WINDOW_START_INDEX)
+  let mut i: usize = 0
+  while i < size {
+    let v = unsafe cstate.tget(table, i)
+    let mut newVal: u32 = 0
+    if preserveMark && v == 1 {
+      // `ZSTD_DUBT_UNSORTED_MARK`.
+      newVal = 1
+    } else if v < reducerThreshold {
+      newVal = 0
+    } else {
+      newVal = mem.s32(v, reducerValue)
+    }
+    unsafe cstate.tset(table, i, newVal)
+    i = i + 1
+  }
+}
+
+// `ZSTD_overflowCorrectIfNeeded`.
+unsafe fn overflowCorrectIfNeeded(ms: &mut MatchState, ws: &mut Cwksp, p: &Params, ip: [*]const u8, iend: [*]const u8) -> () {
+  let cycle = cparams.cycleLog(p.cParams.chainLog, p.cParams.strategy)
+  let maxDist = mem.shl32(1, p.cParams.windowLog)
+  if cstate.windowNeedOverflowCorrection(&ms.window, iend) {
+    let correction = cstate.windowCorrectOverflow(&mut ms.window, cycle, maxDist, ip)
+    cstate.wsMarkTablesDirty(&mut ws)
+    // `ZSTD_reduceIndex`.
+    unsafe reduceTable(ms.hashTable, mem.shlz(1, p.cParams.hashLog), correction, false)
+    if cparams.allocateChainTable(p.cParams.strategy, p.useRowMatchFinder, ms.dedicatedDictSearch) {
+      unsafe reduceTable(ms.chainTable, mem.shlz(1, p.cParams.chainLog), correction, p.cParams.strategy == cparams.BTLAZY2)
+    }
+    if ms.hashLog3 != 0 { unsafe reduceTable(ms.hashTable3, mem.shlz(1, ms.hashLog3), correction, false) }
+    cstate.wsMarkTablesClean(&mut ws)
+    if ms.nextToUpdate < correction { ms.nextToUpdate = 0 } else { ms.nextToUpdate = ms.nextToUpdate - correction }
+    // Invalidate dictionaries on overflow correction.
+    ms.loadedDictEnd = 0
+    ms.dictMatchState = Pointer.null<MatchState>()
+  }
+}
+
+const SPLIT_LEVELS: [u32; 10] = [0, 0, 1, 2, 2, 3, 3, 4, 4, 4]
+
+// `ZSTD_optimalBlockSize`: the size of the next block of `src`; the pre-block splitter.
+unsafe fn optimalBlockSize(c: &mut CCtx, src: [*]const u8, srcSize: usize, blockSizeMax: usize, splitLevel0: i32, strategy: u32, savings: i64) -> usize {
+  // Split only full blocks: a partial block is already a "split".
+  if srcSize < 131072 || blockSizeMax < 131072 {
+    if srcSize < blockSizeMax { return srcSize }
+    return blockSizeMax
+  }
+  // Do not split incompressible data at the start of a frame: it would grow the output, and
+  // sub-blocks of incompressible data are not a gain.
+  if savings < 3 { return 131072 }
+  // Apply the split heuristic.
+  if splitLevel0 == 1 { return 131072 }
+  let mut splitLevel: u32 = 0
+  if splitLevel0 == 0 {
+    splitLevel = SPLIT_LEVELS[mem.z(strategy)]
+  } else {
+    splitLevel = i32.toU32(splitLevel0 - 2)
+  }
+  return unsafe presplit.splitBlock(src, blockSizeMax, splitLevel, c.tmpWorkspace)
+}
+
+// `ZSTD_compress_frameChunk`: compresses `src` as whole blocks of the frame.
+unsafe fn compressFrameChunk(c: &mut CCtx, dst: [*]mut u8, dstCapacity0: usize, src: [*]const u8, srcSize: usize, lastFrameChunk: bool) -> usize {
+  let blockSizeMax = c.blockSizeMax
+  let mut remaining = srcSize
+  let mut ip: usize = 0
+  let mut op: usize = 0
+  let mut dstCapacity = dstCapacity0
+  let maxDist = mem.shl32(1, c.appliedParams.cParams.windowLog)
+  let mut savings: i64 = i64.wrappingSubtract(u64.wrappingToI64(c.consumedSrcSize), u64.wrappingToI64(c.producedCSize))
+  if c.appliedParams.checksumFlag != 0 && srcSize != 0 { unsafe xxh64.update(&mut c.xxhState, src, 0, srcSize) }
+  while remaining != 0 {
+    let block = unsafe mem.addc(src, ip)
+    let splitLevel = c.appliedParams.preBlockSplitterLevel
+    let strategy = c.appliedParams.cParams.strategy
+    let blockSize = unsafe optimalBlockSize(&mut c, block, remaining, blockSizeMax, splitLevel, strategy, savings)
+    let lastBlock: u32 = if lastFrameChunk && blockSize == remaining { 1 } else { 0 }
+    let blockEnd = unsafe mem.addc(block, blockSize)
+    if dstCapacity < cstate.BLOCK_HEADER_SIZE + cstate.MIN_CBLOCK_SIZE + 1 { return errors.err(errors.E_DSTSIZE_TOOSMALL) }
+    let params = c.appliedParams
+    unsafe overflowCorrectIfNeeded(&mut c.matchState, &mut c.workspace, &params, block, blockEnd)
+    // `ZSTD_checkDictValidity`: forget a dictionary that the window no longer reaches.
+    let blockEndIdx = mem.t32(mem.us(mem.addr(blockEnd), mem.addr(c.matchState.window.base)))
+    if blockEndIdx > mem.a32(c.matchState.loadedDictEnd, maxDist) || c.matchState.loadedDictEnd != c.matchState.window.dictLimit {
+      c.matchState.loadedDictEnd = 0
+      c.matchState.dictMatchState = Pointer.null<MatchState>()
+    }
+    // `ZSTD_window_enforceMaxDist`: no match farther than the window size before the block.
+    let blockStartIdx = mem.t32(mem.us(mem.addr(block), mem.addr(c.matchState.window.base)))
+    if blockStartIdx > mem.a32(maxDist, c.matchState.loadedDictEnd) {
+      let newLowLimit = mem.s32(blockStartIdx, maxDist)
+      if c.matchState.window.lowLimit < newLowLimit { c.matchState.window.lowLimit = newLowLimit }
+      if c.matchState.window.dictLimit < c.matchState.window.lowLimit { c.matchState.window.dictLimit = c.matchState.window.lowLimit }
+      c.matchState.loadedDictEnd = 0
+      c.matchState.dictMatchState = Pointer.null<MatchState>()
+    }
+    // Ensure no table index is below the lowest valid one.
+    if c.matchState.nextToUpdate < c.matchState.window.lowLimit { c.matchState.nextToUpdate = c.matchState.window.lowLimit }
+    let out = unsafe mem.add(dst, op)
+    let mut cSize: usize = 0
+    // Hook (`targetCBlockSize`): `ZSTD_compressBlock_targetCBlockSize` when
+    // `c.appliedParams.targetCBlockSize != 0`. Not ported: the block is compressed whole.
+    // Hook (`csplit.silk`): when `c.appliedParams.postBlockSplitter == cparams.PS_ENABLE`, the
+    // reference calls `ZSTD_compressBlock_splitBlock(c, out, dstCapacity, block, blockSize,
+    // lastBlock)` here, which writes whole blocks with their headers and returns their size.
+    // Until it is ported the block is compressed as one, which is a valid frame.
+    let useSplit = c.appliedParams.targetCBlockSize == 0 && c.appliedParams.postBlockSplitter == cparams.PS_ENABLE
+    if useSplit {
+      // `ZSTD_compressBlock_splitBlock` (`csplit.silk`): writes whole blocks, with their headers.
+      cSize = unsafe csplit.compressBlockSplitBlock(&mut c, out, dstCapacity, block, blockSize, lastBlock)
+    } else {
+      cSize = unsafe cctx.compressBlockInternal(&mut c, unsafe mem.add(out, cstate.BLOCK_HEADER_SIZE), dstCapacity - cstate.BLOCK_HEADER_SIZE, block, blockSize)
+    }
+    if errors.isError(cSize) { return cSize }
+    if useSplit {
+      // Nothing to add: the blocks are complete.
+    } else if cSize == 0 {
+      // The block is not compressible.
+      cSize = unsafe cctx.noCompressBlock(out, dstCapacity, block, blockSize, lastBlock)
+      if errors.isError(cSize) { return cSize }
+    } else {
+      let cBlockHeader: u32 = if cSize == 1 {
+        mem.a32(lastBlock + 2, mem.t32(usize.shiftLeft(blockSize, 3)))
+      } else {
+        mem.a32(lastBlock + 4, mem.t32(usize.shiftLeft(cSize, 3)))
+      }
+      unsafe mem.w24(out, 0, cBlockHeader)
+      cSize = cSize + cstate.BLOCK_HEADER_SIZE
+    }
+    savings = i64.wrappingAdd(savings, i64.wrappingSubtract(usize.wrappingToI64(blockSize), usize.wrappingToI64(cSize)))
+    ip = ip + blockSize
+    remaining = remaining - blockSize
+    op = op + cSize
+    dstCapacity = dstCapacity - cSize
+    c.isFirstBlock = false
+  }
+  if lastFrameChunk && op > 0 { c.stage = cctx.CS_ENDING }
+  return op
+}
+
+// `ZSTD_compressContinue_internal` with `frame = 1`.
+pub unsafe fn compressContinueInternal(c: &mut CCtx, dst0: [*]mut u8, dstCapacity0: usize, src: [*]const u8, srcSize: usize, lastFrameChunk: bool) -> usize {
+  let mut fhSize: usize = 0
+  let mut dst = dst0
+  let mut dstCapacity = dstCapacity0
+  if c.stage == cctx.CS_CREATED { return errors.err(errors.E_STAGE_WRONG) }
+  if c.stage == cctx.CS_INIT {
+    let params = c.appliedParams
+    fhSize = unsafe writeFrameHeader(dst, dstCapacity, &params, u64.wrappingSubtract(c.pledgedSrcSizePlusOne, 1), c.dictID)
+    if errors.isError(fhSize) { return fhSize }
+    dstCapacity = dstCapacity - fhSize
+    dst = unsafe mem.add(dst, fhSize)
+    c.stage = cctx.CS_ONGOING
+  }
+  if srcSize == 0 { return fhSize }
+  if !cstate.windowUpdate(&mut c.matchState.window, src, srcSize, c.matchState.forceNonContiguous) {
+    c.matchState.forceNonContiguous = false
+    c.matchState.nextToUpdate = c.matchState.window.dictLimit
+  }
+  if c.appliedParams.ldmParams.enableLdm == cparams.PS_ENABLE {
+    let _w = cstate.windowUpdate(&mut c.ldmState.window, src, srcSize, false)
+  }
+  let cSize = unsafe compressFrameChunk(&mut c, dst, dstCapacity, src, srcSize, lastFrameChunk)
+  if errors.isError(cSize) { return cSize }
+  c.consumedSrcSize = u64.wrappingAdd(c.consumedSrcSize, usize.toU64(srcSize))
+  c.producedCSize = u64.wrappingAdd(c.producedCSize, usize.toU64(cSize + fhSize))
+  if c.pledgedSrcSizePlusOne != 0 {
+    if u64.wrappingAdd(c.consumedSrcSize, 1) > c.pledgedSrcSizePlusOne { return errors.err(errors.E_SRCSIZE_WRONG) }
+  }
+  return cSize + fhSize
+}
+
+// `ZSTD_writeEpilogue`: the end of the frame: a last empty block if needed, and the checksum.
+unsafe fn writeEpilogue(c: &mut CCtx, dst: [*]mut u8, dstCapacity0: usize) -> usize {
+  let mut op: usize = 0
+  let mut dstCapacity = dstCapacity0
+  if c.stage == cctx.CS_CREATED { return errors.err(errors.E_STAGE_WRONG) }
+  // Special case: an empty frame.
+  if c.stage == cctx.CS_INIT {
+    let params = c.appliedParams
+    let fhSize = unsafe writeFrameHeader(dst, dstCapacity, &params, 0, 0)
+    if errors.isError(fhSize) { return fhSize }
+    dstCapacity = dstCapacity - fhSize
+    op = op + fhSize
+    c.stage = cctx.CS_ONGOING
+  }
+  if c.stage != cctx.CS_ENDING {
+    // Write one last empty block, and make it the last block.
+    if dstCapacity < 3 { return errors.err(errors.E_DSTSIZE_TOOSMALL) }
+    unsafe mem.w24(dst, op, 1)
+    op = op + cstate.BLOCK_HEADER_SIZE
+    dstCapacity = dstCapacity - cstate.BLOCK_HEADER_SIZE
+  }
+  if c.appliedParams.checksumFlag != 0 {
+    let checksum = u64.wrappingToU32(xxh64.digest(&c.xxhState))
+    if dstCapacity < 4 { return errors.err(errors.E_DSTSIZE_TOOSMALL) }
+    unsafe mem.w32(dst, op, checksum)
+    op = op + 4
+  }
+  // Return to the "created but no init" status.
+  c.stage = cctx.CS_CREATED
+  return op
+}
+
+// `ZSTD_compressEnd_public`.
+pub unsafe fn compressEnd(c: &mut CCtx, dst: [*]mut u8, dstCapacity: usize, src: [*]const u8, srcSize: usize) -> usize {
+  let cSize = unsafe compressContinueInternal(&mut c, dst, dstCapacity, src, srcSize, true)
+  if errors.isError(cSize) { return cSize }
+  let endResult = unsafe writeEpilogue(&mut c, unsafe mem.add(dst, cSize), dstCapacity - cSize)
+  if errors.isError(endResult) { return endResult }
+  if c.pledgedSrcSizePlusOne != 0 {
+    // The control of the pledged size is on.
+    if c.pledgedSrcSizePlusOne != u64.wrappingAdd(c.consumedSrcSize, 1) { return errors.err(errors.E_SRCSIZE_WRONG) }
+  }
+  return cSize + endResult
+}
+
+// ---- Streaming. ----
+
+// `ZSTD_CCtx_init_compressStream2`: applies the requested parameters and starts a frame.
+unsafe fn initCompressStream2(c: &mut CCtx, endOp: i32, inSize: usize) -> usize {
+  let mut params = c.requestedParams
+  // `ZSTD_initLocalDict`: build the CDict of the dictionary, if not done yet.
+  let le = unsafe cdict.initLocalDict(&mut c)
+  if errors.isError(le) { return le }
+  let prefixDictSize: usize = if Pointer.isNullMany<u8>(c.prefixDict) { 0 } else { c.prefixDictSize }
+  // A prefix is for one frame only.
+  c.prefixDict = mem.nullp()
+  c.prefixDictSize = 0
+  // Auto-determine the size of the frame.
+  if endOp == E_END { c.pledgedSrcSizePlusOne = u64.wrappingAdd(usize.toU64(inSize), 1) }
+  let pledgedSrcSize = u64.wrappingSubtract(c.pledgedSrcSizePlusOne, 1)
+  // Hook (dictionaries): with a CDict the mode can be `CPM_ATTACH_DICT`, and the level is the
+  // one of the CDict.
+  params.cParams = unsafe cdict.frameCParams(&c, &params, pledgedSrcSize, prefixDictSize)
+  let cp = params.cParams
+  params.postBlockSplitter = cparams.resolveBlockSplitterMode(params.postBlockSplitter, &cp)
+  params.ldmParams.enableLdm = cparams.resolveEnableLdm(params.ldmParams.enableLdm, &cp)
+  params.useRowMatchFinder = cparams.resolveRowMatchFinderMode(params.useRowMatchFinder, &cp)
+  params.maxBlockSize = cparams.resolveMaxBlockSize(params.maxBlockSize)
+  params.searchForExternalRepcodes = cparams.resolveExternalRepcodeSearch(params.searchForExternalRepcodes, params.compressionLevel)
+  // Do not invoke multithreading when the source is small. Else the output of the workers is
+  // made on this thread (`zmt.silk`).
+  if pledgedSrcSize <= i32.toU64(cparams.JOBSIZE_MIN) { params.nbWorkers = 0 }
+  if params.nbWorkers > 0 {
+    if prefixDictSize != 0 || !Pointer.isNullMany<u8>(c.localCDict) { return errors.err(errors.E_PARAMETER_UNSUPPORTED) }
+    return unsafe zmt.initCStream(&mut c, &params, pledgedSrcSize)
+  }
+  // `ZSTD_compressBegin_internal`, without a dictionary.
+  // (With the CDict of the dictionary: attached, copied or reloaded, `cdict.silk`.)
+  let e = unsafe cdict.compressBegin(&mut c, &params, pledgedSrcSize)
+  if errors.isError(e) { return e }
+  c.inToCompress = 0
+  c.inBuffPos = 0
+  if c.appliedParams.inBufferMode == 0 {
+    // For small input: avoid automatic flush on reaching the end of the block, since it would
+    // require adding a 3-byte null block to end the frame.
+    let one: usize = if usize.toU64(c.blockSizeMax) == pledgedSrcSize { 1 } else { 0 }
+    c.inBuffTarget = c.blockSizeMax + one
+  } else {
+    c.inBuffTarget = 0
+  }
+  c.outBuffContentSize = 0
+  c.outBuffFlushedSize = 0
+  c.streamStage = cctx.ZCSS_LOAD
+  c.frameEnded = false
+  return 0
+}
+
+// `ZSTD_nextInputSizeHint`.
+fn nextInputSizeHint(c: &CCtx) -> usize {
+  if c.appliedParams.inBufferMode == 1 { return c.blockSizeMax - c.stableInNotConsumed }
+  let hintInSize = c.inBuffTarget - c.inBuffPos
+  if hintInSize == 0 { return c.blockSizeMax }
+  return hintInSize
+}
+
+// `ZSTD_compressStream_generic`.
+unsafe fn compressStreamGeneric(c: &mut CCtx, dst: [*]mut u8, dstSize: usize, dstPos: &mut usize, src: [*]const u8, srcSize: usize, srcPos: &mut usize, flushMode: i32) -> usize {
+  let iend = srcSize
+  let mut ip = srcPos.*
+  let oend = dstSize
+  let mut op = dstPos.*
+  let mut someMoreWork = true
+  let inStable = c.appliedParams.inBufferMode == 1
+  let outStable = c.appliedParams.outBufferMode == 1
+  if inStable {
+    // As the reference: the bytes that an earlier call left in the caller's buffer come first.
+    ip = mem.us(ip, c.stableInNotConsumed)
+    srcPos.* = ip
+    c.stableInNotConsumed = 0
+  }
+  while someMoreWork {
+    if c.streamStage == cctx.ZCSS_INIT { return errors.err(errors.E_INIT_MISSING) }
+    if c.streamStage == cctx.ZCSS_LOAD {
+      if flushMode == E_END && (oend - op >= compressBound(mem.us(iend, ip)) || outStable) && c.inBuffPos == 0 {
+        // Shortcut to compression pass directly into the output buffer.
+        let cSize = unsafe compressEnd(&mut c, unsafe mem.add(dst, op), oend - op, unsafe mem.addc(src, ip), mem.us(iend, ip))
+        if errors.isError(cSize) { return cSize }
+        ip = iend
+        op = op + cSize
+        c.frameEnded = true
+        let _r = resetImpl(&mut c, RESET_SESSION_ONLY)
+        someMoreWork = false
+        break
+      }
+      // Complete loading into the input buffer.
+      if !inStable {
+        let toLoad = c.inBuffTarget - c.inBuffPos
+        let available = mem.us(iend, ip)
+        let loaded = if toLoad < available { toLoad } else { available }
+        if loaded > 0 { let _c = unsafe mem.memcpy(unsafe mem.add(c.inBuff, c.inBuffPos), unsafe mem.addc(src, ip), loaded) }
+        c.inBuffPos = c.inBuffPos + loaded
+        ip = mem.ua(ip, loaded)
+        if flushMode == E_CONTINUE && c.inBuffPos < c.inBuffTarget {
+          // Not enough input to fill a full block: stop here.
+          someMoreWork = false
+          break
+        }
+        if flushMode == E_FLUSH && c.inBuffPos == c.inToCompress {
+          // Empty.
+          someMoreWork = false
+          break
+        }
+      } else {
+        if flushMode == E_CONTINUE && mem.us(iend, ip) < c.blockSizeMax {
+          // Cannot compress a block that is not full: it stays in the caller's buffer.
+          c.stableInNotConsumed = mem.us(iend, ip)
+          ip = iend
+          someMoreWork = false
+          break
+        }
+        if flushMode == E_FLUSH && ip == iend {
+          // Empty.
+          someMoreWork = false
+          break
+        }
+      }
+      // Compress the current block (note: this stage cannot be stopped in the middle).
+      let mut oSize = oend - op
+      let mut iSize: usize = 0
+      if !inStable {
+        iSize = c.inBuffPos - c.inToCompress
+      } else {
+        iSize = if mem.us(iend, ip) < c.blockSizeMax { mem.us(iend, ip) } else { c.blockSizeMax }
+      }
+      let direct = oSize >= compressBound(iSize) || outStable
+      let mut cDst = unsafe mem.add(dst, op)
+      if !direct {
+        cDst = c.outBuff
+        oSize = c.outBuffSize
+      }
+      let mut cSize: usize = 0
+      if !inStable {
+        let lastBlock = flushMode == E_END && ip == iend
+        let from = unsafe mem.addc(unsafe mem.ro(c.inBuff), c.inToCompress)
+        if lastBlock {
+          cSize = unsafe compressEnd(&mut c, cDst, oSize, from, iSize)
+        } else {
+          cSize = unsafe compressContinueInternal(&mut c, cDst, oSize, from, iSize, false)
+        }
+        if errors.isError(cSize) { return cSize }
+        c.frameEnded = lastBlock
+        // Prepare the next block.
+        c.inBuffTarget = c.inBuffPos + c.blockSizeMax
+        if c.inBuffTarget > c.inBuffSize {
+          c.inBuffPos = 0
+          c.inBuffTarget = c.blockSizeMax
+        }
+        c.inToCompress = c.inBuffPos
+      } else {
+        let lastBlock = flushMode == E_END && mem.ua(ip, iSize) == iend
+        if lastBlock {
+          cSize = unsafe compressEnd(&mut c, cDst, oSize, unsafe mem.addc(src, ip), iSize)
+        } else {
+          cSize = unsafe compressContinueInternal(&mut c, cDst, oSize, unsafe mem.addc(src, ip), iSize, false)
+        }
+        // Consume the input prior to error checking, to mirror buffered mode.
+        ip = mem.ua(ip, iSize)
+        if errors.isError(cSize) { return cSize }
+        c.frameEnded = lastBlock
+      }
+      if direct {
+        // No need to flush.
+        op = op + cSize
+        if c.frameEnded {
+          someMoreWork = false
+          let _r = resetImpl(&mut c, RESET_SESSION_ONLY)
+        }
+        continue
+      }
+      c.outBuffContentSize = cSize
+      c.outBuffFlushedSize = 0
+      c.streamStage = cctx.ZCSS_FLUSH
+    }
+    // `zcss_flush`.
+    let toFlush = c.outBuffContentSize - c.outBuffFlushedSize
+    let room = oend - op
+    let flushed = if toFlush < room { toFlush } else { room }
+    if flushed > 0 {
+      let _c = unsafe mem.memcpy(unsafe mem.add(dst, op), unsafe mem.addc(unsafe mem.ro(c.outBuff), c.outBuffFlushedSize), flushed)
+      op = op + flushed
+    }
+    c.outBuffFlushedSize = c.outBuffFlushedSize + flushed
+    if toFlush != flushed {
+      // The flush is not fully completed, presumably because the output is full.
+      someMoreWork = false
+      break
+    }
+    c.outBuffContentSize = 0
+    c.outBuffFlushedSize = 0
+    if c.frameEnded {
+      someMoreWork = false
+      let _r = resetImpl(&mut c, RESET_SESSION_ONLY)
+      break
+    }
+    c.streamStage = cctx.ZCSS_LOAD
+  }
+  srcPos.* = ip
+  dstPos.* = op
+  if c.frameEnded { return 0 }
+  return nextInputSizeHint(&c)
+}
+
+/// `ZSTD_compressStream2` with the arguments of `ZSTD_compressStream2_simpleArgs`: compresses
+/// `src[*srcPos..srcSize]` into `dst[*dstPos..dstSize]` and advances the two positions. `endOp`
+/// is `E_CONTINUE`, `E_FLUSH` or `E_END`.
+///
+/// Returns the number of bytes that are still to be flushed from the internal buffers (0 when
+/// the flush or the frame is complete), or an error. After an error the context must be reset.
+/// The first call of a frame applies the parameters; with `E_END` it pledges `srcSize - *srcPos`
+/// as the size of the frame.
+pub unsafe fn compressStream2(c: [*]mut u8, dst: [*]mut u8, dstSize: usize, dstPos: &mut usize, src: [*]const u8, srcSize: usize, srcPos: &mut usize, endOp: i32) -> usize {
+  let mut anchor = ()
+  let ctx = unsafe cctx.of(&mut anchor, c)
+  // Check conditions.
+  if dstPos.* > dstSize { return errors.err(errors.E_DSTSIZE_TOOSMALL) }
+  if srcPos.* > srcSize { return errors.err(errors.E_SRCSIZE_WRONG) }
+  if endOp < 0 || endOp > E_END { return errors.err(errors.E_PARAMETER_OUTOFBOUND) }
+  // Transparent initialization stage.
+  if ctx.streamStage == cctx.ZCSS_INIT {
+    let inputSize = srcSize - srcPos.*
+    let totalInputSize = inputSize + ctx.stableInNotConsumed
+    if ctx.requestedParams.inBufferMode == 1 && endOp == E_CONTINUE && totalInputSize < cparams.BLOCKSIZE_MAX {
+      if ctx.stableInNotConsumed != 0 {
+        // Not the first time: check the stability of the buffer.
+        if mem.addr(src) != ctx.expectedInSrc { return errors.err(errors.E_STABILITYCONDITION_NOTRESPECTED) }
+        if srcPos.* != ctx.expectedInSize { return errors.err(errors.E_STABILITYCONDITION_NOTRESPECTED) }
+      }
+      // Pretend that the input was consumed, to give a sense of forward progress.
+      srcPos.* = srcSize
+      // Save the stable input position, to check stability and to adjust it later.
+      ctx.expectedInSrc = mem.addr(src)
+      ctx.expectedInSize = srcSize
+      ctx.expectedInPos = srcSize
+      ctx.stableInNotConsumed = ctx.stableInNotConsumed + inputSize
+      // At least some header to produce.
+      if ctx.requestedParams.format == 0 { return 6 }
+      return 2
+    }
+    let e = unsafe initCompressStream2(&mut ctx, endOp, totalInputSize)
+    if errors.isError(e) { return e }
+    // `ZSTD_setBufferExpectations`: set the initial buffer expectations.
+    if ctx.appliedParams.inBufferMode == 1 {
+      ctx.expectedInSrc = mem.addr(src)
+      ctx.expectedInSize = srcSize
+      ctx.expectedInPos = srcPos.*
+    }
+    if ctx.appliedParams.outBufferMode == 1 { ctx.expectedOutBufferSize = dstSize - dstPos.* }
+  }
+  // `ZSTD_checkBufferStability`.
+  if ctx.appliedParams.inBufferMode == 1 {
+    if ctx.expectedInSrc != mem.addr(src) || ctx.expectedInPos != srcPos.* { return errors.err(errors.E_STABILITYCONDITION_NOTRESPECTED) }
+  }
+  if ctx.appliedParams.outBufferMode == 1 {
+    if ctx.expectedOutBufferSize != dstSize - dstPos.* { return errors.err(errors.E_STABILITYCONDITION_NOTRESPECTED) }
+  }
+  // Compression stage.
+  if ctx.appliedParams.nbWorkers > 0 { return unsafe zmt.compressStream2(&mut ctx, dst, dstSize, &mut dstPos, src, srcSize, &mut srcPos, endOp) }
+  let r = unsafe compressStreamGeneric(&mut ctx, dst, dstSize, &mut dstPos, src, srcSize, &mut srcPos, endOp)
+  if errors.isError(r) { return r }
+  if ctx.appliedParams.inBufferMode == 1 {
+    ctx.expectedInSrc = mem.addr(src)
+    ctx.expectedInSize = srcSize
+    ctx.expectedInPos = srcPos.*
+  }
+  if ctx.appliedParams.outBufferMode == 1 { ctx.expectedOutBufferSize = dstSize - dstPos.* }
+  // Remaining to flush.
+  return ctx.outBuffContentSize - ctx.outBuffFlushedSize
+}

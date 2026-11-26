@@ -1,0 +1,1795 @@
+//! Runs the WebGPU commands of a ui-js realm (see [`wire`](wire)) on GPU devices that belong
+//! to the application, apart from the device that draws the window, and shows what a canvas
+//! context drew in its canvas node.
+//!
+//! [`GpuService.run`] takes the bytes JavaScript wrote in a turn. Every object JavaScript
+//! made is in a table under the number JavaScript gave it. A command that fails (a missing
+//! object, a refusal by the GPU library) is dropped alone and reported as an uncaptured error
+//! of its device, or as the failure of its promise. After the commands, each canvas a context
+//! asked the texture of is presented, and what the promises wait for is in
+//! [`GpuService.takeReplies`].
+//!
+//! Commands that the web API answers later (mapping a buffer, waiting for the queue, popping
+//! an error scope) wait for the GPU here, inside `run`.
+import wire
+import wire { Reader }
+import ui_js_calls.gpu { GpuReply }
+import ui_tree.legacy { Batch }
+import ui_tree.mutation { NO_SURFACE }
+import ui_tree_window.canvas_frames { CanvasPresenter }
+import ui_tree_window.gpu_canvas { CanvasGpu, GpuCanvas, sharingFeatures }
+import webgpu.runtime { Adapter, Device, GpuError, Instance, MappedBuffer, RequestAdapterOptions }
+import webgpu.runtime as runtime
+import webgpu.resources as gpu
+import webgpu.resources {
+  BindGroup,
+  BindGroupLayout,
+  BindGroupLayoutRef,
+  Buffer,
+  CommandBuffer,
+  CommandBufferRef,
+  CommandEncoder,
+  ComputePipeline,
+  PipelineLayout,
+  RenderPipeline,
+  Sampler,
+  ShaderModule,
+  Texture,
+  TextureView
+}
+import webgpu.descriptors {
+  BindGroupDescriptor,
+  BindGroupEntry,
+  BindGroupLayoutDescriptor,
+  BindGroupLayoutEntry,
+  BlendComponent,
+  BlendState,
+  BufferBindingLayout,
+  BufferDescriptor,
+  Color,
+  ColorTargetState,
+  ComputePassDescriptor,
+  ComputePipelineDescriptor,
+  ComputeState,
+  ConstantEntry,
+  DepthStencilState,
+  DeviceDescriptor,
+  Extent3D,
+  FragmentState,
+  Limits,
+  MultisampleState,
+  Origin3D,
+  PipelineLayoutDescriptor,
+  PrimitiveState,
+  RenderPassColorAttachment,
+  RenderPassDepthStencilAttachment,
+  RenderPassDescriptor,
+  RenderPipelineDescriptor,
+  SamplerBindingLayout,
+  SamplerDescriptor,
+  StencilFaceState,
+  StorageTextureBindingLayout,
+  TexelCopyBufferInfo,
+  TexelCopyBufferLayout,
+  TexelCopyTextureInfo,
+  TextureBindingLayout,
+  TextureDescriptor,
+  TextureViewDescriptor,
+  VertexAttribute,
+  VertexBufferLayout,
+  VertexState
+}
+import webgpu_sys.generated_webgpu as flags
+import silk.collections.list { List }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f64
+import silk.num.u8
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+import silk.text.string { String }
+
+/// A canvas context that is configured: its canvas, the device that draws it and the node
+/// that shows it.
+struct Shown {
+  canvas: GpuCanvas,
+  device: u32,
+  node: u32,
+  /// Whether a context asked for the texture since the last present.
+  drawn: bool,
+}
+
+/// What a number of JavaScript's stands for.
+union Object {
+  Empty,
+  Adapter { value: Adapter },
+  Device { value: CanvasGpu },
+  Buffer { value: Buffer },
+  Texture { value: Texture },
+  View { value: TextureView },
+  Sampler { value: Sampler },
+  BindGroupLayout { value: BindGroupLayout },
+  PipelineLayout { value: PipelineLayout },
+  BindGroup { value: BindGroup },
+  Shader { value: ShaderModule },
+  RenderPipeline { value: RenderPipeline },
+  ComputePipeline { value: ComputePipeline },
+  Commands { value: CommandBuffer },
+  Canvas { value: Shown },
+}
+
+/// The GPU side of one ui-js realm.
+pub struct GpuService {
+  instance: Option<Instance>,
+  presenter: CanvasPresenter,
+  objects: List<Object>,
+  replies: List<GpuReply>,
+  /// The token of the command being run, 0 when it has none: a failure answers it.
+  token: u32,
+  /// The device of the command being run, for the error of a command that fails.
+  device: u32,
+  /// The buffers JavaScript mapped for writing and did not unmap yet.
+  maps: List<Held>,
+}
+
+/// A buffer mapped for writing: dropping `mapped` unmaps it.
+struct Held {
+  buffer: u32,
+  mapped: MappedBuffer,
+}
+
+effect fn problem(text: &[u8]) -> GpuError
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut message = List<u8>.make()
+  run message.appendSlice(text)
+  return GpuError { code: flags.WGPUErrorType_Validation, message: move message }
+}
+
+effect fn slot<'o>(objects: &'o List<Object>, id: u32) -> &'o Object
+  ! GpuError | OutOfMemoryError
+  ? &mut Allocator {
+  let values = objects.asSlice()
+  let at = u32.toUsize(id)
+  if at >= values.length {
+    fail run problem(b"a GPU object that does not exist was used")
+  }
+  return &values[at]
+}
+
+effect fn deviceOf<'o>(objects: &'o List<Object>, id: u32) -> &'o CanvasGpu
+  ! GpuError | OutOfMemoryError
+  ? &mut Allocator {
+  let found = run slot(objects, id)
+  match &found.* {
+    Object.Device { value } => {
+      return &value
+    }
+    _ => {
+      fail run problem(b"a GPU device that does not exist was used")
+    }
+  }
+}
+
+effect fn bufferOf<'o>(objects: &'o List<Object>, id: u32) -> &'o Buffer
+  ! GpuError | OutOfMemoryError
+  ? &mut Allocator {
+  let found = run slot(objects, id)
+  match &found.* {
+    Object.Buffer { value } => {
+      return &value
+    }
+    _ => {
+      fail run problem(b"a GPUBuffer that does not exist was used")
+    }
+  }
+}
+
+effect fn textureOf<'o>(objects: &'o List<Object>, id: u32) -> &'o Texture
+  ! GpuError | OutOfMemoryError
+  ? &mut Allocator {
+  let found = run slot(objects, id)
+  match &found.* {
+    Object.Texture { value } => {
+      return &value
+    }
+    _ => {
+      fail run problem(b"a GPUTexture that does not exist was used")
+    }
+  }
+}
+
+effect fn viewOf<'o>(objects: &'o List<Object>, id: u32) -> &'o TextureView
+  ! GpuError | OutOfMemoryError
+  ? &mut Allocator {
+  let found = run slot(objects, id)
+  match &found.* {
+    Object.View { value } => {
+      return &value
+    }
+    _ => {
+      fail run problem(b"a GPUTextureView that does not exist was used")
+    }
+  }
+}
+
+effect fn samplerOf<'o>(objects: &'o List<Object>, id: u32) -> &'o Sampler
+  ! GpuError | OutOfMemoryError
+  ? &mut Allocator {
+  let found = run slot(objects, id)
+  match &found.* {
+    Object.Sampler { value } => {
+      return &value
+    }
+    _ => {
+      fail run problem(b"a GPUSampler that does not exist was used")
+    }
+  }
+}
+
+effect fn groupLayoutOf<'o>(objects: &'o List<Object>, id: u32) -> &'o BindGroupLayout
+  ! GpuError | OutOfMemoryError
+  ? &mut Allocator {
+  let found = run slot(objects, id)
+  match &found.* {
+    Object.BindGroupLayout { value } => {
+      return &value
+    }
+    _ => {
+      fail run problem(b"a GPUBindGroupLayout that does not exist was used")
+    }
+  }
+}
+
+effect fn pipelineLayoutOf<'o>(objects: &'o List<Object>, id: u32) -> &'o PipelineLayout
+  ! GpuError | OutOfMemoryError
+  ? &mut Allocator {
+  let found = run slot(objects, id)
+  match &found.* {
+    Object.PipelineLayout { value } => {
+      return &value
+    }
+    _ => {
+      fail run problem(b"a GPUPipelineLayout that does not exist was used")
+    }
+  }
+}
+
+effect fn groupOf<'o>(objects: &'o List<Object>, id: u32) -> &'o BindGroup
+  ! GpuError | OutOfMemoryError
+  ? &mut Allocator {
+  let found = run slot(objects, id)
+  match &found.* {
+    Object.BindGroup { value } => {
+      return &value
+    }
+    _ => {
+      fail run problem(b"a GPUBindGroup that does not exist was used")
+    }
+  }
+}
+
+effect fn shaderOf<'o>(objects: &'o List<Object>, id: u32) -> &'o ShaderModule
+  ! GpuError | OutOfMemoryError
+  ? &mut Allocator {
+  let found = run slot(objects, id)
+  match &found.* {
+    Object.Shader { value } => {
+      return &value
+    }
+    _ => {
+      fail run problem(b"a GPUShaderModule that does not exist was used")
+    }
+  }
+}
+
+effect fn renderPipelineOf<'o>(objects: &'o List<Object>, id: u32) -> &'o RenderPipeline
+  ! GpuError | OutOfMemoryError
+  ? &mut Allocator {
+  let found = run slot(objects, id)
+  match &found.* {
+    Object.RenderPipeline { value } => {
+      return &value
+    }
+    _ => {
+      fail run problem(b"a GPURenderPipeline that does not exist was used")
+    }
+  }
+}
+
+effect fn computePipelineOf<'o>(objects: &'o List<Object>, id: u32) -> &'o ComputePipeline
+  ! GpuError | OutOfMemoryError
+  ? &mut Allocator {
+  let found = run slot(objects, id)
+  match &found.* {
+    Object.ComputePipeline { value } => {
+      return &value
+    }
+    _ => {
+      fail run problem(b"a GPUComputePipeline that does not exist was used")
+    }
+  }
+}
+
+effect fn commandsOf<'o>(objects: &'o List<Object>, id: u32) -> &'o CommandBuffer
+  ! GpuError | OutOfMemoryError
+  ? &mut Allocator {
+  let found = run slot(objects, id)
+  match &found.* {
+    Object.Commands { value } => {
+      return &value
+    }
+    _ => {
+      fail run problem(b"a GPUCommandBuffer that does not exist, or was submitted before, was used")
+    }
+  }
+}
+
+effect fn shownOf<'o>(objects: &'o List<Object>, id: u32) -> &'o Shown
+  ! GpuError | OutOfMemoryError
+  ? &mut Allocator {
+  let found = run slot(objects, id)
+  match &found.* {
+    Object.Canvas { value } => {
+      return &value
+    }
+    _ => {
+      fail run problem(b"a canvas context that is not configured was used")
+    }
+  }
+}
+
+effect fn appendByte(out: &mut String, byte: u8) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let one: [u8; 1] = [byte]
+  run String.append(&mut out, unsafe String.fromUtf8Unchecked(&one))
+}
+
+effect fn decimal(out: &mut String, value: u64) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut digits: [u8; 20] = [0; 20]
+  let mut count: usize = 0
+  let mut rest = value
+  while count == 0 || rest > 0 {
+    digits[19 - count] = u64.toU8(rest % 10) + 48
+    rest = rest / 10
+    count = count + 1
+  }
+  let mut i = 20 - count
+  while i < 20 {
+    run appendByte(&mut out, digits[i])
+    i = i + 1
+  }
+}
+
+/// Appends `bytes` as a JSON string. Bytes that JSON escapes, and bytes outside ASCII, become
+/// a question mark: the names of adapters are plain.
+effect fn quoted(out: &mut String, bytes: Option<&[u8]>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run appendByte(&mut out, 34)
+  if let Option<&[u8]>.Some { value: text } = bytes {
+    let mut i: usize = 0
+    while i < text.length {
+      let byte = text[i]
+      if byte < 32 || byte == 34 || byte == 92 || byte > 126 {
+        run appendByte(&mut out, 63)
+      } else {
+        run appendByte(&mut out, byte)
+      }
+      i = i + 1
+    }
+  }
+  run appendByte(&mut out, 34)
+}
+
+/// The limits as a JSON array, in the order `webgpu.js` names them.
+effect fn limitValues(out: &mut String, limits: &Limits<'_>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let values: [u64; 31] = [
+    u32.toU64(limits.maxTextureDimension1D()),
+    u32.toU64(limits.maxTextureDimension2D()),
+    u32.toU64(limits.maxTextureDimension3D()),
+    u32.toU64(limits.maxTextureArrayLayers()),
+    u32.toU64(limits.maxBindGroups()),
+    u32.toU64(limits.maxBindGroupsPlusVertexBuffers()),
+    u32.toU64(limits.maxBindingsPerBindGroup()),
+    u32.toU64(limits.maxDynamicUniformBuffersPerPipelineLayout()),
+    u32.toU64(limits.maxDynamicStorageBuffersPerPipelineLayout()),
+    u32.toU64(limits.maxSampledTexturesPerShaderStage()),
+    u32.toU64(limits.maxSamplersPerShaderStage()),
+    u32.toU64(limits.maxStorageBuffersPerShaderStage()),
+    u32.toU64(limits.maxStorageTexturesPerShaderStage()),
+    u32.toU64(limits.maxUniformBuffersPerShaderStage()),
+    limits.maxUniformBufferBindingSize(),
+    limits.maxStorageBufferBindingSize(),
+    u32.toU64(limits.minUniformBufferOffsetAlignment()),
+    u32.toU64(limits.minStorageBufferOffsetAlignment()),
+    u32.toU64(limits.maxVertexBuffers()),
+    limits.maxBufferSize(),
+    u32.toU64(limits.maxVertexAttributes()),
+    u32.toU64(limits.maxVertexBufferArrayStride()),
+    u32.toU64(limits.maxInterStageShaderVariables()),
+    u32.toU64(limits.maxColorAttachments()),
+    u32.toU64(limits.maxColorAttachmentBytesPerSample()),
+    u32.toU64(limits.maxComputeWorkgroupStorageSize()),
+    u32.toU64(limits.maxComputeInvocationsPerWorkgroup()),
+    u32.toU64(limits.maxComputeWorkgroupSizeX()),
+    u32.toU64(limits.maxComputeWorkgroupSizeY()),
+    u32.toU64(limits.maxComputeWorkgroupSizeZ()),
+    u32.toU64(limits.maxComputeWorkgroupsPerDimension()),
+  ]
+  run appendByte(&mut out, 91)
+  let mut i: usize = 0
+  while i < values.length {
+    if i > 0 {
+      run appendByte(&mut out, 44)
+    }
+    // JavaScript numbers hold integers up to 2^53 exactly.
+    let limit: u64 = 9007199254740991
+    let shown = if values[i] > limit { limit } else { values[i] }
+    run decimal(&mut out, shown)
+    i = i + 1
+  }
+  run appendByte(&mut out, 93)
+}
+
+/// Sets limit `index` (its place in the order of [`limitValues`]) to `value`.
+fn setLimit(limits: &mut Limits<'_>, index: u32, value: f64) -> () {
+  let small = f64.toU32(value)
+  let large = f64.toU64(value)
+  if index == 0 { limits.setMaxTextureDimension1D(small) }
+  else if index == 1 { limits.setMaxTextureDimension2D(small) }
+  else if index == 2 { limits.setMaxTextureDimension3D(small) }
+  else if index == 3 { limits.setMaxTextureArrayLayers(small) }
+  else if index == 4 { limits.setMaxBindGroups(small) }
+  else if index == 5 { limits.setMaxBindGroupsPlusVertexBuffers(small) }
+  else if index == 6 { limits.setMaxBindingsPerBindGroup(small) }
+  else if index == 7 { limits.setMaxDynamicUniformBuffersPerPipelineLayout(small) }
+  else if index == 8 { limits.setMaxDynamicStorageBuffersPerPipelineLayout(small) }
+  else if index == 9 { limits.setMaxSampledTexturesPerShaderStage(small) }
+  else if index == 10 { limits.setMaxSamplersPerShaderStage(small) }
+  else if index == 11 { limits.setMaxStorageBuffersPerShaderStage(small) }
+  else if index == 12 { limits.setMaxStorageTexturesPerShaderStage(small) }
+  else if index == 13 { limits.setMaxUniformBuffersPerShaderStage(small) }
+  else if index == 14 { limits.setMaxUniformBufferBindingSize(large) }
+  else if index == 15 { limits.setMaxStorageBufferBindingSize(large) }
+  else if index == 16 { limits.setMinUniformBufferOffsetAlignment(small) }
+  else if index == 17 { limits.setMinStorageBufferOffsetAlignment(small) }
+  else if index == 18 { limits.setMaxVertexBuffers(small) }
+  else if index == 19 { limits.setMaxBufferSize(large) }
+  else if index == 20 { limits.setMaxVertexAttributes(small) }
+  else if index == 21 { limits.setMaxVertexBufferArrayStride(small) }
+  else if index == 22 { limits.setMaxInterStageShaderVariables(small) }
+  else if index == 23 { limits.setMaxColorAttachments(small) }
+  else if index == 24 { limits.setMaxColorAttachmentBytesPerSample(small) }
+  else if index == 25 { limits.setMaxComputeWorkgroupStorageSize(small) }
+  else if index == 26 { limits.setMaxComputeInvocationsPerWorkgroup(small) }
+  else if index == 27 { limits.setMaxComputeWorkgroupSizeX(small) }
+  else if index == 28 { limits.setMaxComputeWorkgroupSizeY(small) }
+  else if index == 29 { limits.setMaxComputeWorkgroupSizeZ(small) }
+  else if index == 30 { limits.setMaxComputeWorkgroupsPerDimension(small) }
+}
+
+effect fn featureValues(out: &mut String, features: &[u32]) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run appendByte(&mut out, 91)
+  let mut i: usize = 0
+  while i < features.length {
+    if i > 0 {
+      run appendByte(&mut out, 44)
+    }
+    run decimal(&mut out, u32.toU64(features[i]))
+    i = i + 1
+  }
+  run appendByte(&mut out, 93)
+}
+
+/// What `requestAdapter` resolves with, as JSON.
+effect fn adapterText(adapter: &Adapter) -> String
+  ! GpuError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut out = run String.copy("{\"features\":")
+  let features = adapter.getFeatures()
+  run featureValues(&mut out, features.features())
+  run String.append(&mut out, ",\"limits\":")
+  let limits = run adapter.getLimits()
+  run limitValues(&mut out, &limits)
+  let info = run adapter.getInfo()
+  run String.append(&mut out, ",\"info\":{\"vendor\":")
+  run quoted(&mut out, info.vendor())
+  run String.append(&mut out, ",\"architecture\":")
+  run quoted(&mut out, info.architecture())
+  run String.append(&mut out, ",\"device\":")
+  run quoted(&mut out, info.device())
+  run String.append(&mut out, ",\"description\":")
+  run quoted(&mut out, info.description())
+  run String.append(&mut out, ",\"subgroupMinSize\":")
+  run decimal(&mut out, u32.toU64(info.subgroupMinSize()))
+  run String.append(&mut out, ",\"subgroupMaxSize\":")
+  run decimal(&mut out, u32.toU64(info.subgroupMaxSize()))
+  run String.append(&mut out, ",\"fallback\":")
+  run String.append(&mut out, if info.adapterType() == flags.WGPUAdapterType_CPU { "true" } else { "false" })
+  run String.append(&mut out, "}}")
+  return move out
+}
+
+/// What `requestDevice` resolves with, as JSON.
+effect fn deviceText(device: &Device) -> String
+  ! GpuError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut out = run String.copy("{\"features\":")
+  let features = device.getFeatures()
+  run featureValues(&mut out, features.features())
+  run String.append(&mut out, ",\"limits\":")
+  let limits = run device.getLimits()
+  run limitValues(&mut out, &limits)
+  run String.append(&mut out, "}")
+  return move out
+}
+
+fn contains(values: &[u32], value: u32) -> bool {
+  let mut i: usize = 0
+  while i < values.length {
+    if values[i] == value {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+effect fn requestDevice(adapter: &Adapter, instance: &Instance, r: &mut Reader<'_>) -> CanvasGpu
+  ! GpuError | OutOfMemoryError
+  ? &mut Allocator {
+  let label = r.blob()
+  let mut features = List<u32>.make()
+  let featureCount = r.word()
+  let mut i: u32 = 0
+  while i < featureCount && !r.done() {
+    run features.append(r.word())
+    i = i + 1
+  }
+  let mut limits = Limits.default()
+  let limitCount = r.word()
+  i = 0
+  while i < limitCount && !r.done() {
+    let index = r.word()
+    setLimit(&mut limits, index, r.number())
+    i = i + 1
+  }
+  // The features of zero copy canvases (gpu_canvas.sharingFeatures), when the adapter has them.
+  let sharing = sharingFeatures(adapter)
+  let mut s: usize = 0
+  while s < sharing.length {
+    if !contains(features.asSlice(), sharing[s]) {
+      run features.append(sharing[s])
+    }
+    s = s + 1
+  }
+  let mut descriptor = DeviceDescriptor.default().withLabel(label).withRequiredFeatures(features.asSlice())
+  if limitCount > 0 {
+    descriptor = descriptor.withRequiredLimits(&limits)
+  }
+  let device = run adapter.requestDevice(&descriptor)
+  let queue = run gpu.getQueue(&device)
+  return CanvasGpu { instance: instance.dup(), device: move device, queue: move queue }
+}
+
+effect fn createBuffer(device: &Device, r: &mut Reader<'_>) -> Buffer
+  ! GpuError {
+  let label = r.blob()
+  let size = r.size()
+  let usage = r.word()
+  let mapped = r.flag()
+  let mut descriptor = BufferDescriptor.default().withLabel(label)
+  descriptor.setSize(size)
+  descriptor.setUsage(u32.toU64(usage))
+  descriptor.setMappedAtCreation(mapped)
+  return run gpu.createBuffer(device, &descriptor)
+}
+
+effect fn createTexture(device: &Device, r: &mut Reader<'_>) -> Texture
+  ! GpuError | OutOfMemoryError
+  ? &mut Allocator {
+  let label = r.blob()
+  let mut size = Extent3D.default()
+  size.setWidth(r.word())
+  size.setHeight(r.word())
+  size.setDepthOrArrayLayers(r.word())
+  let mut descriptor = TextureDescriptor.default().withLabel(label)
+  descriptor.setSize(size)
+  descriptor.setMipLevelCount(r.word())
+  descriptor.setSampleCount(r.word())
+  descriptor.setDimension(r.word())
+  descriptor.setFormat(r.word())
+  descriptor.setUsage(u32.toU64(r.word()))
+  let mut formats = List<u32>.make()
+  let count = r.word()
+  let mut i: u32 = 0
+  while i < count && !r.done() {
+    run formats.append(r.word())
+    i = i + 1
+  }
+  if count > 0 {
+    descriptor = descriptor.withViewFormats(formats.asSlice())
+  }
+  return run gpu.createTexture(device, &descriptor)
+}
+
+effect fn createView(texture: &Texture, r: &mut Reader<'_>) -> TextureView
+  ! GpuError {
+  let label = r.blob()
+  let mut descriptor = TextureViewDescriptor.default().withLabel(label)
+  descriptor.setFormat(r.word())
+  descriptor.setDimension(r.word())
+  descriptor.setBaseMipLevel(r.word())
+  descriptor.setMipLevelCount(r.word())
+  descriptor.setBaseArrayLayer(r.word())
+  descriptor.setArrayLayerCount(r.word())
+  descriptor.setAspect(r.word())
+  descriptor.setUsage(u32.toU64(r.word()))
+  return run texture.createView(&descriptor)
+}
+
+effect fn createSampler(device: &Device, r: &mut Reader<'_>) -> Sampler
+  ! GpuError {
+  let label = r.blob()
+  let mut descriptor = SamplerDescriptor.default().withLabel(label)
+  descriptor.setAddressModeU(r.word())
+  descriptor.setAddressModeV(r.word())
+  descriptor.setAddressModeW(r.word())
+  descriptor.setMagFilter(r.word())
+  descriptor.setMinFilter(r.word())
+  descriptor.setMipmapFilter(r.word())
+  descriptor.setLodMinClamp(f64.toF32(r.number()))
+  descriptor.setLodMaxClamp(f64.toF32(r.number()))
+  descriptor.setCompare(r.word())
+  descriptor.setMaxAnisotropy(u32.toU16(r.word()))
+  return run gpu.createSampler(device, &descriptor)
+}
+
+effect fn createBindGroupLayout(device: &Device, r: &mut Reader<'_>) -> BindGroupLayout
+  ! GpuError | OutOfMemoryError
+  ? &mut Allocator {
+  let label = r.blob()
+  let count = r.word()
+  let mut entries = List<BindGroupLayoutEntry<'static>>.make()
+  let mut i: u32 = 0
+  while i < count && !r.done() {
+    let mut entry = BindGroupLayoutEntry.default()
+    entry.setBinding(r.word())
+    entry.setVisibility(u32.toU64(r.word()))
+    let kind = r.word()
+    if kind == 0 {
+      let mut layout = BufferBindingLayout.default()
+      layout.setType(r.word())
+      layout.setHasDynamicOffset(r.flag())
+      layout.setMinBindingSize(r.size())
+      entry.setBuffer(layout)
+    } else if kind == 1 {
+      let mut layout = SamplerBindingLayout.default()
+      layout.setType(r.word())
+      entry.setSampler(layout)
+    } else if kind == 2 {
+      let mut layout = TextureBindingLayout.default()
+      layout.setSampleType(r.word())
+      layout.setViewDimension(r.word())
+      layout.setMultisampled(r.flag())
+      entry.setTexture(layout)
+    } else {
+      let mut layout = StorageTextureBindingLayout.default()
+      layout.setAccess(r.word())
+      layout.setFormat(r.word())
+      layout.setViewDimension(r.word())
+      entry.setStorageTexture(layout)
+    }
+    run entries.append(entry)
+    i = i + 1
+  }
+  let descriptor = BindGroupLayoutDescriptor.default().withLabel(label).withEntries(entries.asSlice())
+  return run gpu.createBindGroupLayout(device, &descriptor)
+}
+
+effect fn createPipelineLayout(objects: &List<Object>, device: &Device, r: &mut Reader<'_>) -> PipelineLayout
+  ! GpuError | OutOfMemoryError
+  ? &mut Allocator {
+  let label = r.blob()
+  let count = r.word()
+  let mut layouts = List<BindGroupLayoutRef<'_>>.make()
+  let mut i: u32 = 0
+  while i < count && !r.done() {
+    let layout = run groupLayoutOf(objects, r.word())
+    run layouts.append(layout.reference())
+    i = i + 1
+  }
+  let descriptor = PipelineLayoutDescriptor.default().withLabel(label).withBindGroupLayouts(layouts.asSlice())
+  return run gpu.createPipelineLayout(device, &descriptor)
+}
+
+effect fn createBindGroup(objects: &List<Object>, device: &Device, r: &mut Reader<'_>) -> BindGroup
+  ! GpuError | OutOfMemoryError
+  ? &mut Allocator {
+  let label = r.blob()
+  let layout = run groupLayoutOf(objects, r.word())
+  let count = r.word()
+  let mut entries = List<BindGroupEntry<'_>>.make()
+  let mut i: u32 = 0
+  while i < count && !r.done() {
+    let mut entry = BindGroupEntry.default()
+    entry.setBinding(r.word())
+    let kind = r.word()
+    if kind == 0 {
+      entry = entry.withBuffer(run bufferOf(objects, r.word()))
+      entry.setOffset(r.size())
+      entry.setSize(r.size())
+    } else if kind == 1 {
+      entry = entry.withSampler(run samplerOf(objects, r.word()))
+    } else {
+      entry = entry.withTextureView(run viewOf(objects, r.word()))
+    }
+    run entries.append(entry)
+    i = i + 1
+  }
+  let descriptor = BindGroupDescriptor.default().withLabel(label).withLayout(layout).withEntries(entries.asSlice())
+  return run gpu.createBindGroup(device, &descriptor)
+}
+
+/// The constants of a pipeline stage: their names borrow the command's bytes.
+effect fn constants<'a>(r: &mut Reader<'a>) -> List<ConstantEntry<'a>>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut entries = List<ConstantEntry<'a>>.make()
+  let count = r.word()
+  let mut i: u32 = 0
+  while i < count && !r.done() {
+    let mut entry = ConstantEntry.default().withKey(r.blob())
+    entry.setValue(r.number())
+    run entries.append(entry)
+    i = i + 1
+  }
+  return move entries
+}
+
+fn stencilFace(r: &mut Reader<'_>) -> StencilFaceState {
+  let mut face = StencilFaceState.default()
+  face.setCompare(r.word())
+  face.setFailOp(r.word())
+  face.setDepthFailOp(r.word())
+  face.setPassOp(r.word())
+  return face
+}
+
+fn blendComponent(r: &mut Reader<'_>) -> BlendComponent {
+  let mut component = BlendComponent.default()
+  component.setOperation(r.word())
+  component.setSrcFactor(r.word())
+  component.setDstFactor(r.word())
+  return component
+}
+
+/// One vertex buffer of a pipeline as the command has it.
+struct VertexBufferFields {
+  stride: u64,
+  step: u32,
+  attributes: List<VertexAttribute>,
+}
+
+/// One color target of a pipeline as the command has it.
+struct TargetFields {
+  format: u32,
+  blends: bool,
+  mask: u32,
+}
+
+effect fn createRenderPipeline(objects: &List<Object>, device: &Device, r: &mut Reader<'_>) -> RenderPipeline
+  ! GpuError | OutOfMemoryError
+  ? &mut Allocator {
+  let label = r.blob()
+  let layout = r.word()
+  let vertexModule = run shaderOf(objects, r.word())
+  let vertexEntry = r.blob()
+  let vertexConstants = run constants(&mut r)
+  let mut buffers = List<VertexBufferFields>.make()
+  let bufferCount = r.word()
+  let mut i: u32 = 0
+  while i < bufferCount && !r.done() {
+    let stride = r.size()
+    let step = r.word()
+    let mut attributes = List<VertexAttribute>.make()
+    let attributeCount = r.word()
+    let mut j: u32 = 0
+    while j < attributeCount && !r.done() {
+      let mut attribute = VertexAttribute.default()
+      attribute.setFormat(r.word())
+      attribute.setOffset(r.size())
+      attribute.setShaderLocation(r.word())
+      run attributes.append(attribute)
+      j = j + 1
+    }
+    run buffers.append(VertexBufferFields { stride: stride, step: step, attributes: move attributes })
+    i = i + 1
+  }
+  let mut layouts = List<VertexBufferLayout<'_>>.make()
+  let fields = buffers.asSlice()
+  let mut b: usize = 0
+  while b < fields.length {
+    let mut one = VertexBufferLayout.default().withAttributes(fields[b].attributes.asSlice())
+    one.setArrayStride(fields[b].stride)
+    one.setStepMode(fields[b].step)
+    run layouts.append(one)
+    b = b + 1
+  }
+  let mut vertex = VertexState.default().withModule(vertexModule).withConstants(vertexConstants.asSlice()).withBuffers(layouts.asSlice())
+  if vertexEntry.length > 0 {
+    vertex = vertex.withEntryPoint(vertexEntry)
+  }
+
+  let mut primitive = PrimitiveState.default()
+  primitive.setTopology(r.word())
+  primitive.setStripIndexFormat(r.word())
+  primitive.setFrontFace(r.word())
+  primitive.setCullMode(r.word())
+  primitive.setUnclippedDepth(r.flag())
+
+  let hasDepth = r.flag()
+  let mut depth = DepthStencilState.default()
+  if hasDepth {
+    depth.setFormat(r.word())
+    depth.setDepthWriteEnabled(r.word())
+    depth.setDepthCompare(r.word())
+    depth.setStencilFront(stencilFace(&mut r))
+    depth.setStencilBack(stencilFace(&mut r))
+    depth.setStencilReadMask(r.word())
+    depth.setStencilWriteMask(r.word())
+    depth.setDepthBias(r.int())
+    depth.setDepthBiasSlopeScale(f64.toF32(r.number()))
+    depth.setDepthBiasClamp(f64.toF32(r.number()))
+  }
+
+  let mut multisample = MultisampleState.default()
+  multisample.setCount(r.word())
+  multisample.setMask(r.word())
+  multisample.setAlphaToCoverageEnabled(r.flag())
+
+  let mut descriptor = RenderPipelineDescriptor.default().withLabel(label).withVertex(vertex)
+  descriptor.setPrimitive(primitive)
+  descriptor.setMultisample(multisample)
+  if hasDepth {
+    descriptor = descriptor.withDepthStencil(&depth)
+  }
+  if layout != 0 {
+    descriptor = descriptor.withLayout(run pipelineLayoutOf(objects, layout))
+  }
+  if !r.flag() {
+    return run gpu.createRenderPipeline(device, &descriptor)
+  }
+
+  let fragmentModule = run shaderOf(objects, r.word())
+  let fragmentEntry = r.blob()
+  let fragmentConstants = run constants(&mut r)
+  let mut targetFields = List<TargetFields>.make()
+  let mut blends = List<BlendState>.make()
+  let targetCount = r.word()
+  i = 0
+  while i < targetCount && !r.done() {
+    let format = r.word()
+    let blended = r.flag()
+    let mut blend = BlendState.default()
+    if blended {
+      blend.setColor(blendComponent(&mut r))
+      blend.setAlpha(blendComponent(&mut r))
+    }
+    run blends.append(blend)
+    run targetFields.append(TargetFields { format: format, blends: blended, mask: r.word() })
+    i = i + 1
+  }
+  let mut targets = List<ColorTargetState<'_>>.make()
+  let wanted = targetFields.asSlice()
+  let blendValues = blends.asSlice()
+  let mut t: usize = 0
+  while t < wanted.length {
+    let mut target = ColorTargetState.default()
+    target.setFormat(wanted[t].format)
+    target.setWriteMask(u32.toU64(wanted[t].mask))
+    if wanted[t].blends {
+      target = target.withBlend(&blendValues[t])
+    }
+    run targets.append(target)
+    t = t + 1
+  }
+  let mut fragment = FragmentState.default().withModule(fragmentModule).withConstants(fragmentConstants.asSlice()).withTargets(targets.asSlice())
+  if fragmentEntry.length > 0 {
+    fragment = fragment.withEntryPoint(fragmentEntry)
+  }
+  descriptor = descriptor.withFragment(&fragment)
+  return run gpu.createRenderPipeline(device, &descriptor)
+}
+
+effect fn createComputePipeline(objects: &List<Object>, device: &Device, r: &mut Reader<'_>) -> ComputePipeline
+  ! GpuError | OutOfMemoryError
+  ? &mut Allocator {
+  let label = r.blob()
+  let layout = r.word()
+  let module = run shaderOf(objects, r.word())
+  let entry = r.blob()
+  let values = run constants(&mut r)
+  let mut compute = ComputeState.default().withModule(module).withConstants(values.asSlice())
+  if entry.length > 0 {
+    compute = compute.withEntryPoint(entry)
+  }
+  let mut descriptor = ComputePipelineDescriptor.default().withLabel(label).withCompute(compute)
+  if layout != 0 {
+    descriptor = descriptor.withLayout(run pipelineLayoutOf(objects, layout))
+  }
+  return run gpu.createComputePipeline(device, &descriptor)
+}
+
+effect fn textureInfo<'o>(objects: &'o List<Object>, r: &mut Reader<'_>) -> TexelCopyTextureInfo<'o>
+  ! GpuError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut info = TexelCopyTextureInfo.default().withTexture(run textureOf(objects, r.word()))
+  info.setMipLevel(r.word())
+  let mut origin = Origin3D.default()
+  origin.setX(r.word())
+  origin.setY(r.word())
+  origin.setZ(r.word())
+  info.setOrigin(origin)
+  info.setAspect(r.word())
+  return info
+}
+
+fn bufferLayout(r: &mut Reader<'_>) -> TexelCopyBufferLayout {
+  let mut layout = TexelCopyBufferLayout.default()
+  layout.setOffset(r.size())
+  layout.setBytesPerRow(r.word())
+  layout.setRowsPerImage(r.word())
+  return layout
+}
+
+effect fn bufferInfo<'o>(objects: &'o List<Object>, r: &mut Reader<'_>) -> TexelCopyBufferInfo<'o>
+  ! GpuError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut info = TexelCopyBufferInfo.default().withBuffer(run bufferOf(objects, r.word()))
+  info.setLayout(bufferLayout(&mut r))
+  return info
+}
+
+fn extent(r: &mut Reader<'_>) -> Extent3D {
+  let mut size = Extent3D.default()
+  size.setWidth(r.word())
+  size.setHeight(r.word())
+  size.setDepthOrArrayLayers(r.word())
+  return size
+}
+
+fn color(r: &mut Reader<'_>) -> Color {
+  let mut value = Color.default()
+  value.setR(r.number())
+  value.setG(r.number())
+  value.setB(r.number())
+  value.setA(r.number())
+  return value
+}
+
+effect fn renderPass(objects: &List<Object>, encoder: &mut CommandEncoder, r: &mut Reader<'_>) -> ()
+  ! GpuError | OutOfMemoryError
+  ? &mut Allocator {
+  let label = r.blob()
+  let mut colors = List<RenderPassColorAttachment<'_>>.make()
+  let count = r.word()
+  let mut i: u32 = 0
+  while i < count && !r.done() {
+    let view = r.word()
+    let mut attachment = RenderPassColorAttachment.default()
+    if view != 0 {
+      attachment = attachment.withView(run viewOf(objects, view))
+      let slice = r.word()
+      if slice != wire.UNDEFINED {
+        attachment.setDepthSlice(slice)
+      }
+      let resolve = r.word()
+      if resolve != 0 {
+        attachment = attachment.withResolveTarget(run viewOf(objects, resolve))
+      }
+      attachment.setLoadOp(r.word())
+      attachment.setStoreOp(r.word())
+      attachment.setClearValue(color(&mut r))
+    }
+    run colors.append(attachment)
+    i = i + 1
+  }
+  let hasDepth = r.flag()
+  let mut depth = RenderPassDepthStencilAttachment.default()
+  if hasDepth {
+    depth = depth.withView(run viewOf(objects, r.word()))
+    depth.setDepthLoadOp(r.word())
+    depth.setDepthStoreOp(r.word())
+    let clear = r.number()
+    // Not a number stands for no clear value.
+    if clear == clear {
+      depth.setDepthClearValue(f64.toF32(clear))
+    }
+    depth.setDepthReadOnly(r.flag())
+    depth.setStencilLoadOp(r.word())
+    depth.setStencilStoreOp(r.word())
+    depth.setStencilClearValue(r.word())
+    depth.setStencilReadOnly(r.flag())
+  }
+  let mut descriptor = RenderPassDescriptor.default().withLabel(label).withColorAttachments(colors.asSlice())
+  if hasDepth {
+    descriptor = descriptor.withDepthStencilAttachment(&depth)
+  }
+  let mut pass = run encoder.beginRenderPass(&descriptor)
+  let mut offsets = List<u32>.make()
+  while !r.done() {
+    let op = r.word()
+    if op == wire.END {
+      break
+    }
+    if op == wire.SET_PIPELINE {
+      pass.setPipeline(run renderPipelineOf(objects, r.word()))
+    } else if op == wire.SET_BIND_GROUP {
+      let index = r.word()
+      let group = r.word()
+      offsets.clear()
+      let offsetCount = r.word()
+      let mut o: u32 = 0
+      while o < offsetCount && !r.done() {
+        run offsets.append(r.word())
+        o = o + 1
+      }
+      if group == 0 {
+        pass.clearBindGroup(index)
+      } else {
+        pass.setBindGroup(index, run groupOf(objects, group), offsets.asSlice())
+      }
+    } else if op == wire.SET_VERTEX_BUFFER {
+      let index = r.word()
+      let buffer = r.word()
+      let offset = r.size()
+      let size = r.size()
+      if buffer == 0 {
+        pass.clearVertexBuffer(index)
+      } else {
+        pass.setVertexBuffer(index, run bufferOf(objects, buffer), offset, size)
+      }
+    } else if op == wire.SET_INDEX_BUFFER {
+      let buffer = run bufferOf(objects, r.word())
+      let format = r.word()
+      let offset = r.size()
+      pass.setIndexBuffer(buffer, format, offset, r.size())
+    } else if op == wire.DRAW {
+      let vertices = r.word()
+      let instances = r.word()
+      let first = r.word()
+      pass.draw(vertices, instances, first, r.word())
+    } else if op == wire.DRAW_INDEXED {
+      let indices = r.word()
+      let instances = r.word()
+      let first = r.word()
+      let base = r.int()
+      pass.drawIndexed(indices, instances, first, base, r.word())
+    } else if op == wire.SET_VIEWPORT {
+      let x = f64.toF32(r.number())
+      let y = f64.toF32(r.number())
+      let width = f64.toF32(r.number())
+      let height = f64.toF32(r.number())
+      let near = f64.toF32(r.number())
+      pass.setViewport(x, y, width, height, near, f64.toF32(r.number()))
+    } else if op == wire.SET_SCISSOR {
+      let x = r.word()
+      let y = r.word()
+      let width = r.word()
+      pass.setScissorRect(x, y, width, r.word())
+    } else if op == wire.SET_BLEND_CONSTANT {
+      let value = color(&mut r)
+      pass.setBlendConstant(&value)
+    } else if op == wire.SET_STENCIL_REFERENCE {
+      pass.setStencilReference(r.word())
+    } else if op == wire.DRAW_INDIRECT {
+      let buffer = run bufferOf(objects, r.word())
+      pass.drawIndirect(buffer, r.size())
+    } else if op == wire.DRAW_INDEXED_INDIRECT {
+      let buffer = run bufferOf(objects, r.word())
+      pass.drawIndexedIndirect(buffer, r.size())
+    } else {
+      pass.end()
+      fail run problem(b"a render pass has a command this host does not know")
+    }
+  }
+  pass.end()
+}
+
+effect fn computePass(objects: &List<Object>, encoder: &mut CommandEncoder, r: &mut Reader<'_>) -> ()
+  ! GpuError | OutOfMemoryError
+  ? &mut Allocator {
+  let label = r.blob()
+  let descriptor = ComputePassDescriptor.default().withLabel(label)
+  let mut pass = run encoder.beginComputePass(&descriptor)
+  let mut offsets = List<u32>.make()
+  while !r.done() {
+    let op = r.word()
+    if op == wire.END {
+      break
+    }
+    if op == wire.SET_PIPELINE {
+      pass.setPipeline(run computePipelineOf(objects, r.word()))
+    } else if op == wire.SET_BIND_GROUP {
+      let index = r.word()
+      let group = r.word()
+      offsets.clear()
+      let offsetCount = r.word()
+      let mut o: u32 = 0
+      while o < offsetCount && !r.done() {
+        run offsets.append(r.word())
+        o = o + 1
+      }
+      if group == 0 {
+        pass.clearBindGroup(index)
+      } else {
+        pass.setBindGroup(index, run groupOf(objects, group), offsets.asSlice())
+      }
+    } else if op == wire.DISPATCH {
+      let x = r.word()
+      let y = r.word()
+      pass.dispatchWorkgroups(x, y, r.word())
+    } else if op == wire.DISPATCH_INDIRECT {
+      let buffer = run bufferOf(objects, r.word())
+      pass.dispatchWorkgroupsIndirect(buffer, r.size())
+    } else {
+      pass.end()
+      fail run problem(b"a compute pass has a command this host does not know")
+    }
+  }
+  pass.end()
+}
+
+/// Makes an encoder, has it do what the command recorded, and finishes it.
+effect fn encode(objects: &List<Object>, device: &Device, r: &mut Reader<'_>) -> CommandBuffer
+  ! GpuError | OutOfMemoryError
+  ? &mut Allocator {
+  let label = r.blob()
+  let mut encoder = run gpu.createCommandEncoder(device, label)
+  while !r.done() {
+    let op = r.word()
+    if op == wire.END {
+      break
+    }
+    if op == wire.RENDER_PASS {
+      run renderPass(objects, &mut encoder, &mut r)
+    } else if op == wire.COMPUTE_PASS {
+      run computePass(objects, &mut encoder, &mut r)
+    } else if op == wire.COPY_BUFFER {
+      let source = run bufferOf(objects, r.word())
+      let sourceOffset = r.size()
+      let destination = run bufferOf(objects, r.word())
+      let destinationOffset = r.size()
+      encoder.copyBufferToBuffer(source, sourceOffset, destination, destinationOffset, r.size())
+    } else if op == wire.COPY_BUFFER_TO_TEXTURE {
+      let source = run bufferInfo(objects, &mut r)
+      let destination = run textureInfo(objects, &mut r)
+      let size = extent(&mut r)
+      encoder.copyBufferToTexture(&source, &destination, &size)
+    } else if op == wire.COPY_TEXTURE_TO_BUFFER {
+      let source = run textureInfo(objects, &mut r)
+      let destination = run bufferInfo(objects, &mut r)
+      let size = extent(&mut r)
+      encoder.copyTextureToBuffer(&source, &destination, &size)
+    } else if op == wire.COPY_TEXTURE {
+      let source = run textureInfo(objects, &mut r)
+      let destination = run textureInfo(objects, &mut r)
+      let size = extent(&mut r)
+      encoder.copyTextureToTexture(&source, &destination, &size)
+    } else if op == wire.CLEAR_BUFFER {
+      let buffer = run bufferOf(objects, r.word())
+      let offset = r.size()
+      encoder.clearBuffer(buffer, offset, r.size())
+    } else {
+      fail run problem(b"a command encoder has a command this host does not know")
+    }
+  }
+  if r.short() {
+    fail run problem(b"a command encoder's commands are cut short")
+  }
+  return run encoder.finish(label)
+}
+
+/// The kind of error `code` is for JavaScript: 1 validation, 2 out of memory, 3 internal.
+fn errorKind(code: u32) -> u32 {
+  if code == flags.WGPUErrorType_OutOfMemory {
+    return 2
+  }
+  if code == flags.WGPUErrorType_Internal {
+    return 3
+  }
+  return 1
+}
+
+effect fn textOf(message: &[u8], fallback: string) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if message.length == 0 {
+    return run String.copy(fallback)
+  }
+  let mut out = String.make()
+  let mut i: usize = 0
+  while i < message.length {
+    // Messages of the GPU library are ASCII; anything else would not be valid text.
+    run appendByte(&mut out, if message[i] < 128 { message[i] } else { 63 })
+    i = i + 1
+  }
+  return move out
+}
+
+impl GpuService {
+  /// A service whose canvases present through `presenter`.
+  pub fn make(presenter: CanvasPresenter) -> GpuService {
+    return GpuService {
+      instance: Option<Instance>.None,
+      presenter: move presenter,
+      objects: List<Object>.make(),
+      replies: List<GpuReply>.make(),
+      token: 0,
+      device: 0,
+      maps: List<Held>.make(),
+    }
+  }
+
+  /// Forgets every object, for a JavaScript realm that starts again: its numbers start again.
+  pub fn reset(self: &mut Self) -> () {
+    self.maps = List<Held>.make()
+    self.objects = List<Object>.make()
+    self.replies = List<GpuReply>.make()
+  }
+
+  /// What the commands run so far answered, oldest first.
+  pub fn takeReplies(self: &mut Self) -> List<GpuReply> {
+    return Intrinsic.replace(self.replies, List<GpuReply>.make())
+  }
+
+  /// Runs the commands in `commands`, presents the canvases they drew, and writes the
+  /// changes of canvas nodes (which surface each shows) into `batch`.
+  pub effect fn serve(self: &mut Self, commands: &[u8], batch: &mut Batch) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut stream = Reader.make(commands)
+    while !stream.done() {
+      let mut command = stream.command()
+      self.token = 0
+      let ran = run Effect.result(self.one(&mut command, &mut batch))
+      match move ran {
+        Result<(), GpuError | OutOfMemoryError>.Success { .. } => ()
+        Result<(), GpuError | OutOfMemoryError>.Failure { error } => match move error {
+          OutOfMemoryError allocation => {
+            fail move allocation
+          }
+          GpuError { code, message } => {
+            run self.failed(code, message.asSlice())
+          }
+        }
+      }
+    }
+    run self.present()
+    run self.uncaptured()
+  }
+
+  /// Answers the promise of the command that failed, or tells its device of the error.
+  effect fn failed(self: &mut Self, code: u32, message: &[u8]) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let text = run textOf(message, "the GPU refused a command")
+    if self.token != 0 {
+      run self.replies.append(
+        GpuReply { token: self.token, status: errorKind(code), number: 0.0, text: move text, bytes: List<u8>.make() },
+      )
+      return ()
+    }
+    let device = self.device
+    run self.tell(device, code, move text)
+  }
+
+  effect fn tell(self: &mut Self, device: u32, code: u32, text: String) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut kind = List<u8>.make()
+    run kind.append(u32.toU8(errorKind(code)))
+    run self.replies.append(
+      GpuReply { token: 0, status: wire.EVENT_ERROR, number: u32.toF64(device), text: move text, bytes: move kind },
+    )
+  }
+
+  effect fn answer(self: &mut Self, status: u32, text: String, bytes: List<u8>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.replies.append(
+      GpuReply { token: self.token, status: status, number: 0.0, text: move text, bytes: move bytes },
+    )
+    self.token = 0
+  }
+
+  effect fn put(self: &mut Self, id: u32, object: Object) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let at = u32.toUsize(id)
+    while self.objects.length() <= at {
+      run self.objects.append(Object.Empty)
+    }
+    self.objects.set(at, move object)
+  }
+
+  fn forget(self: &mut Self, id: u32) -> () {
+    let at = u32.toUsize(id)
+    if at < self.objects.length() {
+      self.objects.set(at, Object.Empty)
+    }
+    self.unmap(id)
+  }
+
+  /// Unmaps buffer `id` if it is mapped for writing.
+  fn unmap(self: &mut Self, id: u32) -> () {
+    let mut i: usize = 0
+    while i < self.maps.length() {
+      if self.maps.asSlice()[i].buffer == id {
+        drop self.maps.remove(i)
+      } else {
+        i = i + 1
+      }
+    }
+  }
+
+  effect fn one(self: &mut Self, r: &mut Reader<'_>, batch: &mut Batch) -> ()
+    ! GpuError | OutOfMemoryError
+    ? &mut Allocator {
+    let op = r.word()
+    if op == wire.REQUEST_ADAPTER {
+      self.token = r.word()
+      let id = r.word()
+      if let Option<Instance>.None = &self.instance {
+        self.instance = Option<Instance>.some(run Instance.create())
+      }
+      if let Option<Instance>.Some { value: instance } = &self.instance {
+        let adapter = run instance.requestAdapter(&RequestAdapterOptions.default())
+        let text = run adapterText(&adapter)
+        run self.put(id, Object.Adapter { value: move adapter })
+        run self.answer(0, move text, List<u8>.make())
+      }
+    } else if op == wire.REQUEST_DEVICE {
+      self.token = r.word()
+      let adapter = r.word()
+      let id = r.word()
+      let made = run self.openDevice(adapter, &mut r)
+      let text = run deviceText(&made.device)
+      run self.put(id, Object.Device { value: move made })
+      self.forget(adapter)
+      run self.answer(0, move text, List<u8>.make())
+    } else if op == wire.DESTROY_DEVICE {
+      let id = r.word()
+      let device = run deviceOf(&self.objects, id)
+      device.device.destroy()
+    } else if op == wire.DROP {
+      self.forget(r.word())
+    } else if op == wire.CREATE_BUFFER {
+      self.device = r.word()
+      let id = r.word()
+      let made = run createBuffer(&(run deviceOf(&self.objects, self.device)).device, &mut r)
+      run self.put(id, Object.Buffer { value: move made })
+    } else if op == wire.BUFFER_WRITE_MAPPED {
+      let buffer = run bufferOf(&self.objects, r.word())
+      let offset = r.offset()
+      run buffer.writeMapped(offset, r.blob())
+    } else if op == wire.BUFFER_UNMAP {
+      let id = r.word()
+      self.unmap(id)
+      let buffer = run bufferOf(&self.objects, id)
+      buffer.unmap()
+    } else if op == wire.BUFFER_MAP {
+      self.token = r.word()
+      self.device = r.word()
+      let buffer = r.word()
+      let mode = r.word()
+      let offset = r.offset()
+      let size = r.offset()
+      let bytes = run self.map(buffer, mode, offset, size)
+      run self.answer(0, String.make(), move bytes)
+    } else if op == wire.BUFFER_DESTROY {
+      let id = r.word()
+      self.unmap(id)
+      let buffer = run bufferOf(&self.objects, id)
+      buffer.destroy()
+    } else if op == wire.CREATE_TEXTURE {
+      self.device = r.word()
+      let id = r.word()
+      let made = run createTexture(&(run deviceOf(&self.objects, self.device)).device, &mut r)
+      run self.put(id, Object.Texture { value: move made })
+    } else if op == wire.CREATE_VIEW {
+      let texture = r.word()
+      let id = r.word()
+      let made = run createView(run textureOf(&self.objects, texture), &mut r)
+      run self.put(id, Object.View { value: move made })
+    } else if op == wire.TEXTURE_DESTROY {
+      let texture = run textureOf(&self.objects, r.word())
+      texture.destroy()
+    } else if op == wire.CREATE_SAMPLER {
+      self.device = r.word()
+      let id = r.word()
+      let made = run createSampler(&(run deviceOf(&self.objects, self.device)).device, &mut r)
+      run self.put(id, Object.Sampler { value: move made })
+    } else if op == wire.CREATE_BIND_GROUP_LAYOUT {
+      self.device = r.word()
+      let id = r.word()
+      let made = run createBindGroupLayout(&(run deviceOf(&self.objects, self.device)).device, &mut r)
+      run self.put(id, Object.BindGroupLayout { value: move made })
+    } else if op == wire.CREATE_PIPELINE_LAYOUT {
+      self.device = r.word()
+      let id = r.word()
+      let made = run createPipelineLayout(&self.objects, &(run deviceOf(&self.objects, self.device)).device, &mut r)
+      run self.put(id, Object.PipelineLayout { value: move made })
+    } else if op == wire.CREATE_BIND_GROUP {
+      self.device = r.word()
+      let id = r.word()
+      let made = run createBindGroup(&self.objects, &(run deviceOf(&self.objects, self.device)).device, &mut r)
+      run self.put(id, Object.BindGroup { value: move made })
+    } else if op == wire.CREATE_SHADER_MODULE {
+      self.device = r.word()
+      let id = r.word()
+      let label = r.blob()
+      let made = run gpu.createShaderModule(&(run deviceOf(&self.objects, self.device)).device, label, r.blob())
+      run self.put(id, Object.Shader { value: move made })
+    } else if op == wire.CREATE_RENDER_PIPELINE {
+      self.device = r.word()
+      let id = r.word()
+      let token = r.word()
+      // A promise wants to hear of a pipeline the GPU refuses: an error scope catches it.
+      let device = &(run deviceOf(&self.objects, self.device)).device
+      if token != 0 {
+        self.token = token
+        device.pushErrorScope(flags.WGPUErrorFilter_Validation)
+      }
+      let made = run Effect.result(createRenderPipeline(&self.objects, device, &mut r))
+      if token != 0 {
+        run device.popErrorScope()
+      }
+      match move made {
+        Result<RenderPipeline, GpuError | OutOfMemoryError>.Success { value } => {
+          run self.put(id, Object.RenderPipeline { value: move value })
+        }
+        Result<RenderPipeline, GpuError | OutOfMemoryError>.Failure { error } => {
+          fail move error
+        }
+      }
+      if token != 0 {
+        run self.answer(0, String.make(), List<u8>.make())
+      }
+    } else if op == wire.CREATE_COMPUTE_PIPELINE {
+      self.device = r.word()
+      let id = r.word()
+      let token = r.word()
+      let device = &(run deviceOf(&self.objects, self.device)).device
+      if token != 0 {
+        self.token = token
+        device.pushErrorScope(flags.WGPUErrorFilter_Validation)
+      }
+      let made = run Effect.result(createComputePipeline(&self.objects, device, &mut r))
+      if token != 0 {
+        run device.popErrorScope()
+      }
+      match move made {
+        Result<ComputePipeline, GpuError | OutOfMemoryError>.Success { value } => {
+          run self.put(id, Object.ComputePipeline { value: move value })
+        }
+        Result<ComputePipeline, GpuError | OutOfMemoryError>.Failure { error } => {
+          fail move error
+        }
+      }
+      if token != 0 {
+        run self.answer(0, String.make(), List<u8>.make())
+      }
+    } else if op == wire.PIPELINE_LAYOUT_OF {
+      let pipeline = r.word()
+      let index = r.word()
+      let id = r.word()
+      let made = run self.layoutOf(pipeline, index)
+      run self.put(id, Object.BindGroupLayout { value: move made })
+    } else if op == wire.ENCODE {
+      self.device = r.word()
+      let id = r.word()
+      let made = run encode(&self.objects, &(run deviceOf(&self.objects, self.device)).device, &mut r)
+      run self.put(id, Object.Commands { value: move made })
+    } else if op == wire.SUBMIT {
+      self.device = r.word()
+      let count = r.word()
+      let mut ids = List<u32>.make()
+      let mut i: u32 = 0
+      while i < count && !r.done() {
+        run ids.append(r.word())
+        i = i + 1
+      }
+      run self.submit(ids.asSlice())
+    } else if op == wire.WRITE_BUFFER {
+      self.device = r.word()
+      let device = run deviceOf(&self.objects, self.device)
+      let buffer = run bufferOf(&self.objects, r.word())
+      let offset = r.size()
+      device.queue.writeBuffer(buffer, offset, r.blob())
+    } else if op == wire.WRITE_TEXTURE {
+      self.device = r.word()
+      let device = run deviceOf(&self.objects, self.device)
+      let destination = run textureInfo(&self.objects, &mut r)
+      let layout = bufferLayout(&mut r)
+      let size = extent(&mut r)
+      device.queue.writeTexture(&destination, r.blob(), &layout, &size)
+    } else if op == wire.WORK_DONE {
+      self.token = r.word()
+      self.device = r.word()
+      let device = run deviceOf(&self.objects, self.device)
+      run runtime.onSubmittedWorkDone(&device.device, &device.queue)
+      run self.answer(0, String.make(), List<u8>.make())
+    } else if op == wire.PUSH_ERROR_SCOPE {
+      self.device = r.word()
+      let device = run deviceOf(&self.objects, self.device)
+      device.device.pushErrorScope(r.word())
+    } else if op == wire.POP_ERROR_SCOPE {
+      self.token = r.word()
+      self.device = r.word()
+      let device = run deviceOf(&self.objects, self.device)
+      // A scope that caught an error fails here, which answers the promise with the error.
+      run device.device.popErrorScope()
+      run self.answer(0, String.make(), List<u8>.make())
+    } else if op == wire.COMPILATION_INFO {
+      self.token = r.word()
+      run self.answer(0, run String.copy("[]"), List<u8>.make())
+    } else if op == wire.CONFIGURE {
+      let id = r.word()
+      let node = r.word()
+      self.device = r.word()
+      let width = r.word()
+      let height = r.word()
+      let format = r.word()
+      let opaque = r.flag()
+      let surface = run self.configure(id, node, width, height, format, opaque)
+      run batch.canvasSurface(node, surface, width, height, opaque)
+    } else if op == wire.UNCONFIGURE {
+      let id = r.word()
+      let node = r.word()
+      self.forget(id)
+      run batch.canvasSurface(node, NO_SURFACE, 0, 0, false)
+    } else if op == wire.CANVAS_TEXTURE {
+      let id = r.word()
+      let texture = r.word()
+      let target = (run shownOf(&self.objects, id)).canvas.texture().dup()
+      run self.put(texture, Object.Texture { value: move target })
+      self.drew(id)
+    } else if op != 0 {
+      fail run problem(b"the GPU service does not know a command")
+    }
+    if r.short() {
+      fail run problem(b"a GPU command is cut short")
+    }
+  }
+
+  effect fn openDevice(self: &Self, adapter: u32, r: &mut Reader<'_>) -> CanvasGpu
+    ! GpuError | OutOfMemoryError
+    ? &mut Allocator {
+    match &self.instance {
+      Option<Instance>.Some { value: instance } => {
+        let found = run slot(&self.objects, adapter)
+        match &found.* {
+          Object.Adapter { value } => {
+            return run requestDevice(&value, &instance, &mut r)
+          }
+          _ => {
+            fail run problem(b"the adapter already made its device")
+          }
+        }
+      }
+      Option<Instance>.None => {
+        fail run problem(b"a device was requested before an adapter")
+      }
+    }
+  }
+
+  /// Maps `size` bytes of buffer `buffer` from `offset` and waits for it. A read gives the
+  /// bytes and unmaps; a write stays mapped for `BUFFER_WRITE_MAPPED`.
+  effect fn map(self: &mut Self, buffer: u32, mode: u32, offset: usize, size: usize) -> List<u8>
+    ! GpuError | OutOfMemoryError
+    ? &mut Allocator {
+    let device = run deviceOf(&self.objects, self.device)
+    let target = run bufferOf(&self.objects, buffer)
+    if u32.toU64(mode) == flags.WGPUMapMode_Read {
+      return run runtime.mapRead(&device.device, target, offset, size)
+    }
+    let mapped = run runtime.mapAsync(&device.device, target, u32.toU64(mode), offset, size)
+    // The buffer stays mapped until JavaScript unmaps it.
+    run self.maps.append(Held { buffer: buffer, mapped: move mapped })
+    return List<u8>.make()
+  }
+
+  effect fn layoutOf(self: &Self, pipeline: u32, index: u32) -> BindGroupLayout
+    ! GpuError | OutOfMemoryError
+    ? &mut Allocator {
+    let found = run slot(&self.objects, pipeline)
+    match &found.* {
+      Object.RenderPipeline { value } => {
+        return run value.getBindGroupLayout(index)
+      }
+      Object.ComputePipeline { value } => {
+        return run value.getBindGroupLayout(index)
+      }
+      _ => {
+        fail run problem(b"a pipeline that does not exist was used")
+      }
+    }
+  }
+
+  effect fn submit(self: &mut Self, ids: &[u32]) -> ()
+    ! GpuError | OutOfMemoryError
+    ? &mut Allocator {
+    run self.submitted(ids)
+    let mut i: usize = 0
+    while i < ids.length {
+      self.forget(ids[i])
+      i = i + 1
+    }
+  }
+
+  effect fn submitted(self: &Self, ids: &[u32]) -> ()
+    ! GpuError | OutOfMemoryError
+    ? &mut Allocator {
+    let device = run deviceOf(&self.objects, self.device)
+    let mut buffers = List<CommandBufferRef<'_>>.make()
+    let mut i: usize = 0
+    while i < ids.length {
+      run buffers.append((run commandsOf(&self.objects, ids[i])).reference())
+      i = i + 1
+    }
+    device.queue.submit(buffers.asSlice())
+  }
+
+  /// Gives canvas context `id` a canvas of this size and format on the device of the
+  /// command, and answers the surface its node shows.
+  effect fn configure(self: &mut Self, id: u32, node: u32, width: u32, height: u32, format: u32, opaque: bool) -> u32
+    ! GpuError | OutOfMemoryError
+    ? &mut Allocator {
+    let made = run self.shown(id, node, width, height, format, opaque)
+    let surface = made.canvas.surface()
+    run self.put(id, Object.Canvas { value: move made })
+    return surface
+  }
+
+  effect fn shown(self: &mut Self, id: u32, node: u32, width: u32, height: u32, format: u32, opaque: bool) -> Shown
+    ! GpuError | OutOfMemoryError
+    ? &mut Allocator {
+    // The canvas the context had keeps its surface when only its size changes.
+    let at = u32.toUsize(id)
+    let old = if at < self.objects.length() { Intrinsic.replace(self.objects.asMutSlice()[at], Object.Empty) } else { Object.Empty }
+    let device = run deviceOf(&self.objects, self.device)
+    match move old {
+      Object.Canvas { value } => {
+        let mut kept = move value
+        if kept.device == self.device && kept.canvas.format() == format {
+          run kept.canvas.resize(device, width, height)
+          kept.canvas.opaque = opaque
+          kept.node = node
+          kept.drawn = false
+          return move kept
+        }
+      }
+      _ => {}
+    }
+    let mut canvas = run GpuCanvas.makeIn(device, &self.presenter, width, height, format)
+    canvas.opaque = opaque
+    return Shown { canvas: move canvas, device: self.device, node: node, drawn: false }
+  }
+
+  fn drew(self: &mut Self, id: u32) -> () {
+    let at = u32.toUsize(id)
+    if at >= self.objects.length() {
+      return ()
+    }
+    let entry = &mut self.objects.asMutSlice()[at]
+    match &mut entry.* {
+      Object.Canvas { value } => {
+        value.drawn = true
+      }
+      _ => {}
+    }
+  }
+
+  /// Presents every canvas a context took the texture of since the last present.
+  effect fn present(self: &mut Self) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut i: usize = 0
+    while i < self.objects.length() {
+      let mut failure = Option<GpuError>.None
+      let mut device: u32 = 0
+      let mut drawn = false
+      match &self.objects.asSlice()[i] {
+        Object.Canvas { value } => {
+          drawn = value.drawn
+          device = value.device
+        }
+        _ => {}
+      }
+      if drawn {
+        // Out of the table while it presents: a present moves the canvas to its next image.
+        let mut taken = Intrinsic.replace(self.objects.asMutSlice()[i], Object.Empty)
+        let presented = run Effect.result(presentTaken(&self.objects, &mut taken))
+        drop Intrinsic.replace(self.objects.asMutSlice()[i], move taken)
+        match move presented {
+          Result<(), GpuError | OutOfMemoryError>.Success { .. } => ()
+          Result<(), GpuError | OutOfMemoryError>.Failure { error } => match move error {
+            OutOfMemoryError allocation => {
+              fail move allocation
+            }
+            GpuError { code, message } => {
+              failure = Option<GpuError>.some(GpuError { code: code, message: move message })
+            }
+          }
+        }
+      }
+      let entry = &mut self.objects.asMutSlice()[i]
+      match &mut entry.* {
+        Object.Canvas { value } => {
+          value.drawn = false
+        }
+        _ => {}
+      }
+      if let Option<GpuError>.Some { value: error } = move failure {
+        let text = run textOf(error.message.asSlice(), "a canvas could not be presented")
+        run self.tell(device, error.code, move text)
+      }
+      i = i + 1
+    }
+  }
+
+  /// Tells each device of the errors no error scope caught.
+  effect fn uncaptured(self: &mut Self) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut i: usize = 0
+    while i < self.objects.length() {
+      let mut failure = Option<GpuError>.None
+      match &self.objects.asSlice()[i] {
+        Object.Device { value } => {
+          let checked = run Effect.result(value.device.checkErrors())
+          match move checked {
+            Result<(), GpuError>.Success { .. } => ()
+            Result<(), GpuError>.Failure { error } => {
+              failure = Option<GpuError>.some(move error)
+            }
+          }
+        }
+        _ => {}
+      }
+      if let Option<GpuError>.Some { value: error } = move failure {
+        let text = run textOf(error.message.asSlice(), "the GPU reported an error")
+        run self.tell(usize.toU32(i), error.code, move text)
+      }
+      i = i + 1
+    }
+  }
+}
+
+effect fn presentTaken(objects: &List<Object>, taken: &mut Object) -> ()
+  ! GpuError | OutOfMemoryError
+  ? &mut Allocator {
+  if let Object.Canvas { value } = &mut taken.* {
+    run presentOne(objects, &mut value)
+  }
+}
+
+effect fn presentOne(objects: &List<Object>, shown: &mut Shown) -> ()
+  ! GpuError | OutOfMemoryError
+  ? &mut Allocator {
+  let device = run deviceOf(objects, shown.device)
+  run shown.canvas.present(device)
+}

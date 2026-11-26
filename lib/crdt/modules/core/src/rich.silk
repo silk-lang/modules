@@ -1,0 +1,766 @@
+//! Rich text: formatting marks over the plain text CRDT, after Peritext.
+//!
+//! A mark sets one key (bold, link, a heading level) to a value over a range. Its ends are
+//! anchored to bytes, not offsets: each end sits just before or just after a named byte, so the
+//! range keeps covering the same bytes while other replicas insert and delete around it. Where an
+//! end sits decides whether text typed at that edge takes the mark: bold typed at its end grows,
+//! a link does not. The local `mark` call turns an [`Expand`] choice into the right anchors.
+//!
+//! Marks never change the bytes. On each byte the mark with the highest delta id for a key wins,
+//! and a removal is a mark that wins with no value. That is a pure function of the set of marks
+//! and the order of the bytes, so replicas that saw the same deltas show the same formatting.
+//!
+//! Blocks and embeds need no operations of their own. A block's attributes (a heading, a list
+//! item) are non-expanding marks on its closing line break, as in Quill and Yjs. An embed is an
+//! object replacement character (U+FFFC) carrying a mark under [`EMBED`] whose value is the
+//! embed's data.
+import clock { DeltaId }
+import codec { DecodeError, Reader, Writer }
+import text { CharId, decodeChar, DeleteOp, encodeChar, InsertOp, Text, TextVersion }
+import silk.collections.hash { Hash }
+import silk.collections.hash_map { HashMap }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+import silk.text.string { String }
+
+/// The key of the mark that holds an embed's data. Applications choose every other key.
+pub const EMBED: u32 = 4294967295
+
+/// Which side of a byte an anchor sits on.
+pub enum Side {
+  Before,
+  After,
+}
+
+/// A point in the text: just before or just after a named byte. With no byte, `Before` is the
+/// start of the text and `After` is its end.
+pub struct Anchor {
+  pub char: CharId,
+  pub side: Side,
+}
+
+impl Copy for Anchor {}
+
+impl Anchor {
+  pub fn before(char: CharId) -> Anchor {
+    return Anchor { char: char, side: Side.Before }
+  }
+
+  pub fn after(char: CharId) -> Anchor {
+    return Anchor { char: char, side: Side.After }
+  }
+
+  /// The start of the text, before every byte ever inserted.
+  pub fn start() -> Anchor {
+    return Anchor { char: CharId.none(), side: Side.Before }
+  }
+
+  /// The end of the text, after every byte ever inserted.
+  pub fn end() -> Anchor {
+    return Anchor { char: CharId.none(), side: Side.After }
+  }
+}
+
+/// Which edges of a mark take text typed there.
+pub enum Expand {
+  /// Neither edge: links, comments, embeds and block attributes.
+  None,
+  Start,
+  /// The end only: bold, italic and most inline styles.
+  End,
+  Both,
+}
+
+/// A mark as replicas exchange it.
+pub struct MarkOp {
+  pub id: DeltaId,
+  pub key: u32,
+  pub start: Anchor,
+  pub end: Anchor,
+  /// Whether this mark clears `key` instead of setting it.
+  pub remove: bool,
+  pub value: List<u8>,
+}
+
+/// The two operations that insert an embed: the U+FFFC byte run and the mark holding its data.
+pub struct EmbedOps {
+  pub insert: InsertOp,
+  pub mark: MarkOp,
+}
+
+/// One key set on a span: the key and the mark that set it, whose value [`RichText.value`] reads.
+pub struct Attr {
+  pub key: u32,
+  pub mark: DeltaId,
+}
+
+impl Copy for Attr {}
+
+/// A run of visible bytes with the same attributes, sorted by key.
+pub struct Span {
+  pub start: usize,
+  pub length: usize,
+  pub attrs: List<Attr>,
+}
+
+struct Mark {
+  id: DeltaId,
+  key: u32,
+  start: Anchor,
+  end: Anchor,
+  remove: bool,
+  valueStart: usize,
+  valueLength: usize,
+}
+
+impl Copy for Mark {}
+
+struct Range {
+  start: Anchor,
+  end: Anchor,
+}
+
+impl Copy for Range {}
+
+// A mark's covered bytes as indexes among all bytes, deleted ones included: [from, to).
+struct Cover {
+  from: usize,
+  to: usize,
+}
+
+impl Copy for Cover {}
+
+/// A version of a rich text kept with [`RichText.version`].
+pub struct RichVersion {
+  text: TextVersion,
+  marks: usize,
+  values: usize,
+}
+
+impl Copy for RichVersion {}
+
+/// One replica of a rich text.
+pub struct RichText {
+  plain: Text,
+  marks: List<Mark>,
+  known: HashMap<DeltaId, usize>,
+  values: List<u8>,
+  changes: u64,
+}
+
+impl RichText {
+  /// An empty rich text.
+  pub fn make() -> RichText {
+    return RichText {
+      plain: Text.make(),
+      marks: List<Mark>.make(),
+      known: HashMap<DeltaId, usize>.make(Hash.seed(14695981039346656037)),
+      values: List<u8>.make(),
+      changes: 0,
+    }
+  }
+
+  /// A number that grows with every change to this rich text, so a caller can keep the result
+  /// of [`RichText.spans`] or [`RichText.read`] until it moves.
+  pub fn revision(self: &Self) -> u64 {
+    return self.changes
+  }
+
+  /// Keeps this rich text as it is now; see [`Text.version`].
+  pub fn version(self: &mut Self) -> RichVersion {
+    return RichVersion {
+      text: self.plain.version(),
+      marks: self.marks.length(),
+      values: self.values.length(),
+    }
+  }
+
+  /// A new rich text holding `version` of this one; see [`Text.restore`].
+  pub effect fn restore(self: &Self, version: RichVersion) -> RichText
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut past = RichText.make()
+    past.plain = run self.plain.restore(version.text)
+    run past.marks.appendSlice(Slice.view(self.marks.asSlice(), 0, version.marks))
+    run past.values.appendSlice(Slice.view(self.values.asSlice(), 0, version.values))
+    let mut k: usize = 0
+    while k < version.marks {
+      drop run past.known.insert(past.marks.get(k).id, k)
+      k = k + 1
+    }
+    return move past
+  }
+
+  /// Appends `version` of this rich text to `out`, to rebuild with [`RichText.decode`].
+  pub effect fn encodeVersion(self: &Self, version: RichVersion, out: &mut Writer) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.plain.encodeVersion(version.text, &mut out)
+    run out.size(version.marks)
+    let mut k: usize = 0
+    while k < version.marks {
+      let mark = self.marks.get(k)
+      run out.id(mark.id)
+      run out.number(u32ToU64(mark.key))
+      run encodeAnchor(mark.start, &mut out)
+      run encodeAnchor(mark.end, &mut out)
+      run out.flag(mark.remove)
+      run out.data(Slice.view(self.values.asSlice(), mark.valueStart, mark.valueLength))
+      k = k + 1
+    }
+  }
+
+  /// A rich text read from what [`RichText.encodeVersion`] wrote.
+  pub effect fn decode(input: &mut Reader<'_>) -> RichText
+    ! DecodeError | OutOfMemoryError
+    ? &mut Allocator {
+    let mut rich = RichText.make()
+    rich.plain = run Text.decode(&mut input)
+    let count = run input.size()
+    let mut k: usize = 0
+    while k < count {
+      let id = run input.id()
+      let key = run input.number()
+      if key > 4294967295 {
+        fail DecodeError {}
+      }
+      let start = run decodeAnchor(&mut input)
+      let end = run decodeAnchor(&mut input)
+      let remove = run input.flag()
+      let value = run input.data()
+      if rich.known.contains(id) {
+        fail DecodeError {}
+      }
+      let valueStart = rich.values.length()
+      run rich.values.appendSlice(value)
+      drop run rich.known.insert(id, rich.marks.length())
+      run rich.marks.append(
+        Mark {
+          id: id,
+          key: u64ToU32(key),
+          start: start,
+          end: end,
+          remove: remove,
+          valueStart: valueStart,
+          valueLength: value.length,
+        },
+      )
+      k = k + 1
+    }
+    return move rich
+  }
+
+  /// The plain text under the marks.
+  pub fn text(self: &Self) -> &Text {
+    return &self.plain
+  }
+
+  /// The number of visible bytes.
+  pub fn length(self: &Self) -> usize {
+    return self.plain.length()
+  }
+
+  /// The number of marks, removals included.
+  pub fn markCount(self: &Self) -> usize {
+    return self.marks.length()
+  }
+
+  /// The visible text.
+  pub effect fn read(self: &Self) -> String
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return run self.plain.read()
+  }
+
+  /// Inserts `bytes` at visible offset `offset`; see [`Text.insert`].
+  pub effect fn insert(self: &mut Self, id: DeltaId, offset: usize, bytes: &[u8]) -> InsertOp
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    self.changes = self.changes + 1
+    return run self.plain.insert(id, offset, bytes)
+  }
+
+  /// Grows insertion `id` with bytes typed right after it; see [`Text.extend`].
+  pub effect fn extend(self: &mut Self, id: DeltaId, offset: usize, bytes: &[u8]) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    self.changes = self.changes + 1
+    return run self.plain.extend(id, offset, bytes)
+  }
+
+  /// Deletes visible bytes; see [`Text.delete`]. Marks over them stay and cover nothing visible.
+  pub effect fn delete(self: &mut Self, offset: usize, length: usize) -> DeleteOp
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    self.changes = self.changes + 1
+    return run self.plain.delete(offset, length)
+  }
+
+  pub effect fn applyInsert(self: &mut Self, op: &InsertOp) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    self.changes = self.changes + 1
+    run self.plain.applyInsert(op)
+  }
+
+  pub effect fn applyDelete(self: &mut Self, op: &DeleteOp) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    self.changes = self.changes + 1
+    run self.plain.applyDelete(op)
+  }
+
+  /// Sets `key` to `value` over `length` visible bytes from `offset` as delta `id`, and returns
+  /// the operation to send. Traps on an empty range or one past the end.
+  pub effect fn mark(
+    self: &mut Self,
+    id: DeltaId,
+    offset: usize,
+    length: usize,
+    key: u32,
+    value: &[u8],
+    expand: Expand,
+  ) -> MarkOp
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let range = self.rangeOf(offset, length, expand)
+    let mut copy = List<u8>.make()
+    run copy.appendSlice(value)
+    let op = MarkOp {
+      id: id,
+      key: key,
+      start: range.start,
+      end: range.end,
+      remove: false,
+      value: move copy,
+    }
+    run self.applyMark(&op)
+    return move op
+  }
+
+  /// Clears `key` over `length` visible bytes from `offset` as delta `id`, and returns the
+  /// operation to send. `expand` says whether text later typed at the edges stays clear.
+  pub effect fn unmark(
+    self: &mut Self,
+    id: DeltaId,
+    offset: usize,
+    length: usize,
+    key: u32,
+    expand: Expand,
+  ) -> MarkOp
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let range = self.rangeOf(offset, length, expand)
+    let op = MarkOp {
+      id: id,
+      key: key,
+      start: range.start,
+      end: range.end,
+      remove: true,
+      value: List<u8>.make(),
+    }
+    run self.applyMark(&op)
+    return move op
+  }
+
+  /// Applies a mark made here or by another replica. The bytes its anchors name must already be
+  /// applied. Applying a mark twice is harmless.
+  pub effect fn applyMark(self: &mut Self, op: &MarkOp) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if self.known.contains(op.id) {
+      return ()
+    }
+    self.changes = self.changes + 1
+    let valueStart = self.values.length()
+    run self.values.appendSlice(op.value.asSlice())
+    let mark = Mark {
+      id: op.id,
+      key: op.key,
+      start: op.start,
+      end: op.end,
+      remove: op.remove,
+      valueStart: valueStart,
+      valueLength: op.value.length(),
+    }
+    drop run self.known.insert(op.id, self.marks.length())
+    run self.marks.append(mark)
+  }
+
+  /// Inserts an embed carrying `data` at visible offset `offset`: the U+FFFC bytes as delta
+  /// `id` and its [`EMBED`] mark as delta `markId`.
+  pub effect fn insertEmbed(
+    self: &mut Self,
+    id: DeltaId,
+    markId: DeltaId,
+    offset: usize,
+    data: &[u8],
+  ) -> EmbedOps
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let object: [u8; 3] = [239, 191, 188]
+    let insert = run self.plain.insert(id, offset, &object)
+    let mark = run self.mark(markId, offset, 3, EMBED, data, Expand.None)
+    return EmbedOps { insert: move insert, mark: move mark }
+  }
+
+  /// The value of mark `id`, empty for a removal. Traps if `id` is unknown.
+  pub fn value(self: &Self, id: DeltaId) -> &[u8] {
+    let index = match move self.known.get(id) {
+      Option<usize>.Some { value } => value
+      Option<usize>.None => Intrinsic.trap("RichText.value: the mark is unknown")
+    }
+    let mark = self.marks.get(index)
+    return Slice.view(self.values.asSlice(), mark.valueStart, mark.valueLength)
+  }
+
+  /// The visible text as runs of equal attributes, in order, covering every visible byte.
+  pub effect fn spans(self: &Self) -> List<Span>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let total = self.plain.totalLength()
+
+    // Where each mark starts and stops among all bytes, and every place the attributes may change.
+    let mut covers = List<Cover>.make()
+    let mut froms = List<usize>.make()
+    let mut tos = List<usize>.make()
+    let mut cuts = List<usize>.make()
+    run cuts.append(0)
+    run cuts.append(total)
+    let mut m: usize = 0
+    while m < self.marks.length() {
+      let mark = self.marks.get(m)
+      let from = clamp(self.pointOf(mark.start) / 2, total)
+      let mut to = clamp(self.pointOf(mark.end) / 2, total)
+      if to < from {
+        to = from
+      }
+      run covers.append(Cover { from: from, to: to })
+      run froms.append(from)
+      run tos.append(to)
+      run cuts.append(from)
+      run cuts.append(to)
+      m = m + 1
+    }
+    run cuts.sort()
+    let byStart = run orderBy(&froms)
+    let byEnd = run orderBy(&tos)
+
+    // Sweep the cuts in order, keeping the marks that cover the current piece, and walk the
+    // fragments alongside, turning each piece between cuts into visible bytes.
+    let mut active = List<usize>.make()
+    let mut nextStart: usize = 0
+    let mut nextEnd: usize = 0
+    let mut spans = List<Span>.make()
+    let mut piece: usize = 0
+    let mut pieceStart: usize = 0
+    let mut position: usize = 0
+    let mut visible: usize = 0
+    let mut c: usize = 0
+    while c + 1 < cuts.length() {
+      let from = cuts.get(c)
+      let to = cuts.get(c + 1)
+      c = c + 1
+      if to == from {
+        continue
+      }
+      while nextStart < byStart.length() && froms.get(byStart.get(nextStart)) <= from {
+        run active.append(byStart.get(nextStart))
+        nextStart = nextStart + 1
+      }
+      while nextEnd < byEnd.length() && tos.get(byEnd.get(nextEnd)) <= from {
+        let ended = byEnd.get(nextEnd)
+        let mut a: usize = 0
+        while a < active.length() {
+          if active.get(a) == ended {
+            drop active.remove(a)
+            break
+          }
+          a = a + 1
+        }
+        nextEnd = nextEnd + 1
+      }
+      let first = visible
+      while position < to {
+        let fragment = self.plain.pieceAt(piece)
+        let pieceEnd = pieceStart + fragment.chars.length
+        let mut stop = pieceEnd
+        if to < stop {
+          stop = to
+        }
+        if !fragment.deleted {
+          visible = visible + stop - position
+        }
+        position = stop
+        if position == pieceEnd {
+          piece = piece + 1
+          pieceStart = pieceEnd
+        }
+      }
+      if visible > first {
+        let attrs = run self.attrsOf(&active)
+        run appendSpan(&mut spans, first, visible - first, move attrs)
+      }
+    }
+    return move spans
+  }
+
+  // The winning attributes on bytes from `at` up to the next cut, sorted by key.
+  /// The same runs as [`RichText.spans`], found by checking every mark at every byte. It is slow
+  /// and exists so tests can check `spans` against it.
+  pub effect fn spansByScan(self: &Self) -> List<Span>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let total = self.plain.totalLength()
+    let mut froms = List<usize>.make()
+    let mut tos = List<usize>.make()
+    let mut m: usize = 0
+    while m < self.marks.length() {
+      let mark = self.marks.get(m)
+      run froms.append(clamp(self.pointOf(mark.start) / 2, total))
+      run tos.append(clamp(self.pointOf(mark.end) / 2, total))
+      m = m + 1
+    }
+    let mut spans = List<Span>.make()
+    let mut index: usize = 0
+    let mut visible: usize = 0
+    let mut piece: usize = 0
+    while index < total {
+      let fragment = self.plain.pieceAt(piece)
+      let mut k: usize = 0
+      while k < fragment.chars.length {
+        if !fragment.deleted {
+          let mut active = List<usize>.make()
+          let mut n: usize = 0
+          while n < self.marks.length() {
+            if froms.get(n) <= index + k && index + k < tos.get(n) {
+              run active.append(n)
+            }
+            n = n + 1
+          }
+          let attrs = run self.attrsOf(&active)
+          run appendSpan(&mut spans, visible, 1, move attrs)
+          visible = visible + 1
+        }
+        k = k + 1
+      }
+      index = index + fragment.chars.length
+      piece = piece + 1
+    }
+    return move spans
+  }
+
+  // The attributes the marks in `active` give: on each key, the mark with the highest id.
+  effect fn attrsOf(self: &Self, active: &List<usize>) -> List<Attr>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut winners = List<usize>.make()
+    let mut k: usize = 0
+    while k < active.length() {
+      let m = active.get(k)
+      let mark = self.marks.get(m)
+      let mut found = false
+      let mut w: usize = 0
+      while w < winners.length() {
+        let other = self.marks.get(winners.get(w))
+        if other.key == mark.key {
+          found = true
+          if other.id.before(&mark.id) {
+            winners.set(w, m)
+          }
+          break
+        }
+        w = w + 1
+      }
+      if !found {
+        run winners.append(m)
+      }
+      k = k + 1
+    }
+    let mut attrs = List<Attr>.make()
+    let mut w: usize = 0
+    while w < winners.length() {
+      let mark = self.marks.get(winners.get(w))
+      if !mark.remove {
+        let attr = Attr { key: mark.key, mark: mark.id }
+        let mut at_: usize = attrs.length()
+        while at_ > 0 && attrs.get(at_ - 1).key > attr.key {
+          at_ = at_ - 1
+        }
+        run attrs.insert(at_, attr)
+      }
+      w = w + 1
+    }
+    return move attrs
+  }
+
+  // An anchor as a point among all bytes: the start is 0, just before byte t is 2t + 1, just
+  // after it is 2t + 2, and the end is past every byte.
+  fn pointOf(self: &Self, anchor: Anchor) -> usize {
+    if anchor.char.isNone() {
+      return match anchor.side {
+        Side.Before => 0
+        Side.After => usize.MAX
+      }
+    }
+    let index = self.plain.indexOf(anchor.char)
+    return match anchor.side {
+      Side.Before => 2 * index + 1
+      Side.After => 2 * index + 2
+    }
+  }
+
+  fn rangeOf(self: &Self, offset: usize, length: usize, expand: Expand) -> Range {
+    if length == 0 || offset + length > self.plain.length() {
+      Intrinsic.trap("RichText: a mark range is empty or runs past the end")
+    }
+    let expandStart = match expand {
+      Expand.Start => true
+      Expand.Both => true
+      _ => false
+    }
+    let expandEnd = match expand {
+      Expand.End => true
+      Expand.Both => true
+      _ => false
+    }
+    let mut start = Anchor.before(self.plain.charAt(offset))
+    if expandStart {
+      if offset == 0 {
+        start = Anchor.start()
+      } else {
+        start = Anchor.after(self.plain.charAt(offset - 1))
+      }
+    }
+    let last = offset + length
+    let mut end = Anchor.after(self.plain.charAt(last - 1))
+    if expandEnd {
+      if last == self.plain.length() {
+        end = Anchor.end()
+      } else {
+        end = Anchor.before(self.plain.charAt(last))
+      }
+    }
+    return Range { start: start, end: end }
+  }
+}
+
+fn clamp(value: usize, limit: usize) -> usize {
+  if value > limit {
+    return limit
+  }
+  return value
+}
+
+// The indexes of `values` in the order of their values, ties in index order (a merge sort).
+effect fn orderBy(values: &List<usize>) -> List<usize>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let count = values.length()
+  let mut order = List<usize>.make()
+  let mut spare = List<usize>.make()
+  let mut k: usize = 0
+  while k < count {
+    run order.append(k)
+    run spare.append(k)
+    k = k + 1
+  }
+  let mut width: usize = 1
+  while width < count {
+    let mut low: usize = 0
+    while low < count {
+      let middle = clamp(low + width, count)
+      let high = clamp(low + 2 * width, count)
+      let mut left = low
+      let mut right = middle
+      let mut out = low
+      while out < high {
+        if left < middle
+          && (right >= high || values.get(order.get(left)) <= values.get(order.get(right))) {
+          spare.set(out, order.get(left))
+          left = left + 1
+        } else {
+          spare.set(out, order.get(right))
+          right = right + 1
+        }
+        out = out + 1
+      }
+      low = high
+    }
+    let mut copy: usize = 0
+    while copy < count {
+      order.set(copy, spare.get(copy))
+      copy = copy + 1
+    }
+    width = width * 2
+  }
+  return move order
+}
+
+fn sameAttrs(left: &List<Attr>, right: &List<Attr>) -> bool {
+  if left.length() != right.length() {
+    return false
+  }
+  let mut k: usize = 0
+  while k < left.length() {
+    let a = left.get(k)
+    let b = right.get(k)
+    if a.key != b.key || !a.mark.same(&b.mark) {
+      return false
+    }
+    k = k + 1
+  }
+  return true
+}
+
+// Appends a span, merging it into the last one when their attributes match.
+effect fn appendSpan(spans: &mut List<Span>, start: usize, length: usize, attrs: List<Attr>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let count = spans.length()
+  if count > 0 {
+    let last = &mut spans.asMutSlice()[count - 1]
+    if sameAttrs(&last.attrs, &attrs) {
+      last.length = last.length + length
+      return ()
+    }
+  }
+  run spans.append(Span { start: start, length: length, attrs: move attrs })
+}
+
+/// Appends an anchor to `out`.
+pub effect fn encodeAnchor(anchor: Anchor, out: &mut Writer) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run encodeChar(anchor.char, &mut out)
+  let after = match anchor.side {
+    Side.Before => false
+    Side.After => true
+  }
+  run out.flag(after)
+}
+
+/// Reads an anchor written by [`encodeAnchor`].
+pub effect fn decodeAnchor(input: &mut Reader<'_>) -> Anchor
+  ! DecodeError {
+  let char = run decodeChar(&mut input)
+  let after = run input.flag()
+  if after {
+    return Anchor.after(char)
+  }
+  return Anchor.before(char)
+}
+
+fn u32ToU64(value: u32) -> u64 {
+  return u32.toU64(value)
+}
+
+fn u64ToU32(value: u64) -> u32 {
+  return u64.toU32(value)
+}

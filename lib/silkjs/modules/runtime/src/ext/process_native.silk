@@ -1,0 +1,579 @@
+//! Children (started by ext/spawn_sync, their exits watched on the runtime's reactor), synchronous
+//! children without an event loop (ext/spawn_sync), IPC descriptors polled on the reactor, and
+//! signals: one `silk.system.signal_watch` on the reactor, and SIGINT through ext/vm_interrupt's
+//! broker. No handle is libuv's (the loop plan, step 7, in docs/composable-runtime.md).
+//! Stdio ownership transfers to JS only after spawn succeeds. Teardown never kills children.
+//! Host operations:
+//! spawn/spawnSync(file, argvNul, envNul or null for the thread's process.env, cwd or null for this one's, fds, flags, uid, gid, callback/input, timeout, maxBuffer, killSignal).
+//! Async returns [id,pid,...ownedParentFds], or a negative uv error; exit callback(code,signal).
+//! Sync returns [uvError,pid,exitCode,signal,...capturedArrayBuffers], or a negative spawn error.
+//! fds use -1 for socketpair pipes, -2 for ignore, and nonnegative inherited descriptors.
+//! kill(id,signal), ref(id), unref(id); signalStart(signal,callback)->id, signalStop(id).
+//! ipcOpen(fd,callback)->id takes ownership on success; callback(events,fd), events use UV_READABLE/WRITABLE.
+//! ipcRead(fd)->[ArrayBuffer,receivedFd] or negative uv error; ipcWrite(fd,buffer,offset,length,sendFd)->bytes/error.
+//! ipcEvents(id,events), ipcClose(id), closeFd(fd), errorName(status). IPC sendFd is borrowed.
+import ext.system_errors as systemErrors
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silkjs.js_owned_value { Value,  lendFor }
+import silkjs.js_realm { lendRealm }
+import silk.mem.pointer { Pointer }
+import silk.mem.layout { Layout }
+import silk.collections.list { List }
+import silk.core.effect { Effect }
+import silk.core.result { Result }
+import silk.core.option { Option }
+import silk.concurrency.sync { Arc }
+import silk.num.i32
+import silk.num.i64
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+import silk.num.isize
+import silk.num.f64
+import silkjs.js_engine { Engine }
+import silkjs.js_engine_host { EngineServices }
+import silkjs.js_heap { HeapHeader }
+import silkjs.js_value { ValueBits }
+import silkjs.js_core_types { NativeErrorKind }
+import silkjs.js_exceptions { JsException }
+import silkjs.js_coercion_host { CoercionHooks }
+import libs.core.owners { Scope }
+import libs.core.owners as owners
+import silkjs.js_std_support as host
+import libs.core.common as common
+import silkjs.js_promise as promise
+import silkjs.js_buffer_storage as buffers
+import silkjs.js_libc_platform as platform
+import ext.os_abi as mem
+import ext.process_abi as abi
+import ext.fs_native { equal }
+import ext.vm_interrupt { Observer, Service }
+import ext.vm_interrupt
+import ext.worker_native
+import ext.sigint_trace
+import silkjs.js_runtime as runtime
+import ext.spawn_sync
+import ext.fs_async
+import silk.io.reactor { Interest, ReadyEvent }
+import silk.system.signal_watch { SignalError, SignalWatch }
+import silk.system.subprocess { ExitStatus, ExitWatch, SubprocessError }
+@foreign(noCapture: .("status"))
+unsafe extern "C" fn waitpid(pid:i32,status:*mut i32,options:i32)->i32
+unsafe extern "C" fn kill(pid:i32,signal:i32)->i32
+unsafe extern "C" fn raise(signal:i32)->i32
+unsafe extern "C" fn fcntl(fd:i32,command:i32,...)->i32
+// `watch` holds the signals that process.on listeners (signal handles) and the inspector's SIGUSR1
+// activation take, as a reactor descriptor (signalfd or kqueue), opened at the first; `watchers`
+// counts the open signal handles of each signal number. `debugCallback` is the activation,
+// retained, which a SIGUSR1 listener pauses; `debugFired` says the last wait took a SIGUSR1 for it.
+pub struct State { io:*mut fs_async.State, first:?*mut Handle, next:i32, polling:bool, closing:bool, workers:*mut worker_native.State, watchdog:Option<Arc<Service>>, trace:?*mut Handle, watch:Option<SignalWatch>, watchers:[u32;65], debugCallback:ValueBits, debugPaused:bool, debugFired:bool, sequence:u64 }
+// The reactor token of the signal watch's descriptor; tokens below fs_async.DESCRIPTOR_TOKENS are fixed.
+const SIGNAL_TOKEN:u64=2
+// The reactor tokens of the handles' descriptors (a child's exit watch, an IPC descriptor): this
+// base plus the handle id. Below fs_async.NET_TOKENS, above DNS's descriptor tokens.
+const HANDLE_TOKENS:u64=2305843009213693952
+// Handle kinds, as libuv's: a child (10) and an IPC descriptor (8) on the reactor, a signal (16) in
+// the signal watch or, for SIGINT, an observer of the broker, as is the trace observer (17).
+const CHILD:i32=10
+const IPC:i32=8
+const SIGNAL:i32=16
+const TRACE:i32=17
+// `fd` is the descriptor a child or IPC handle has in the reactor (-1 when none), `referenced` its
+// ref state (as a libuv handle's), `exit` a child's exit watch, `pid` its process. A SIGINT handle
+// and the trace observer are the broker's `observer`, whose wake is the loop's waker. `sequence`
+// orders the handles with events by their arrival (0 for none), as libuv runs their callbacks.
+struct Handle { sequence:u64, next:?*mut Handle, callback:ValueBits, id:i32, kind:i32, pending:i32, code:i64, signal:i32, closed:bool, delivered:bool, closing:bool, observer:Observer, fd:i32, referenced:bool, holding:bool, exit:Option<ExitWatch>, pid:i32 }
+unsafe fn nn<T>(p:?*mut T)->*mut T { return unsafe Intrinsic.pointerRequalify<?*mut T,*mut T>(p) }
+unsafe fn bytes<T>(p:*mut T)->*mut u8 { return unsafe Intrinsic.pointerReinterpret<*mut T,*mut u8>(p) }
+fn undefined(v:ValueBits)->bool { return match v { ValueBits.Undefined=>true _=>false } }
+fn number(v:ValueBits)->i32 { if v.isNumber() { return f64.toI32(v.numericValue()) } return 0 }
+pub effect fn make(io:*mut fs_async.State,workers:*mut worker_native.State)->*mut State !OutOfMemoryError { let raw=unsafe mem.calloc(1,Layout.of<State>().bytes) if Pointer.isNull<u8>(raw) { fail OutOfMemoryError {} } let p=unsafe Intrinsic.pointerReinterpret<*mut u8,*mut State>(unsafe nn(raw)) unsafe Pointer.put<State>(p,State { io:io,first:Pointer.null<Handle>(),next:1,polling:false,closing:false,workers:workers,watchdog:Option<Arc<Service>>.none(),trace:Pointer.null<Handle>(),watch:Option<SignalWatch>.none(),watchers:[0;65],debugCallback:ValueBits.Undefined,debugPaused:false,debugFired:false,sequence:0 }) return p }
+unsafe effect fn create(state:*mut State,kind:i32,callback:ValueBits)->*mut Handle !OutOfMemoryError {
+  let allocation=unsafe mem.calloc(1,Layout.of<Handle>().bytes) if Pointer.isNull<u8>(allocation) { fail OutOfMemoryError {} }
+  let raw=unsafe nn(allocation)
+  let p=unsafe Intrinsic.pointerReinterpret<*mut u8,*mut Handle>(raw) let mut a=() let s=unsafe Pointer.borrowMut<(),State>(&mut a,state) let id=s.next s.next=id+1
+  let wake=unsafe fs_async.wakerAddress(s.io)
+  unsafe Pointer.put<Handle>(p,Handle { sequence:0,next:s.first,callback:unsafe callback.retained(),id:id,kind:kind,pending:0,code:0,signal:0,closed:false,delivered:false,closing:false,observer:Observer.make(wake),fd:-1,referenced:true,holding:false,exit:Option<ExitWatch>.none(),pid:0 }) s.first=p
+  return p
+}
+// The next arrival number.
+unsafe fn stamp(state:*mut State)->u64 { let mut a=() let s=unsafe Pointer.borrowMut<(),State>(&mut a,state) s.sequence=s.sequence+1 return s.sequence }
+unsafe fn lookup(state:*mut State,id:i32)->?*mut Handle { let a=() let s=unsafe Pointer.borrow<(),State>(&a,state) let mut p=s.first drop s while !Pointer.isNull<Handle>(p) { let h=unsafe Pointer.borrow<(),Handle>(&a,unsafe nn(p)) if h.id==id { return p } p=h.next } return Pointer.null<Handle>() }
+unsafe effect fn vector(text:&List<u8>)->List<?*const u8> !OutOfMemoryError ?&mut Allocator { let mut result=List<?*const u8>.make() let data=text.asSlice() let mut i:usize=0 while i+1<data.length { run result.append(Pointer.fromRef<u8>(&data[i])) while i<data.length && data[i]!=0 { i=i+1 } i=i+1 } run result.append(Pointer.null<u8>()) return move result }
+unsafe effect fn push<'m,S:EngineServices>(engine:&mut Engine<'m,S>,context:*mut HeapHeader,array:ValueBits,index:u32,value:ValueBits)->() !JsException ?&mut Allocator { run unsafe common.defineIndex(&mut engine,context,array,index,value) }
+unsafe effect fn packed<'m,S:EngineServices>(engine:&mut Engine<'m,S>,context:*mut HeapHeader,value:ValueBits)->List<u8> !OutOfMemoryError|JsException ?&mut Allocator { let mut text=run host.text(&mut engine,unsafe lendRealm(&context, context),unsafe lendFor(value)) run text.append(0) return move text }
+// null stands for the thread's own process.env, read natively instead of key by key in JavaScript.
+unsafe effect fn environmentText<'m,S:EngineServices>(engine:&mut Engine<'m,S>,context:*mut HeapHeader,state:*mut State,value:ValueBits)->List<u8> !OutOfMemoryError|JsException ?&mut Allocator {
+  match value { ValueBits.Null=>{} _=>{ return run unsafe packed(&mut engine,context,value) } }
+  let a=() let s=unsafe Pointer.borrow<(),State>(&a,state) let workers=s.workers drop s
+  let mut text=List<u8>.make() run unsafe worker_native.environmentEntries(workers,&mut text) return move text
+}
+// child_process.spawn: ext/spawn_sync starts the child (PATH search, posix_spawn, a fork for a user
+// or group change, a new session when detached), and its exit descriptor (a pidfd on Linux, a
+// kqueue on Darwin) joins the runtime's reactor, as libuv's process handle does with SIGCHLD.
+unsafe effect fn spawn<'m,S:EngineServices>(engine:&mut Engine<'m,S>,context:*mut HeapHeader,state:*mut State,args:&Scope,result:ValueBits)->ValueBits !OutOfMemoryError|JsException ?&mut Allocator {
+  let file=run host.text(&mut engine,unsafe lendRealm(&context, context),unsafe lendFor(args.values[0]))
+  let arguments=run unsafe packed(&mut engine,context,args.values[1])
+  let environment=run unsafe environmentText(&mut engine,context,state,args.values[2])
+  let mut directory=List<u8>.make()
+  match args.values[3] { ValueBits.Null=>{} _=>{ directory=run host.text(&mut engine,unsafe lendRealm(&context, context),unsafe lendFor(args.values[3])) if directory.length()==0 { return ValueBits.Int { value:-2 } } } }
+  let countValue=run unsafe common.get(&mut engine,context,args.values[4],b"length") let count=number(countValue) unsafe owners.release(&mut engine,context,countValue)
+  let mut slots=List<i32>.make()
+  let mut i:i32=0 while i<count { let descriptor=run unsafe owners.getIndex(&mut engine,context,args.values[4],i32.toU32(i)) run slots.append(number(descriptor)) unsafe owners.release(&mut engine,context,descriptor) i=i+1 }
+  let flags=number(args.values[5])
+  let request=spawn_sync.Request { file:move file,arguments:move arguments,environment:move environment,directory:move directory,slots:move slots,
+    detached:(flags&8)!=0,hasUser:(flags&1)!=0,user:f64.toU32(args.values[6].numericValue()),hasGroup:(flags&2)!=0,group:f64.toU32(args.values[7].numericValue()),
+    input:List<u8>.make(),timeout:0.0,maximum:0.0,killSignal:0 }
+  let mut parents=List<i32>.make()
+  let pid=run unsafe spawn_sync.launch(&request,&mut parents)
+  if pid<0 { return ValueBits.Int { value:pid } }
+  let watched=run Effect.result(ExitWatch.open(pid))
+  let watch=match move watched {
+    Result<ExitWatch,SubprocessError>.Success { value }=>move value
+    Result<ExitWatch,SubprocessError>.Failure { error }=>{
+      // No exit descriptor (a kernel without pidfds): the child cannot be watched, so it ends now.
+      let _killed=unsafe kill(pid,9) let mut status:i32=0 let _reaped=unsafe waitpid(pid,Pointer.fromMutRef<i32>(&mut status),0)
+      let fds=parents.asSlice() let mut k:usize=0 while k<fds.length { if fds[k]>=0 { let _closed=unsafe abi.close(fds[k]) } k=k+1 }
+      return ValueBits.Int { value:0-error.code }
+    }
+  }
+  let hptr=run unsafe create(state,CHILD,args.values[8])
+  let mut a=() let s=unsafe Pointer.borrow<(),State>(&a,state) let io=s.io drop s
+  let h=unsafe Pointer.borrowMut<(),Handle>(&mut a,hptr) let id=h.id let fd=watch.descriptor() h.pid=pid h.fd=fd h.exit=Option<ExitWatch>.some(move watch) drop h
+  let registered=unsafe fs_async.watchDescriptor(io,fd,HANDLE_TOKENS+i32.toU64(id),Interest.readOnly())
+  if registered!=0 { Intrinsic.trap("a child's exit descriptor cannot join the runtime reactor") }
+  unsafe holdFor(state,hptr)
+  run unsafe push(&mut engine,context,result,0,ValueBits.Int { value:id }) run unsafe push(&mut engine,context,result,1,ValueBits.Int { value:pid })
+  let fds=parents.asSlice()
+  i=0 while i<count { run unsafe push(&mut engine,context,result,i32.toU32(i+2),ValueBits.Int { value:fds[i32.toUsize(i)] }) i=i+1 }
+  return unsafe result.retained()
+}
+// A referenced child or IPC handle keeps the loop's reactor waiting, as a referenced libuv handle
+// kept libuv's loop alive: it holds fs_async's loop while it is referenced and open.
+unsafe fn holdFor(state:*mut State,p:*mut Handle)->() {
+  let mut a=() let s=unsafe Pointer.borrow<(),State>(&a,state) let io=s.io drop s
+  let h=unsafe Pointer.borrowMut<(),Handle>(&mut a,p)
+  let want=h.referenced && !h.closing
+  if want==h.holding { return () }
+  h.holding=want drop h
+  if want { unsafe fs_async.hold(io) } else { unsafe fs_async.unhold(io) }
+}
+// The events a ready IPC descriptor has, as libuv's poll reports them: UV_READABLE 1, UV_WRITABLE 2.
+fn pollEvents(event:&ReadyEvent)->i64 {
+  let mut events:i64=0
+  if event.readable || event.hangup || event.error { events=events|1 }
+  if event.writable { events=events|2 }
+  return events
+}
+fn interestOf(events:i32)->Interest { return Interest { readable:(events&1)!=0, writable:(events&2)!=0 } }
+// Takes the reactor's events for the children and IPC descriptors: a child that ended is
+// collected (its exit reported once, as libuv's exit callback is), an IPC descriptor's events
+// wait for JavaScript.
+unsafe effect fn collectReady(state:*mut State)->() ?&mut Allocator {
+  let mut a=() let s=unsafe Pointer.borrow<(),State>(&a,state) let io=s.io drop s
+  let count=unsafe fs_async.readyCount(io) let mut index:usize=0
+  while index<count {
+    let event=unsafe fs_async.readyAt(io,index) index=index+1
+    if event.token==SIGNAL_TOKEN { unsafe takeSignals(state) continue }
+    if event.token<HANDLE_TOKENS || event.token>=fs_async.NET_TOKENS { continue }
+    let p=unsafe lookup(state,u64.toI32(event.token-HANDLE_TOKENS)) if Pointer.isNull<Handle>(p) { continue }
+    let h=unsafe Pointer.borrowMut<(),Handle>(&mut a,unsafe nn(p))
+    if h.closing || h.closed { continue }
+    if h.kind==IPC { h.code=pollEvents(&event) h.pending=1 if h.sequence==0 { h.sequence=unsafe stamp(state) } continue }
+    if h.kind!=CHILD { continue }
+    let fd=h.fd h.fd=-1
+    unsafe fs_async.forgetDescriptor(io,fd)
+    h.code=0 h.signal=0
+    if let Option<ExitWatch>.Some { value }=&h.exit {
+      let collected=run Effect.result(value.collect())
+      // libuv's exit callback: the exit code, or 0 and the signal that ended the child.
+      if let Result<ExitStatus,SubprocessError>.Success { value:status }=move collected { if status.signaled { h.signal=status.signal } else { h.code=i32.toI64(status.code) } }
+    }
+    h.exit=Option<ExitWatch>.none()
+    h.pending=1 h.closing=true h.closed=true if h.sequence==0 { h.sequence=unsafe stamp(state) } drop h
+    unsafe holdFor(state,unsafe nn(p))
+  }
+  // The SIGINTs the broker counted, after the signals of the watch: a process that signals itself
+  // flushes the broker after kill, so they arrived last.
+  let first=unsafe Pointer.borrow<(),State>(&a,state) let mut observed=first.first drop first
+  while !Pointer.isNull<Handle>(observed) {
+    let h=unsafe Pointer.borrow<(),Handle>(&a,unsafe nn(observed)) let next=h.next let kind=h.kind drop h
+    if kind==SIGNAL || kind==TRACE { unsafe takeObserved(state,unsafe nn(observed)) }
+    observed=next
+  }
+}
+// Reads the signals that arrived from the watch: each open handle of one counts it, as libuv's
+// signal handle did, and a SIGUSR1 for the inspector's activation is noted for its drain.
+unsafe fn takeSignals(state:*mut State)->() {
+  let mut a=() let s=unsafe Pointer.borrowMut<(),State>(&mut a,state)
+  let mut received:[i32;64]=[0;64] let mut count:usize=0
+  if let Option<SignalWatch>.Some { value:watch }=&mut s.watch {
+    let read=run Effect.result(watch.read(&mut received))
+    if let Result<usize,SignalError>.Success { value }=move read { count=value }
+  }
+  let debug=!undefined(s.debugCallback) && !s.debugPaused
+  let mut p=s.first drop s
+  let mut i:usize=0
+  while i<count {
+    let signal=received[i] i=i+1
+    if signal==SignalWatch.userOne() && debug { let d=unsafe Pointer.borrowMut<(),State>(&mut a,state) d.debugFired=true drop d }
+    let mut cursor=p
+    while !Pointer.isNull<Handle>(cursor) {
+      let h=unsafe Pointer.borrowMut<(),Handle>(&mut a,unsafe nn(cursor))
+      if h.kind==SIGNAL && h.signal==signal && h.signal!=2 && !h.closing { h.pending=h.pending+1 if h.sequence==0 { h.sequence=unsafe stamp(state) } }
+      cursor=h.next drop h
+    }
+  }
+  drop p
+}
+// spawnSync runs without libuv: see ext/spawn_sync.
+unsafe effect fn spawnSync<'m,S:EngineServices>(engine:&mut Engine<'m,S>,context:*mut HeapHeader,state:*mut State,args:&Scope,result:ValueBits)->ValueBits !OutOfMemoryError|JsException ?&mut Allocator {
+  let file=run host.text(&mut engine,unsafe lendRealm(&context, context),unsafe lendFor(args.values[0]))
+  let arguments=run unsafe packed(&mut engine,context,args.values[1])
+  let environment=run unsafe environmentText(&mut engine,context,state,args.values[2])
+  let mut directory=List<u8>.make()
+  match args.values[3] { ValueBits.Null=>{} _=>{ directory=run host.text(&mut engine,unsafe lendRealm(&context, context),unsafe lendFor(args.values[3])) if directory.length()==0 { return ValueBits.Int { value:-2 } } } }
+  let countValue=run unsafe common.get(&mut engine,context,args.values[4],b"length") let count=number(countValue) unsafe owners.release(&mut engine,context,countValue)
+  let mut slots=List<i32>.make()
+  let mut i:i32=0 while i<count { let descriptor=run unsafe owners.getIndex(&mut engine,context,args.values[4],i32.toU32(i)) run slots.append(number(descriptor)) unsafe owners.release(&mut engine,context,descriptor) i=i+1 }
+  let flags=number(args.values[5])
+  let buffer=run buffers.getArrayBuffer(&mut engine,unsafe lendRealm(&context, context),unsafe lendFor(args.values[8]))
+  let mut input=List<u8>.make()
+  if buffer.byteLength>0 { run input.reserveExact(u64.toUsize(buffer.byteLength)) let mut at:u64=0 while at<buffer.byteLength { run input.append(u64.toU8(unsafe buffers.loadScalar(buffer,at,0))) at=at+1 } }
+  let request=spawn_sync.Request { file:move file,arguments:move arguments,environment:move environment,directory:move directory,slots:move slots,
+    detached:(flags&8)!=0,hasUser:(flags&1)!=0,user:f64.toU32(args.values[6].numericValue()),hasGroup:(flags&2)!=0,group:f64.toU32(args.values[7].numericValue()),
+    input:move input,timeout:args.values[9].numericValue(),maximum:args.values[10].numericValue(),killSignal:number(args.values[11]) }
+  let outcome=run unsafe spawn_sync.execute(&request)
+  if outcome.pid<0 { return ValueBits.Int { value:outcome.pid } }
+  run unsafe push(&mut engine,context,result,0,ValueBits.Int { value:outcome.error }) run unsafe push(&mut engine,context,result,1,ValueBits.Int { value:outcome.pid })
+  run unsafe push(&mut engine,context,result,2,ValueBits.number(i32.toF64(outcome.status.code))) run unsafe push(&mut engine,context,result,3,ValueBits.Int { value:outcome.status.signal })
+  let outputs=outcome.outputs.asSlice()
+  let mut slot:usize=0
+  while slot<outputs.length {
+    let output=outputs[slot].asSlice()
+    let mut data:?*const u8=Pointer.null<u8>()
+    if output.length>0 { data=Pointer.fromRef<u8>(&output[0]) }
+    let memory=engine.memory
+    let value=run unsafe buffers.newArrayBufferCopy(&mut engine,memory,unsafe lendRealm(&context, context),data,usize.toU64(output.length))
+    run unsafe push(&mut engine,context,result,usize.toU32(slot+4),value)
+    slot=slot+1
+  }
+  return unsafe result.retained()
+}
+// The process state owns the broker lease. Its borrowed worker state outlives
+// process.close; no cross-isolate JavaScript value enters the native broker.
+unsafe effect fn acquireSignalService(state:*mut State)->i32 !OutOfMemoryError {
+  let mut anchor=() let current=unsafe Pointer.borrow<(),State>(&anchor,state)
+  if let Option<Arc<Service>>.Some { .. }=&current.watchdog { return 0 }
+  let workers=current.workers drop current
+  let acquired=run Effect.result(unsafe worker_native.vmWatchdog(workers))
+  return match move acquired {
+    Result<Arc<Service>,OutOfMemoryError|vm_interrupt.StartError>.Success { value }=>{
+      let current=unsafe Pointer.borrowMut<(),State>(&mut anchor,state)
+      current.watchdog=Option<Arc<Service>>.some(move value)
+      0
+    }
+    Result<Arc<Service>,OutOfMemoryError|vm_interrupt.StartError>.Failure { error }=>match move error {
+      OutOfMemoryError {}=>{ fail OutOfMemoryError {} }
+      vm_interrupt.StartError { code }=>if code<0 { code } else { 0-code }
+    }
+  }
+}
+unsafe fn signalObserver(state:*mut State,pointer:*mut Handle,active:bool)->i32 {
+  let ownerAnchor=() let mut anchor=() let current=unsafe Pointer.borrow<(),State>(&ownerAnchor,state)
+  let watcher=match &current.watchdog {
+    Option<Arc<Service>>.Some { value }=>value.get()
+    _=>{ Intrinsic.trap("SIGINT observer has no service owner") }
+  }
+  let handle=unsafe Pointer.borrowMut<(),Handle>(&mut anchor,pointer)
+  let observer=Pointer.fromMutRef<Observer>(&mut handle.observer)
+  drop handle
+  if active { return unsafe vm_interrupt.observe(watcher,observer) }
+  unsafe vm_interrupt.unobserve(watcher,observer)
+  return 0
+}
+// Takes the SIGINTs the broker counted for an observer since the last poll, as libuv's async
+// callback did: a trace observer notes that one arrived while the loop was idle.
+unsafe fn takeObserved(state:*mut State,pointer:*mut Handle)->() {
+  let mut anchor=() let handle=unsafe Pointer.borrowMut<(),Handle>(&mut anchor,pointer)
+  if handle.closing || !handle.observer.linked { return () }
+  let pending=vm_interrupt.takePending(&mut handle.observer)
+  handle.pending=i32.wrappingAdd(handle.pending,u32.toI32(pending))
+  if pending!=0 && handle.sequence==0 { handle.sequence=unsafe stamp(state) }
+  if handle.kind==TRACE && pending!=0 { handle.code=1 }
+}
+// Opens the signal watch and adds its descriptor to the reactor, at the first signal: 0, or a
+// negative errno.
+unsafe fn openWatch(state:*mut State)->i32 {
+  let mut a=() let s=unsafe Pointer.borrowMut<(),State>(&mut a,state)
+  if s.watch.isSome() { return 0 }
+  let opened=run Effect.result(SignalWatch.open())
+  let watch=match move opened { Result<SignalWatch,SignalError>.Success { value }=>move value Result<SignalWatch,SignalError>.Failure { error }=>{ return signalCode(move error) } }
+  let registered=unsafe fs_async.watchDescriptor(s.io,watch.descriptor(),SIGNAL_TOKEN,Interest.readOnly())
+  if registered!=0 { return -registered }
+  s.watch=Option<SignalWatch>.some(move watch)
+  return 0
+}
+// Puts `signal` in the watch while a handle of it is open, or (SIGUSR1) while the inspector's
+// activation is started and not paused, and takes it out otherwise: 0, or a negative errno.
+unsafe fn settle(state:*mut State,signal:i32)->i32 {
+  let opened=unsafe openWatch(state) if opened!=0 { return opened }
+  let mut a=() let s=unsafe Pointer.borrowMut<(),State>(&mut a,state)
+  let debug=signal==SignalWatch.userOne() && !undefined(s.debugCallback) && !s.debugPaused
+  let wanted=s.watchers[i32.toUsize(signal)]>0 || debug
+  if let Option<SignalWatch>.Some { value:watch }=&mut s.watch {
+    if wanted==watch.contains(signal) { return 0 }
+    let changed=if wanted { run Effect.result(watch.add(signal)) } else { run Effect.result(watch.remove(signal)) }
+    if let Result<(),SignalError>.Failure { error }=move changed { return signalCode(move error) }
+  }
+  return 0
+}
+unsafe fn stopSignal(state:*mut State,pointer:*mut Handle)->i32 {
+  let anchor=() let handle=unsafe Pointer.borrow<(),Handle>(&anchor,pointer)
+  let broker=handle.signal==2 || handle.kind==TRACE let signal=handle.signal drop handle
+  if broker { return unsafe signalObserver(state,pointer,false) }
+  let mut held=() let s=unsafe Pointer.borrowMut<(),State>(&mut held,state)
+  let index=i32.toUsize(signal) if s.watchers[index]>0 { s.watchers[index]=s.watchers[index]-1 } drop s
+  return unsafe settle(state,signal)
+}
+// The trace observer uses the same broker as VM guards and process listeners.
+// Its stable unreferenced async handle persists across enable/disable cycles.
+unsafe effect fn traceEnable(state:*mut State,enable:bool)->i32 !OutOfMemoryError {
+  let mut anchor=() let current=unsafe Pointer.borrow<(),State>(&anchor,state)
+  let mut pointer=current.trace drop current
+  if Pointer.isNull<Handle>(pointer) {
+    if !enable { return 0 }
+    let acquired=run unsafe acquireSignalService(state) if acquired<0 { return acquired }
+    // Unreferenced, as the libuv async handle it replaces was.
+    let created=run unsafe create(state,TRACE,ValueBits.Undefined)
+    let handle=unsafe Pointer.borrowMut<(),Handle>(&mut anchor,created)
+    handle.signal=2 handle.delivered=true handle.referenced=false drop handle
+    let current=unsafe Pointer.borrowMut<(),State>(&mut anchor,state) current.trace=created drop current
+    pointer=created
+  }
+  let handle=unsafe Pointer.borrowMut<(),Handle>(&mut anchor,unsafe nn(pointer))
+  if enable==!handle.delivered { return 0 }
+  handle.pending=0 handle.code=0 drop handle
+  let status=unsafe signalObserver(state,unsafe nn(pointer),enable)
+  if status==0 {
+    let handle=unsafe Pointer.borrowMut<(),Handle>(&mut anchor,unsafe nn(pointer))
+    handle.delivered=!enable
+  }
+  return status
+}
+pub unsafe effect fn traceInterrupt(context:*mut HeapHeader,state:?*mut State,captureStack:bool)->() ?&mut Allocator {
+  if Pointer.isNull<State>(state) { return () }
+  let mut anchor=() let current=unsafe Pointer.borrow<(),State>(&anchor,unsafe nn(state))
+  let pointer=current.trace drop current
+  if Pointer.isNull<Handle>(pointer) { return () }
+  let handle=unsafe Pointer.borrowMut<(),Handle>(&mut anchor,unsafe nn(pointer))
+  if handle.delivered || handle.closing { return () }
+  let pending=vm_interrupt.takePending(&mut handle.observer)
+  if pending==0 && handle.pending==0 { return () }
+  let idle=handle.code!=0
+  handle.pending=0 handle.code=0 handle.delivered=true drop handle
+  // Detaching synchronizes with the broker before restoring/re-raising SIGINT.
+  // This never calls JS, changes an exception, or clears VM termination state.
+  let _stopped=unsafe signalObserver(unsafe nn(state),unsafe nn(pointer),false)
+  run unsafe sigint_trace.print(unsafe runtime.contextRuntime(context),captureStack && !idle)
+  let _raised=unsafe raise(2)
+}
+unsafe effect fn invoke<'m,S:EngineServices>(engine:&mut Engine<'m,S>,context:*mut HeapHeader,state:*mut State,op:&[u8],args:&Scope,result:ValueBits)->ValueBits !OutOfMemoryError|JsException ?&mut Allocator {
+  if equal(op,b"traceSigint") { return ValueBits.Int { value:run unsafe traceEnable(state,match args.values[0] { ValueBits.Bool { value }=>value _=>false }) } }
+  if equal(op,b"spawn") { return run unsafe spawn(&mut engine,context,state,args,result) }
+  if equal(op,b"spawnSync") { return run unsafe spawnSync(&mut engine,context,state,args,result) }
+  if equal(op,b"errorName") { return (run systemErrors.nameValue(&mut engine,unsafe lendRealm(&context, context),number(args.values[0]))).intoBits() }
+  if equal(op,b"closeFd") { return ValueBits.Int { value:unsafe abi.close(number(args.values[0])) } }
+  if equal(op,b"ipcRead") || equal(op,b"ipcWrite") { return run unsafe ipcTransfer(&mut engine,context,op,args,result) }
+  if equal(op,b"ipcOpen") {
+    // The descriptor joins the reactor for reads, as uv_poll_start(UV_READABLE) did.
+    let p=run unsafe create(state,IPC,args.values[1]) let mut a=() let s=unsafe Pointer.borrow<(),State>(&a,state) let io=s.io drop s let h=unsafe Pointer.borrowMut<(),Handle>(&mut a,p) let id=h.id h.signal=number(args.values[0]) let fd=h.signal drop h
+    // Reads end at EAGAIN, so the descriptor is nonblocking, as uv_poll_init makes it.
+    let flags=unsafe fcntl(fd,3) if flags>=0 { let _set=unsafe fcntl(fd,4,flags|abi.nonblockFlag()) }
+    let status=unsafe fs_async.watchDescriptor(io,fd,HANDLE_TOKENS+i32.toU64(id),Interest.readOnly())
+    if status!=0 { let h=unsafe Pointer.borrowMut<(),Handle>(&mut a,p) h.closed=true h.closing=true h.delivered=true return ValueBits.Int { value:0-status } }
+    let opened=unsafe Pointer.borrowMut<(),Handle>(&mut a,p) opened.fd=fd drop opened
+    unsafe holdFor(state,p)
+    return ValueBits.Int { value:id }
+  }
+  if equal(op,b"debugSignalStart") { return ValueBits.Int { value:run unsafe debugSignalStart(state,args.values[0]) } }
+  if equal(op,b"debugSignalPause") { return ValueBits.Int { value:run unsafe debugSignalPause(state,match args.values[0] { ValueBits.Bool { value }=>value _=>false }) } }
+  if equal(op,b"signalFlush") {
+    let anchor=() let current=unsafe Pointer.borrow<(),State>(&anchor,state)
+    if let Option<Arc<Service>>.Some { value }=&current.watchdog { unsafe vm_interrupt.flush(value.get()) }
+    return ValueBits.Undefined
+  }
+  if equal(op,b"signalStart") {
+    let signal=number(args.values[0]) let broker=signal==2
+    if broker { let status=run unsafe acquireSignalService(state) if status<0 { return ValueBits.Int { value:status } } }
+    if signal<1 || signal>64 { return ValueBits.Int { value:-22 } }
+    // Unreferenced until JavaScript refs it, as uv_signal_init leaves a handle inactive.
+    let p=run unsafe create(state,SIGNAL,args.values[1])
+    let mut a=() let h=unsafe Pointer.borrowMut<(),Handle>(&mut a,p) let id=h.id h.signal=signal h.referenced=false drop h
+    if !broker { let s=unsafe Pointer.borrowMut<(),State>(&mut a,state) s.watchers[i32.toUsize(signal)]=s.watchers[i32.toUsize(signal)]+1 drop s }
+    let status=if broker { unsafe signalObserver(state,p,true) } else { unsafe settle(state,signal) }
+    if status<0 {
+      if !broker { let s=unsafe Pointer.borrowMut<(),State>(&mut a,state) s.watchers[i32.toUsize(signal)]=s.watchers[i32.toUsize(signal)]-1 drop s }
+      let h=unsafe Pointer.borrowMut<(),Handle>(&mut a,p) h.closing=true h.delivered=true h.closed=true drop h return ValueBits.Int { value:status }
+    }
+    return ValueBits.Int { value:id }
+  }
+  let p=unsafe lookup(state,number(args.values[0])) if Pointer.isNull<Handle>(p) { return ValueBits.Int { value:-3 } }
+  let mut a=() let h=unsafe Pointer.borrowMut<(),Handle>(&mut a,unsafe nn(p)) let closing=h.closing let kind=h.kind let watched=h.fd let pid=h.pid let id=h.id
+  let st=() let current=unsafe Pointer.borrow<(),State>(&st,state) let io=current.io drop current
+  if equal(op,b"ipcEvents") { drop h if closing || watched<0 { return ValueBits.Undefined } return ValueBits.Int { value:0-unsafe fs_async.modifyDescriptor(io,watched,HANDLE_TOKENS+i32.toU64(id),interestOf(number(args.values[1]))) } }
+  if equal(op,b"ipcClose") { if !closing { h.closing=true h.delivered=true h.pending=0 h.closed=true let fd=h.signal h.fd=-1 drop h if watched>=0 { unsafe fs_async.forgetDescriptor(io,watched) } let _closed=unsafe abi.close(fd) unsafe holdFor(state,unsafe nn(p)) } return ValueBits.Undefined }
+  if equal(op,b"signalStop") { if !closing { h.closing=true h.delivered=true h.pending=0 h.closed=true drop h let _ignored=unsafe stopSignal(state,unsafe nn(p)) unsafe holdFor(state,unsafe nn(p)) } return ValueBits.Undefined }
+  let exitUndelivered=h.pending>0 && !h.delivered
+  drop h
+  // libuv reports a child's exit in the same loop turn that reaps it, so Node never sees a
+  // reaped child it has not been told about; until JS gets the exit here, the child acts as a
+  // zombie, which accepts any signal (Node's kill() then sets killed).
+  // uv_process_kill is kill(2), with libuv's error codes (negated errnos).
+  if equal(op,b"kill") { if closing { return ValueBits.Int { value:if exitUndelivered { 0 } else { -3 } } } if unsafe kill(pid,number(args.values[1]))<0 { return ValueBits.Int { value:0-unsafe platform.errno() } } return ValueBits.Int { value:0 } }
+  if !closing && kind!=TRACE {
+    let referenced=if equal(op,b"ref") { 1 } else if equal(op,b"unref") { 0 } else { -1 }
+    if referenced>=0 { let r=unsafe Pointer.borrowMut<(),Handle>(&mut a,unsafe nn(p)) r.referenced=referenced==1 drop r unsafe holdFor(state,unsafe nn(p)) }
+  }
+  return ValueBits.Undefined
+}
+unsafe effect fn dispatchBody<'m,S:EngineServices>(engine:&mut Engine<'m,S>,context:*mut HeapHeader,state:*mut State,operation:ValueBits,args:ValueBits,scope:&mut Scope)->ValueBits !OutOfMemoryError|JsException ?&mut Allocator {
+  let text=run host.text(&mut engine,unsafe lendRealm(&context, context),unsafe lendFor(operation)) let mut i:u32=0 while i<12 { scope.values[u32.toUsize(i)]=run unsafe owners.getIndex(&mut engine,context,args,i) i=i+1 }
+  let mut result=ValueBits.Undefined
+  if equal(text.asSlice(),b"spawn") || equal(text.asSlice(),b"spawnSync") || equal(text.asSlice(),b"ipcRead") { let memory=engine.memory result=run unsafe common.array(&mut engine,memory,context) }
+  let outcome=run Effect.result(unsafe invoke(&mut engine,context,state,text.asSlice(),&scope.*,result)) unsafe owners.release(&mut engine,context,result)
+  return match move outcome { Result<ValueBits,OutOfMemoryError|JsException>.Success { value }=>value Result<ValueBits,OutOfMemoryError|JsException>.Failure { error }=>{ fail move error } }
+}
+pub unsafe effect fn dispatch<'m,S:EngineServices>(engine:&mut Engine<'m,S>,context:*mut HeapHeader,state:*mut State,operation:ValueBits,args:ValueBits)->ValueBits !OutOfMemoryError|JsException ?&mut Allocator {
+  let mut scope=Scope.make() let outcome=run Effect.result(unsafe dispatchBody(&mut engine,context,state,operation,args,&mut scope)) unsafe owners.cleanup(&mut engine,context,move scope)
+  return match move outcome { Result<ValueBits,OutOfMemoryError|JsException>.Success { value }=>value Result<ValueBits,OutOfMemoryError|JsException>.Failure { error }=>{ fail move error } }
+}
+unsafe fn sweep<'m,S:EngineServices>(engine:&mut Engine<'m,S>,context:*mut HeapHeader,state:*mut State)->() {
+  let mut a=() let s=unsafe Pointer.borrowMut<(),State>(&mut a,state) let mut link=Pointer.fromMutRef<?*mut Handle>(&mut s.first) drop s
+  while !Pointer.isNull<Handle>(unsafe Pointer.read<?*mut Handle>(link)) { let p=unsafe nn(unsafe Pointer.read<?*mut Handle>(link)) let h=unsafe Pointer.borrowMut<(),Handle>(&mut a,p)
+    if h.closed && h.delivered { unsafe Pointer.put<?*mut Handle>(link,h.next) let callback=h.callback drop h unsafe owners.release(&mut engine,context,callback) unsafe mem.free(unsafe bytes(p)) }
+    else { link=Pointer.fromMutRef<?*mut Handle>(&mut h.next) drop h }
+  }
+}
+fn signalCode(error:SignalError)->i32 { return -error.code }
+// Watches SIGUSR1 for callback with one signalfd (Linux) or kqueue (Darwin) in the loop's reactor.
+// Returns 0, or a negative errno.
+unsafe effect fn debugSignalStart(state:*mut State,callback:ValueBits)->i32 !OutOfMemoryError {
+  let mut a=() let s=unsafe Pointer.borrowMut<(),State>(&mut a,state)
+  if !undefined(s.debugCallback) { return -16 }
+  s.debugCallback=unsafe callback.retained() drop s
+  let status=unsafe settle(state,SignalWatch.userOne())
+  return status
+}
+// A process.on('SIGUSR1') listener takes the signal from the activation: the watch keeps it for
+// the listener's handle while paused, and for the activation after.
+unsafe effect fn debugSignalPause(state:*mut State,paused:bool)->i32 !OutOfMemoryError {
+  let mut a=() let s=unsafe Pointer.borrowMut<(),State>(&mut a,state)
+  if s.debugPaused==paused { return 0 }
+  s.debugPaused=paused drop s
+  return unsafe settle(state,SignalWatch.userOne())
+}
+// Calls the activation callback when the last reactor wait found SIGUSR1 for it.
+unsafe effect fn debugSignalDrain<'m,S:EngineServices>(engine:&mut Engine<'m,S>,context:*mut HeapHeader,state:*mut State)->bool !OutOfMemoryError|JsException ?&mut Allocator {
+  let mut a=() let s=unsafe Pointer.borrowMut<(),State>(&mut a,state)
+  if !s.debugFired { return false }
+  s.debugFired=false
+  if undefined(s.debugCallback) { return false }
+  let callback=unsafe s.debugCallback.retained() drop s
+  let outcome=run Effect.result(promise.call(&mut engine,unsafe lendRealm(&context, context),unsafe lendFor(callback),unsafe lendFor(ValueBits.Undefined),&[]))
+  unsafe owners.release(&mut engine,context,callback)
+  match move outcome { Result<Value,JsException>.Success { value }=>{ unsafe owners.release(&mut engine,context,value.intoBits()) } Result<Value,JsException>.Failure { error }=>{ fail move error } }
+  return true
+}
+unsafe effect fn drain<'m,S:EngineServices>(engine:&mut Engine<'m,S>,context:*mut HeapHeader,state:*mut State)->bool !OutOfMemoryError|JsException ?&mut Allocator {
+  run unsafe traceInterrupt(context,state,false)
+  let mut ran=false let mut a=() let s=unsafe Pointer.borrow<(),State>(&a,state) let limit=s.sequence drop s
+  // One callback for each handle's earliest event, in the order the events arrived, as libuv runs
+  // them; a handle with more waits for a later turn.
+  while true {
+    let s=unsafe Pointer.borrow<(),State>(&a,state) let mut p=s.first drop s
+    let mut best=Pointer.null<Handle>() let mut bestSequence:u64=0
+    while !Pointer.isNull<Handle>(p) {
+      let h=unsafe Pointer.borrow<(),Handle>(&a,unsafe nn(p))
+      if h.pending>0 && !h.delivered && h.sequence<=limit && (Pointer.isNull<Handle>(best) || h.sequence<bestSequence) { best=p bestSequence=h.sequence }
+      p=h.next
+    }
+    if Pointer.isNull<Handle>(best) { break }
+    let h=unsafe Pointer.borrowMut<(),Handle>(&mut a,unsafe nn(best))
+    h.pending=h.pending-1 let kind=h.kind let code=h.code let signal=h.signal let callback=unsafe h.callback.retained() if kind==CHILD { h.delivered=true }
+    h.sequence=if h.pending>0 { unsafe stamp(state) } else { 0 }
+    drop h
+    let outcome=run Effect.result(promise.call(&mut engine,unsafe lendRealm(&context, context),unsafe lendFor(callback),unsafe lendFor(ValueBits.Undefined),&[ValueBits.number(i64.toF64(code)),ValueBits.Int { value:signal }])) unsafe owners.release(&mut engine,context,callback)
+    match move outcome { Result<Value,JsException>.Success { value }=>{ unsafe owners.release(&mut engine,context,value.intoBits()) } Result<Value,JsException>.Failure { error }=>{ fail move error } } ran=true
+  }
+  return ran
+}
+pub unsafe effect fn poll<'m,S:EngineServices>(engine:&mut Engine<'m,S>,context:*mut HeapHeader,state:*mut State)->bool !OutOfMemoryError|JsException ?&mut Allocator {
+  let mut a=() let s=unsafe Pointer.borrowMut<(),State>(&mut a,state) if s.polling || s.closing { return false } s.polling=true drop s
+  run unsafe collectReady(state)
+  let signalled=run Effect.result(unsafe debugSignalDrain(&mut engine,context,state))
+  if let Result<bool,OutOfMemoryError|JsException>.Failure { error }=move signalled { let failed=unsafe Pointer.borrowMut<(),State>(&mut a,state) failed.polling=false drop failed fail move error }
+  let outcome=run Effect.result(unsafe drain(&mut engine,context,state)) let finished=unsafe Pointer.borrowMut<(),State>(&mut a,state) finished.polling=false drop finished unsafe sweep(&mut engine,context,state)
+  return match move outcome { Result<bool,OutOfMemoryError|JsException>.Success { value }=>value Result<bool,OutOfMemoryError|JsException>.Failure { error }=>{ fail move error } }
+}
+pub unsafe fn hasPending(state:*mut State)->bool { let a=() let s=unsafe Pointer.borrow<(),State>(&a,state) let mut p=s.first drop s while !Pointer.isNull<Handle>(p) { let h=unsafe Pointer.borrow<(),Handle>(&a,unsafe nn(p)) if (!h.closing && h.kind!=TRACE && h.referenced) || (h.pending>0 && !h.delivered) { return true } p=h.next } return false }
+pub unsafe fn close<'m,S:EngineServices>(engine:&mut Engine<'m,S>,context:*mut HeapHeader,state:*mut State)->() {
+  let mut a=() let s=unsafe Pointer.borrowMut<(),State>(&mut a,state) s.closing=true let mut p=s.first drop s
+  while !Pointer.isNull<Handle>(p) { let h=unsafe Pointer.borrowMut<(),Handle>(&mut a,unsafe nn(p)) let next=h.next h.delivered=true h.pending=0 if !h.closing { h.closing=true h.closed=true let kind=h.kind let fd=h.signal let watched=h.fd h.fd=-1 drop h
+      // A child or IPC handle leaves the reactor at once; teardown never kills a child. Its exit
+      // watch owns the descriptor, so it closes only after the descriptor left the reactor.
+      if kind==CHILD || kind==IPC { let held=() let owner=unsafe Pointer.borrow<(),State>(&held,state) let io=owner.io drop owner if watched>=0 { unsafe fs_async.forgetDescriptor(io,watched) } if kind==IPC { let _closed=unsafe abi.close(fd) }
+        let left=unsafe Pointer.borrowMut<(),Handle>(&mut a,unsafe nn(p)) left.exit=Option<ExitWatch>.none() drop left }
+      else if kind==SIGNAL || kind==TRACE { let _ignored=unsafe stopSignal(state,unsafe nn(p)) }
+      unsafe holdFor(state,unsafe nn(p)) } else { drop h } p=next }
+  unsafe sweep(&mut engine,context,state)
+  let s2=unsafe Pointer.borrowMut<(),State>(&mut a,state)
+  if let Option<SignalWatch>.Some { value:watch }=&s2.watch { unsafe fs_async.forgetDescriptor(s2.io,watch.descriptor()) }
+  let callback=Intrinsic.replace(s2.debugCallback,ValueBits.Undefined) drop s2
+  unsafe owners.release(&mut engine,context,callback)
+  let owned=unsafe Pointer.take<State>(state) drop owned
+  unsafe mem.free(unsafe bytes(state))
+}
+unsafe effect fn ipcTransfer<'m,S:EngineServices>(engine:&mut Engine<'m,S>,context:*mut HeapHeader,op:&[u8],args:&Scope,result:ValueBits)->ValueBits !OutOfMemoryError|JsException ?&mut Allocator {
+  let fd=number(args.values[0]) let writing=equal(op,b"ipcWrite") let mut slab:[u8;65536]=[0;65536] let mut staging=List<u8>.make()
+  let mut data=Pointer.fromMutRef<u8>(&mut slab[0]) let mut length:usize=65536
+  if writing {
+    let backing=run buffers.getArrayBuffer(&mut engine,unsafe lendRealm(&context, context),unsafe lendFor(args.values[1])) let mut offset:u64=0 let mut count:u64=0
+    if args.values[2].isNumber() { offset=i64.toU64(f64.toI64(args.values[2].numericValue())) }
+    if args.values[3].isNumber() { count=i64.toU64(f64.toI64(args.values[3].numericValue())) }
+    if offset>backing.byteLength || count>backing.byteLength-offset { return run engine.throwError(unsafe lendRealm(&context, context),NativeErrorKind.Range,b"IPC buffer range is out of bounds") }
+    length=u64.toUsize(count) if length>0 { data=unsafe buffers.dataAt(backing.data,offset) }
+    if backing.physicalCapacity!=0 { let mut i:u64=0 run staging.reserveExact(length) while i<count { run staging.append(u64.toU8(unsafe buffers.loadScalar(backing,offset+i,0))) i=i+1 } if length>0 { data=Pointer.fromMutRef<u8>(&mut staging.asMutSlice()[0]) } }
+  }
+  let mut vector=abi.Iovec { base:data,length:length } let mut control=abi.Control { length:0,level:abi.socketLevel(),kind:1,fd:-1 }
+  static if Intrinsic.targetOperatingSystem()=="darwin" { control.length=usize.toU32(abi.controlLength()) } else { control.length=abi.controlLength() }
+  let mut message=abi.Message { name:Pointer.null<u8>(),nameLength:0,vectors:Pointer.fromMutRef<abi.Iovec>(&mut vector),vectorCount:1,control:unsafe bytes(Pointer.fromMutRef<abi.Control>(&mut control)),controlLength:0,flags:0 }
+  static if Intrinsic.targetOperatingSystem()=="darwin" { message.controlLength=usize.toU32(Layout.of<abi.Control>().bytes) } else { message.controlLength=Layout.of<abi.Control>().bytes }
+  let mut n:isize=0
+  if writing { control.fd=number(args.values[4]) if control.fd<0 { message.control=Pointer.null<u8>() message.controlLength=0 } n=unsafe abi.sendmsg(fd,Pointer.fromRef<abi.Message>(&message),abi.noSignal()) }
+  else { n=unsafe abi.recvmsg(fd,Pointer.fromMutRef<abi.Message>(&mut message),0) }
+  if n<0 { return ValueBits.Int { value:0-unsafe platform.errno() } }
+  if writing { return ValueBits.number(isize.toF64(n)) }
+  let mut received:i32=-1 if message.controlLength>=16 && control.level==abi.socketLevel() && control.kind==1 { received=control.fd let _ignored=unsafe fcntl(received,2,1) }
+  let memory=engine.memory let buffer=run unsafe buffers.newArrayBufferCopy(&mut engine,memory,unsafe lendRealm(&context, context),data,isize.toU64(n))
+  run unsafe push(&mut engine,context,result,0,buffer) run unsafe push(&mut engine,context,result,1,ValueBits.Int { value:received }) return unsafe result.retained()
+}
+
+/// The handles still open, which a startup snapshot cannot keep: their ids name entries of
+/// this process's state, and a start from the snapshot has a state of its own.
+pub unsafe fn openHandles(state: *mut State) -> usize {
+  let mut anchor = () let s = unsafe Pointer.borrowMut<(), State>(&mut anchor, state)
+  let mut cursor = s.first drop s
+  let mut count: usize = 0
+  while !Pointer.isNull<Handle>(cursor) {
+    let mut held = () let h = unsafe Pointer.borrowMut<(), Handle>(&mut held, unsafe Intrinsic.pointerRequalify<?*mut Handle, *mut Handle>(cursor))
+    if !h.closed && !h.closing { count = count + 1 }
+    cursor = h.next drop h
+  }
+  return count
+}
+
+// Generated by tools/keep_exports.py; do not edit below.
+/// Takes each C export as a value, so that Silk emits it (see tools/keep_exports.py).
+pub fn keepExports() -> () {
+}

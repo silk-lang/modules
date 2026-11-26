@@ -1,0 +1,407 @@
+//! IntersectionObserver and ResizeObserver over UiTree's last layout, for hosts that run
+//! scripts (ui-js) and any other caller. `update` runs once per frame after layout: it costs
+//! one geometry read per observation and reports only the observations whose state crossed
+//! a threshold or whose size changed, so scrolling past observed nodes costs nothing in the
+//! script until one of them crosses.
+//! Limits: the containing block chain is the parent chain (a fixed box inside a scroller is
+//! still clipped by it), and a resize reported by `update` is laid out in the next frame.
+import engine { UiTree }
+import node { NONE, NO_INDEX }
+import mutation { NodeKind, Overflow }
+import paint { paddingBox }
+import scrollbar { scrolls, usedOverflow }
+import cssom_view
+import layout.lib { WritingMode }
+import silk.collections.list { List }
+import silk.core.ownership { Copy }
+import silk.geometry.rect { Rect }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f32
+import silk.num.f64
+import silk.num.u32
+import silk.num.usize
+
+/// A `rootMargin` or `scrollMargin`: top, right, bottom, left, each in pixels or (its bit in
+/// `percent`: 1 top, 2 right, 4 bottom, 8 left) in percent of the box it grows.
+pub struct Margin {
+  pub top: f64,
+  pub right: f64,
+  pub bottom: f64,
+  pub left: f64,
+  pub percent: u32,
+}
+
+impl Copy for Margin {}
+
+impl Margin {
+  pub fn zero() -> Margin { return Margin { top: 0.0, right: 0.0, bottom: 0.0, left: 0.0, percent: 0 } }
+}
+
+/// An IntersectionObserver's options. `root` 0 is the viewport (the implicit root).
+pub struct Config {
+  pub observer: u32,
+  pub root: u32,
+  pub rootMargin: Margin,
+  pub scrollMargin: Margin,
+  pub first: usize,
+  pub count: usize,
+}
+
+impl Copy for Config {}
+
+/// One observed target. `kind` 0 is an intersection; 1, 2 and 3 a resize of the content,
+/// border and device pixel content box.
+pub struct Observation {
+  pub observer: u32,
+  pub target: u32,
+  pub kind: u32,
+  /// Intersection: the last threshold index (-1 before the first update) and state.
+  pub index: i64,
+  pub intersecting: bool,
+  /// Resize: the last reported inline and block size of the observed box (-1 before).
+  pub inline: f64,
+  pub block: f64,
+}
+
+impl Copy for Observation {}
+
+/// How many numbers `update` writes for an intersection entry and for a resize entry. Each
+/// entry starts with its kind (1 intersection, 2 resize), the observer and the target.
+/// Intersection: isIntersecting (0 or 1), intersectionRatio, then boundingClientRect,
+/// intersectionRect and rootBounds as x, y, width, height.
+/// Resize: contentRect x, y, width, height, then borderBoxSize, contentBoxSize and
+/// devicePixelContentBoxSize as inline, block.
+pub const INTERSECTION_LENGTH: usize = 17
+pub const RESIZE_LENGTH: usize = 13
+
+pub struct Observers {
+  pub configs: List<Config>,
+  pub thresholds: List<f64>,
+  pub observations: List<Observation>,
+  /// True after `observe` adds or re-arms an observation until `update` runs.
+  pub pending: bool,
+}
+
+struct Box4 {
+  left: f64,
+  top: f64,
+  right: f64,
+  bottom: f64,
+}
+
+impl Copy for Box4 {}
+
+fn boxOf(rect: Rect<f32>) -> Box4 {
+  return Box4 { left: f32.toF64(rect.xMin), top: f32.toF64(rect.yMin), right: f32.toF64(rect.xMax), bottom: f32.toF64(rect.yMax) }
+}
+
+fn grown(base: Box4, margin: Margin) -> Box4 {
+  let width = base.right - base.left
+  let height = base.bottom - base.top
+  let top = if margin.percent & 1 != 0 { margin.top * height / 100.0 } else { margin.top }
+  let right = if margin.percent & 2 != 0 { margin.right * width / 100.0 } else { margin.right }
+  let bottom = if margin.percent & 4 != 0 { margin.bottom * height / 100.0 } else { margin.bottom }
+  let left = if margin.percent & 8 != 0 { margin.left * width / 100.0 } else { margin.left }
+  return Box4 { left: base.left - left, top: base.top - top, right: base.right + right, bottom: base.bottom + bottom }
+}
+
+fn emptyMargin(margin: Margin) -> bool {
+  return margin.top == 0.0 && margin.right == 0.0 && margin.bottom == 0.0 && margin.left == 0.0
+}
+
+impl Observers {
+  pub fn make() -> Observers {
+    return Observers { configs: List<Config>.make(), thresholds: List<f64>.make(), observations: List<Observation>.make(), pending: false }
+  }
+
+  /// Whether anything is observed: `update` has nothing to do otherwise.
+  pub fn any(self: &Self) -> bool { return self.observations.length() != 0 }
+
+  fn configAt(self: &Self, observer: u32) -> usize {
+    let mut i: usize = 0
+    while i < self.configs.length() {
+      if self.configs.get(i).observer == observer { return i }
+      i = i + 1
+    }
+    return NO_INDEX
+  }
+
+  /// Sets IntersectionObserver `observer`'s options, without thresholds (see `threshold`).
+  pub effect fn configure(self: &mut Self, observer: u32, root: u32, rootMargin: Margin, scrollMargin: Margin) -> ()
+    ! OutOfMemoryError ? &mut Allocator {
+    self.forget(observer)
+    run self.configs.append(Config {
+      observer: observer, root: root, rootMargin: rootMargin, scrollMargin: scrollMargin,
+      first: self.thresholds.length(), count: 0,
+    })
+  }
+
+  /// Adds `value` to the thresholds of `observer`, after `configure` and in ascending order.
+  pub effect fn threshold(self: &mut Self, observer: u32, value: f64) -> () ! OutOfMemoryError ? &mut Allocator {
+    let at = self.configAt(observer)
+    if at == NO_INDEX { return () }
+    let mut config = self.configs.get(at)
+    // The last configured observer owns the end of the list.
+    if config.first + config.count != self.thresholds.length() { return () }
+    run self.thresholds.append(value)
+    config.count = config.count + 1
+    self.configs.set(at, config)
+  }
+
+  /// Drops `observer`'s options and thresholds.
+  fn forget(self: &mut Self, observer: u32) -> () {
+    let at = self.configAt(observer)
+    if at == NO_INDEX { return () }
+    let gone = self.configs.get(at)
+    // Thresholds are kept in configuration order, so the later ones move down.
+    let mut i = gone.first
+    let total = self.thresholds.length()
+    while i + gone.count < total {
+      let moved = self.thresholds.get(i + gone.count)
+      self.thresholds.set(i, moved)
+      i = i + 1
+    }
+    self.thresholds.truncate(total - gone.count)
+    drop self.configs.remove(at)
+    let mut j: usize = 0
+    while j < self.configs.length() {
+      let mut config = self.configs.get(j)
+      if config.first > gone.first {
+        config.first = config.first - gone.count
+        self.configs.set(j, config)
+      }
+      j = j + 1
+    }
+  }
+
+  /// Observes node `target` for `observer` (see `Observation.kind`). Observing it again
+  /// changes the resize box and keeps the state.
+  pub effect fn observe(self: &mut Self, observer: u32, target: u32, kind: u32) -> () ! OutOfMemoryError ? &mut Allocator {
+    let mut i: usize = 0
+    while i < self.observations.length() {
+      let mut item = self.observations.get(i)
+      if item.observer == observer && item.target == target {
+        if item.kind != kind {
+          item.kind = kind
+          item.inline = -1.0
+          item.block = -1.0
+          self.observations.set(i, item)
+          self.pending = true
+        }
+        return ()
+      }
+      i = i + 1
+    }
+    run self.observations.append(Observation {
+      observer: observer, target: target, kind: kind, index: -1, intersecting: false, inline: -1.0, block: -1.0,
+    })
+    self.pending = true
+  }
+
+  /// Stops observing `target` for `observer`, or every target with `target` 0 (`disconnect`).
+  /// An observer left with nothing to observe drops its options.
+  pub fn unobserve(self: &mut Self, observer: u32, target: u32) -> () {
+    let mut kept: usize = 0
+    let mut left = false
+    let mut i: usize = 0
+    while i < self.observations.length() {
+      let item = self.observations.get(i)
+      let drops = item.observer == observer && (target == 0 || item.target == target)
+      if !drops {
+        if item.observer == observer { left = true }
+        self.observations.set(kept, item)
+        kept = kept + 1
+      }
+      i = i + 1
+    }
+    self.observations.truncate(kept)
+    if !left { self.forget(observer) }
+  }
+
+  /// Computes every observation on the tree's last layout and appends an entry (see
+  /// [`INTERSECTION_LENGTH`]) to `out` for each that changed. Answers how many entries.
+  pub effect fn update(self: &mut Self, tree: &UiTree<'_>, out: &mut List<f64>) -> usize ! OutOfMemoryError ? &mut Allocator {
+    self.pending = false
+    let mut entries: usize = 0
+    let mut i: usize = 0
+    while i < self.observations.length() {
+      let mut item = self.observations.get(i)
+      if item.kind == 0 {
+        let at = self.configAt(item.observer)
+        if at != NO_INDEX {
+          let config = self.configs.get(at)
+          if run intersect(tree, &item, config, self.thresholds.asSlice(), &mut out.*) {
+            let length = out.length()
+            item.index = f64.toI64(out.get(length - 1))
+            item.intersecting = out.get(length - 1 - INTERSECTION_LENGTH + 3) != 0.0
+            out.truncate(length - 1)
+            self.observations.set(i, item)
+            entries = entries + 1
+          }
+        }
+      } else if run resize(tree, &item, &mut out.*) {
+        let shift: usize = if item.kind == 2 { 6 } else if item.kind == 3 { 2 } else { 4 }
+        let length = out.length()
+        item.inline = out.get(length - shift)
+        item.block = out.get(length - shift + 1)
+        self.observations.set(i, item)
+        entries = entries + 1
+      }
+      i = i + 1
+    }
+    return entries
+  }
+}
+
+fn clipsX(tree: &UiTree<'_>, slot: u32) -> bool { return usedOverflow(&tree.node(slot).computed().*, true) != Overflow.Visible }
+fn clipsY(tree: &UiTree<'_>, slot: u32) -> bool { return usedOverflow(&tree.node(slot).computed().*, false) != Overflow.Visible }
+
+/// The padding box of `slot` in window coordinates, or `valid` false when it has no box.
+fn paddingOf(tree: &UiTree<'_>, slot: u32, valid: &mut bool) -> Box4 {
+  let first = cssom_view.firstFragment(tree, slot)
+  if first == NO_INDEX {
+    valid.* = false
+    return Box4 { left: 0.0, top: 0.0, right: 0.0, bottom: 0.0 }
+  }
+  let fragment = tree.output.fragments.values.asSlice()[first]
+  return boxOf(tree.visualRect(first, paddingBox(&fragment)))
+}
+
+effect fn appendBox(out: &mut List<f64>, b: Box4) -> () ! OutOfMemoryError ? &mut Allocator {
+  run out.append(b.left)
+  run out.append(b.top)
+  run out.append(b.right - b.left)
+  run out.append(b.bottom - b.top)
+}
+
+/// Intersection Observer §3.2.8 for one observation. When the threshold index or the state
+/// changed, appends the entry and then the new threshold index, and answers true.
+effect fn intersect(tree: &UiTree<'_>, item: &Observation, config: Config, thresholds: &[f64], out: &mut List<f64>) -> bool
+  ! OutOfMemoryError ? &mut Allocator {
+  let slot = tree.slotOf(item.target)
+  let target = run cssom_view.getBoundingClientRect(tree, item.target)
+  let targetBox = Box4 { left: target.x, top: target.y, right: target.x + target.width, bottom: target.y + target.height }
+  let mut valid = slot != NONE && cssom_view.attached(tree, slot) && tree.node(slot).kind != NodeKind.Text
+    && cssom_view.firstFragment(tree, slot) != NO_INDEX
+  // The root intersection rectangle.
+  let rootSlot = if config.root == 0 { NONE } else { tree.slotOf(config.root) }
+  let mut rootBox = if config.root == 0 {
+    Box4 { left: 0.0, top: 0.0, right: f32.toF64(tree.input.width), bottom: f32.toF64(tree.input.height) }
+  } else if rootSlot == NONE {
+    valid = false
+    Box4 { left: 0.0, top: 0.0, right: 0.0, bottom: 0.0 }
+  } else if clipsX(tree, rootSlot) || clipsY(tree, rootSlot) {
+    paddingOf(tree, rootSlot, &mut valid)
+  } else {
+    let rect = run cssom_view.getBoundingClientRect(tree, config.root)
+    Box4 { left: rect.x, top: rect.y, right: rect.x + rect.width, bottom: rect.y + rect.height }
+  }
+  rootBox = grown(rootBox, config.rootMargin)
+  // Clip through the containing block chain up to the root.
+  let mut rect = targetBox
+  if valid {
+    let mut ancestor = tree.node(slot).parent
+    let mut reached = rootSlot == NONE
+    while ancestor != NONE && valid {
+      if ancestor == rootSlot {
+        reached = true
+        break
+      }
+      let x = clipsX(tree, ancestor)
+      let y = clipsY(tree, ancestor)
+      if x || y {
+        let mut has = true
+        let mut clip = paddingOf(tree, ancestor, &mut has)
+        if has {
+          let computed = &tree.node(ancestor).computed().*
+          let scroller = scrolls(usedOverflow(computed, true)) || scrolls(usedOverflow(computed, false))
+          if scroller && !emptyMargin(config.scrollMargin) { clip = grown(clip, config.scrollMargin) }
+          if x {
+            rect.left = f64.max(rect.left, clip.left)
+            rect.right = f64.min(rect.right, clip.right)
+          }
+          if y {
+            rect.top = f64.max(rect.top, clip.top)
+            rect.bottom = f64.min(rect.bottom, clip.bottom)
+          }
+          if rect.right < rect.left || rect.bottom < rect.top { valid = false }
+        }
+      }
+      ancestor = tree.node(ancestor).parent
+    }
+    if !reached { valid = false }
+  }
+  if valid {
+    rect.left = f64.max(rect.left, rootBox.left)
+    rect.right = f64.min(rect.right, rootBox.right)
+    rect.top = f64.max(rect.top, rootBox.top)
+    rect.bottom = f64.min(rect.bottom, rootBox.bottom)
+    if rect.right < rect.left || rect.bottom < rect.top { valid = false }
+  }
+  if !valid { rect = Box4 { left: 0.0, top: 0.0, right: 0.0, bottom: 0.0 } }
+  let targetArea = target.width * target.height
+  let ratio = if !valid { 0.0 } else if targetArea > 0.0 {
+    f64.min(1.0, (rect.right - rect.left) * (rect.bottom - rect.top) / targetArea)
+  } else { 1.0 }
+  let mut index: usize = 0
+  while index < thresholds.length && thresholds[index] <= ratio { index = index + 1 }
+  if usize.toI64(index) == item.index && valid == item.intersecting { return false }
+  run out.append(1.0)
+  run out.append(u32.toF64(item.observer))
+  run out.append(u32.toF64(item.target))
+  run out.append(if valid { 1.0 } else { 0.0 })
+  run out.append(ratio)
+  run appendBox(&mut out.*, targetBox)
+  run appendBox(&mut out.*, rect)
+  run appendBox(&mut out.*, rootBox)
+  run out.append(usize.toF64(index))
+  return true
+}
+
+/// Resize Observer for one observation: appends the entry when the observed box's size
+/// changed and answers true.
+effect fn resize(tree: &UiTree<'_>, item: &Observation, out: &mut List<f64>) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let slot = tree.slotOf(item.target)
+  let first = if slot == NONE { NO_INDEX } else { cssom_view.firstFragment(tree, slot) }
+  let mut contentX: f64 = 0.0
+  let mut contentY: f64 = 0.0
+  let mut contentW: f64 = 0.0
+  let mut contentH: f64 = 0.0
+  let mut borderW: f64 = 0.0
+  let mut borderH: f64 = 0.0
+  let mut vertical = false
+  if first != NO_INDEX && tree.node(slot).kind != NodeKind.Text {
+    let fragment = tree.output.fragments.values.asSlice()[first]
+    contentX = f32.toF64(fragment.contentRect.x - fragment.paddingRect.x)
+    contentY = f32.toF64(fragment.contentRect.y - fragment.paddingRect.y)
+    contentW = f32.toF64(fragment.contentRect.width)
+    contentH = f32.toF64(fragment.contentRect.height)
+    borderW = f32.toF64(fragment.size.width)
+    borderH = f32.toF64(fragment.size.height)
+    vertical = tree.node(slot).computed().text.writingMode != WritingMode.HorizontalTb
+  }
+  let scale = f32.toF64(tree.input.scale)
+  let borderInline = if vertical { borderH } else { borderW }
+  let borderBlock = if vertical { borderW } else { borderH }
+  let contentInline = if vertical { contentH } else { contentW }
+  let contentBlock = if vertical { contentW } else { contentH }
+  let deviceInline = f64.round(contentInline * scale)
+  let deviceBlock = f64.round(contentBlock * scale)
+  let inline = if item.kind == 2 { borderInline } else if item.kind == 3 { deviceInline } else { contentInline }
+  let block = if item.kind == 2 { borderBlock } else if item.kind == 3 { deviceBlock } else { contentBlock }
+  if inline == item.inline && block == item.block { return false }
+  run out.append(2.0)
+  run out.append(u32.toF64(item.observer))
+  run out.append(u32.toF64(item.target))
+  run out.append(contentX)
+  run out.append(contentY)
+  run out.append(contentW)
+  run out.append(contentH)
+  run out.append(borderInline)
+  run out.append(borderBlock)
+  run out.append(contentInline)
+  run out.append(contentBlock)
+  run out.append(deviceInline)
+  run out.append(deviceBlock)
+  return true
+}

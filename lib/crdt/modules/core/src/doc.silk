@@ -1,0 +1,1161 @@
+//! A document: rich texts and maps, changed only by deltas that form a causal graph.
+//!
+//! Local edits apply at once and gather in a pending delta until [`Document.commit`] seals them,
+//! so a transaction is every edit between two commits. Each operation in a delta has its own id:
+//! the delta's id is its first operation's, and later operations count up the Lamport clock from
+//! there. A delta from another replica applies once every parent is known here; operations name
+//! bytes and entries, not offsets, so deltas apply in any causal order.
+//!
+//! Every [`SNAPSHOT_EVERY`] deltas (see [`Document.setSnapshotInterval`]) the document keeps a
+//! snapshot of its objects. [`Document.checkout`] starts from the latest snapshot inside the
+//! version it rebuilds and applies only the deltas after it. Text snapshots share tree nodes with
+//! the live text, so one costs about the nodes later edits copy.
+//!
+//! Objects are named by [`ObjectId`] and come into being on first use. An application picks the
+//! ids, usually constants or hashes of names.
+import clock { ActorId, DeltaId, Frontier }
+import codec { DecodeError, Reader, VERSION, Writer }
+import graph { CausalGraph, NONE }
+import map { Map, SetOp }
+import rich { decodeAnchor, encodeAnchor, Expand, MarkOp, RichText, RichVersion }
+import text { CharRun, decodeChar, DeleteOp, encodeChar, InsertOp }
+import silk.collections.hash { Hash }
+import silk.collections.hash_map { HashMap }
+import silk.collections.list { List }
+import silk.core.ownership { Copy }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.u32
+import silk.num.u64
+
+/// The name of an object in a document.
+pub type ObjectId = u64
+
+/// One change to one object.
+pub union Op {
+  Insert { pub object: ObjectId, pub op: InsertOp },
+  Delete { pub object: ObjectId, pub op: DeleteOp },
+  Mark { pub object: ObjectId, pub op: MarkOp },
+  Set { pub object: ObjectId, pub op: SetOp },
+}
+
+/// A sealed set of operations and the deltas its author had seen.
+pub struct Delta {
+  pub id: DeltaId,
+  pub parents: List<DeltaId>,
+  pub ops: List<Op>,
+}
+
+/// What [`Document.apply`] did with a delta.
+pub enum Applied {
+  Applied,
+  /// The delta was already here.
+  Known,
+  /// A parent is not here yet; nothing changed.
+  Missing,
+}
+
+struct TextSlot {
+  object: ObjectId,
+  rich: RichText,
+}
+
+struct MapSlot {
+  object: ObjectId,
+  map: Map,
+}
+
+/// How many deltas a document applies between snapshots, unless set otherwise.
+pub const SNAPSHOT_EVERY: usize = 256
+
+struct TextSnapshot {
+  object: ObjectId,
+  version: RichVersion,
+}
+
+impl Copy for TextSnapshot {}
+
+struct Decoded {
+  deltas: usize,
+  lamport: u64,
+  tips: Frontier,
+  texts: List<TextSlot>,
+  maps: List<MapSlot>,
+}
+
+// Reads what `Document.encodeLatestSnapshot` wrote.
+effect fn decodeSnapshot(bytes: &[u8]) -> Decoded
+  ! DecodeError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut input = Reader.of(bytes)
+  if (run input.number()) != VERSION {
+    fail DecodeError {}
+  }
+  let deltas = run input.number()
+  let lamport = run input.number()
+  let tipCount = run input.size()
+  let mut ids = List<DeltaId>.make()
+  let mut k: usize = 0
+  while k < tipCount {
+    let id = run input.id()
+    run ids.append(id)
+    k = k + 1
+  }
+  let tips = run Frontier.of(ids.asSlice())
+  let mut texts = List<TextSlot>.make()
+  let textCount = run input.size()
+  k = 0
+  while k < textCount {
+    let object = run input.number()
+    let rich = run RichText.decode(&mut input)
+    run texts.append(TextSlot { object: object, rich: move rich })
+    k = k + 1
+  }
+  let mut maps = List<MapSlot>.make()
+  let mapCount = run input.size()
+  k = 0
+  while k < mapCount {
+    let object = run input.number()
+    let map = run Map.decode(&mut input)
+    run maps.append(MapSlot { object: object, map: move map })
+    k = k + 1
+  }
+  if !input.done() {
+    fail DecodeError {}
+  }
+  return Decoded {
+    deltas: u64ToUsize(deltas),
+    lamport: lamport,
+    tips: move tips,
+    texts: move texts,
+    maps: move maps,
+  }
+}
+
+// Whether the first `count` of `deltas` apply in order and end at `tips`.
+effect fn startsWith(deltas: &List<Delta>, count: usize, tips: &Frontier) -> bool
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut graph = CausalGraph.make()
+  let mut heads = Frontier.empty()
+  let mut k: usize = 0
+  while k < count {
+    let delta = &deltas.asSlice()[k]
+    let seq = run graph.add(delta.id, delta.parents.asSlice())
+    if seq != k {
+      return false
+    }
+    run heads.advance(delta.parents.asSlice(), delta.id)
+    k = k + 1
+  }
+  return heads.same(tips)
+}
+
+struct Plan {
+  seqs: List<usize>,
+  snapshot: usize,
+}
+
+// The objects after the first `deltas` deltas, numbered as the causal graph numbers them.
+struct Snapshot {
+  deltas: usize,
+  lamport: u64,
+  tips: Frontier,
+  texts: List<TextSnapshot>,
+  maps: List<MapSlot>,
+}
+
+/// One replica of a document.
+pub struct Document {
+  owner: ActorId,
+  lamport: u64,
+  history: CausalGraph,
+  heads: Frontier,
+  deltas: List<Delta>,
+  texts: List<TextSlot>,
+  maps: List<MapSlot>,
+  pending: List<Op>,
+  pendingId: DeltaId,
+  snapshots: List<Snapshot>,
+  snapshotEvery: usize,
+  textIndex: HashMap<ObjectId, usize>,
+  mapIndex: HashMap<ObjectId, usize>,
+}
+
+impl Document {
+  /// An empty document edited by `actor`, which must be nonzero and unique among replicas.
+  pub effect fn make(actor: ActorId) -> Document
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if actor == 0 {
+      Intrinsic.trap("Document.make: the actor must be nonzero")
+    }
+    return Document {
+      owner: actor,
+      lamport: 0,
+      history: CausalGraph.make(),
+      heads: Frontier.empty(),
+      deltas: List<Delta>.make(),
+      texts: List<TextSlot>.make(),
+      maps: List<MapSlot>.make(),
+      pending: List<Op>.make(),
+      pendingId: DeltaId.make(0, 0),
+      snapshots: List<Snapshot>.make(),
+      snapshotEvery: SNAPSHOT_EVERY,
+      textIndex: HashMap<ObjectId, usize>.make(Hash.seed(7809847782465536322)),
+      mapIndex: HashMap<ObjectId, usize>.make(Hash.seed(7809847782465536323)),
+    }
+  }
+
+  pub fn actor(self: &Self) -> ActorId {
+    return self.owner
+  }
+
+  /// The tips of every committed delta here.
+  pub fn frontier(self: &Self) -> &Frontier {
+    return &self.heads
+  }
+
+  pub fn graph(self: &Self) -> &CausalGraph {
+    return &self.history
+  }
+
+  /// The number of deltas here, which are numbered in the order they arrived.
+  pub fn deltaCount(self: &Self) -> usize {
+    return self.deltas.length()
+  }
+
+  /// Delta `seq`, numbered as the causal graph numbers it.
+  pub fn delta(self: &Self, seq: usize) -> &Delta {
+    return &self.deltas.asSlice()[seq]
+  }
+
+  /// Takes a snapshot every `deltas` deltas from now on; 0 takes none.
+  pub fn setSnapshotInterval(self: &mut Self, deltas: usize) -> () {
+    self.snapshotEvery = deltas
+  }
+
+  /// The number of snapshots kept.
+  pub fn snapshotCount(self: &Self) -> usize {
+    return self.snapshots.length()
+  }
+
+  /// Whether local edits wait for a commit.
+  pub fn hasPending(self: &Self) -> bool {
+    return self.pending.length() > 0
+  }
+
+  /// The rich text `object`, if anything has touched it.
+  pub fn text(self: &Self, object: ObjectId) -> Option<&RichText> {
+    let k = self.findText(object)
+    if k == NONE {
+      return Option<&RichText>.None
+    }
+    return Option<&RichText>.Some { value: &self.texts.asSlice()[k].rich }
+  }
+
+  /// The map `object`, if anything has touched it.
+  pub fn map(self: &Self, object: ObjectId) -> Option<&Map> {
+    let k = match move self.mapIndex.get(object) {
+      Option<usize>.Some { value } => value
+      Option<usize>.None => NONE
+    }
+    if k == NONE {
+      return Option<&Map>.None
+    }
+    return Option<&Map>.Some { value: &self.maps.asSlice()[k].map }
+  }
+
+  // The slot of text `object`, or NONE.
+  fn findText(self: &Self, object: ObjectId) -> usize {
+    return match move self.textIndex.get(object) {
+      Option<usize>.Some { value } => value
+      Option<usize>.None => NONE
+    }
+  }
+
+  effect fn addText(self: &mut Self, object: ObjectId, rich: RichText) -> usize
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.texts.append(TextSlot { object: object, rich: move rich })
+    drop run self.textIndex.insert(object, self.texts.length() - 1)
+    return self.texts.length() - 1
+  }
+
+  effect fn addMap(self: &mut Self, object: ObjectId, map: Map) -> usize
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.maps.append(MapSlot { object: object, map: move map })
+    drop run self.mapIndex.insert(object, self.maps.length() - 1)
+    return self.maps.length() - 1
+  }
+
+  /// The visible length of text `object`, 0 when it does not exist yet.
+  pub fn textLength(self: &Self, object: ObjectId) -> usize {
+    return match self.text(object) {
+      Option<&RichText>.Some { value } => value.length()
+      Option<&RichText>.None => 0
+    }
+  }
+
+  pub effect fn insertText(self: &mut Self, object: ObjectId, offset: usize, bytes: &[u8]) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if run self.extendPending(object, offset, bytes) {
+      return ()
+    }
+    let id = self.nextId()
+    let slot = run self.textSlot(object)
+    let op = run self.texts.asMutSlice()[slot].rich.insert(id, offset, bytes)
+    run self.pending.append(Op.Insert { object: object, op: move op })
+  }
+
+  pub effect fn deleteText(self: &mut Self, object: ObjectId, offset: usize, length: usize) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    drop self.nextId()
+    let slot = run self.textSlot(object)
+    let op = run self.texts.asMutSlice()[slot].rich.delete(offset, length)
+    run self.pending.append(Op.Delete { object: object, op: move op })
+  }
+
+  pub effect fn mark(
+    self: &mut Self,
+    object: ObjectId,
+    offset: usize,
+    length: usize,
+    key: u32,
+    value: &[u8],
+    expand: Expand,
+  ) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let id = self.nextId()
+    let slot = run self.textSlot(object)
+    let op = run self.texts.asMutSlice()[slot].rich.mark(id, offset, length, key, value, expand)
+    run self.pending.append(Op.Mark { object: object, op: move op })
+  }
+
+  pub effect fn unmark(
+    self: &mut Self,
+    object: ObjectId,
+    offset: usize,
+    length: usize,
+    key: u32,
+    expand: Expand,
+  ) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let id = self.nextId()
+    let slot = run self.textSlot(object)
+    let op = run self.texts.asMutSlice()[slot].rich.unmark(id, offset, length, key, expand)
+    run self.pending.append(Op.Mark { object: object, op: move op })
+  }
+
+  pub effect fn insertEmbed(self: &mut Self, object: ObjectId, offset: usize, data: &[u8]) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let id = self.nextId()
+    let markId = self.nextId()
+    let slot = run self.textSlot(object)
+    let ops = run self.texts.asMutSlice()[slot].rich.insertEmbed(id, markId, offset, data)
+    run self.pending.append(Op.Insert { object: object, op: move ops.insert })
+    run self.pending.append(Op.Mark { object: object, op: move ops.mark })
+  }
+
+  pub effect fn set(self: &mut Self, object: ObjectId, key: &[u8], value: &[u8]) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let id = self.nextId()
+    let slot = run self.mapSlot(object)
+    let op = run self.maps.asMutSlice()[slot].map.set(id, key, value)
+    run self.pending.append(Op.Set { object: object, op: move op })
+  }
+
+  pub effect fn remove(self: &mut Self, object: ObjectId, key: &[u8]) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let id = self.nextId()
+    let slot = run self.mapSlot(object)
+    let op = run self.maps.asMutSlice()[slot].map.remove(id, key)
+    run self.pending.append(Op.Set { object: object, op: move op })
+  }
+
+  /// Seals the pending edits into one delta whose parents are the current frontier, and returns
+  /// its sequence number, or nothing when no edits wait.
+  pub effect fn commit(self: &mut Self) -> Option<usize>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if self.pending.length() == 0 {
+      return Option<usize>.None
+    }
+    let mut parents = List<DeltaId>.make()
+    run parents.appendSlice(self.heads.tips())
+    let id = self.pendingId
+    let seq = run self.history.add(id, parents.asSlice())
+    run self.heads.advance(parents.asSlice(), id)
+    let mut ops = List<Op>.make()
+    while self.pending.length() > 0 {
+      run ops.append(self.pending.remove(0))
+    }
+    run self.deltas.append(Delta { id: id, parents: move parents, ops: move ops })
+    self.pendingId = DeltaId.make(0, 0)
+    run self.snapshotIfDue()
+    return Option<usize>.Some { value: seq }
+  }
+
+  /// Applies a delta from another replica, committing local edits first.
+  pub effect fn apply(self: &mut Self, delta: Delta) -> Applied
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    drop run self.commit()
+    if self.history.contains(delta.id) {
+      return Applied.Known
+    }
+    if !self.history.containsAll(delta.parents.asSlice()) {
+      return Applied.Missing
+    }
+    let mut k: usize = 0
+    while k < delta.ops.length() {
+      let top = run self.applyOp(&delta.ops.asSlice()[k])
+      if top > self.lamport {
+        self.lamport = top
+      }
+      k = k + 1
+    }
+    if delta.id.lamport > self.lamport {
+      self.lamport = delta.id.lamport
+    }
+    drop run self.history.add(delta.id, delta.parents.asSlice())
+    run self.heads.advance(delta.parents.asSlice(), delta.id)
+    run self.deltas.append(move delta)
+    run self.snapshotIfDue()
+    return Applied.Applied
+  }
+
+  /// The sequence numbers of deltas here that a replica at `peer` lacks, in an order that
+  /// applies. Tips of `peer` unknown here are skipped: that replica has deltas this one lacks.
+  pub effect fn missingFor(self: &Self, peer: &Frontier) -> List<usize>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut known = List<usize>.make()
+    let tips = peer.tips()
+    let mut k: usize = 0
+    while k < tips.length {
+      let seq = self.history.seqOf(tips[k])
+      if seq != NONE {
+        run known.append(seq)
+      }
+      k = k + 1
+    }
+    let mine = run self.history.seqs(self.heads.tips())
+    return run self.history.diff(known.asSlice(), mine.asSlice())
+  }
+
+  /// A new document holding exactly the deltas `version` reaches, as a replica that saw only those
+  /// would. Every tip of `version` must be here. It starts from the latest snapshot whose deltas
+  /// all lie inside `version` and applies the rest.
+  pub effect fn checkout(self: &Self, version: &Frontier, actor: ActorId) -> Document
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut past = run Document.make(actor)
+    let plan = run self.planFor(version)
+    let mut start: usize = 0
+    if plan.snapshot != NONE {
+      let snapshot = &self.snapshots.asSlice()[plan.snapshot]
+      run self.restoreInto(snapshot, &mut past)
+      start = snapshot.deltas
+    }
+    past.history = run self.history.prefix(start)
+    let mut d: usize = 0
+    while d < start {
+      let copy = run self.delta(d).copy()
+      run past.heads.advance(copy.parents.asSlice(), copy.id)
+      run past.deltas.append(move copy)
+      d = d + 1
+    }
+    let mut k: usize = 0
+    while k < plan.seqs.length() {
+      let seq = plan.seqs.get(k)
+      if seq >= start {
+        let copy = run self.delta(seq).copy()
+        drop run past.apply(move copy)
+      }
+      k = k + 1
+    }
+    return move past
+  }
+
+  /// Rich text `object` as it was at `version`, without the rest of the document: the cheap way
+  /// to show history. It starts from the latest snapshot inside `version`, as
+  /// [`Document.checkout`] does, and applies only this object's operations after it. An object
+  /// that did not exist yet comes back empty.
+  pub effect fn textAt(self: &Self, object: ObjectId, version: &Frontier) -> RichText
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let plan = run self.planFor(version)
+    let mut rich = RichText.make()
+    let mut start: usize = 0
+    if plan.snapshot != NONE {
+      let snapshot = &self.snapshots.asSlice()[plan.snapshot]
+      start = snapshot.deltas
+      let mut t: usize = 0
+      while t < snapshot.texts.length() {
+        let kept = snapshot.texts.get(t)
+        if kept.object == object {
+          rich = run self.texts.asSlice()[self.slotOf(object)].rich.restore(kept.version)
+        }
+        t = t + 1
+      }
+    }
+    let mut k: usize = 0
+    while k < plan.seqs.length() {
+      let seq = plan.seqs.get(k)
+      if seq >= start {
+        let delta = self.delta(seq)
+        let mut o: usize = 0
+        while o < delta.ops.length() {
+          match &delta.ops.asSlice()[o] {
+            Op.Insert { object: target, op } => {
+              if target == object {
+                run rich.applyInsert(&op)
+              }
+            }
+            Op.Delete { object: target, op } => {
+              if target == object {
+                run rich.applyDelete(&op)
+              }
+            }
+            Op.Mark { object: target, op } => {
+              if target == object {
+                run rich.applyMark(&op)
+              }
+            }
+            Op.Set { object: _, op: _ } => {}
+          }
+          o = o + 1
+        }
+      }
+      k = k + 1
+    }
+    return move rich
+  }
+
+  // The deltas `version` reaches in an order that applies, and the latest snapshot whose deltas
+  // all lie among them (or NONE).
+  effect fn planFor(self: &Self, version: &Frontier) -> Plan
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let target = run self.history.seqs(version.tips())
+    let none = List<usize>.make()
+    let seqs = run self.history.diff(none.asSlice(), target.asSlice())
+
+    // The longest run of deltas 0, 1, 2, ... that `version` reaches.
+    let mut inside = List<bool>.make()
+    run inside.appendRepeated(false, self.deltas.length())
+    let mut k: usize = 0
+    while k < seqs.length() {
+      inside.set(seqs.get(k), true)
+      k = k + 1
+    }
+    let mut prefix: usize = 0
+    while prefix < inside.length() && inside.get(prefix) {
+      prefix = prefix + 1
+    }
+    let mut chosen = NONE
+    let mut s = self.snapshots.length()
+    while s > 0 {
+      s = s - 1
+      if self.snapshots.asSlice()[s].deltas <= prefix {
+        chosen = s
+        break
+      }
+    }
+    return Plan { seqs: move seqs, snapshot: chosen }
+  }
+
+  /// How many deltas the latest snapshot holds, 0 when there is none.
+  pub fn latestSnapshot(self: &Self) -> usize {
+    if self.snapshots.length() == 0 {
+      return 0
+    }
+    return self.snapshots.asSlice()[self.snapshots.length() - 1].deltas
+  }
+
+  /// Appends the latest snapshot to `out` for a store, and returns how many deltas it holds: the
+  /// first that many in [`Document.delta`] order. Writes nothing and returns 0 when there is none.
+  pub effect fn encodeLatestSnapshot(self: &Self, out: &mut Writer) -> usize
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if self.snapshots.length() == 0 {
+      return 0
+    }
+    let snapshot = &self.snapshots.asSlice()[self.snapshots.length() - 1]
+    run out.number(VERSION)
+    run out.size(snapshot.deltas)
+    run out.number(snapshot.lamport)
+    let tips = snapshot.tips.tips()
+    run out.size(tips.length)
+    let mut k: usize = 0
+    while k < tips.length {
+      run out.id(tips[k])
+      k = k + 1
+    }
+    run out.size(snapshot.texts.length())
+    let mut t: usize = 0
+    while t < snapshot.texts.length() {
+      let kept = snapshot.texts.get(t)
+      run out.number(kept.object)
+      run self.texts.asSlice()[self.slotOf(kept.object)].rich.encodeVersion(kept.version, &mut out)
+      t = t + 1
+    }
+    run out.size(snapshot.maps.length())
+    let mut m: usize = 0
+    while m < snapshot.maps.length() {
+      let slot = &snapshot.maps.asSlice()[m]
+      run out.number(slot.object)
+      run slot.map.encode(&mut out)
+      m = m + 1
+    }
+    return snapshot.deltas
+  }
+
+  /// The document that `deltas`, in an order that applies, make, edited from now on by `actor`.
+  /// When `snapshot` holds what [`Document.encodeLatestSnapshot`] wrote for the first deltas of
+  /// that order, those deltas are recorded without applying them again. A snapshot that does not
+  /// decode, or whose deltas are not the first ones of `deltas`, is ignored.
+  pub effect fn fromSaved(actor: ActorId, snapshot: &[u8], deltas: List<Delta>) -> Document
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut document = run Document.make(actor)
+    let mut start: usize = 0
+    if snapshot.length > 0 {
+      let decoded = run Effect.result(decodeSnapshot(snapshot))
+      match move decoded {
+        Result<Decoded, DecodeError | OutOfMemoryError>.Success { value } => {
+          let mut saved = move value
+          let fits = saved.deltas > 0 && saved.deltas <= deltas.length()
+          if fits && run startsWith(&deltas, saved.deltas, &saved.tips) {
+            document.lamport = saved.lamport
+            while saved.texts.length() > 0 {
+              let slot = saved.texts.remove(0)
+              drop run document.addText(slot.object, move slot.rich)
+            }
+            while saved.maps.length() > 0 {
+              let slot = saved.maps.remove(0)
+              drop run document.addMap(slot.object, move slot.map)
+            }
+            start = saved.deltas
+          }
+        }
+        _ => {}
+      }
+    }
+    let mut rest = move deltas
+    let total = rest.length()
+    let mut k: usize = 0
+    while k < total {
+      let delta = rest.remove(0)
+      if k < start {
+        drop run document.history.add(delta.id, delta.parents.asSlice())
+        run document.heads.advance(delta.parents.asSlice(), delta.id)
+        run document.deltas.append(move delta)
+        if k + 1 == start {
+          run document.snapshotNow()
+        }
+      } else {
+        drop run document.apply(move delta)
+      }
+      k = k + 1
+    }
+    return move document
+  }
+
+  // Puts the objects of `snapshot` into the empty document `past`.
+  effect fn restoreInto(self: &Self, snapshot: &Snapshot, past: &mut Document) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    past.lamport = snapshot.lamport
+    let mut t: usize = 0
+    while t < snapshot.texts.length() {
+      let kept = snapshot.texts.get(t)
+      let live = self.slotOf(kept.object)
+      let rich = run self.texts.asSlice()[live].rich.restore(kept.version)
+      drop run past.addText(kept.object, move rich)
+      t = t + 1
+    }
+    let mut m: usize = 0
+    while m < snapshot.maps.length() {
+      let slot = &snapshot.maps.asSlice()[m]
+      let map = run slot.map.copy()
+      drop run past.addMap(slot.object, move map)
+      m = m + 1
+    }
+  }
+
+  // Takes a snapshot when enough deltas have arrived since the last and no local edit waits, so
+  // the objects hold exactly the deltas so far.
+  effect fn snapshotIfDue(self: &mut Self) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if self.snapshotEvery == 0 || self.pending.length() > 0 {
+      return ()
+    }
+    let mut last: usize = 0
+    if self.snapshots.length() > 0 {
+      last = self.snapshots.asSlice()[self.snapshots.length() - 1].deltas
+    }
+    if self.deltas.length() - last < self.snapshotEvery {
+      return ()
+    }
+    run self.snapshotNow()
+  }
+
+  // Keeps the objects as they are now as a snapshot of every delta so far.
+  effect fn snapshotNow(self: &mut Self) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut texts = List<TextSnapshot>.make()
+    let mut t: usize = 0
+    while t < self.texts.length() {
+      let slot = &mut self.texts.asMutSlice()[t]
+      run texts.append(TextSnapshot { object: slot.object, version: slot.rich.version() })
+      t = t + 1
+    }
+    let mut maps = List<MapSlot>.make()
+    let mut m: usize = 0
+    while m < self.maps.length() {
+      let slot = &self.maps.asSlice()[m]
+      let map = run slot.map.copy()
+      run maps.append(MapSlot { object: slot.object, map: move map })
+      m = m + 1
+    }
+    let tips = run self.heads.copy()
+    run self.snapshots.append(
+      Snapshot {
+        deltas: self.deltas.length(),
+        lamport: self.lamport,
+        tips: move tips,
+        texts: move texts,
+        maps: move maps,
+      },
+    )
+  }
+
+  // The index of the live text slot for `object`, which a snapshot names so it exists.
+  fn slotOf(self: &Self, object: ObjectId) -> usize {
+    let k = self.findText(object)
+    if k == NONE {
+      Intrinsic.trap("Document: a snapshot names an unknown text")
+    }
+    return k
+  }
+
+  // Grows the last pending operation when it inserted into `object` right before `offset`, so
+  // text typed a byte at a time in one transaction is one insertion.
+  effect fn extendPending(self: &mut Self, object: ObjectId, offset: usize, bytes: &[u8]) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let count = self.pending.length()
+    if count == 0 || bytes.length == 0 {
+      return false
+    }
+    let mut id = DeltaId.make(0, 0)
+    match &self.pending.asSlice()[count - 1] {
+      Op.Insert { object: target, op } => {
+        if target != object {
+          return false
+        }
+        id = op.id
+      }
+      _ => {
+        return false
+      }
+    }
+    let slot = run self.textSlot(object)
+    if !(run self.texts.asMutSlice()[slot].rich.extend(id, offset, bytes)) {
+      return false
+    }
+    let last = match move self.pending.pop() {
+      Option<Op>.Some { value } => move value
+      Option<Op>.None => Intrinsic.trap("Document: the pending operation vanished")
+    }
+    match move last {
+      Op.Insert { object: target, op } => {
+        let mut grown = move op
+        run grown.bytes.appendSlice(bytes)
+        run self.pending.append(Op.Insert { object: target, op: move grown })
+      }
+      _ => Intrinsic.trap("Document: the pending operation changed")
+    }
+    return true
+  }
+
+  fn nextId(self: &mut Self) -> DeltaId {
+    self.lamport = self.lamport + 1
+    let id = DeltaId.make(self.lamport, self.owner)
+    if self.pending.length() == 0 && self.pendingId.lamport == 0 {
+      self.pendingId = id
+    }
+    return id
+  }
+
+  effect fn textSlot(self: &mut Self, object: ObjectId) -> usize
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let k = self.findText(object)
+    if k != NONE {
+      return k
+    }
+    return run self.addText(object, RichText.make())
+  }
+
+  effect fn mapSlot(self: &mut Self, object: ObjectId) -> usize
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    match move self.mapIndex.get(object) {
+      Option<usize>.Some { value } => {
+        return value
+      }
+      Option<usize>.None => {}
+    }
+    return run self.addMap(object, Map.make())
+  }
+
+  // Applies one operation and returns the highest Lamport time it names.
+  effect fn applyOp(self: &mut Self, op: &Op) -> u64
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return match &op.* {
+      Op.Insert { object, op: change } => {
+        let slot = run self.textSlot(object)
+        run self.texts.asMutSlice()[slot].rich.applyInsert(&change)
+        change.id.lamport
+      }
+      Op.Delete { object, op: change } => {
+        let slot = run self.textSlot(object)
+        run self.texts.asMutSlice()[slot].rich.applyDelete(&change)
+        0
+      }
+      Op.Mark { object, op: change } => {
+        let slot = run self.textSlot(object)
+        run self.texts.asMutSlice()[slot].rich.applyMark(&change)
+        change.id.lamport
+      }
+      Op.Set { object, op: change } => {
+        let slot = run self.mapSlot(object)
+        run self.maps.asMutSlice()[slot].map.apply(&change)
+        change.id.lamport
+      }
+    }
+  }
+}
+
+impl Delta {
+  /// Appends this delta's encoding to `out`.
+  pub effect fn encode(self: &Self, out: &mut Writer) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run out.number(VERSION)
+    run out.id(self.id)
+    run out.size(self.parents.length())
+    let mut p: usize = 0
+    while p < self.parents.length() {
+      run out.id(self.parents.get(p))
+      p = p + 1
+    }
+    run out.size(self.ops.length())
+    let mut k: usize = 0
+    while k < self.ops.length() {
+      run encodeOp(&self.ops.asSlice()[k], &mut out)
+      k = k + 1
+    }
+  }
+
+  /// This delta encoded on its own.
+  pub effect fn toBytes(self: &Self) -> List<u8>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut out = Writer.make()
+    run self.encode(&mut out)
+    return move out.bytes
+  }
+
+  /// Reads one delta written by [`Delta.encode`].
+  pub effect fn decode(input: &mut Reader<'_>) -> Delta
+    ! DecodeError | OutOfMemoryError
+    ? &mut Allocator {
+    let version = run input.number()
+    if version != VERSION {
+      fail DecodeError {}
+    }
+    let id = run input.id()
+    let mut parents = List<DeltaId>.make()
+    let parentCount = run input.size()
+    let mut p: usize = 0
+    while p < parentCount {
+      let parent = run input.id()
+      run parents.append(parent)
+      p = p + 1
+    }
+    let mut ops = List<Op>.make()
+    let opCount = run input.size()
+    let mut k: usize = 0
+    while k < opCount {
+      let op = run decodeOp(&mut input)
+      run ops.append(move op)
+      k = k + 1
+    }
+    return Delta { id: id, parents: move parents, ops: move ops }
+  }
+
+  /// Reads a delta that is the whole of `bytes`.
+  pub effect fn fromBytes(bytes: &[u8]) -> Delta
+    ! DecodeError | OutOfMemoryError
+    ? &mut Allocator {
+    let mut input = Reader.of(bytes)
+    let delta = run Delta.decode(&mut input)
+    if !input.done() {
+      fail DecodeError {}
+    }
+    return move delta
+  }
+
+  /// A copy of this delta.
+  pub effect fn copy(self: &Self) -> Delta
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut parents = List<DeltaId>.make()
+    run parents.appendSlice(self.parents.asSlice())
+    let mut ops = List<Op>.make()
+    let mut k: usize = 0
+    while k < self.ops.length() {
+      let op = run copyOp(&self.ops.asSlice()[k])
+      run ops.append(move op)
+      k = k + 1
+    }
+    return Delta { id: self.id, parents: move parents, ops: move ops }
+  }
+}
+
+effect fn copyBytes(bytes: &List<u8>) -> List<u8>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut out = List<u8>.make()
+  run out.appendSlice(bytes.asSlice())
+  return move out
+}
+
+effect fn copyOp(op: &Op) -> Op
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  return match &op.* {
+    Op.Insert { object, op: change } => {
+      let bytes = run copyBytes(&change.bytes)
+      Op.Insert {
+        object: object,
+        op: InsertOp {
+          id: change.id,
+          originLeft: change.originLeft,
+          originRight: change.originRight,
+          bytes: move bytes,
+        },
+      }
+    }
+    Op.Delete { object, op: change } => {
+      let mut runs = List<CharRun>.make()
+      run runs.appendSlice(change.runs.asSlice())
+      Op.Delete { object: object, op: DeleteOp { runs: move runs } }
+    }
+    Op.Mark { object, op: change } => {
+      let value = run copyBytes(&change.value)
+      Op.Mark {
+        object: object,
+        op: MarkOp {
+          id: change.id,
+          key: change.key,
+          start: change.start,
+          end: change.end,
+          remove: change.remove,
+          value: move value,
+        },
+      }
+    }
+    Op.Set { object, op: change } => {
+      let key = run copyBytes(&change.key)
+      let value = run copyBytes(&change.value)
+      let mut observed = List<DeltaId>.make()
+      run observed.appendSlice(change.observed.asSlice())
+      Op.Set {
+        object: object,
+        op: SetOp {
+          id: change.id,
+          key: move key,
+          value: move value,
+          remove: change.remove,
+          observed: move observed,
+        },
+      }
+    }
+  }
+}
+
+const TAG_INSERT: u8 = 1
+
+const TAG_DELETE: u8 = 2
+
+const TAG_MARK: u8 = 3
+
+const TAG_SET: u8 = 4
+
+effect fn encodeOp(op: &Op, out: &mut Writer) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  match &op.* {
+    Op.Insert { object, op: change } => {
+      run out.byte(TAG_INSERT)
+      run out.number(object)
+      run out.id(change.id)
+      run encodeChar(change.originLeft, &mut out)
+      run encodeChar(change.originRight, &mut out)
+      run out.data(change.bytes.asSlice())
+    }
+    Op.Delete { object, op: change } => {
+      run out.byte(TAG_DELETE)
+      run out.number(object)
+      run out.size(change.runs.length())
+      let mut k: usize = 0
+      while k < change.runs.length() {
+        let r = change.runs.get(k)
+        run out.id(r.id)
+        run out.size(r.start)
+        run out.size(r.length)
+        k = k + 1
+      }
+    }
+    Op.Mark { object, op: change } => {
+      run out.byte(TAG_MARK)
+      run out.number(object)
+      run out.id(change.id)
+      run out.number(u32ToU64(change.key))
+      run encodeAnchor(change.start, &mut out)
+      run encodeAnchor(change.end, &mut out)
+      run out.flag(change.remove)
+      run out.data(change.value.asSlice())
+    }
+    Op.Set { object, op: change } => {
+      run out.byte(TAG_SET)
+      run out.number(object)
+      run out.id(change.id)
+      run out.data(change.key.asSlice())
+      run out.data(change.value.asSlice())
+      run out.flag(change.remove)
+      run out.size(change.observed.length())
+      let mut k: usize = 0
+      while k < change.observed.length() {
+        run out.id(change.observed.get(k))
+        k = k + 1
+      }
+    }
+  }
+}
+
+effect fn decodeData(input: &mut Reader<'_>) -> List<u8>
+  ! DecodeError | OutOfMemoryError
+  ? &mut Allocator {
+  let bytes = run input.data()
+  let mut out = List<u8>.make()
+  run out.appendSlice(bytes)
+  return move out
+}
+
+effect fn decodeOp(input: &mut Reader<'_>) -> Op
+  ! DecodeError | OutOfMemoryError
+  ? &mut Allocator {
+  let tag = run input.byte()
+  let object = run input.number()
+  if tag == TAG_INSERT {
+    let id = run input.id()
+    let left = run decodeChar(&mut input)
+    let right = run decodeChar(&mut input)
+    let bytes = run decodeData(&mut input)
+    return Op.Insert {
+      object: object,
+      op: InsertOp { id: id, originLeft: left, originRight: right, bytes: move bytes },
+    }
+  }
+  if tag == TAG_DELETE {
+    let count = run input.size()
+    let mut runs = List<CharRun>.make()
+    let mut k: usize = 0
+    while k < count {
+      let id = run input.id()
+      let start = run input.number()
+      let length = run input.number()
+      run runs.append(CharRun { id: id, start: u64ToUsize(start), length: u64ToUsize(length) })
+      k = k + 1
+    }
+    return Op.Delete { object: object, op: DeleteOp { runs: move runs } }
+  }
+  if tag == TAG_MARK {
+    let id = run input.id()
+    let key = run input.number()
+    if key > 4294967295 {
+      fail DecodeError {}
+    }
+    let start = run decodeAnchor(&mut input)
+    let end = run decodeAnchor(&mut input)
+    let remove = run input.flag()
+    let value = run decodeData(&mut input)
+    return Op.Mark {
+      object: object,
+      op: MarkOp {
+        id: id,
+        key: u64ToU32(key),
+        start: start,
+        end: end,
+        remove: remove,
+        value: move value,
+      },
+    }
+  }
+  if tag == TAG_SET {
+    let id = run input.id()
+    let key = run decodeData(&mut input)
+    let value = run decodeData(&mut input)
+    let remove = run input.flag()
+    let count = run input.size()
+    let mut observed = List<DeltaId>.make()
+    let mut k: usize = 0
+    while k < count {
+      let seen = run input.id()
+      run observed.append(seen)
+      k = k + 1
+    }
+    return Op.Set {
+      object: object,
+      op: SetOp {
+        id: id,
+        key: move key,
+        value: move value,
+        remove: remove,
+        observed: move observed,
+      },
+    }
+  }
+  fail DecodeError {}
+}
+
+fn u64ToUsize(value: u64) -> usize {
+  return u64.toUsize(value)
+}
+
+fn u64ToU32(value: u64) -> u32 {
+  return u64.toU32(value)
+}
+
+fn u32ToU64(value: u32) -> u64 {
+  return u32.toU64(value)
+}

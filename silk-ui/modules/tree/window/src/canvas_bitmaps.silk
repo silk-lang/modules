@@ -1,0 +1,765 @@
+//! Shows the bitmaps a tree keeps for its canvas nodes: the ones JavaScript draws with Canvas 2D,
+//! the pixels a client sets (`Mutation.SetCanvasPixels`), and the bitmaps of large canvases'
+//! commands (`ui_tree.canvas_raster`). Each goes to the renderer through the window's
+//! [`CanvasPresenter`], as a GPU canvas's frames do.
+//!
+//! Large canvas command lists are rasterized off the UI thread by [`CanvasRasterizer`] after
+//! their content, scale, and subpixel placement have stayed unchanged for [`SETTLE_SECONDS`],
+//! avoiding UI-thread hitches during and immediately after interactive pan/zoom gestures.
+import ui_tree.legacy { UiTree, TreeError, Batch }
+import ui_tree.canvas2d { Bitmap, CommandRasterizer }
+import ui_tree.canvas_raster {
+  CancelCheck,
+  Frame as RasterFrame,
+  Job as RasterJob,
+  Live as RasterLive,
+  NeverCancel,
+  Want as RasterWant,
+}
+import ui_tree.mutation { NO_SURFACE }
+import canvas_frames { CanvasPresenter, CanvasFrame, SharedPicture }
+import silk.collections.list { List }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.u32
+import silk.num.usize
+import silk.trace { Trace as Prof }
+import vector.pixmap { Pixmap }
+
+static if Intrinsic.targetArchitecture() != "wasm32" {
+  import background { Cancellation }
+  import platform_thread { Nudge }
+  import silk.concurrency.sync { Arc, Mutex }
+  import silk.concurrency.thread { Transferable }
+  import silk.concurrency.thread_native { NativeThread, JoinHandle }
+}
+
+/// How long a large canvas's commands, scale, and subpixel placement must remain unchanged before
+/// background rasterization starts, in seconds.
+pub const SETTLE_SECONDS: f64 = 0.25
+
+/// The most background canvas rasterization workers running at once.
+pub const MAX_WORKERS: usize = 2
+
+struct PendingRaster {
+  want: RasterWant,
+  dueAt: f64,
+}
+
+static if Intrinsic.targetArchitecture() != "wasm32" {
+  struct RasterInput {
+    job: RasterJob,
+    cancel: Cancellation,
+  }
+
+  impl Transferable for RasterInput {}
+
+  struct RasterOutput {
+    pixels: Option<List<u8>>,
+    width: u32,
+    height: u32,
+    x: i32,
+    y: i32,
+  }
+
+  impl Transferable for RasterOutput {}
+
+  struct RasterCancel {
+    flag: Cancellation,
+  }
+
+  impl CancelCheck for RasterCancel {
+    fn cancelled(self: &Self) -> bool {
+      return self.flag.cancelled()
+    }
+  }
+
+  struct RunningJob {
+    node: u32,
+    key: u64,
+    content: u64,
+    cancel: Cancellation,
+    done: Arc<Mutex<bool>>,
+    handle: Option<JoinHandle<RasterOutput>>,
+  }
+
+  impl RunningJob {
+    fn ready(self: &Self) -> bool {
+      return self.done.get().lock().get().*
+    }
+
+    fn join(self: &mut Self) -> Option<RasterOutput> {
+      return match move Intrinsic.replace(self.handle, Option<JoinHandle<RasterOutput>>.None) {
+        Option<JoinHandle<RasterOutput>>.Some { value } => Option<RasterOutput>.some(value.join())
+        Option<JoinHandle<RasterOutput>>.None => Option<RasterOutput>.None
+      }
+    }
+  }
+
+  effect fn rasterJobEffect(input: RasterInput) -> RasterOutput
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let check = RasterCancel { flag: move input.cancel }
+    if check.cancelled() {
+      return RasterOutput { pixels: Option<List<u8>>.None, width: 0, height: 0, x: 0, y: 0 }
+    }
+    let mut rasterizer = CommandRasterizer.make()
+    let drawn = run rasterizer.draw(
+      input.job.commands.asSlice(),
+      input.job.scale,
+      input.job.dx,
+      input.job.dy,
+      input.job.width,
+      input.job.height,
+      &check,
+    )
+    let bitmap = match move drawn {
+      Option<Pixmap>.Some { value } => move value
+      Option<Pixmap>.None => {
+        return RasterOutput { pixels: Option<List<u8>>.None, width: 0, height: 0, x: 0, y: 0 }
+      }
+    }
+    if check.cancelled() {
+      return RasterOutput { pixels: Option<List<u8>>.None, width: 0, height: 0, x: 0, y: 0 }
+    }
+    let bytes = run copyPixmapBytes(&bitmap)
+    return RasterOutput {
+      pixels: Option<List<u8>>.some(move bytes),
+      width: bitmap.width(),
+      height: bitmap.height(),
+      x: input.job.x,
+      y: input.job.y,
+    }
+  }
+
+  fn runRasterJob(input: RasterInput) -> RasterOutput {
+    let mut heap = Allocator.systemAllocatorProvider()
+    let result = run Effect.result(rasterJobEffect(move input))
+      |> Effect.provideMut<Allocator>(&mut heap)
+    return match move result {
+      Result.Success { value } => move value
+      Result.Failure { error } => {
+        drop error
+        RasterOutput { pixels: Option<List<u8>>.None, width: 0, height: 0, x: 0, y: 0 }
+      }
+    }
+  }
+
+  struct WorkerPool {
+    running: List<RunningJob>,
+    nudge: Option<Nudge>,
+  }
+
+  impl WorkerPool {
+    fn make() -> WorkerPool {
+      return WorkerPool { running: List<RunningJob>.make(), nudge: Option<Nudge>.None }
+    }
+
+    fn wakeWith(self: &mut Self, nudge: Nudge) -> () {
+      self.nudge = Option<Nudge>.some(move nudge)
+    }
+
+    fn runningCount(self: &Self) -> usize {
+      return self.running.length()
+    }
+
+    fn full(self: &Self) -> bool {
+      return self.running.length() >= MAX_WORKERS
+    }
+
+    fn hasActiveKey(self: &Self, node: u32, key: u64) -> bool {
+      let list = self.running.asSlice()
+      let mut i: usize = 0
+      while i < list.length {
+        if list[i].node == node && list[i].key == key && !list[i].cancel.cancelled() {
+          return true
+        }
+        i = i + 1
+      }
+      return false
+    }
+
+    fn hasActiveNode(self: &Self, node: u32) -> bool {
+      let list = self.running.asSlice()
+      let mut i: usize = 0
+      while i < list.length {
+        if list[i].node == node && !list[i].cancel.cancelled() {
+          return true
+        }
+        i = i + 1
+      }
+      return false
+    }
+
+    fn cancelOther(self: &mut Self, node: u32, key: u64) -> () {
+      let list = self.running.asSlice()
+      let mut i: usize = 0
+      while i < list.length {
+        if list[i].node == node && list[i].key != key {
+          list[i].cancel.cancel()
+        }
+        i = i + 1
+      }
+    }
+
+    fn pruneStale(self: &mut Self, tree: &UiTree<'_>) -> () {
+      let list = self.running.asSlice()
+      let mut i: usize = 0
+      while i < list.length {
+        if !list[i].cancel.cancelled() && !tree.acceptsRaster(list[i].node, list[i].content, list[i].key) {
+          list[i].cancel.cancel()
+        }
+        i = i + 1
+      }
+    }
+
+    effect fn collect(
+      self: &mut Self,
+      presenter: &CanvasPresenter,
+      tree: &mut UiTree<'_>,
+      pending: &List<PendingRaster>,
+    ) -> bool
+      ! OutOfMemoryError
+      ? &mut Allocator {
+      let mut changed = false
+      let mut i: usize = 0
+      while i < self.running.length() {
+        if !self.running.asSlice()[i].ready() {
+          i = i + 1
+          continue
+        }
+        let mut job = self.running.remove(i)
+        let completed = job.join()
+        if job.cancel.cancelled() {
+          continue
+        }
+        if hasPendingNode(pending, job.node) {
+          continue
+        }
+        if !tree.acceptsRaster(job.node, job.content, job.key) {
+          continue
+        }
+        if let Option<RasterOutput>.Some { value: output } = move completed {
+          if let Option<List<u8>>.Some { value: pixels } = move output.pixels {
+            run presentOneRaster(
+              presenter,
+              &mut tree,
+              job.node,
+              job.key,
+              output.x,
+              output.y,
+              output.width,
+              output.height,
+              move pixels,
+            )
+            changed = true
+          }
+        }
+      }
+      return changed
+    }
+
+    effect fn startJob(
+      self: &mut Self,
+      presenter: &CanvasPresenter,
+      tree: &mut UiTree<'_>,
+      job: RasterJob,
+    ) -> bool
+      ! OutOfMemoryError
+      ? &mut Allocator {
+      drop presenter
+      drop tree
+      let node = job.node
+      let key = job.key
+      let content = job.content
+      let mut heap = Allocator.systemAllocatorProvider()
+      let cancel = run Cancellation.make() |> Effect.provideMut<Allocator>(&mut heap)
+      let done = run Arc<Mutex<bool>>.make(run Mutex<bool>.make(false))
+        |> Effect.provideMut<Allocator>(&mut heap)
+      let signal = done.clone()
+      let wake = match &self.nudge {
+        Option<Nudge>.Some { value } => Option<Nudge>.some(value.clone())
+        Option<Nudge>.None => Option<Nudge>.None
+      }
+      let input = RasterInput { job: move job, cancel: cancel.clone() }
+      let spawned = run Effect.result(
+        NativeThread.spawn(
+          || -> RasterOutput {
+            let input = move input
+            let signal = move signal
+            let wake = move wake
+            let output = runRasterJob(move input)
+            let mut guard = signal.get().lock()
+            let state = guard.getMut()
+            state.* = true
+            drop guard
+            if let Option<Nudge>.Some { value } = &wake {
+              value.nudge()
+            }
+            return move output
+          },
+        ),
+      )
+        |> Effect.provideMut<Allocator>(&mut heap)
+      match move spawned {
+        Result.Success { value: handle } => {
+          run self.running.append(
+            RunningJob {
+              node: node,
+              key: key,
+              content: content,
+              cancel: move cancel,
+              done: move done,
+              handle: Option<JoinHandle<RasterOutput>>.some(move handle),
+            },
+          )
+        }
+        Result.Failure { error } => {
+          drop error
+        }
+      }
+      return false
+    }
+
+    fn stop(self: &mut Self) -> () {
+      let list = self.running.asSlice()
+      let mut i: usize = 0
+      while i < list.length {
+        list[i].cancel.cancel()
+        i = i + 1
+      }
+      while self.running.length() > 0 {
+        let mut job = self.running.remove(0)
+        drop job.join()
+      }
+    }
+  }
+}
+
+static if Intrinsic.targetArchitecture() == "wasm32" {
+  struct WorkerPool {}
+
+  impl WorkerPool {
+    fn make() -> WorkerPool {
+      return WorkerPool {}
+    }
+
+    fn runningCount(self: &Self) -> usize {
+      return 0
+    }
+
+    fn full(self: &Self) -> bool {
+      return false
+    }
+
+    fn hasActiveKey(self: &Self, node: u32, key: u64) -> bool {
+      drop node
+      drop key
+      return false
+    }
+
+    fn hasActiveNode(self: &Self, node: u32) -> bool {
+      drop node
+      return false
+    }
+
+    fn cancelOther(self: &mut Self, node: u32, key: u64) -> () {
+      drop node
+      drop key
+    }
+
+    fn pruneStale(self: &mut Self, tree: &UiTree<'_>) -> () {
+      drop tree
+    }
+
+    effect fn collect(
+      self: &mut Self,
+      presenter: &CanvasPresenter,
+      tree: &mut UiTree<'_>,
+      pending: &List<PendingRaster>,
+    ) -> bool
+      ! OutOfMemoryError
+      ? &mut Allocator {
+      drop presenter
+      drop tree
+      drop pending
+      return false
+    }
+
+    effect fn startJob(
+      self: &mut Self,
+      presenter: &CanvasPresenter,
+      tree: &mut UiTree<'_>,
+      job: RasterJob,
+    ) -> bool
+      ! OutOfMemoryError
+      ? &mut Allocator {
+      let mut rasterizer = CommandRasterizer.make()
+      let never = NeverCancel {}
+      let drawn = run rasterizer.draw(
+        job.commands.asSlice(),
+        job.scale,
+        job.dx,
+        job.dy,
+        job.width,
+        job.height,
+        &never,
+      )
+      if let Option<Pixmap>.Some { value: bitmap } = move drawn {
+        let mut heap = Allocator.systemAllocatorProvider()
+        let pixels = run copyPixmapBytes(&bitmap) |> Effect.provideMut<Allocator>(&mut heap)
+        run presentOneRaster(
+          presenter,
+          &mut tree,
+          job.node,
+          job.key,
+          job.x,
+          job.y,
+          bitmap.width(),
+          bitmap.height(),
+          move pixels,
+        )
+        return true
+      }
+      return false
+    }
+
+    fn stop(self: &mut Self) -> () {}
+  }
+}
+
+/// Schedules large-canvas rasterization off the UI thread after a settle cooldown, cancelling and
+/// discarding stale jobs when a canvas's content, scale, or subpixel placement changes.
+pub struct CanvasRasterizer {
+  settle: f64,
+  queued: List<PendingRaster>,
+  workers: WorkerPool,
+}
+
+impl CanvasRasterizer {
+  /// Creates a rasterizer with the default [`SETTLE_SECONDS`] cooldown.
+  pub fn make() -> CanvasRasterizer {
+    return CanvasRasterizer.withSettle(SETTLE_SECONDS)
+  }
+
+  /// Creates a rasterizer with a custom settle cooldown in seconds.
+  pub fn withSettle(settleSeconds: f64) -> CanvasRasterizer {
+    let settle = if settleSeconds < 0.0 { 0.0 } else { settleSeconds }
+    return CanvasRasterizer {
+      settle: settle,
+      queued: List<PendingRaster>.make(),
+      workers: WorkerPool.make(),
+    }
+  }
+
+  /// Drains `tree.canvasRasters.wants`, debounces changes per canvas node, and cancels any
+  /// stale pending or running jobs.
+  pub effect fn observe(self: &mut Self, tree: &mut UiTree<'_>, now: f64) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let wants = Intrinsic.replace(tree.canvasRasters.wants, List<RasterWant>.make())
+    let all = wants.asSlice()
+    let mut i: usize = 0
+    while i < all.length {
+      let want = all[i]
+      i = i + 1
+      self.workers.cancelOther(want.node, want.key)
+      let at = pendingIndex(&self.queued, want.node)
+      if self.workers.hasActiveKey(want.node, want.key) {
+        if at != usize.MAX {
+          drop self.queued.remove(at)
+        }
+        continue
+      }
+      if at != usize.MAX {
+        let entry = &mut self.queued.asMutSlice()[at]
+        if entry.want.key != want.key {
+          entry.want = want
+          entry.dueAt = now + self.settle
+        }
+      } else {
+        run self.queued.append(PendingRaster { want: want, dueAt: now + self.settle })
+      }
+    }
+    drop wants
+    let mut p: usize = 0
+    while p < self.queued.length() {
+      let want = self.queued.asSlice()[p].want
+      if !tree.acceptsRaster(want.node, want.content, want.key) {
+        drop self.queued.remove(p)
+      } else {
+        p = p + 1
+      }
+    }
+    self.workers.pruneStale(&tree.*)
+  }
+
+  /// Collects finished background rasters, starts any pending rasters whose settle cooldown has
+  /// elapsed, and presents ready bitmaps through `presenter`. Never blocks on unfinished workers.
+  /// Returns whether any canvas bitmap was installed into `tree`.
+  pub effect fn poll(
+    self: &mut Self,
+    presenter: &CanvasPresenter,
+    tree: &mut UiTree<'_>,
+    now: f64,
+  ) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let _span = Prof.span("ui_window.canvasRasterizer.poll")
+    run self.observe(&mut tree, now)
+    let mut changed = run self.workers.collect(presenter, &mut tree, &self.queued)
+    while !self.workers.full() {
+      let next = nextDueIndex(&self.queued, &self.workers, now)
+      if next == usize.MAX {
+        break
+      }
+      let entry = self.queued.remove(next)
+      if let Option<RasterJob>.Some { value: job } = move run tree.prepareRasterJob(entry.want) {
+        if run self.workers.startJob(presenter, &mut tree, move job) {
+          changed = true
+        }
+      }
+    }
+    return changed
+  }
+
+  /// The earliest timestamp at which a settled canvas becomes ready to rasterize, or `None` when
+  /// nothing is waiting for a cooldown (or all worker slots are already busy).
+  pub fn nextDeadline(self: &Self) -> Option<f64> {
+    if self.workers.full() {
+      return Option<f64>.None
+    }
+    let list = self.queued.asSlice()
+    let mut found = false
+    let mut earliest: f64 = 0.0
+    let mut i: usize = 0
+    while i < list.length {
+      if !self.workers.hasActiveNode(list[i].want.node) {
+        if !found || list[i].dueAt < earliest {
+          earliest = list[i].dueAt
+          found = true
+        }
+      }
+      i = i + 1
+    }
+    return if found { Option<f64>.some(earliest) } else { Option<f64>.None }
+  }
+
+  /// Whether any canvas is waiting for cooldown or currently rasterizing in the background.
+  pub fn pending(self: &Self) -> bool {
+    return self.queued.length() != 0 || self.workers.runningCount() != 0
+  }
+
+  /// Number of canvases waiting for their settle cooldown.
+  pub fn pendingCount(self: &Self) -> usize {
+    return self.queued.length()
+  }
+
+  /// Number of background raster workers currently running (including cancelled ones not yet reaped).
+  pub fn runningCount(self: &Self) -> usize {
+    return self.workers.runningCount()
+  }
+
+  /// Cancels and joins any running background workers, and clears pending wants.
+  pub fn stop(self: &mut Self) -> () {
+    self.queued.clear()
+    self.workers.stop()
+  }
+}
+
+static if Intrinsic.targetArchitecture() != "wasm32" {
+  impl CanvasRasterizer {
+    /// Wakes the UI thread through `nudge` as soon as a background raster finishes.
+    pub fn wakeWith(self: &mut Self, nudge: Nudge) -> () {
+      self.workers.wakeWith(move nudge)
+    }
+  }
+}
+
+fn pendingIndex(pending: &List<PendingRaster>, node: u32) -> usize {
+  let list = pending.asSlice()
+  let mut i: usize = 0
+  while i < list.length {
+    if list[i].want.node == node {
+      return i
+    }
+    i = i + 1
+  }
+  return usize.MAX
+}
+
+fn hasPendingNode(pending: &List<PendingRaster>, node: u32) -> bool {
+  return pendingIndex(pending, node) != usize.MAX
+}
+
+fn nextDueIndex(pending: &List<PendingRaster>, workers: &WorkerPool, now: f64) -> usize {
+  let list = pending.asSlice()
+  let mut i: usize = 0
+  while i < list.length {
+    if list[i].dueAt <= now && !workers.hasActiveNode(list[i].want.node) {
+      return i
+    }
+    i = i + 1
+  }
+  return usize.MAX
+}
+
+effect fn copyPixmapBytes(bitmap: &Pixmap) -> List<u8>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut bytes = List<u8>.make()
+  run bytes.appendSlice(bitmap.data())
+  return move bytes
+}
+
+effect fn presentOneRaster(
+  presenter: &CanvasPresenter,
+  tree: &mut UiTree<'_>,
+  node: u32,
+  key: u64,
+  x: i32,
+  y: i32,
+  width: u32,
+  height: u32,
+  pixels: List<u8>,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut surface = tree.canvasRasters.surfaceOf(node, NO_SURFACE)
+  if surface == NO_SURFACE { surface = presenter.open() }
+  if presenter.keeps() {
+    let mut heap = Allocator.systemAllocatorProvider()
+    let mut copy = List<u8>.make()
+    run copy.appendSlice(pixels.asSlice()) |> Effect.provideMut<Allocator>(&mut heap)
+    run presenter.keepPixels(surface, width, height, move copy)
+  }
+  run presenter.present(CanvasFrame {
+    surface: surface,
+    width: width,
+    height: height,
+    pixels: move pixels,
+    shared: Option<SharedPicture>.None,
+  })
+  run tree.showRaster(node, surface, key, x, y, width, height)
+}
+
+/// Presents every canvas bitmap drawn since the last call through `presenter`: Canvas 2D /
+/// `SetCanvasPixels` bitmaps and any already-rasterized large-canvas frames in
+/// `tree.canvasRasters.frames`. Closes the surfaces of canvases no longer in the tree. Never
+/// blocks to rasterize large-canvas command lists; use [`CanvasRasterizer`] for that. Says
+/// whether it changed the tree. A host calls it before each frame's layout, so the frame paints
+/// what was presented.
+pub effect fn presentCanvasBitmaps(presenter: &CanvasPresenter, tree: &mut UiTree<'_>) -> bool
+  ! TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let _span = Prof.span("ui_window.presentCanvasBitmaps")
+  let changed = run presentRasters(presenter, &mut tree)
+  let mut nodes = List<u32>.make()
+  let all = tree.canvas2d.drawn()
+  let mut i: usize = 0
+  while i < all.length {
+    run nodes.append(all[i].node)
+    i = i + 1
+  }
+  let mut batch = Batch.make()
+  i = 0
+  while i < nodes.length() {
+    let node = nodes.get(i)
+    i = i + 1
+    let gone = !tree.contains(node)
+    let mut empty = false
+    let bitmaps = tree.canvas2d.drawn()
+    let mut k: usize = 0
+    while k < bitmaps.length {
+      if bitmaps[k].node == node { empty = bitmaps[k].pixels.width() == 0 }
+      k = k + 1
+    }
+    if !gone && !empty { continue }
+    if let Option<Bitmap>.Some { value } = tree.canvas2d.remove(node) {
+      if value.surface != NO_SURFACE {
+        run presenter.close(value.surface)
+        // Pixels taken away: the canvas draws its commands again.
+        if !gone { run batch.canvasSurface(node, NO_SURFACE, 0, 0, false) }
+      }
+    }
+  }
+  let mut heap = Allocator.systemAllocatorProvider()
+  let bitmaps = tree.canvas2d.drawn()
+  i = 0
+  while i < bitmaps.length {
+    let bitmap = &mut bitmaps[i]
+    i = i + 1
+    if !bitmap.drawn { continue }
+    bitmap.drawn = false
+    let width = bitmap.pixels.width()
+    let height = bitmap.pixels.height()
+    if bitmap.surface == NO_SURFACE {
+      bitmap.surface = presenter.open()
+      bitmap.resized = true
+    }
+    if bitmap.resized {
+      bitmap.resized = false
+      run batch.canvasSurface(bitmap.node, bitmap.surface, width, height, bitmap.opaque)
+    }
+    let mut pixels = List<u8>.make()
+    run pixels.appendSlice(bitmap.pixels.data()) |> Effect.provideMut<Allocator>(&mut heap)
+    if presenter.keeps() {
+      let mut kept = List<u8>.make()
+      run kept.appendSlice(pixels.asSlice()) |> Effect.provideMut<Allocator>(&mut heap)
+      run presenter.keepPixels(bitmap.surface, width, height, move kept)
+    }
+    run presenter.present(CanvasFrame { surface: bitmap.surface, width: width, height: height, pixels: move pixels, shared: Option<SharedPicture>.None })
+  }
+  if batch.length() == 0 { return changed }
+  run tree.apply(run batch.take())
+  return true
+}
+
+/// Presents any ready bitmaps in `tree.canvasRasters.frames` whose canvas still matches, and
+/// closes the surfaces of canvases gone.
+effect fn presentRasters(presenter: &CanvasPresenter, tree: &mut UiTree<'_>) -> bool
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut kept = List<RasterLive>.make()
+  let live = tree.canvasRasters.live.asSlice()
+  let mut i: usize = 0
+  let mut closed = false
+  while i < live.length {
+    if tree.contains(live[i].node) {
+      run kept.append(live[i])
+    } else {
+      run presenter.close(live[i].surface)
+      closed = true
+    }
+    i = i + 1
+  }
+  if closed { tree.canvasRasters.live = move kept }
+  let frames = Intrinsic.replace(tree.canvasRasters.frames, List<RasterFrame>.make())
+  let mut heap = Allocator.systemAllocatorProvider()
+  let all = frames.asSlice()
+  let mut presented = false
+  i = 0
+  while i < all.length {
+    let frame = &all[i]
+    i = i + 1
+    if !tree.acceptsRaster(frame.node, frame.content, frame.key) { continue }
+    let width = frame.pixels.width()
+    let height = frame.pixels.height()
+    let pixels = run copyPixmapBytes(&frame.pixels) |> Effect.provideMut<Allocator>(&mut heap)
+    run presentOneRaster(
+      presenter,
+      &mut tree,
+      frame.node,
+      frame.key,
+      frame.x,
+      frame.y,
+      width,
+      height,
+      move pixels,
+    )
+    presented = true
+  }
+  return presented
+}

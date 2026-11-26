@@ -1,0 +1,2144 @@
+//! The capability graph (step 0 of modules/runtime/docs/composable-runtime.md): which service owns
+//! each built-in, native function and Silk module of the runtime, bytes per service, and every
+//! require or native call that crosses a service line without a declared need.
+//!
+//! It reads the runtime's sources and tools/capabilities.toml, and writes docs/capability-graph.md
+//! with docs/capability-crossings.txt, the list `check` compares against. `--sizes` records the
+//! linked size of one tools/build.py build in docs/capability-sizes.md, which the report includes.
+import silk.cli.task { Task, TaskError }
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.core.ownership { Copy }
+import silk.io.writer { WriterError }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.u32
+import silk.num.u64
+import silk.num.i64
+import silk.num.usize
+import silk.system.child_process { ChildProcess, ProcessError }
+import silk.system.filesystem { DirectoryInfo, FileError, FileInfo, FileSystem, Path }
+import silk.system.glob_scan { ScanOptions, scanBytes }
+import silk.system.host_input { HostInput, HostInputError }
+import silk.text.string { InvalidUtf8, String }
+import silk.num.u8
+import silk.toml.value { Toml, Value }
+import silk.toml.scanner { TomlError }
+import silk.toml.codec { TomlCodec }
+import scan { Facts, same }
+import scan
+
+const CORE: &[u8] = b"Core"
+
+const EXECUTABLE: &[u8] = b"Executable"
+
+struct Rule {
+  owner: Bytes,
+  names: List<Bytes>,
+  prefixes: List<Bytes>
+}
+
+struct Need {
+  owner: Bytes,
+  needs: List<Bytes>
+}
+
+struct Block {
+  first: u32,
+  last: u32,
+  owner: Bytes
+}
+
+struct Named {
+  name: Bytes,
+  owner: Bytes
+}
+
+struct Library {
+  name: Bytes,
+  owner: Bytes,
+  pins: List<Bytes>,
+  paths: List<Bytes>
+}
+
+struct Rules {
+  services: List<Bytes>,
+  needs: List<Need>,
+  builtins: List<Rule>,
+  silk: List<Rule>,
+  blocks: List<Block>,
+  data: List<Named>,
+  libraries: List<Library>,
+}
+
+struct Builtin {
+  name: Bytes,
+  bytes: usize,
+  owner: Bytes,
+  facts: Facts,
+  requires: List<Require>
+}
+
+struct Require {
+  target: usize,
+  lazy: bool
+}
+
+impl Copy for Require {}
+
+struct Module {
+  path: Bytes,
+  owner: Bytes,
+  bytes: usize,
+  externC: u32
+}
+
+struct Crossing {
+  line: Bytes,
+  from: usize,
+  to: Bytes,
+  toOwner: Bytes,
+  when: u8
+}
+
+const LOAD: u8 = 0
+
+const LAZY: u8 = 1
+
+const CALL: u8 = 2
+
+// ---- small helpers -------------------------------------------------------------------------
+
+fn startsWith(text: &[u8], prefix: &[u8]) -> bool {
+  if text.length < prefix.length {
+    return false
+  }
+  return same(Slice.view<u8>(text, 0, prefix.length), prefix)
+}
+
+// A symbol's own name. Since Silk 0.1.0-dev.88 a Linux executable's symbol table names each Silk
+// function by its declaration, `package:src/file.silk::name`, C exports included.
+fn declared(symbol: &[u8]) -> &[u8] {
+  let mut at = symbol.length
+  while at >= 2 {
+    if symbol[at - 1] == 58 && symbol[at - 2] == 58 {
+      return Slice.view<u8>(symbol, at, symbol.length - at)
+    }
+    at = at - 1
+  }
+  return symbol
+}
+
+fn endsWith(text: &[u8], suffix: &[u8]) -> bool {
+  if text.length < suffix.length {
+    return false
+  }
+  return same(Slice.view<u8>(text, text.length - suffix.length, suffix.length), suffix)
+}
+
+fn find(text: &[u8], needle: &[u8], from: usize) -> Option<usize> {
+  if needle.length == 0 || text.length < needle.length {
+    return Option<usize>.none()
+  }
+  let mut at = from
+  while at + needle.length <= text.length {
+    if text[at] == needle[0] && same(Slice.view<u8>(text, at, needle.length), needle) {
+      return Option<usize>.some(at)
+    }
+    at = at + 1
+  }
+  return Option<usize>.none()
+}
+
+fn contains(text: &[u8], needle: &[u8]) -> bool {
+  return match find(text, needle, 0) {
+    Option<usize>.Some { .. } => true
+    Option<usize>.None => false
+  }
+}
+
+fn view(text: &[u8], start: usize, end: usize) -> &[u8] {
+  return Slice.view<u8>(text, start, end - start)
+}
+
+fn has(list: &List<Bytes>, item: &[u8]) -> bool {
+  let items = list.asSlice()
+  let mut at: usize = 0
+  while at < items.length {
+    if same(items[at].asSlice(), item) {
+      return true
+    }
+    at = at + 1
+  }
+  return false
+}
+
+fn less(left: &[u8], right: &[u8]) -> bool {
+  let mut at: usize = 0
+  while at < left.length && at < right.length {
+    if left[at] != right[at] {
+      return left[at] < right[at]
+    }
+    at = at + 1
+  }
+  return left.length < right.length
+}
+
+/// Sorts byte strings in place, by repeated selection (the lists here are hundreds long).
+effect fn sorted(list: List<Bytes>) -> List<Bytes>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut rest = move list
+  let mut out = List<Bytes>.make()
+  while rest.length() > 0 {
+    let items = rest.asSlice()
+    let mut best: usize = 0
+    let mut at: usize = 1
+    while at < items.length {
+      if less(items[at].asSlice(), items[best].asSlice()) {
+        best = at
+      }
+      at = at + 1
+    }
+    run out.append(rest.remove(best))
+  }
+  return move out
+}
+
+effect fn number(out: &mut Bytes, value: u64) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if value >= 10 {
+    run number(&mut out.*, value / 10)
+  }
+  run out.append(&[u64.toU8(value % 10) + 48])
+}
+
+// 1,234 with thousands separators.
+effect fn grouped(out: &mut Bytes, value: u64) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if value >= 1000 {
+    run grouped(&mut out.*, value / 1000)
+    let rest = value % 1000
+    run out.append(b",")
+    if rest < 100 {
+      run out.append(b"0")
+    }
+    if rest < 10 {
+      run out.append(b"0")
+    }
+    run number(&mut out.*, rest)
+    return
+  }
+  run number(&mut out.*, value)
+}
+
+// Bytes as KiB with one decimal: 1,234.5.
+effect fn kib(out: &mut Bytes, bytes: usize) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let tenths = (usize.toU64(bytes) * 10 + 512) / 1024
+  run grouped(&mut out.*, tenths / 10)
+  run out.append(b".")
+  run number(&mut out.*, tenths % 10)
+}
+
+effect fn mib(out: &mut Bytes, bytes: usize) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let tenths = (usize.toU64(bytes) * 10 + 524288) / 1048576
+  run grouped(&mut out.*, tenths / 10)
+  run out.append(b".")
+  run number(&mut out.*, tenths % 10)
+}
+
+effect fn line(out: &mut Bytes, parts: &[&[u8]]) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut at: usize = 0
+  while at < parts.length {
+    run out.append(parts[at])
+    at = at + 1
+  }
+  run out.append(b"\n")
+}
+
+fn digits(text: &[u8], from: usize) -> u32 {
+  let mut value: u32 = 0
+  let mut at = from
+  while at < text.length && text[at] >= 48 && text[at] <= 57 {
+    value = value * 10 + u8.toU32(text[at] - 48)
+    at = at + 1
+  }
+  return value
+}
+
+effect fn path(root: &Path, relative: &[u8]) -> Path
+  ! FileError | OutOfMemoryError
+  ? &mut Allocator {
+  return run Path.resolveBytes(root, relative)
+}
+
+effect fn read(root: &Path, relative: &[u8]) -> Bytes
+  ! FileError | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  let file = run path(root, relative)
+  return run FileSystem.readFile(&file)
+}
+
+effect fn glob(root: &Path, base: &[u8], pattern: &[u8]) -> List<Bytes>
+  ! FileError | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  let directory = run path(root, base)
+  let options = run ScanOptions.make(&directory)
+  let found = run scanBytes(pattern, move options)
+  return run sorted(move found)
+}
+
+// ---- rules -----------------------------------------------------------------------------------
+
+effect fn textOf(value: Option<&Value>) -> Bytes
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  return match Toml.asString(value) {
+    Option<string>.Some { value: found } => run Bytes.copy(String.utf8Bytes(found))
+    Option<string>.None => Bytes.make()
+  }
+}
+
+effect fn texts(value: Option<&Value>) -> List<Bytes>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut out = List<Bytes>.make()
+  let array = match value {
+    Option<&Value>.Some { value: found } => found
+    Option<&Value>.None => {
+      return move out
+    }
+  }
+  let mut at: usize = 0
+  while true {
+    match Toml.item(array, at) {
+      Option<&Value>.Some { value: item } => {
+        run out.append(run textOf(Option<&Value>.some(item)))
+      }
+      Option<&Value>.None => {
+        return move out
+      }
+    }
+    at = at + 1
+  }
+  return move out
+}
+
+fn integer(value: Option<&Value>) -> u32 {
+  return match value {
+    Option<&Value>.Some { value: found } => match TomlCodec.decodeOne<i64>(found) {
+      Result<i64, TomlError>.Success { value: n } => i64.toU32(n)
+      _ => 0
+    }
+    Option<&Value>.None => 0
+  }
+}
+
+effect fn rules(table: &Value, name: string) -> List<Rule>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut out = List<Rule>.make()
+  let array = match Toml.field(table, name) {
+    Option<&Value>.Some { value } => value
+    Option<&Value>.None => {
+      return move out
+    }
+  }
+  let mut at: usize = 0
+  while true {
+    let item = match Toml.item(array, at) {
+      Option<&Value>.Some { value } => value
+      Option<&Value>.None => {
+        return move out
+      }
+    }
+    run out.append(
+      Rule {
+        owner: run textOf(Toml.field(item, "service")),
+        names: run texts(Toml.field(item, "names")),
+        prefixes: run texts(Toml.field(item, "prefixes")),
+      },
+    )
+    at = at + 1
+  }
+  return move out
+}
+
+effect fn loadRules(root: &Path) -> Rules
+  ! FileError | TaskError | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  let source = run read(root, b"tools/capabilities.toml")
+  let parsed = run Effect.result(Toml.parse(source.asSlice()))
+  let table = match move parsed {
+    Result<Value, TomlError | OutOfMemoryError>.Success { value } => move value
+    Result<Value, TomlError | OutOfMemoryError>.Failure { .. } => run Task.abort(
+      "tools/capabilities.toml is not valid TOML",
+    )
+  }
+  let mut needs = List<Need>.make()
+  let mut blocks = List<Block>.make()
+  let mut data = List<Named>.make()
+  let mut libraries = List<Library>.make()
+  let mut at: usize = 0
+  if let Option<&Value>.Some { value: array } = Toml.field(&table, "need") {
+    while true {
+      let item = match Toml.item(array, at) {
+        Option<&Value>.Some { value } => value
+        Option<&Value>.None => {
+          break
+        }
+      }
+      run needs.append(
+        Need {
+          owner: run textOf(Toml.field(item, "service")),
+          needs: run texts(Toml.field(item, "needs")),
+        },
+      )
+      at = at + 1
+    }
+  }
+  at = 0
+  if let Option<&Value>.Some { value: array } = Toml.field(&table, "block") {
+    while true {
+      let item = match Toml.item(array, at) {
+        Option<&Value>.Some { value } => value
+        Option<&Value>.None => {
+          break
+        }
+      }
+      run blocks.append(
+        Block {
+          first: integer(Toml.field(item, "first")),
+          last: integer(Toml.field(item, "last")),
+          owner: run textOf(Toml.field(item, "service")),
+        },
+      )
+      at = at + 1
+    }
+  }
+  at = 0
+  if let Option<&Value>.Some { value: array } = Toml.field(&table, "native") {
+    while true {
+      let item = match Toml.item(array, at) {
+        Option<&Value>.Some { value } => value
+        Option<&Value>.None => {
+          break
+        }
+      }
+      run data.append(
+        Named {
+          name: run textOf(Toml.field(item, "name")),
+          owner: run textOf(Toml.field(item, "service")),
+        },
+      )
+      at = at + 1
+    }
+  }
+  at = 0
+  if let Option<&Value>.Some { value: array } = Toml.field(&table, "library") {
+    while true {
+      let item = match Toml.item(array, at) {
+        Option<&Value>.Some { value } => value
+        Option<&Value>.None => {
+          break
+        }
+      }
+      run libraries.append(
+        Library {
+          name: run textOf(Toml.field(item, "name")),
+          owner: run textOf(Toml.field(item, "service")),
+          pins: run texts(Toml.field(item, "pins")),
+          paths: run texts(Toml.field(item, "paths")),
+        },
+      )
+      at = at + 1
+    }
+  }
+  return Rules {
+    services: run texts(Toml.field(&table, "services")),
+    needs: move needs,
+    builtins: run rules(&table, "builtin"),
+    silk: run rules(&table, "silk"),
+    blocks: move blocks,
+    data: move data,
+    libraries: move libraries,
+  }
+}
+
+effect fn classify(rules: &List<Rule>, name: &[u8]) -> Bytes
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let items = rules.asSlice()
+  let mut at: usize = 0
+  while at < items.length {
+    if has(&items[at].names, name) {
+      return run Bytes.copy(items[at].owner.asSlice())
+    }
+    let prefixes = items[at].prefixes.asSlice()
+    let mut p: usize = 0
+    while p < prefixes.length {
+      if startsWith(name, prefixes[p].asSlice()) {
+        return run Bytes.copy(items[at].owner.asSlice())
+      }
+      p = p + 1
+    }
+    at = at + 1
+  }
+  return run Bytes.copy(CORE)
+}
+
+// A built-in of `source` may name one of `target`: the same service, the core, the services that are
+// always real, or a declared need.
+fn allowed(rules: &Rules, source: &[u8], target: &[u8]) -> bool {
+  if same(source, target) || same(target, CORE) || same(target, b"Platform")
+    || same(target, b"ModuleResolver") {
+    return true
+  }
+  let needs = rules.needs.asSlice()
+  let mut at: usize = 0
+  while at < needs.length {
+    if same(needs[at].owner.asSlice(), source) {
+      return has(&needs[at].needs, target)
+    }
+    at = at + 1
+  }
+  return false
+}
+
+// ---- built-ins -------------------------------------------------------------------------------
+
+// The built-ins as tools/embed.py lists them, then the bootstrap: name, file.
+effect fn builtinFiles(root: &Path) -> List<Named>
+  ! FileError | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  let mut out = List<Named>.make()
+  run out.append(
+    Named {
+      name: run Bytes.copy(b"internal/fs_async"),
+      owner: run Bytes.copy(b"runtime/fs_async.js"),
+    },
+  )
+  let bases = [b"ext/node", b"ext/web", b"libs/node_resolver"]
+  let prefixes = [b"", b"internal/web/", b"internal/loader/"]
+  let mut at: usize = 0
+  while at < bases.length {
+    let found = run glob(root, bases[at], b"**/*.js")
+    let files = found.asSlice()
+    let mut f: usize = 0
+    while f < files.length {
+      let relative = files[f].asSlice()
+      let mut name = run Bytes.copy(prefixes[at])
+      run name.append(view(relative, 0, relative.length - 3))
+      let mut file = run Bytes.copy(bases[at])
+      run file.append(b"/")
+      run file.append(relative)
+      run out.append(Named { name: move name, owner: move file })
+      f = f + 1
+    }
+    at = at + 1
+  }
+  run out.append(
+    Named {
+      name: run Bytes.copy(b"internal/bootstrap/silk"),
+      owner: run Bytes.copy(b"runtime/bootstrap.js"),
+    },
+  )
+  return move out
+}
+
+fn index(builtins: &List<Builtin>, name: &[u8]) -> Option<usize> {
+  let items = builtins.asSlice()
+  let mut at: usize = 0
+  while at < items.length {
+    if same(items[at].name.asSlice(), name) {
+      return Option<usize>.some(at)
+    }
+    at = at + 1
+  }
+  return Option<usize>.none()
+}
+
+// The built-in a require string names, as bootstrap.js internalRequire resolves it.
+effect fn resolve(builtins: &List<Builtin>, specifier: &[u8], parent: &[u8]) -> Option<usize>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut name = if startsWith(specifier, b"node:") {
+    run Bytes.copy(view(specifier, 5, specifier.length))
+  } else {
+    run Bytes.copy(specifier)
+  }
+  if startsWith(name.asSlice(), b".") {
+    let mut base = Bytes.make()
+    let mut cut: usize = 0
+    let mut at: usize = 0
+    while at < parent.length {
+      if parent[at] == 47 {
+        cut = at
+      }
+      at = at + 1
+    }
+    if cut > 0 {
+      run base.append(view(parent, 0, cut))
+    }
+    let request = name.asSlice()
+    let mut start: usize = 0
+    while start <= request.length {
+      let mut end = start
+      while end < request.length && request[end] != 47 {
+        end = end + 1
+      }
+      let part = view(request, start, end)
+      if same(part, b"..") {
+        let current = base.asSlice()
+        let mut last: usize = 0
+        let mut i: usize = 0
+        while i < current.length {
+          if current[i] == 47 {
+            last = i
+          }
+          i = i + 1
+        }
+        base.truncate(last)
+      } else if part.length > 0 && !same(part, b".") {
+        if base.length() > 0 {
+          run base.append(b"/")
+        }
+        run base.append(part)
+      }
+      start = end + 1
+    }
+    name = move base
+  }
+  if endsWith(name.asSlice(), b".js") {
+    let length = name.length() - 3
+    name.truncate(length)
+  }
+  return index(builtins, name.asSlice())
+}
+
+// ---- natives ---------------------------------------------------------------------------------
+
+effect fn constant(root: &Path, module: &[u8], fallback: u32) -> u32
+  ! FileError | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  let mut relative = run Bytes.copy(b"src/ext/")
+  run relative.append(module)
+  run relative.append(b".silk")
+  let source = run read(root, relative.asSlice())
+  let text = source.asSlice()
+  let at = match find(text, b"pub const BASE", 0) {
+    Option<usize>.Some { value } => value
+    Option<usize>.None => {
+      return fallback
+    }
+  }
+  let equals = match find(text, b"=", at) {
+    Option<usize>.Some { value } => value
+    Option<usize>.None => {
+      return fallback
+    }
+  }
+  let mut d = equals + 1
+  while d < text.length && text[d] == 32 {
+    d = d + 1
+  }
+  return digits(text, d)
+}
+
+// Every b"name" in `text` from `start` up to `end`.
+effect fn names(text: &[u8], start: usize, end: usize) -> List<Bytes>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut out = List<Bytes>.make()
+  let mut at = start
+  while at + 1 < end {
+    if text[at] == 98 && text[at + 1] == 34 {
+      let mut close = at + 2
+      while close < end && text[close] != 34 {
+        close = close + 1
+      }
+      run out.append(run Bytes.copy(view(text, at + 2, close)))
+      at = close + 1
+      continue
+    }
+    at = at + 1
+  }
+  return move out
+}
+
+struct Native {
+  name: Bytes,
+  id: u32
+}
+
+// The functions worker.silk configure defines on __silkNative, with their ids.
+effect fn natives(root: &Path) -> List<Native>
+  ! FileError | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  let mut out = List<Native>.make()
+  let source = run read(root, b"src/runtime/worker.silk")
+  let text = source.asSlice()
+  let start = match find(text, b"unsafe effect fn configure", 0) {
+    Option<usize>.Some { value } => value
+    Option<usize>.None => {
+      return move out
+    }
+  }
+  let end = match find(text, b"let result = (run evaluation.evaluate", start) {
+    Option<usize>.Some { value } => value
+    Option<usize>.None => text.length
+  }
+
+  // One function: function(&mut engine, context, native, b"name", 2100)
+  let single = b"context, native, b\""
+  let mut at = start
+  while true {
+    let found = match find(text, single, at) {
+      Option<usize>.Some { value } => value
+      Option<usize>.None => {
+        break
+      }
+    }
+    if found >= end {
+      break
+    }
+    let nameStart = found + single.length
+    let mut close = nameStart
+    while close < end && text[close] != 34 {
+      close = close + 1
+    }
+    if close + 3 < end && text[close + 1] == 44 && text[close + 3] >= 48 && text[close + 3] <= 57 {
+      run out.append(
+        Native { name: run Bytes.copy(view(text, nameStart, close)), id: digits(text, close + 3) },
+      )
+    }
+    at = close
+  }
+
+  // Lists: let xNames = [b"a", b"b"] ... xNames[at], BASE + usize.toU32(at)
+  at = start
+  while true {
+    let found = match find(text, b"let ", at) {
+      Option<usize>.Some { value } => value
+      Option<usize>.None => {
+        break
+      }
+    }
+    if found >= end {
+      break
+    }
+    let nameStart = found + 4
+    let mut nameEnd = nameStart
+    while nameEnd < end && text[nameEnd] != 32 {
+      nameEnd = nameEnd + 1
+    }
+    at = nameEnd
+    if !(nameEnd + 4 < end && text[nameEnd + 1] == 61 && text[nameEnd + 3] == 91) {
+      continue
+    }
+    let close = match find(text, b"]", nameEnd + 4) {
+      Option<usize>.Some { value } => value
+      Option<usize>.None => {
+        break
+      }
+    }
+    let listName = view(text, nameStart, nameEnd)
+    let listed = run names(text, nameEnd + 4, close)
+    let mut usage = run Bytes.copy(listName)
+    run usage.append(b"[at], ")
+    let used = match find(text, usage.asSlice(), close) {
+      Option<usize>.Some { value } => value
+      Option<usize>.None => {
+        continue
+      }
+    }
+    let baseStart = used + usage.length()
+    let mut base: u32 = 0
+    if text[baseStart] >= 48 && text[baseStart] <= 57 {
+      base = digits(text, baseStart)
+    } else if startsWith(view(text, baseStart, end), b"url_native.BASE") {
+      base = run constant(root, b"url_native", 2800)
+    } else if startsWith(view(text, baseStart, end), b"inspector_native.BASE") {
+      base = run constant(root, b"inspector_native", 15000)
+    } else if startsWith(view(text, baseStart, end), b"usize.toU32(at) + 1") {
+      base = 1
+    } else {
+      continue
+    }
+    let items = listed.asSlice()
+    let mut i: usize = 0
+    while i < items.length {
+      run out.append(Native { name: run Bytes.copy(items[i].asSlice()), id: base + usize.toU32(i) })
+      i = i + 1
+    }
+    at = close
+  }
+
+  // The profiler's operations: profile_native.name(), from BASE.
+  let profile = run read(root, b"src/ext/profile_native.silk")
+  let ptext = profile.asSlice()
+  let profileBase = run constant(root, b"profile_native", 18000)
+  if let Option<usize>.Some { value: fnStart } = find(ptext, b"pub fn name(operation: u32)", 0) {
+    let fnEnd = match find(ptext, b"\n}", fnStart) {
+      Option<usize>.Some { value } => value
+      Option<usize>.None => ptext.length
+    }
+    let listed = run names(ptext, fnStart, fnEnd)
+    let items = listed.asSlice()
+    let mut i: usize = 0
+    while i < items.length {
+      run out.append(
+        Native { name: run Bytes.copy(items[i].asSlice()), id: profileBase + usize.toU32(i) },
+      )
+      i = i + 1
+    }
+  }
+  return move out
+}
+
+effect fn nativeService(rules: &Rules, natives: &List<Native>, name: &[u8]) -> Option<Bytes>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let data = rules.data.asSlice()
+  let mut at: usize = 0
+  while at < data.length {
+    if same(data[at].name.asSlice(), name) {
+      return Option<Bytes>.some(run Bytes.copy(data[at].owner.asSlice()))
+    }
+    at = at + 1
+  }
+  let items = natives.asSlice()
+  at = 0
+  while at < items.length {
+    if same(items[at].name.asSlice(), name) {
+      let id = items[at].id
+      let blocks = rules.blocks.asSlice()
+      let mut b: usize = 0
+      while b < blocks.length {
+        if id >= blocks[b].first && id <= blocks[b].last {
+          return Option<Bytes>.some(run Bytes.copy(blocks[b].owner.asSlice()))
+        }
+        b = b + 1
+      }
+      return Option<Bytes>.some(run Bytes.copy(CORE))
+    }
+    at = at + 1
+  }
+  return Option<Bytes>.none()
+}
+
+// ---- the graph -------------------------------------------------------------------------------
+
+struct Graph {
+  builtins: List<Builtin>,
+  modules: List<Module>,
+  crossings: List<Crossing>,
+  natives: List<Named>
+}
+
+effect fn build(root: &Path, rules: &Rules) -> Graph
+  ! FileError | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  let files = run builtinFiles(root)
+  let mut builtins = List<Builtin>.make()
+  let entries = files.asSlice()
+  let mut at: usize = 0
+  while at < entries.length {
+    let source = run read(root, entries[at].owner.asSlice())
+    let facts = run scan.scan(source.asSlice())
+    let name = entries[at].name.asSlice()
+    let owner = if same(name, b"internal/bootstrap/silk") {
+      run Bytes.copy(CORE)
+    } else {
+      run classify(&rules.builtins, name)
+    }
+    run builtins.append(
+      Builtin {
+        name: run Bytes.copy(name),
+        bytes: source.length(),
+        owner: move owner,
+        facts: move facts,
+        requires: List<Require>.make(),
+      },
+    )
+    at = at + 1
+  }
+
+  // Resolve every require to a built-in.
+  at = 0
+  while at < builtins.length() {
+    let mut requires = List<Require>.make()
+    let edges = builtins.asSlice()[at].facts.edges.asSlice()
+    let mut e: usize = 0
+    while e < edges.length {
+      let specifier = edges[e].specifier.asSlice()
+      if !same(specifier, b"internal/host") && !startsWith(specifier, b"silk:host/") {
+        if let Option<usize>.Some { value: target } = run resolve(
+          &builtins,
+          specifier,
+          builtins.asSlice()[at].name.asSlice(),
+        ) {
+          // One edge per target, load-time when any of them is.
+          let existing = requires.asMutSlice()
+          let mut found = false
+          let mut r: usize = 0
+          while r < existing.length {
+            if existing[r].target == target {
+              found = true
+              if !edges[e].lazy {
+                existing[r].lazy = false
+              }
+            }
+            r = r + 1
+          }
+          if !found {
+            run requires.append(Require { target: target, lazy: edges[e].lazy })
+          }
+        }
+      }
+      e = e + 1
+    }
+    let slot = builtins.asMutSlice()
+    let old = Intrinsic.replace(slot[at].requires, move requires)
+    drop old
+    at = at + 1
+  }
+
+  // Natives and their services.
+  let defined = run natives(root)
+  let mut nativeServices = List<Named>.make()
+  let ids = defined.asSlice()
+  at = 0
+  while at < ids.length {
+    if let Option<Bytes>.Some { value } = run nativeService(
+      rules,
+      &defined,
+      ids[at].name.asSlice(),
+    ) {
+      run nativeServices.append(
+        Named { name: run Bytes.copy(ids[at].name.asSlice()), owner: move value },
+      )
+    }
+    at = at + 1
+  }
+  let data = rules.data.asSlice()
+  at = 0
+  while at < data.length {
+    run nativeServices.append(
+      Named {
+        name: run Bytes.copy(data[at].name.asSlice()),
+        owner: run Bytes.copy(data[at].owner.asSlice()),
+      },
+    )
+    at = at + 1
+  }
+
+  // Crossings.
+  let mut crossings = List<Crossing>.make()
+  let all = builtins.asSlice()
+  at = 0
+  while at < all.length {
+    let source = all[at].owner.asSlice()
+    let requires = all[at].requires.asSlice()
+    let mut r: usize = 0
+    while r < requires.length {
+      let target = &all[requires[r].target]
+      if !allowed(rules, source, target.owner.asSlice()) {
+        run crossings.append(
+          run crossing(
+            all,
+            at,
+            target.name.asSlice(),
+            target.owner.asSlice(),
+            if requires[r].lazy {
+              LAZY
+            } else {
+              LOAD
+            },
+          ),
+        )
+      }
+      r = r + 1
+    }
+    let used = all[at].facts.natives.asSlice()
+    let mut n: usize = 0
+    while n < used.length {
+      if let Option<Bytes>.Some { value: owner } = run nativeService(
+        rules,
+        &defined,
+        used[n].asSlice(),
+      ) {
+        if !allowed(rules, source, owner.asSlice()) {
+          let mut to = run Bytes.copy(b"host.")
+          run to.append(used[n].asSlice())
+          run crossings.append(run crossing(all, at, to.asSlice(), owner.asSlice(), CALL))
+        }
+      }
+      n = n + 1
+    }
+    at = at + 1
+  }
+
+  // Silk and C of the core's src/ and of the packages beside it (WebAssembly, compression (both), HTTP/2 (both), HTTP/1 (both), SQLite, OpenSSL, crypto in Silk, the inspector, amaro, Node-API, the executable, the
+  // smoke test); a path is shown with its package directory when it is not the core's.
+  let mut modules = List<Module>.make()
+  let packages = [b"src", b"wamr/src", b"compress/src", b"silkcompress/src", b"http2/src", b"silkhttp2/src", b"llhttp/src", b"silkhttp/src", b"sqlite/src", b"openssl/src", b"silkcrypto/src", b"silktls/src", b"inspector/src", b"amaro/src", b"napi/src", b"cli/src", b"smoke/src"]
+  let patterns = [b"**/*.silk", b"**/*.c", b"**/*.h"]
+  let mut k: usize = 0
+  while k < packages.length {
+    let mut p: usize = 0
+    while p < patterns.length {
+      let found = run glob(root, packages[k], patterns[p])
+      let paths = found.asSlice()
+      let mut f: usize = 0
+      while f < paths.length {
+        let mut relative = run Bytes.copy(packages[k])
+        run relative.append(b"/")
+        run relative.append(paths[f].asSlice())
+        let source = run read(root, relative.asSlice())
+        let text = source.asSlice()
+        let mut count: u32 = 0
+        let mut from: usize = 0
+        while true {
+          match find(text, b"extern \"C\" fn", from) {
+            Option<usize>.Some { value } => {
+              count = count + 1
+              from = value + 1
+            }
+            Option<usize>.None => {
+              break
+            }
+          }
+        }
+        let shown = if k == 0 {
+          run Bytes.copy(paths[f].asSlice())
+        } else {
+          run Bytes.copy(relative.asSlice())
+        }
+        run modules.append(
+          Module {
+            path: move shown,
+            owner: run classify(&rules.silk, paths[f].asSlice()),
+            bytes: source.length(),
+            externC: count,
+          },
+        )
+        f = f + 1
+      }
+      p = p + 1
+    }
+    k = k + 1
+  }
+  return Graph {
+    builtins: move builtins,
+    modules: move modules,
+    crossings: move crossings,
+    natives: move nativeServices,
+  }
+}
+
+effect fn crossing(all: &[Builtin], from: usize, to: &[u8], toOwner: &[u8], when: u8) -> Crossing
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut text = run Bytes.copy(all[from].name.asSlice())
+  run text.append(b"\t")
+  run text.append(all[from].owner.asSlice())
+  run text.append(b"\t")
+  run text.append(to)
+  run text.append(b"\t")
+  run text.append(toOwner)
+  run text.append(b"\t")
+  run text.append(
+    if when == LOAD {
+      b"load"
+    } else if when == LAZY {
+      b"lazy"
+    } else {
+      b"call"
+    },
+  )
+  return Crossing {
+    line: move text,
+    from: from,
+    to: run Bytes.copy(to),
+    toOwner: run Bytes.copy(toOwner),
+    when: when,
+  }
+}
+
+// ---- the report ------------------------------------------------------------------------------
+
+struct Row {
+  builtins: u64,
+  js: usize,
+  load: u64,
+  lazy: u64,
+  silk: u64,
+  silkBytes: usize,
+  externC: u64
+}
+
+impl Copy for Row {}
+
+fn row(graph: &Graph, owner: &[u8]) -> Row {
+  let mut out = Row { builtins: 0, js: 0, load: 0, lazy: 0, silk: 0, silkBytes: 0, externC: 0 }
+  let builtins = graph.builtins.asSlice()
+  let mut at: usize = 0
+  while at < builtins.length {
+    if same(builtins[at].owner.asSlice(), owner) {
+      out.builtins = out.builtins + 1
+      out.js = out.js + builtins[at].bytes
+      let requires = builtins[at].requires.asSlice()
+      let mut r: usize = 0
+      while r < requires.length {
+        if requires[r].lazy {
+          out.lazy = out.lazy + 1
+        } else {
+          out.load = out.load + 1
+        }
+        r = r + 1
+      }
+    }
+    at = at + 1
+  }
+  let modules = graph.modules.asSlice()
+  at = 0
+  while at < modules.length {
+    if same(modules[at].owner.asSlice(), owner) {
+      out.silk = out.silk + 1
+      out.silkBytes = out.silkBytes + modules[at].bytes
+      out.externC = out.externC + u32.toU64(modules[at].externC)
+    }
+    at = at + 1
+  }
+  return out
+}
+
+effect fn order(rules: &Rules) -> List<Bytes>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut out = List<Bytes>.make()
+  run out.append(run Bytes.copy(CORE))
+  let services = rules.services.asSlice()
+  let mut at: usize = 0
+  while at < services.length {
+    run out.append(run Bytes.copy(services[at].asSlice()))
+    at = at + 1
+  }
+  run out.append(run Bytes.copy(EXECUTABLE))
+  return move out
+}
+
+effect fn cell(out: &mut Bytes, value: u64) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run out.append(b" | ")
+  run number(&mut out.*, value)
+}
+
+effect fn kibCell(out: &mut Bytes, value: usize) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run out.append(b" | ")
+  run kib(&mut out.*, value)
+}
+
+effect fn render(rules: &Rules, graph: &Graph, sizes: Option<Bytes>) -> Bytes
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut out = Bytes.make()
+  run out.append(
+    b"# Capability graph\n\nGenerated by `silk task graph` in `tools/capabilities` (step 0 of [the composable runtime](composable-runtime.md)).\n",
+  )
+  run out.append(
+    b"Do not edit by hand. Which service owns each built-in, native function and Silk module is a first cut by\n",
+  )
+  run out.append(
+    b"name, in `tools/capabilities.toml`; moving a file between services is a change there, and this report is\nwhat to read before making it.\n\n",
+  )
+  run out.append(
+    b"## Size by service\n\nBuilt-in JavaScript is source bytes (before bytecode). Silk is source bytes of `src/`. `extern \"C\"` counts\n",
+  )
+  run out.append(
+    b"declarations, the libc and library surface each service reaches today. Requires are edges between built-ins.\n\n",
+  )
+  run out.append(
+    b"| Service | Built-ins | JavaScript KiB | Load-time requires | Lazy requires | Silk files | Silk KiB | `extern \"C\"` |\n",
+  )
+  run out.append(b"| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n")
+  let services = run order(rules)
+  let mut total = Row { builtins: 0, js: 0, load: 0, lazy: 0, silk: 0, silkBytes: 0, externC: 0 }
+  let list = services.asSlice()
+  let mut at: usize = 0
+  while at < list.length {
+    let r = row(graph, list[at].asSlice())
+    if r.builtins + r.silk > 0 {
+      run out.append(b"| ")
+      run out.append(list[at].asSlice())
+      run cell(&mut out, r.builtins)
+      run kibCell(&mut out, r.js)
+      run cell(&mut out, r.load)
+      run cell(&mut out, r.lazy)
+      run cell(&mut out, r.silk)
+      run kibCell(&mut out, r.silkBytes)
+      run cell(&mut out, r.externC)
+      run out.append(b" |\n")
+      total = Row {
+        builtins: total.builtins + r.builtins,
+        js: total.js + r.js,
+        load: total.load + r.load,
+        lazy: total.lazy + r.lazy,
+        silk: total.silk + r.silk,
+        silkBytes: total.silkBytes + r.silkBytes,
+        externC: total.externC + r.externC,
+      }
+    }
+    at = at + 1
+  }
+  run out.append(b"| **Total**")
+  run cell(&mut out, total.builtins)
+  run kibCell(&mut out, total.js)
+  run cell(&mut out, total.load)
+  run cell(&mut out, total.lazy)
+  run cell(&mut out, total.silk)
+  run kibCell(&mut out, total.silkBytes)
+  run cell(&mut out, total.externC)
+  run out.append(b" |\n\n")
+
+  match move sizes {
+    Option<Bytes>.Some { value } => {
+      run out.append(value.asSlice())
+    }
+    Option<Bytes>.None => {
+      run out.append(
+        b"Linked sizes are not here yet: build with `tools/build.py`, then run `silk task graph --sizes ../../build`.\n\n",
+      )
+    }
+  }
+
+  run out.append(b"### Largest built-ins\n\n| Built-in | Service | KiB |\n| --- | --- | ---: |\n")
+  let builtins = graph.builtins.asSlice()
+  let mut taken = List<usize>.make()
+  let mut n: usize = 0
+  while n < 12 && n < builtins.length {
+    let mut best: usize = builtins.length
+    let mut b: usize = 0
+    while b < builtins.length {
+      let mut used = false
+      let picked = taken.asSlice()
+      let mut t: usize = 0
+      while t < picked.length {
+        if picked[t] == b {
+          used = true
+        }
+        t = t + 1
+      }
+      if !used && (best == builtins.length || builtins[b].bytes > builtins[best].bytes) {
+        best = b
+      }
+      b = b + 1
+    }
+    run taken.append(best)
+    run out.append(b"| `")
+    run out.append(builtins[best].name.asSlice())
+    run out.append(b"` | ")
+    run out.append(builtins[best].owner.asSlice())
+    run kibCell(&mut out, builtins[best].bytes)
+    run out.append(b" |\n")
+    n = n + 1
+  }
+
+  run out.append(
+    b"\n## Edges across service lines\n\nA require or native call from one service into another that is not among its declared needs\n",
+  )
+  run out.append(
+    b"(`[[need]]` in `tools/capabilities.toml`, the pairs `embed.start` will check). Each is a decision for step 2: move the\n",
+  )
+  run out.append(
+    b"piece to the core, turn it into a registration the capability makes when it loads, or declare the need.\n",
+  )
+  run out.append(
+    b"Load-time edges block an empty service outright; lazy ones fail only on the path that takes them.\n\n",
+  )
+  run out.append(b"| From | To | Edges | Load-time |\n| --- | --- | ---: | ---: |\n")
+  let crossings = graph.crossings.asSlice()
+  let mut pairs = List<Bytes>.make()
+  let mut c: usize = 0
+  while c < crossings.length {
+    let mut key = run Bytes.copy(builtins[crossings[c].from].owner.asSlice())
+    run key.append(b" | ")
+    run key.append(crossings[c].toOwner.asSlice())
+    if !has(&pairs, key.asSlice()) {
+      run pairs.append(move key)
+    }
+    c = c + 1
+  }
+  let pairList = run sorted(move pairs)
+  let keys = pairList.asSlice()
+  let mut k: usize = 0
+  while k < keys.length {
+    let mut count: u64 = 0
+    let mut load: u64 = 0
+    c = 0
+    while c < crossings.length {
+      let mut key = run Bytes.copy(builtins[crossings[c].from].owner.asSlice())
+      run key.append(b" | ")
+      run key.append(crossings[c].toOwner.asSlice())
+      if same(key.asSlice(), keys[k].asSlice()) {
+        count = count + 1
+        if crossings[c].when == LOAD {
+          load = load + 1
+        }
+      }
+      c = c + 1
+    }
+    run out.append(b"| ")
+    run out.append(keys[k].asSlice())
+    run cell(&mut out, count)
+    run cell(&mut out, load)
+    run out.append(b" |\n")
+    k = k + 1
+  }
+  run out.append(
+    b"\n### Every crossing\n\n| Built-in | Service | Reaches | Service | When |\n| --- | --- | --- | --- | --- |\n",
+  )
+  let mut rows = List<Bytes>.make()
+  c = 0
+  while c < crossings.length {
+    let mut text = run Bytes.copy(b"| `")
+    run text.append(builtins[crossings[c].from].name.asSlice())
+    run text.append(b"` | ")
+    run text.append(builtins[crossings[c].from].owner.asSlice())
+    run text.append(b" | `")
+    run text.append(crossings[c].to.asSlice())
+    run text.append(b"` | ")
+    run text.append(crossings[c].toOwner.asSlice())
+    run text.append(b" | ")
+    run text.append(
+      if crossings[c].when == LOAD {
+        b"load"
+      } else if crossings[c].when == LAZY {
+        b"lazy"
+      } else {
+        b"call"
+      },
+    )
+    run text.append(b" |\n")
+    run rows.append(move text)
+    c = c + 1
+  }
+  let rowList = run sorted(move rows)
+  let rendered = rowList.asSlice()
+  c = 0
+  while c < rendered.length {
+    run out.append(rendered[c].asSlice())
+    c = c + 1
+  }
+
+  run out.append(b"\n## Native functions by service\n\n| Service | Natives |\n| --- | --- |\n")
+  at = 0
+  while at < list.length {
+    let mut named = List<Bytes>.make()
+    let natives = graph.natives.asSlice()
+    let mut i: usize = 0
+    while i < natives.length {
+      if same(natives[i].owner.asSlice(), list[at].asSlice())
+        && !has(&named, natives[i].name.asSlice()) {
+        run named.append(run Bytes.copy(natives[i].name.asSlice()))
+      }
+      i = i + 1
+    }
+    if named.length() > 0 {
+      let names = run sorted(move named)
+      run out.append(b"| ")
+      run out.append(list[at].asSlice())
+      run out.append(b" | ")
+      let items = names.asSlice()
+      i = 0
+      while i < items.length {
+        if i > 0 {
+          run out.append(b", ")
+        }
+        run out.append(b"`")
+        run out.append(items[i].asSlice())
+        run out.append(b"`")
+        i = i + 1
+      }
+      run out.append(b" |\n")
+    }
+    at = at + 1
+  }
+  run out.append(b"\n## Silk modules by service\n\n| Service | Modules |\n| --- | --- |\n")
+  at = 0
+  while at < list.length {
+    let modules = graph.modules.asSlice()
+    let mut first = true
+    let mut i: usize = 0
+    while i < modules.length {
+      if same(modules[i].owner.asSlice(), list[at].asSlice())
+        && endsWith(modules[i].path.asSlice(), b".silk") {
+        if first {
+          run out.append(b"| ")
+          run out.append(list[at].asSlice())
+          run out.append(b" | ")
+          first = false
+        } else {
+          run out.append(b", ")
+        }
+        run out.append(b"`")
+        run out.append(modules[i].path.asSlice())
+        run out.append(b"`")
+      }
+      i = i + 1
+    }
+    if !first {
+      run out.append(b" |\n")
+    }
+    at = at + 1
+  }
+  run out.append(
+    b"\n## Computed requires\n\nBuilt-ins that call require with a computed name, which no static check can see; step 2 reviews them by hand.\n\n",
+  )
+  run out.append(b"| Built-in | At load | Lazily |\n| --- | ---: | ---: |\n")
+  let mut b: usize = 0
+  while b < builtins.length {
+    if builtins[b].facts.dynamicLoad + builtins[b].facts.dynamicLazy > 0 {
+      run out.append(b"| `")
+      run out.append(builtins[b].name.asSlice())
+      run out.append(b"`")
+      run cell(&mut out, u32.toU64(builtins[b].facts.dynamicLoad))
+      run cell(&mut out, u32.toU64(builtins[b].facts.dynamicLazy))
+      run out.append(b" |\n")
+    }
+    b = b + 1
+  }
+  return move out
+}
+
+effect fn crossingsText(graph: &Graph) -> Bytes
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut lines = List<Bytes>.make()
+  let crossings = graph.crossings.asSlice()
+  let mut c: usize = 0
+  while c < crossings.length {
+    run lines.append(run Bytes.copy(crossings[c].line.asSlice()))
+    c = c + 1
+  }
+  let ordered = run sorted(move lines)
+  let mut out = run Bytes.copy(
+    b"# Every require or native call across a service line (silk task graph): built-in, service, what it reaches, service, when.\n",
+  )
+  let items = ordered.asSlice()
+  c = 0
+  while c < items.length {
+    run out.append(items[c].asSlice())
+    run out.append(b"\n")
+    c = c + 1
+  }
+  return move out
+}
+
+// ---- linked sizes ----------------------------------------------------------------------------
+
+struct Pin {
+  key: Bytes,
+  name: Bytes
+}
+
+// What pins each archive or git dependency (sha256 or rev to its name), and machine overrides.
+effect fn pins(root: &Path) -> List<Pin>
+  ! FileError | OutOfMemoryError | HostInputError
+  ? &mut FileSystem | &mut Allocator | &mut HostInput {
+  let mut out = List<Pin>.make()
+  let manifests = run glob(root, b"..", b"**/silk.toml")
+  let paths = manifests.asSlice()
+  let mut at: usize = 0
+  while at < paths.length {
+    let relative = paths[at].asSlice()
+    if contains(relative, b"build/") || contains(relative, b"vendor/") {
+      at = at + 1
+      continue
+    }
+    let mut full = run Bytes.copy(b"../")
+    run full.append(relative)
+    let source = run read(root, full.asSlice())
+    let text = source.asSlice()
+    let mut from: usize = 0
+    while true {
+      let header = match find(text, b"[native.archive.", from) {
+        Option<usize>.Some { value } => value
+        Option<usize>.None => {
+          break
+        }
+      }
+      let nameStart = header + 16
+      let mut nameEnd = nameStart
+      while nameEnd < text.length && text[nameEnd] != 93 && text[nameEnd] != 46 {
+        nameEnd = nameEnd + 1
+      }
+      if let Option<usize>.Some { value: sha } = find(text, b"sha256 = \"", nameEnd) {
+        run out.append(
+          Pin {
+            key: run Bytes.copy(view(text, sha + 10, sha + 74)),
+            name: run Bytes.copy(view(text, nameStart, nameEnd)),
+          },
+        )
+      }
+      from = nameEnd
+    }
+    from = 0
+    while true {
+      let rev = match find(text, b"rev = \"", from) {
+        Option<usize>.Some { value } => value
+        Option<usize>.None => {
+          break
+        }
+      }
+      let mut close = rev + 7
+      while close < text.length && text[close] != 34 {
+        close = close + 1
+      }
+      if let Option<usize>.Some { value: packageAt } = find(text, b"package = \"", close) {
+        let mut end = packageAt + 11
+        while end < text.length && text[end] != 34 {
+          end = end + 1
+        }
+        run out.append(
+          Pin {
+            key: run Bytes.copy(view(text, rev + 7, close)),
+            name: run Bytes.copy(view(text, packageAt + 11, end)),
+          },
+        )
+      }
+      from = close
+    }
+    at = at + 1
+  }
+  if let Option<Bytes>.Some { value: home } = run HostInput.variableNamed("HOME") {
+    let mut file = run Bytes.copy(home.asSlice())
+    run file.append(b"/.silk/native-overrides.toml")
+    let overrides = run Path.fromBytes(file.asSlice())
+    match move run Effect.result(FileSystem.readFile(&overrides)) {
+      Result<Bytes, FileError | OutOfMemoryError>.Success { value: source } => {
+        let text = source.asSlice()
+        let mut from: usize = 0
+        while true {
+          let header = match find(text, b"[native.override.", from) {
+            Option<usize>.Some { value } => value
+            Option<usize>.None => {
+              break
+            }
+          }
+          let nameStart = header + 17
+          let mut nameEnd = nameStart
+          while nameEnd < text.length && text[nameEnd] != 93 {
+            nameEnd = nameEnd + 1
+          }
+          if let Option<usize>.Some { value: p } = find(text, b"path = \"", nameEnd) {
+            let mut end = p + 8
+            while end < text.length && text[end] != 34 {
+              end = end + 1
+            }
+            run out.append(
+              Pin {
+                key: run Bytes.copy(view(text, p + 8, end)),
+                name: run Bytes.copy(view(text, nameStart, nameEnd)),
+              },
+            )
+          }
+          from = nameEnd
+        }
+      }
+      Result<Bytes, FileError | OutOfMemoryError>.Failure { .. } => {}
+    }
+  }
+  return move out
+}
+
+effect fn libraryOf(rules: &Rules, pins: &List<Pin>, source: &[u8]) -> Bytes
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let libraries = rules.libraries.asSlice()
+  let pinned = pins.asSlice()
+  let mut p: usize = 0
+  while p < pinned.length {
+    if contains(source, pinned[p].key.asSlice()) {
+      let mut l: usize = 0
+      while l < libraries.length {
+        if has(&libraries[l].pins, pinned[p].name.asSlice()) {
+          return run Bytes.copy(libraries[l].name.asSlice())
+        }
+        l = l + 1
+      }
+      return run Bytes.copy(pinned[p].name.asSlice())
+    }
+    p = p + 1
+  }
+  let mut l: usize = 0
+  while l < libraries.length {
+    let paths = libraries[l].paths.asSlice()
+    let mut i: usize = 0
+    while i < paths.length {
+      if contains(source, paths[i].asSlice()) {
+        return run Bytes.copy(libraries[l].name.asSlice())
+      }
+      i = i + 1
+    }
+    l = l + 1
+  }
+  return run Bytes.copy(b"runtime C")
+}
+
+struct Tally {
+  name: Bytes,
+  bytes: usize
+}
+
+effect fn add(tallies: &mut List<Tally>, name: &[u8], bytes: usize) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let items = tallies.asMutSlice()
+  let mut at: usize = 0
+  while at < items.length {
+    if same(items[at].name.asSlice(), name) {
+      items[at].bytes = items[at].bytes + bytes
+      return
+    }
+    at = at + 1
+  }
+  run tallies.append(Tally { name: run Bytes.copy(name), bytes: bytes })
+}
+
+// The tallies, largest first.
+effect fn largest(tallies: List<Tally>) -> List<Tally>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut rest = move tallies
+  let mut out = List<Tally>.make()
+  while rest.length() > 0 {
+    let items = rest.asSlice()
+    let mut best: usize = 0
+    let mut at: usize = 1
+    while at < items.length {
+      if items[at].bytes > items[best].bytes {
+        best = at
+      }
+      at = at + 1
+    }
+    run out.append(rest.remove(best))
+  }
+  return move out
+}
+
+fn hex(text: &[u8]) -> usize {
+  let mut value: usize = 0
+  let mut at: usize = 0
+  while at < text.length {
+    let c = text[at]
+    let d = if c >= 48 && c <= 57 {
+      c - 48
+    } else if c >= 97 && c <= 102 {
+      c - 87
+    } else {
+      return value
+    }
+    value = value * 16 + u8.toUsize(d)
+    at = at + 1
+  }
+  return value
+}
+
+// Whitespace-separated fields of one line.
+effect fn fields(text: &[u8]) -> List<Bytes>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut out = List<Bytes>.make()
+  let mut at: usize = 0
+  while at < text.length {
+    while at < text.length && (text[at] == 32 || text[at] == 9) {
+      at = at + 1
+    }
+    let start = at
+    while at < text.length && text[at] != 32 && text[at] != 9 {
+      at = at + 1
+    }
+    if at > start {
+      run out.append(run Bytes.copy(view(text, start, at)))
+    }
+  }
+  return move out
+}
+
+effect fn tabs(text: &[u8]) -> List<Bytes>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut out = List<Bytes>.make()
+  let mut start: usize = 0
+  let mut at: usize = 0
+  while at <= text.length {
+    if at == text.length || text[at] == 9 {
+      run out.append(run Bytes.copy(view(text, start, at)))
+      start = at + 1
+    }
+    at = at + 1
+  }
+  return move out
+}
+
+effect fn lines(text: &[u8]) -> List<Bytes>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut out = List<Bytes>.make()
+  let mut start: usize = 0
+  let mut at: usize = 0
+  while at <= text.length {
+    if at == text.length || text[at] == 10 {
+      if at > start {
+        run out.append(run Bytes.copy(view(text, start, at)))
+      }
+      start = at + 1
+    }
+    at = at + 1
+  }
+  return move out
+}
+
+effect fn capture(program: string, arguments: &List<Bytes>) -> Bytes
+  ! TaskError | ProcessError | HostInputError | OutOfMemoryError | WriterError
+  ? &mut HostInput | &mut Allocator | &mut ChildProcess | &mut FileSystem {
+  let mut views = List<string>.make()
+  let items = arguments.asSlice()
+  let mut at: usize = 0
+  while at < items.length {
+    match String.fromUtf8(items[at].asSlice()) {
+      Result<string, InvalidUtf8>.Success { value } => {
+        run views.append(value)
+      }
+      Result<string, InvalidUtf8>.Failure { .. } => run Task.abort("an argument is not UTF-8")
+    }
+    at = at + 1
+  }
+  return run Task.capture(program, views.asSlice())
+}
+
+/// Linked bytes of one tools/build.py build in `directory` (relative to the runtime), as the
+/// report's section, in Markdown. Needs llvm-size, llvm-nm and llvm-dwarfdump on PATH.
+effect fn sizes(root: &Path, rules: &Rules, directory: &[u8], profile: &[u8]) -> Bytes
+  ! TaskError | ProcessError | FileError | HostInputError | OutOfMemoryError | WriterError
+  ? &mut HostInput | &mut Allocator | &mut ChildProcess | &mut FileSystem {
+  let mut native = run Bytes.copy(directory)
+  run native.append(b"/silkjsruntime.native")
+  let objects = run glob(root, native.asSlice(), b"*.o")
+  if objects.length() == 0 {
+    run Task.abort("no native objects in that build directory")
+  }
+  let base = run path(root, native.asSlice())
+  let mut arguments = List<Bytes>.make()
+  let items = objects.asSlice()
+  let mut at: usize = 0
+  while at < items.length {
+    let mut full = run Bytes.copy(Path.rawBytes(&base))
+    run full.append(b"/")
+    run full.append(items[at].asSlice())
+    run arguments.append(move full)
+    at = at + 1
+  }
+  let measured = run capture("llvm-size", &arguments)
+  let rows = run lines(measured.asSlice())
+  let known = run pins(root)
+  let mut libraries = List<Tally>.make()
+  let all = arguments.asSlice()
+  at = 0
+  while at < all.length && at + 1 < rows.length() {
+    let row = run fields(rows.asSlice()[at + 1].asSlice())
+    let bytes = u32.toUsize(digits(row.asSlice()[0].asSlice(), 0))
+      + u32.toUsize(digits(row.asSlice()[1].asSlice(), 0))
+    let mut one = List<Bytes>.make()
+    run one.append(run Bytes.copy(b"--debug-info"))
+    run one.append(run Bytes.copy(all[at].asSlice()))
+    let unit = run capture("llvm-dwarfdump", &one)
+    let text = unit.asSlice()
+    let mut source = Bytes.make()
+    if let Option<usize>.Some { value: name } = find(text, b"DW_AT_name\t(\"", 0) {
+      let mut end = name + 13
+      while end < text.length && text[end] != 34 {
+        end = end + 1
+      }
+      run source.append(view(text, name + 13, end))
+    }
+    let library = run libraryOf(rules, &known, source.asSlice())
+    run add(&mut libraries, library.asSlice(), bytes)
+    at = at + 1
+  }
+
+  // Silk: every function is in program.o; the symbol table names its module.
+  let mut symbolsPath = run Bytes.copy(directory)
+  run symbolsPath.append(b"/silkjsruntime.symbols")
+  let symbols = run read(root, symbolsPath.asSlice())
+  let table = run Owners.make(symbols.asSlice())
+  let mut program = run Bytes.copy(Path.rawBytes(root))
+  run program.append(b"/")
+  run program.append(directory)
+  run program.append(b"/program.o")
+  let mut nmArguments = List<Bytes>.make()
+  run nmArguments.append(run Bytes.copy(b"-S"))
+  run nmArguments.append(run Bytes.copy(b"--defined-only"))
+  run nmArguments.append(move program)
+  let listed = run capture("llvm-nm", &nmArguments)
+  let symbolLines = run lines(listed.asSlice())
+  let mut silk = List<Tally>.make()
+  let entries = symbolLines.asSlice()
+  at = 0
+  while at < entries.length {
+    let parts = run fields(entries[at].asSlice())
+    if parts.length() == 4 {
+      if let Option<usize>.Some { value: slot } = table.find(parts.asSlice()[3].asSlice()) {
+        let owning = table.moduleOf(slot)
+        let bytes = hex(parts.asSlice()[1].asSlice())
+        let colon = match find(owning, b":", 0) {
+          Option<usize>.Some { value } => value
+          Option<usize>.None => owning.length
+        }
+        let packageName = view(owning, 0, colon)
+        if startsWith(packageName, b"silkjsruntime") {
+          let owner = run classify(&rules.silk, view(owning, colon + 1, owning.length))
+          run add(&mut silk, owner.asSlice(), bytes)
+        } else if startsWith(packageName, b"silkjs@") {
+          run add(&mut silk, b"Engine", bytes)
+        } else if startsWith(packageName, b"pm@") {
+          run add(&mut silk, EXECUTABLE, bytes)
+        } else {
+          run add(&mut silk, b"Silk standard library", bytes)
+        }
+      }
+    }
+    at = at + 1
+  }
+  let mut out = run Bytes.copy(b"## Linked size\n\nFrom one build (")
+  run out.append(profile)
+  run out.append(
+    b"): text and data of each native object by the library its source comes from, and of each\n",
+  )
+  run out.append(
+    b"Silk function by its module, without debug information. Every native object is linked today, so this is what a\n",
+  )
+  run out.append(
+    b"build without the capability would drop, at most.\n\n| C library | Service | KiB |\n| --- | --- | ---: |\n",
+  )
+  let ordered = run largest(move libraries)
+  let libs = ordered.asSlice()
+  at = 0
+  while at < libs.length {
+    run out.append(b"| ")
+    run out.append(libs[at].name.asSlice())
+    run out.append(b" | ")
+    let known = rules.libraries.asSlice()
+    let mut l: usize = 0
+    while l < known.length {
+      if same(known[l].name.asSlice(), libs[at].name.asSlice()) {
+        run out.append(known[l].owner.asSlice())
+        break
+      }
+      l = l + 1
+    }
+    if l == known.length && same(libs[at].name.asSlice(), b"runtime C") {
+      run out.append(CORE)
+    }
+    run kibCell(&mut out, libs[at].bytes)
+    run out.append(b" |\n")
+    at = at + 1
+  }
+  run out.append(b"\n| Silk code | KiB |\n| --- | ---: |\n")
+  let silkOrdered = run largest(move silk)
+  let silks = silkOrdered.asSlice()
+  at = 0
+  while at < silks.length {
+    run out.append(b"| ")
+    run out.append(silks[at].name.asSlice())
+    run kibCell(&mut out, silks[at].bytes)
+    run out.append(b" |\n")
+    at = at + 1
+  }
+  run out.append(b"\n| File | MiB |\n| --- | ---: |\n")
+  let files = [b"/builtin-cache/builtins.bin", b"/heap-image.bin", b"/silkjsruntime"]
+  let labels = [b"Built-in bytecode", b"Heap image", b"Executable"]
+  at = 0
+  while at < files.length {
+    let mut relative = run Bytes.copy(directory)
+    run relative.append(files[at])
+    let file = run path(root, relative.asSlice())
+    match move run Effect.result(FileSystem.stat(&file)) {
+      Result<FileInfo | DirectoryInfo, FileError>.Success { value } => {
+        match move value {
+          FileInfo info => {
+            run out.append(b"| ")
+            run out.append(labels[at])
+            run out.append(b" | ")
+            run mib(&mut out, info.byteLength)
+            run out.append(b" |\n")
+          }
+          DirectoryInfo _ => {}
+        }
+      }
+      Result<FileInfo | DirectoryInfo, FileError>.Failure { .. } => {}
+    }
+    at = at + 1
+  }
+  run out.append(b"\n")
+  return move out
+}
+
+// The symbol table (mangled name, kind, module::function), hashed by mangled name.
+struct Owners {
+  text: Bytes,
+  starts: List<usize>,
+  nameEnds: List<usize>,
+  moduleStarts: List<usize>,
+  moduleEnds: List<usize>,
+  buckets: List<List<usize>>
+}
+
+impl Owners {
+  effect fn make(text: &[u8]) -> Owners
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut owners = Owners {
+      text: run Bytes.copy(text),
+      starts: List<usize>.make(),
+      nameEnds: List<usize>.make(),
+      moduleStarts: List<usize>.make(),
+      moduleEnds: List<usize>.make(),
+      buckets: List<List<usize>>.make(),
+    }
+    let mut b: usize = 0
+    while b < 65536 {
+      run owners.buckets.append(List<usize>.make())
+      b = b + 1
+    }
+    let mut start: usize = 0
+    while start < text.length {
+      let mut end = start
+      while end < text.length && text[end] != 10 {
+        end = end + 1
+      }
+      let mut first = start
+      while first < end && text[first] != 9 {
+        first = first + 1
+      }
+      let mut second = first + 1
+      while second < end && text[second] != 9 {
+        second = second + 1
+      }
+      if second < end {
+        let mut moduleEnd = second + 1
+        while moduleEnd + 1 < end && !(text[moduleEnd] == 58 && text[moduleEnd + 1] == 58) {
+          moduleEnd = moduleEnd + 1
+        }
+        let slot = owners.starts.length()
+        run owners.starts.append(start)
+        run owners.nameEnds.append(first)
+        run owners.moduleStarts.append(second + 1)
+        run owners.moduleEnds.append(moduleEnd)
+        let bucket = hashOf(view(text, start, first)) % 65536
+        run owners.buckets.asMutSlice()[bucket].append(slot)
+      }
+      start = end + 1
+    }
+    return move owners
+  }
+
+  fn find(self: &Self, name: &[u8]) -> Option<usize> {
+    let bucket = self.buckets.asSlice()[hashOf(name) % 65536].asSlice()
+    let text = self.text.asSlice()
+    let mut at: usize = 0
+    while at < bucket.length {
+      let slot = bucket[at]
+      if same(view(text, self.starts.asSlice()[slot], self.nameEnds.asSlice()[slot]), name) {
+        return Option<usize>.some(slot)
+      }
+      at = at + 1
+    }
+    return Option<usize>.none()
+  }
+
+  fn moduleOf(self: &Self, slot: usize) -> &[u8] {
+    return view(
+      self.text.asSlice(),
+      self.moduleStarts.asSlice()[slot],
+      self.moduleEnds.asSlice()[slot],
+    )
+  }
+}
+
+fn hashOf(bytes: &[u8]) -> usize {
+  // Kept below 2^31 at every step: Silk arithmetic traps on overflow.
+  let mut hash: u64 = 5381
+  let mut at: usize = 0
+  while at < bytes.length {
+    hash = (hash * 33 + u8.toU64(bytes[at])) % 2147483647
+    at = at + 1
+  }
+  return u64.toUsize(hash)
+}
+
+// ---- the task --------------------------------------------------------------------------------
+
+/// `silk task graph`: writes the report and the crossings list. With `check`, writes nothing and
+/// fails on a crossing the list does not have, or one it has that is gone. With `sizesFrom`, first
+/// records that build's linked sizes in docs/capability-sizes.md.
+pub effect fn perform(check: bool, sizesFrom: Option<Bytes>, profile: Option<Bytes>) -> ()
+  ! TaskError | ProcessError | FileError | HostInputError | OutOfMemoryError | WriterError
+  ? &mut HostInput | &mut Allocator | &mut ChildProcess | &mut FileSystem {
+  let package = run Task.root()
+  let root = run path(&package, b"../..")
+  let rules = run loadRules(&root)
+  let sizesFile = run path(&root, b"docs/capability-sizes.md")
+  match move sizesFrom {
+    Option<Bytes>.Some { value: directory } => {
+      let named = match move profile {
+        Option<Bytes>.Some { value } => move value
+        Option<Bytes>.None => run Bytes.copy(b"tools/build.py")
+      }
+      let section = run sizes(&root, &rules, directory.asSlice(), named.asSlice())
+      run FileSystem.writeFile(&sizesFile, section.asSlice())
+    }
+    Option<Bytes>.None => {}
+  }
+  let recorded = match move run Effect.result(FileSystem.readFile(&sizesFile)) {
+    Result<Bytes, FileError | OutOfMemoryError>.Success { value } => Option<Bytes>.some(move value)
+    Result<Bytes, FileError | OutOfMemoryError>.Failure { .. } => Option<Bytes>.none()
+  }
+  let graph = run build(&root, &rules)
+  let report = run render(&rules, &graph, move recorded)
+  let crossings = run crossingsText(&graph)
+  let reportFile = run path(&root, b"docs/capability-graph.md")
+  let crossingsFile = run path(&root, b"docs/capability-crossings.txt")
+  if check {
+    let before = match move run Effect.result(FileSystem.readFile(&crossingsFile)) {
+      Result<Bytes, FileError | OutOfMemoryError>.Success { value } => move value
+      Result<Bytes, FileError | OutOfMemoryError>.Failure { .. } => Bytes.make()
+    }
+    let known = run lines(before.asSlice())
+    let current = run lines(crossings.asSlice())
+    let mut message = run Bytes.copy(
+      b"new edges across service lines (docs/composable-runtime.md, \"The Node surface when a capability is absent\"):",
+    )
+    let mut added = false
+    let items = current.asSlice()
+    let mut at: usize = 0
+    while at < items.length {
+      if !has(&known, items[at].asSlice()) {
+        // built-in (service) -> target (service), when
+        let parts = run tabs(items[at].asSlice())
+        let field = parts.asSlice()
+        run message.append(
+          if added {
+            b"; "
+          } else {
+            b" "
+          },
+        )
+        run message.append(field[0].asSlice())
+        run message.append(b" (")
+        run message.append(field[1].asSlice())
+        run message.append(b") -> ")
+        run message.append(field[2].asSlice())
+        run message.append(b" (")
+        run message.append(field[3].asSlice())
+        run message.append(b"), ")
+        run message.append(field[4].asSlice())
+        added = true
+      }
+      at = at + 1
+    }
+    if added {
+      run message.append(
+        b". Move the piece to the core, register it from the capability, or declare the need in tools/capabilities.toml; then run silk task graph.",
+      )
+      fail TaskError {
+        message: match run String.copyUtf8(message.asSlice()) {
+          Result<String, InvalidUtf8>.Success { value } => move value
+          Result<String, InvalidUtf8>.Failure { .. } => run String.copy(
+            "new edges across service lines",
+          )
+        },
+        status: 1,
+      }
+    }
+
+    // An edge that went away leaves the list stale: it is regenerated so that it stays the list of
+    // what crosses. The report's sizes change with every edit and are not checked.
+    if !same(before.asSlice(), crossings.asSlice()) {
+      run Task.abort(
+        "docs/capability-crossings.txt lists edges that are gone: run silk task graph in tools/capabilities",
+      )
+    }
+    return
+  }
+  run FileSystem.writeFile(&reportFile, report.asSlice())
+  run FileSystem.writeFile(&crossingsFile, crossings.asSlice())
+}
+
+/// `silk task symbols`: whether the linked program `binary` (relative to this package) defines a
+/// symbol starting with `prefix`. With `absent`, one fails the task (an empty capability left its
+/// library in); without, none does. Reads the symbol table with nm.
+pub effect fn symbols(binary: &[u8], prefix: &[u8], absent: bool) -> ()
+  ! TaskError | ProcessError | FileError | HostInputError | OutOfMemoryError | WriterError
+  ? &mut HostInput | &mut Allocator | &mut ChildProcess | &mut FileSystem {
+  let package = run Task.root()
+  let program = run path(&package, binary)
+  let mut arguments = List<Bytes>.make()
+  run arguments.append(run Bytes.copy(b"--defined-only"))
+  run arguments.append(run Bytes.copy(Path.rawBytes(&program)))
+  let listed = run capture("nm", &arguments)
+  let rows = run lines(listed.asSlice())
+  let items = rows.asSlice()
+  let mut found: u64 = 0
+  let mut first = Bytes.make()
+  let mut at: usize = 0
+  while at < items.length {
+    let parts = run fields(items[at].asSlice())
+    if parts.length() >= 3 && startsWith(declared(parts.asSlice()[2].asSlice()), prefix) {
+      if found == 0 {
+        run first.append(parts.asSlice()[2].asSlice())
+      }
+      found = found + 1
+    }
+    at = at + 1
+  }
+  let mut message = Bytes.make()
+  if absent && found > 0 {
+    run message.append(binary)
+    run message.append(b" defines ")
+    run number(&mut message, found)
+    run message.append(b" symbols starting with ")
+    run message.append(prefix)
+    run message.append(b", such as ")
+    run message.append(first.asSlice())
+  } else if !absent && found == 0 {
+    run message.append(binary)
+    run message.append(b" defines no symbol starting with ")
+    run message.append(prefix)
+  } else {
+    return
+  }
+  fail TaskError {
+    message: match run String.copyUtf8(message.asSlice()) {
+      Result<String, InvalidUtf8>.Success { value } => move value
+      Result<String, InvalidUtf8>.Failure { .. } => run String.copy("symbol check failed")
+    },
+    status: 1,
+  }
+}

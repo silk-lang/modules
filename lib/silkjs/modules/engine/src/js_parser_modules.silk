@@ -1,0 +1,519 @@
+// Native module/source-element grammar, pinned quickjs.c:32380-32846.
+// Metadata owns every committed atom/value edge; the compile owner tears down the
+// linked function/module on failure. Temporary atom owners release on all exits.
+import js_realm { lendRealm }
+import js_owned_value { Value, lendBits, immediateRef }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.num.i32
+import silk.num.u32
+import silk.num.usize
+import js_heap { HeapCell, CellRef }
+import js_value { ValueBits }
+import js_core_types { RuntimeState, ModuleDef, linkedModule, ObjectData, SlotBits, ExportBinding,
+  ImportEntry, ClosureKind, VariableKind, FunctionKind, NativeFunctionId, JS_PROP_C_W_E, OwnedAtom,
+  RequestedModule, ShapeData }
+import js_compiler_types { ParseFunctionKind, ParseExportKind, CompilerError, FunctionId }
+import js_debug_positions { SourceLocation }
+import js_compiler_state as state
+import js_parser_core { Parser, ParserStackOverflow, PF_IN_ACCEPTED }
+import js_parser_diagnostics { SyntaxError }
+import js_parser_host { ModuleAttributeHooks }
+import js_exceptions { JsException }
+import js_parser_support as support
+import js_parser_functions as functions
+import js_parser_literals as literals
+import js_parser_expressions as expressions
+import js_parser_statements as statements
+import js_parser_lvalues { setObjectName }
+import js_module_metadata as metadata
+import js_module_metadata { ExportKind, ModuleMetadataError }
+import js_tokens { TokenPayload, LexError }
+import js_tokens as tok
+import js_atom_data as atoms
+import js_opcode_data as op
+import js_string_types { FlatString, StringLengthError, stringReference }
+import js_bigint { BigIntError }
+import js_gc { HeapHooks }
+import js_gc as gc
+import js_shapes as shapes
+import js_strings { Strings }
+import js_object_allocate as objects
+import runtime_memory { AllocationObserver }
+import js_invariant { invariant }
+
+// Marks the current function as one that awaits, at the await, for await or
+// await using that starts at start; a module body's own awaits keep their
+// location for --experimental-print-required-tla.
+pub effect fn markAwait(s: &mut Parser<'_>, start: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  let fd = s.function()
+  fd.hasAwait = true
+  let root = match &fd.parent { Option<FunctionId>.None => true _ => false }
+  let module = fd.module drop fd
+  if !root { return () }
+  match module {
+    Option<CellRef<ModuleDef>>.Some { value } => {
+      // locate counts from 0; the locations Node reports, from 1.
+      let at = s.lexer.location(start)
+      let mut anchor = ()
+      let data = value.getMut(&mut anchor)
+      run data.topLevelAwaits.append(SourceLocation { line: at.line + 1, column: at.column + 1 })
+    }
+    _ => ()
+  }
+}
+fn modulePointer(s: &Parser<'_>) -> CellRef<ModuleDef> {
+  let fd = s.functionView()
+  return linkedModule(fd.module)
+}
+fn tokenString(s: &Parser<'_>) -> ValueBits {
+  return match &s.token.payload {
+    TokenPayload.String { value, .. } => s.lexer.heldValue(value)
+    _ => invariant()
+  }
+}
+effect fn stringAtom(s: &Parser<'_>) -> OwnedAtom
+  ! OutOfMemoryError | StringLengthError ? &mut Allocator {
+  let mut anchor = ()
+  let rt = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, s.runtimeCell())
+  let atom = run rt.atoms.intern(tokenString(s))
+  return unsafe OwnedAtom.adopt(s.runtimeCell(), atom)
+}
+// Lexer string tokens are flat UTF-16/Latin-1 strings. Only import/export names
+// (not specifiers or attribute keys/values) require well-formed Unicode here.
+effect fn checkStringName(s: &mut Parser<'_>) -> ()
+  ! OutOfMemoryError | StringLengthError | SyntaxError ? &mut Allocator {
+  let anchor = ()
+  let string = unsafe HeapCell.shortPayload<FlatString, ()>(&anchor, stringReference(tokenString(&s.*)))
+  let mut invalid = false
+  if string.wide {
+    let mut index: usize = 0
+    while index < string.length() {
+      let unit = string.unit(index)
+      index = index + 1
+      if unit >= 0xd800 && unit <= 0xdfff {
+        if unit >= 0xdc00 || index == string.length() { invalid = true break }
+        let next = string.unit(index)
+        if next < 0xdc00 || next > 0xdfff { invalid = true break }
+        index = index + 1
+      }
+    }
+  }
+  drop string
+  if invalid { return run s.syntax<()>(b"contains unpaired surrogate") }
+}
+effect fn duplicateExport(error: ModuleMetadataError) -> i32 { drop error return -1 }
+
+// Both names are borrowed; metadata retains only on successful append. The
+// independently owned metadata diagnostic is dropped before source translation.
+pub effect fn addExport(s: &mut Parser<'_>, localName: u32, exportName: u32,
+  kind: ExportKind) -> usize
+  ! OutOfMemoryError | StringLengthError | SyntaxError ? &mut Allocator {
+  let module = modulePointer(&s.*)
+  let mut ma = ()
+  let m = module.getMut(&mut ma)
+  let rt = s.runtimeState()
+  let index = run metadata.addExport(&mut m, &mut rt.atoms, localName, exportName, kind)
+    |> Effect.catch<ModuleMetadataError>(duplicateExport)
+  drop rt drop m
+  if index < 0 {
+    return run s.syntaxAtom<usize>(b"duplicate exported name '", exportName, b"'")
+  }
+  return i32.toUsize(index)
+}
+effect fn addRequested(s: &Parser<'_>, name: u32) -> i32
+  ! OutOfMemoryError ? &mut Allocator {
+  let module = modulePointer(s)
+  let mut ma = () let mut ra = ()
+  let m = module.getMut(&mut ma)
+  let rt = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut ra, s.runtimeCell())
+  return run metadata.addRequested(&mut m, &mut rt.atoms, name)
+}
+fn attributes(s: &Parser<'_>, index: i32) -> ValueBits {
+  let anchor = ()
+  let m = modulePointer(s).get(&anchor)
+  return m.requestedModules.asSlice()[i32.toUsize(index)].attributes.view()
+}
+fn setIndirect(s: &Parser<'_>, exportIndex: usize, requestedIndex: i32) -> () {
+  let mut anchor = ()
+  let m = modulePointer(s).getMut(&mut anchor)
+  let mut entry = m.exports.get(exportIndex)
+  entry.binding = ExportBinding.Indirect { requestedModuleIndex: requestedIndex }
+  m.exports.set(exportIndex, entry)
+}
+effect fn parseWith<H: HeapHooks + ModuleAttributeHooks>(s: &mut Parser<'_>,
+  hooks: &mut H, memory: &AllocationObserver, index: i32) -> ()
+  ! OutOfMemoryError | StringLengthError | BigIntError | LexError | SyntaxError | ParserStackOverflow | CompilerError | JsException ? &mut Allocator {
+  run s.advance()
+  run s.expect(123)
+  while s.token.kind != 125 {
+    let keyOffset = s.token.start
+    let mut key = OwnedAtom.none()
+    if s.token.kind == tok.TOK_STRING { key = run stringAtom(&s.*) }
+    else {
+      if !support.tokenIsIdent(s.token.kind) { return run s.unexpected<()>() }
+      key = support.ownedToken(&mut s)
+    }
+    run s.advance()
+    run s.expect(58)
+    if s.token.kind != tok.TOK_STRING { return run s.syntaxAt<()>(keyOffset, b"string expected") }
+    let mut object = attributes(&s.*, index)
+    if object.tag() == 3 {
+      let realmAnchor = ()
+      object = run objects.withPrototype(&mut hooks, memory, unsafe lendRealm(&realmAnchor, s.contextCell()), immediateRef(ValueBits.Null))
+      // Root immediately, before any other fallible operation or callback.
+      let mut anchor = ()
+      let m = modulePointer(&s.*).getMut(&mut anchor)
+      let requested = &mut m.requestedModules.asMutSlice()[i32.toUsize(index)]
+      requested.attributes = unsafe Value.adoptBits(object)
+    }
+    let reference = match object { ValueBits.Object { reference } => reference _ => invariant() }
+    let mut anchor = ()
+    let data = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, reference)
+    let duplicate = match unsafe shapes.lookup(data.shape, key.get()) {
+      Option<usize>.Some { .. } => true
+      Option<usize>.None => false
+    }
+    if duplicate { drop data return run s.syntax<()>(b"duplicate with key") }
+    // This is our private ordinary null-prototype object, so own shape lookup is
+    // exactly HasProperty and addProperty is exactly DefinePropertyValue(C_W_E).
+    let added = run unsafe shapes.addProperty(s.runtimeCell(), &mut data, key.get(), u32.toU8(JS_PROP_C_W_E))
+    let value = unsafe tokenString(&s.*).retained()
+    data.setSlot(added.index, SlotBits.value(value))
+    drop data
+    unsafe gc.releaseOptional(&mut hooks, s.runtimeCell(), added.retiredShape)
+    run s.advance()
+    if s.token.kind != 44 { break }
+    run s.advance()
+  }
+  let object = attributes(&s.*, index)
+  let function = s.functionView()
+  let deferAttributes = function.deferModuleAttributes drop function
+  if object.tag() != 3 && !deferAttributes {
+    let anchor = ()
+    let rt = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, s.runtimeCell())
+    let callback = match &rt.moduleLoader.checkSupportedImportAttributes {
+      Option<NativeFunctionId>.Some { value } => Option<NativeFunctionId>.some(value)
+      Option<NativeFunctionId>.None => Option<NativeFunctionId>.none()
+    }
+    let opaque = rt.moduleLoader.opaque
+    drop rt
+    match move callback {
+      Option<NativeFunctionId>.Some { value } => {
+        let realmAnchor = () run unsafe hooks.checkModuleAttributes(unsafe lendRealm(&realmAnchor, s.contextCell()), value, opaque, unsafe lendBits(&realmAnchor, object))
+      }
+      Option<NativeFunctionId>.None => ()
+    }
+  }
+  // Empty `with {}` leaves attributes Undefined and never dispatches the host.
+  run s.expect(125)
+}
+/// Whether two import attribute records hold the same keys and values. Each is
+/// Undefined (no attributes) or the parser's private null-prototype object of
+/// string data properties, which never has deleted records.
+unsafe fn sameAttributes(first: ValueBits, second: ValueBits) -> bool {
+  let a = match first { ValueBits.Object { reference } => reference _ => { return second.tag() == first.tag() } }
+  let b = match second { ValueBits.Object { reference } => reference _ => { return false } }
+  let anchor = ()
+  let x = unsafe HeapCell.payload<ObjectData, ()>(&anchor, a)
+  let y = unsafe HeapCell.payload<ObjectData, ()>(&anchor, b)
+  let count = unsafe shapes.recordCount(x.shape)
+  if count != unsafe shapes.recordCount(y.shape) { return false }
+  let records = unsafe HeapCell.payload<ShapeData, ()>(&anchor, x.shape)
+  let mut i: usize = 0
+  while i < count {
+    let found = unsafe shapes.lookup(y.shape, records.properties.get(i).atom)
+    let same = match found {
+      Option<usize>.Some { value } => Strings.equal(x.slot(i).valueBits(), y.slot(value).valueBits())
+      Option<usize>.None => false
+    }
+    if !same { return false }
+    i = i + 1
+  }
+  return true
+}
+/// A module's requests hold each (specifier, attributes, phase) once, like the
+/// spec's ModuleRequest records: when the request just parsed at index (always the
+/// last) equals an earlier one, it is dropped and the earlier index is returned.
+fn uniqueRequest<H: HeapHooks>(s: &Parser<'_>, hooks: &mut H, index: i32) -> i32 {
+  let module = modulePointer(s)
+  let mut anchor = ()
+  let m = module.getMut(&mut anchor)
+  let last = i32.toUsize(index)
+  let requests = m.requestedModules.asSlice()
+  let name = requests[last].name
+  let sourcePhase = requests[last].sourcePhase
+  let attributes = requests[last].attributes.view()
+  let mut i: usize = 0
+  while i < last {
+    if requests[i].name == name && requests[i].sourcePhase == sourcePhase && unsafe sameAttributes(requests[i].attributes.view(), attributes) { break }
+    i = i + 1
+  }
+  drop requests
+  if i == last { return index }
+  let mut removed = match m.requestedModules.pop() { Option<RequestedModule>.Some { value } => move value _ => invariant() }
+  drop m
+  let bits = Intrinsic.replace(removed.attributes, Value.immediate(ValueBits.Undefined)).intoBits()
+  drop removed
+  let mut ra = ()
+  let rt = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut ra, s.runtimeCell())
+  rt.atoms.release(name) drop rt
+  unsafe gc.release(&mut hooks, s.runtimeCell(), bits)
+  return usize.toI32(i)
+}
+effect fn parseFrom<H: HeapHooks + ModuleAttributeHooks>(s: &mut Parser<'_>,
+  hooks: &mut H, memory: &AllocationObserver, sourcePhase: bool) -> i32
+  ! OutOfMemoryError | StringLengthError | BigIntError | LexError | SyntaxError | ParserStackOverflow | CompilerError | JsException ? &mut Allocator {
+  if !support.pseudoKeyword(&s.*, atoms.JS_ATOM_from) { return run s.syntax<i32>(b"from clause expected") }
+  run s.advance()
+  if s.token.kind != tok.TOK_STRING { return run s.syntax<i32>(b"string expected") }
+  let name = run stringAtom(&s.*)
+  run s.advance()
+  let index = run addRequested(&s.*, name.get())
+  drop name
+  if sourcePhase {
+    let mut anchor = ()
+    let m = modulePointer(&s.*).getMut(&mut anchor)
+    let requests = m.requestedModules.asMutSlice()
+    requests[i32.toUsize(index)].sourcePhase = true
+  }
+  if s.token.kind == tok.TOK_WITH { run parseWith(&mut s, &mut hooks, memory, index) }
+  return uniqueRequest(&s.*, &mut hooks, index)
+}
+effect fn parseExport<H: HeapHooks + ModuleAttributeHooks>(s: &mut Parser<'_>,
+  hooks: &mut H, memory: &AllocationObserver) -> ()
+  ! OutOfMemoryError | StringLengthError | BigIntError | LexError | SyntaxError | ParserStackOverflow | CompilerError | JsException ? &mut Allocator {
+  run s.advance()
+  let token = s.token.kind
+  if token == tok.TOK_CLASS {
+    return run literals.parseClass(&mut s, &mut hooks, memory, false, ParseExportKind.Named)
+  }
+  if token == tok.TOK_FUNCTION || (support.pseudoKeyword(&s.*, atoms.JS_ATOM_async) && s.peek(true) == tok.TOK_FUNCTION) {
+    let start = s.token.start
+    let _child = run functions.parseFunction(&mut s, &mut hooks, memory,
+      ParseFunctionKind.Statement, FunctionKind.Normal, 0, Option<usize>.some(start), ParseExportKind.Named)
+    return ()
+  }
+  run s.advance()
+  if token == 123 {
+    let anchor = ()
+    let m = modulePointer(&s.*).get(&anchor)
+    let first = m.exports.length()
+    drop m
+    while s.token.kind != 125 {
+      if !support.tokenIsIdent(s.token.kind) { return run s.unexpected<()>() }
+      let localName = support.ownedToken(&mut s)
+      run s.advance()
+      let mut exportName = OwnedAtom.none()
+      if support.pseudoKeyword(&s.*, atoms.JS_ATOM_as) {
+        run s.advance()
+        if s.token.kind == tok.TOK_STRING {
+          run checkStringName(&mut s)
+          exportName = run stringAtom(&s.*)
+        } else {
+          if !support.tokenIsIdent(s.token.kind) { return run s.unexpected<()>() }
+          exportName = support.ownedToken(&mut s)
+        }
+        run s.advance()
+      } else { exportName = support.ownedAtom(&mut s, localName.get()) }
+      let _added = run addExport(&mut s, localName.get(), exportName.get(), ExportKind.Local)
+      drop localName drop exportName
+      if s.token.kind != 44 { break }
+      run s.advance()
+    }
+    run s.expect(125)
+    if support.pseudoKeyword(&s.*, atoms.JS_ATOM_from) {
+      let requested = run parseFrom(&mut s, &mut hooks, memory, false)
+      let countAnchor = ()
+      let current = modulePointer(&s.*).get(&countAnchor)
+      let count = current.exports.length()
+      drop current
+      let mut index = first
+      while index < count { setIndirect(&s.*, index, requested) index = index + 1 }
+    }
+  } else if token == 42 {
+    if support.pseudoKeyword(&s.*, atoms.JS_ATOM_as) {
+      run s.advance()
+      if !support.tokenIsIdent(s.token.kind) { return run s.unexpected<()>() }
+      let exportName = support.ownedToken(&mut s)
+      run s.advance()
+      let requested = run parseFrom(&mut s, &mut hooks, memory, false)
+      let added = run addExport(&mut s, atoms.JS_ATOM__star_, exportName.get(), ExportKind.Indirect)
+      setIndirect(&s.*, added, requested)
+    } else {
+      let requested = run parseFrom(&mut s, &mut hooks, memory, false)
+      let mut anchor = ()
+      let m = modulePointer(&s.*).getMut(&mut anchor)
+      let _added = run metadata.addStarExport(&mut m, requested)
+    }
+  } else if token == tok.TOK_DEFAULT {
+    if s.token.kind == tok.TOK_CLASS {
+      return run literals.parseClass(&mut s, &mut hooks, memory, false, ParseExportKind.Default)
+    }
+    if s.token.kind == tok.TOK_FUNCTION || (support.pseudoKeyword(&s.*, atoms.JS_ATOM_async) && s.peek(true) == tok.TOK_FUNCTION) {
+      let start = s.token.start
+      let _child = run functions.parseFunction(&mut s, &mut hooks, memory,
+        ParseFunctionKind.Statement, FunctionKind.Normal, 0, Option<usize>.some(start), ParseExportKind.Default)
+      return ()
+    }
+    run expressions.parseAssignment(&mut s, &mut hooks, memory, PF_IN_ACCEPTED)
+    run setObjectName(&mut s, atoms.JS_ATOM_default)
+    run support.defineVar(&mut s, atoms.JS_ATOM__default_, tok.TOK_LET)
+    run support.emitOpAtomU16(&mut s, op.OP_scope_put_var_init, atoms.JS_ATOM__default_, 0)
+    let _added = run addExport(&mut s, atoms.JS_ATOM__default_, atoms.JS_ATOM_default, ExportKind.Local)
+  } else if token == tok.TOK_VAR || token == tok.TOK_LET || token == tok.TOK_CONST {
+    return run statements.parseVar(&mut s, &mut hooks, memory, token, true, PF_IN_ACCEPTED)
+  } else { return run s.syntax<()>(b"invalid export syntax") }
+  run s.semicolon()
+}
+effect fn addImport(s: &mut Parser<'_>, localName: u32, importName: u32, isStar: bool, position: usize, length: usize) -> ()
+  ! OutOfMemoryError | StringLengthError | SyntaxError | CompilerError ? &mut Allocator {
+  if localName == atoms.JS_ATOM_arguments || localName == atoms.JS_ATOM_eval {
+    return run s.syntax<()>(b"invalid import binding")
+  }
+  // locate counts from 0; V8's message locations, from 1.
+  let at = s.lexer.location(position)
+  let module = modulePointer(&s.*)
+  let cells = s.cells() let fd = move cells.function
+  if localName != atoms.JS_ATOM_default && state.findClosureVar(&fd.*, localName) >= 0 {
+    drop fd return run s.syntax<()>(b"duplicate import binding")
+  }
+  let mut ma = ()
+  let m = module.getMut(&mut ma)
+  let rt = move cells.runtime
+  let mut kind = ClosureKind.ModuleImport
+  if isStar { kind = ClosureKind.ModuleDeclaration }
+  let variable = run state.addClosureVar(&mut fd, &mut rt.atoms, kind,
+    usize.toI32(m.imports.length()), localName, true, true, VariableKind.Normal)
+  let _added = run metadata.addImport(&mut m, &mut rt.atoms, ImportEntry {
+    variableIndex: variable, isStar: isStar, importName: importName, requestedModuleIndex: 0, line: i32.toU32(at.line + 1), column: i32.toU32(at.column + 1), length: usize.toU32(length) })
+}
+effect fn parseImport<H: HeapHooks + ModuleAttributeHooks>(s: &mut Parser<'_>,
+  hooks: &mut H, memory: &AllocationObserver) -> ()
+  ! OutOfMemoryError | StringLengthError | BigIntError | LexError | SyntaxError | ParserStackOverflow | CompilerError | JsException ? &mut Allocator {
+  run s.advance()
+  let module = modulePointer(&s.*)
+  let anchor = ()
+  let m = module.get(&anchor)
+  let first = m.imports.length()
+  drop m
+  let mut requested: i32 = -1
+  let mut sourcePhase = false
+  if s.token.kind == tok.TOK_STRING {
+    let name = run stringAtom(&s.*)
+    run s.advance()
+    requested = run addRequested(&s.*, name.get())
+    drop name
+    if s.token.kind == tok.TOK_WITH { run parseWith(&mut s, &mut hooks, memory, requested) }
+    requested = uniqueRequest(&s.*, &mut hooks, requested)
+  } else {
+    let mut ended = false
+    if s.token.kind == tok.TOK_IDENT {
+      if support.tokenReserved(&s.*) { return run s.reserved<()>() }
+      let plain = support.pseudoKeyword(&s.*, atoms.JS_ATOM_source)
+      let localStart = s.token.start
+      let localLength = s.token.end - s.token.start
+      let localName = support.ownedToken(&mut s)
+      run s.advance()
+      // `import source x from 'y'` (source phase imports). `import source from 'y'`
+      // stays a default import named source; `import source from from 'y'` is not.
+      if plain && s.token.kind == tok.TOK_IDENT
+          && (!support.pseudoKeyword(&s.*, atoms.JS_ATOM_from) || s.peek(false) == tok.TOK_IDENT) {
+        drop localName
+        if support.tokenReserved(&s.*) { return run s.reserved<()>() }
+        let bindingStart = s.token.start
+        let bindingLength = s.token.end - s.token.start
+        let binding = support.ownedToken(&mut s)
+        run s.advance()
+        run addImport(&mut s, binding.get(), atoms.JS_ATOM__star_, true, bindingStart, bindingLength)
+        drop binding
+        sourcePhase = true ended = true
+      } else {
+        run addImport(&mut s, localName.get(), atoms.JS_ATOM_default, false, localStart, localLength)
+        drop localName
+        if s.token.kind != 44 { ended = true } else { run s.advance() }
+      }
+    }
+    if !ended {
+      if s.token.kind == 42 {
+        run s.advance()
+        if !support.pseudoKeyword(&s.*, atoms.JS_ATOM_as) { return run s.unexpected<()>() }
+        run s.advance()
+        if !support.tokenIsIdent(s.token.kind) { return run s.unexpected<()>() }
+        let namespaceStart = s.token.start
+        let namespaceLength = s.token.end - s.token.start
+        let localName = support.ownedToken(&mut s)
+        run s.advance()
+        run addImport(&mut s, localName.get(), atoms.JS_ATOM__star_, true, namespaceStart, namespaceLength)
+      } else if s.token.kind == 123 {
+        run s.advance()
+        while s.token.kind != 125 {
+          let isString = s.token.kind == tok.TOK_STRING
+          let importStart = s.token.start
+          let importLength = s.token.end - s.token.start
+          let mut importName = OwnedAtom.none()
+          if isString {
+            run checkStringName(&mut s)
+            importName = run stringAtom(&s.*)
+          } else {
+            if !support.tokenIsIdent(s.token.kind) { return run s.unexpected<()>() }
+            importName = support.ownedToken(&mut s)
+          }
+          run s.advance()
+          let mut localName = OwnedAtom.none()
+          if support.pseudoKeyword(&s.*, atoms.JS_ATOM_as) {
+            run s.advance()
+            if !support.tokenIsIdent(s.token.kind) { return run s.unexpected<()>() }
+            localName = support.ownedToken(&mut s)
+            run s.advance()
+          } else {
+            if isString { return run s.unexpected<()>() }
+            localName = support.ownedAtom(&mut s, importName.get())
+          }
+          run addImport(&mut s, localName.get(), importName.get(), false, importStart, importLength)
+          drop localName drop importName
+          if s.token.kind != 44 { break }
+          run s.advance()
+        }
+        run s.expect(125)
+      }
+    }
+    requested = run parseFrom(&mut s, &mut hooks, memory, sourcePhase)
+  }
+  let mut updateAnchor = ()
+  let updated = module.getMut(&mut updateAnchor)
+  let mut index = first
+  while index < updated.imports.length() {
+    let mut entry = updated.imports.get(index)
+    entry.requestedModuleIndex = requested
+    updated.imports.set(index, entry)
+    index = index + 1
+  }
+  drop updated
+  run s.semicolon()
+}
+
+pub effect fn parseSourceElement<H: HeapHooks + ModuleAttributeHooks>(s: &mut Parser<'_>,
+  hooks: &mut H, memory: &AllocationObserver) -> ()
+  ! OutOfMemoryError | StringLengthError | BigIntError | LexError | SyntaxError | ParserStackOverflow | CompilerError | JsException ? &mut Allocator {
+  let fd = s.functionView()
+  let module = fd.module.isSome()
+  drop fd
+  if s.token.kind == tok.TOK_FUNCTION || (support.pseudoKeyword(&s.*, atoms.JS_ATOM_async) && s.peek(true) == tok.TOK_FUNCTION) {
+    let start = s.token.start
+    let _child = run functions.parseFunction(&mut s, &mut hooks, memory,
+      ParseFunctionKind.Statement, FunctionKind.Normal, 0, Option<usize>.some(start), ParseExportKind.None)
+  } else if s.token.kind == tok.TOK_EXPORT && module {
+    run parseExport(&mut s, &mut hooks, memory)
+  } else if s.token.kind == tok.TOK_IMPORT && module {
+    let next = s.peek(false)
+    if next != 40 && next != 46 {
+      run parseImport(&mut s, &mut hooks, memory)
+    } else {
+      run statements.parseStatement(&mut s, &mut hooks, memory, statements.DECL_MASK_ALL)
+    }
+  } else {
+    run statements.parseStatement(&mut s, &mut hooks, memory, statements.DECL_MASK_ALL)
+  }
+}

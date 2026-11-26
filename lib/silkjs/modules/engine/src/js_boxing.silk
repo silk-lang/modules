@@ -1,0 +1,198 @@
+//! JS_SetObjectData and JS_ToObject/JS_ToObjectFree, quickjs.c:5913-5937,
+//! 40733-40787. Boxed strings contain flat text, never a rope.
+import js_realm { Realm }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.effect { Effect }
+import silk.core.result { Result }
+import silk.num.usize
+import js_heap { HeapCell }
+import js_value { ValueBits }
+import js_owned_value { Value, ValueRef }
+import js_object_ref { ObjectRef }
+import js_core_types { ObjectData, ObjectPayload, NativeErrorKind }
+import js_gc { HeapHooks }
+import js_gc as gc
+import js_runtime as runtime
+import js_class_data as classes
+import js_atom_data as atoms
+import js_object_allocate as objects
+import js_coercions as coercions
+import js_coercion_host { CoercionHooks }
+import js_property_host { OwnPropertyHooks }
+import js_property_write_host { PropertyWriteHooks }
+import js_property_mutations as properties
+import js_string_types { StringLengthError }
+import js_strings { Strings }
+import js_bigint { BigIntError }
+import js_exceptions { JsException, exceptionValue }
+import runtime_memory { AllocationObserver }
+import js_invariant { invariant }
+
+fn boxedClass(classId: u32) -> bool {
+  return classId == classes.JS_CLASS_NUMBER || classId == classes.JS_CLASS_STRING
+    || classId == classes.JS_CLASS_BOOLEAN || classId == classes.JS_CLASS_SYMBOL
+    || classId == classes.JS_CLASS_DATE || classId == classes.JS_CLASS_BIG_INT
+}
+
+// Consumes data on every exit. The caller keeps object/context live; String-class
+// data must be a flat string. A pre-existing Exception preserves its pending error.
+pub unsafe effect fn setObjectData<'a, 'b, H: HeapHooks + CoercionHooks>(hooks: &mut H,realm: Realm<'a>, object: ValueRef<'b>, data: ValueBits) -> () ! JsException ? &mut Allocator {
+  let rt = realm.runtime()
+  match object.view() {
+    ValueBits.Object { reference } => {
+      let anchor = ()
+      let before = unsafe HeapCell.payload<ObjectData, ()>(&anchor, reference)
+      if boxedClass(before.classId()) {
+        let previous = match &before.payload {
+          ObjectPayload.Boxed { value } => value
+          _ => invariant()
+        }
+        drop before
+        unsafe gc.release(&mut hooks, rt, previous)
+        let mut freshAnchor = ()
+        let fresh = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut freshAnchor, reference)
+        fresh.payload = ObjectPayload.Boxed { value: data }
+        return ()
+      }
+    }
+    _ => ()
+  }
+  unsafe gc.release(&mut hooks, rt, data)
+  if object.view().isException() { fail JsException {} }
+  return run hooks.throwError(realm, NativeErrorKind.Type, b"invalid object type")
+}
+
+// Source boxing materializes errors before dropping its temporary flat string or
+// consuming input. BigInt conversion is unreachable for the fresh String length.
+effect fn materialize<'a, H: CoercionHooks>(hooks: &mut H, realm: Realm<'a>,
+  error: OutOfMemoryError | StringLengthError | BigIntError | JsException) -> ValueBits
+  ! JsException ? &mut Allocator {
+  match move error {
+    OutOfMemoryError _allocation => { return run hooks.throwOutOfMemory(realm) }
+    StringLengthError _length => { return run hooks.throwError(realm, NativeErrorKind.Range, b"Invalid string length") }
+    BigIntError _impossible => invariant()
+    JsException signal => { fail move signal }
+  }
+}
+effect fn allocate<'a, H: HeapHooks + CoercionHooks>(hooks: &mut H, memory: &AllocationObserver,realm: Realm<'a>, classId: u32) -> Value ! JsException ? &mut Allocator {
+  let result = run Effect.result(objects.withClass(&mut hooks, memory, realm, classId))
+  return match move result {
+    Result<ValueBits, OutOfMemoryError>.Success { value } => unsafe Value.adoptBits(value)
+    Result<ValueBits, OutOfMemoryError>.Failure { error: _error } => run hooks.throwOutOfMemory(realm)
+  }
+}
+unsafe effect fn install<'a, 'b, H: HeapHooks + CoercionHooks>(hooks: &mut H, realm: Realm<'a>,
+  object: Value, data: ValueBits) -> ValueBits ! JsException ? &mut Allocator {
+  let installed = run Effect.result(unsafe setObjectData(&mut hooks, realm, object.borrow(), data))
+  match move installed {
+    Result<(), JsException>.Success { .. } => { return object.intoBits() }
+    Result<(), JsException>.Failure { error } => {
+      realm.release(&mut hooks, move object)
+      fail move error
+    }
+  }
+}
+effect fn flatObject<'a, 'b, H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks>(
+  hooks: &mut H, memory: &AllocationObserver, realm: Realm<'a>, flat: ValueRef<'b>) -> ValueBits
+  ! JsException ? &mut Allocator {
+  let object = run allocate(&mut hooks, memory, realm, classes.JS_CLASS_STRING)
+  let length = ValueBits.Int { value: usize.toI32(Strings.length(flat.view())) }
+  let defined = run Effect.result(properties.definePropertyValue(&mut hooks, realm,
+    object.borrow(), atoms.JS_ATOM_length, unsafe Value.adoptBits(length), 0))
+  match move defined {
+    Result<bool, OutOfMemoryError | StringLengthError | BigIntError | JsException>.Success { .. } => ()
+    Result<bool, OutOfMemoryError | StringLengthError | BigIntError | JsException>.Failure { error } => {
+      // Upstream ignores this result: the box survives, with the error pending.
+      let _ignored = run Effect.catch<JsException>(materialize(&mut hooks, realm, move error), exceptionValue)
+    }
+  }
+  return run unsafe install(&mut hooks, realm, move object, flat.dup().intoBits())
+}
+effect fn stringObject<'a, 'b, H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks>(
+  hooks: &mut H, memory: &AllocationObserver, realm: Realm<'a>, input: ValueRef<'b>) -> ValueBits
+  ! JsException ? &mut Allocator {
+  // JS_ToString duplicates a rope before linearizing it. Keep that owner alive
+  // through pending-error construction, then release it before ToObjectFree's input.
+  let mut linearizationOwner = Value.immediate(ValueBits.Undefined)
+  if input.view().tag() == -6 { linearizationOwner = input.dup() }
+  let converted = run Effect.result(coercions.toString(&mut hooks, realm, input))
+  let normalized = match move converted {
+    Result<Value, OutOfMemoryError | StringLengthError | BigIntError | JsException>.Success { value } =>
+      Result<ValueBits, JsException>.Success { value: value.intoBits() }
+    Result<Value, OutOfMemoryError | StringLengthError | BigIntError | JsException>.Failure { error } =>
+      run Effect.result(materialize(&mut hooks, realm, move error))
+  }
+  realm.release(&mut hooks, move linearizationOwner)
+  let flat = match move normalized {
+    Result<ValueBits, JsException>.Success { value } => unsafe Value.adoptBits(value)
+    Result<ValueBits, JsException>.Failure { error } => { fail move error }
+  }
+  let result = run Effect.result(flatObject(&mut hooks, memory, realm, flat.borrow()))
+  realm.release(&mut hooks, move flat)
+  return match move result {
+    Result<ValueBits, JsException>.Success { value } => value
+    Result<ValueBits, JsException>.Failure { error } => { fail move error }
+  }
+}
+
+/// `toObject` returning its new owner.
+@inlineAlways
+pub effect fn toObjectValue<'a, 'b, H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks>(
+  hooks: &mut H, memory: &AllocationObserver, realm: Realm<'a>, value: ValueRef<'b>) -> Value ! JsException ? &mut Allocator {
+  return unsafe Value.adoptBits(run toObject(&mut hooks, memory, realm, value))
+}
+// Borrows input. Object identity and the Exception sentinel pass through; null,
+// undefined and internal non-JavaScript tags throw rather than manufacture boxes.
+pub effect fn toObject<'a, 'b, H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks>(
+  hooks: &mut H, memory: &AllocationObserver, realm: Realm<'a>, value: ValueRef<'b>) -> ValueBits
+  ! JsException ? &mut Allocator {
+  if value.view().isObject() || value.view().isException() { return value.dup().intoBits() }
+  if value.view().isString() { return run stringObject(&mut hooks, memory, realm, value) }
+  let classId = match value.view() {
+    ValueBits.BigInt { .. } => classes.JS_CLASS_BIG_INT
+    ValueBits.ShortBigInt { .. } => classes.JS_CLASS_BIG_INT
+    ValueBits.Int { .. } => classes.JS_CLASS_NUMBER
+    ValueBits.Float64 { .. } => classes.JS_CLASS_NUMBER
+    ValueBits.Bool { .. } => classes.JS_CLASS_BOOLEAN
+    ValueBits.Symbol { .. } => classes.JS_CLASS_SYMBOL
+    _ => { return run hooks.throwError(realm, NativeErrorKind.Type, b"Cannot convert undefined or null to object") }
+  }
+  let object = run allocate(&mut hooks, memory, realm, classId)
+  return run unsafe install(&mut hooks, realm, move object, value.dup().intoBits())
+}
+/// ToObject that consumes `value`, released through the hooks after the conversion.
+pub effect fn toObjectFree<'a, H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks>(
+  hooks: &mut H, memory: &AllocationObserver, realm: Realm<'a>, value: Value) -> ValueBits
+  ! JsException ? &mut Allocator {
+  let result = run Effect.result(toObject(&mut hooks, memory, realm, value.borrow()))
+  unsafe gc.release(&mut hooks, realm.runtime(), value.intoBits())
+  return match move result {
+    Result<ValueBits, JsException>.Success { value: output } => output
+    Result<ValueBits, JsException>.Failure { error } => { fail move error }
+  }
+}
+
+pub fn isConstructor<'a>(value: ValueRef<'a>) -> bool {
+  if !value.view().isObject() { return false }
+  let anchor = () let object = ObjectRef.of(value).data(&anchor)
+  return object.isConstructor()
+}
+pub fn setConstructorBit<'a>(value: ValueRef<'a>, flag: bool) -> bool {
+  match value.view() {
+    ValueBits.Object { .. } => {
+      let mut anchor = () let object = ObjectRef.of(value).dataMut(&mut anchor)
+      object.setIsConstructor(flag)
+      return true
+    }
+    _ => { return false }
+  }
+}
+pub fn isError<'a>(value: ValueRef<'a>) -> bool {
+  match value.view() {
+    ValueBits.Object { .. } => {
+      let anchor = () let object = ObjectRef.of(value).data(&anchor)
+      return object.classId() == classes.JS_CLASS_ERROR
+    }
+    _ => { return false }
+  }
+}

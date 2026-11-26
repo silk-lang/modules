@@ -1,0 +1,732 @@
+//! `ui-inspect-cli`: talks to a running Silk UI's inspector (see modules/inspect/server).
+//!
+//!   ui-inspect-cli [--connect ADDRESS] COMMAND [OPTIONS]
+//!
+//! ADDRESS is in the syntax of `SILK_UI_INSPECT` (`1`, `tcp:<port>` or a socket path); without
+//! `--connect` the CLI reads `SILK_UI_INSPECT`, and without that it uses `1`.
+//!
+//! Commands: hello, extensions, snapshot [--styles] [FILE], query, inspect, pick X Y, highlight [ID ...],
+//! screenshot FILE, click, hover, scroll [--dx N] [--dy N], press KEY [--code CODE],
+//! type TEXT, wait [--gone] [--timeout MS], stats, raw JSON.
+//!
+//! Devtools: frames [--since FRAME] [--limit N], performance [--since FRAME] [--limit N], styles, set-style CSS [--state STATE] [--replace],
+//! reset-styles [--state STATE] [--property NAME], pick-mode [on|off], audit. These print for
+//! people; `--json` prints the reply line instead.
+//!
+//! Edits: edits [--status open|resolved] [--kind edit|comment] [--since SEQ] lists the style edits
+//! and comments people made; comment TEXT [--reply ID] [--author NAME] comments on the target (or
+//! the app); resolve ID... [--reopen] marks entries done (or open again). `edits` prints for
+//! people.
+//!
+//! Extensions: `extensions` lists what the app's extensions add (`hello`'s `extensions`, for
+//! people); any of their commands runs by its name, `<id>.<command>`, with the options above as
+//! its request members, and prints the reply line. Other `--name value` options are members
+//! too (`screen-reader.do --command nextHeading`).
+//!
+//! Targets: --node ID, --role ROLE, --name TEXT, --label TEXT, --text TEXT, --test-id ID,
+//! --within ID, --exact, --hidden. Input commands also take --modifiers shift,control,alt,meta
+//! and click takes --count N; query takes --limit N.
+//!
+//! Text replies (snapshot, inspect) print their text; screenshot writes the PNG; the others
+//! print the reply line. Exit code 0 on `"ok": true`, 1 on a failed command, 2 when the app
+//! cannot be reached or the arguments are wrong.
+import server { Address, parseAddress, describeAddress, resolved }
+import reply { writeString }
+import commands { Command, parseCommand, requestLine, replyPng }
+import mcp { Bridge, Action, writeValue }
+import client as client
+import silk.num.u32
+import silk.num.i64
+import client { connect, exchange }
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.io.byte_duplex { ByteIoError }
+import silk.io.writer { Writer }
+import silk.io.writer_native { StderrWriter, StdoutWriter }
+import silk.json.scanner { JsonError }
+import silk.json.value { Json, Value }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.net.socket_native { NativeSocketError }
+import silk.system.filesystem { FileError, FileSystem, Path }
+import silk.system.filesystem_machine { MachineFileSystem }
+import silk.system.host_input { HostInput, HostInputError }
+import silk.system.monotonic_clock { MonotonicClock }
+import silk.system.monotonic_clock_native { OsMonotonicClock }
+
+static if Intrinsic.targetOperatingSystem() == "windows" {
+  import silk.platform.windows.path { WindowsPath }
+}
+import silk.text.string { String, InvalidUtf8 }
+
+effect fn out(text: string) -> () {
+  let mut writer = StdoutWriter.make()
+  drop run Effect.result(Writer.writeString(text) |> Effect.provideMut<Writer>(&mut writer))
+  drop run Effect.result(Writer.flush() |> Effect.provideMut<Writer>(&mut writer))
+}
+
+effect fn err(text: string) -> () {
+  let mut writer = StderrWriter.make()
+  drop run Effect.result(Writer.writeString(text) |> Effect.provideMut<Writer>(&mut writer))
+}
+
+fn textOf(bytes: &Bytes) -> string {
+  return match HostInput.text(bytes.asSlice()) {
+    Result<string, InvalidUtf8>.Success { value } => value
+    Result<string, InvalidUtf8>.Failure { error: _ } => ""
+  }
+}
+
+fn items<'a>(document: &'a Value, key: string) -> &'a [Value] {
+  return match Json.field(document, key) {
+    Option<&Value>.Some { value } => match &value.* {
+      Value.Array { values } => values.asSlice()
+      _ => &[]
+    }
+    Option<&Value>.None => &[]
+  }
+}
+
+fn flag(value: &Value, key: string) -> bool {
+  return match Json.field(value, key) {
+    Option<&Value>.Some { value: found } => match &found.* {
+      Value.Bool { value: b } => b
+      _ => false
+    }
+    Option<&Value>.None => false
+  }
+}
+
+fn word<'a>(value: &'a Value, key: string) -> string<'a> {
+  return Json.asString(Json.field(value, key)).unwrapOr("")
+}
+
+effect fn number(text: &mut String, value: &Value, key: string) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  match Json.field(value, key) {
+    Option<&Value>.Some { value: found } => {
+      run writeValue(&mut text, found)
+    }
+    Option<&Value>.None => {
+      run text.append("-")
+    }
+  }
+}
+
+/// Appends `label` and the names in `list`, each as `<id>.<name>`, on one line.
+effect fn names(text: &mut String, label: string, id: string, list: &[Value]) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if list.length == 0 {
+    return ()
+  }
+  run text.append(label)
+  let mut i: usize = 0
+  while i < list.length {
+    run text.append(" ")
+    run text.append(id)
+    run text.append(".")
+    run text.append(Json.asString(Option<&Value>.Some { value: &list[i] }).unwrapOr(""))
+    i = i + 1
+  }
+  run text.append("\n")
+}
+
+/// `#<id> <kind> <status>  ` of an edit log entry.
+effect fn entryHead(text: &mut String, e: &Value) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run text.append("#")
+  run number(&mut text, e, "id")
+  run text.append(" ")
+  run text.append(word(e, "kind"))
+  run text.append(" ")
+  run text.append(word(e, "status"))
+  run text.append("  ")
+}
+
+/// A value of an edit, or `none`.
+effect fn valueOrNone(text: &mut String, e: &Value, key: string) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let value = word(e, key)
+  if value == "" {
+    run text.append("none")
+  } else {
+    run text.append(value)
+  }
+}
+
+/// `    on <element> #<id>, in <named>` for an edit log entry's target.
+effect fn targetLine(text: &mut String, e: &Value) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let target = Json.field(e, "target").unwrapOr(e)
+  let element = match Json.field(target, "element") {
+    Option<&Value>.Some { value } => value
+    Option<&Value>.None => {
+      run text.append("    on the app\n")
+      return ()
+    }
+  }
+  run text.append("    on ")
+  run nodeText(&mut text, element)
+  if let Option<&Value>.Some { value: named } = Json.field(target, "named") {
+    if !sameNumber(named, element, "id") {
+      run text.append(", in ")
+      run nodeText(&mut text, named)
+    }
+  }
+  run text.append("\n")
+}
+
+fn sameNumber(a: &Value, b: &Value, key: string) -> bool {
+  return Json.asU64(Json.field(a, key)).unwrapOr(0) == Json.asU64(Json.field(b, key)).unwrapOr(1)
+}
+
+/// `<kind> <role> "<name>" testId=<id> #<id>`.
+effect fn nodeText(text: &mut String, node: &Value) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run text.append(word(node, "kind"))
+  if word(node, "role") != "" {
+    run text.append(" ")
+    run text.append(word(node, "role"))
+  }
+  if word(node, "name") != "" {
+    run text.append(" \"")
+    run text.append(word(node, "name"))
+    run text.append("\"")
+  }
+  if word(node, "testId") != "" {
+    run text.append(" testId=")
+    run text.append(word(node, "testId"))
+  }
+  run text.append(" #")
+  run number(&mut text, node, "id")
+}
+
+/// Prints the reply of a devtools command for a person. False when `cmd` has no such form.
+effect fn pretty(cmd: string, document: &Value) -> bool
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut text = String.make()
+  if cmd == "extensions" {
+    let list = items(document, "extensions")
+    let mut i: usize = 0
+    while i < list.length {
+      let e = &list[i]
+      let id = word(e, "id")
+      run text.append(id)
+      run text.append(" ")
+      run text.append(word(e, "version"))
+      run text.append("\n")
+      run names(&mut text, "  commands:", id, items(e, "commands"))
+      run names(&mut text, "  topics:", id, items(e, "topics"))
+      let panels = items(e, "panels")
+      let mut p: usize = 0
+      while p < panels.length {
+        let panel = &panels[p]
+        run text.append("  panel ")
+        run text.append(word(panel, "id"))
+        run text.append(" \"")
+        run text.append(word(panel, "title"))
+        run text.append("\"")
+        if word(panel, "data") != "" {
+          run text.append(", data from ")
+          run text.append(id)
+          run text.append(".")
+          run text.append(word(panel, "data"))
+        }
+        if word(panel, "view") != "" {
+          run text.append(", view on ")
+          run text.append(id)
+          run text.append(".")
+          run text.append(word(panel, "view"))
+        }
+        run text.append("\n")
+        p = p + 1
+      }
+      i = i + 1
+    }
+    if list.length == 0 {
+      run text.append("(no extensions)\n")
+    }
+  } else if cmd == "frames" {
+    let list = items(document, "frames")
+    run text.append("frame  layout ms  paint ms  repainted  replayed  primitives  glyphs\n")
+    let mut i: usize = 0
+    while i < list.length {
+      let f = &list[i]
+      run number(&mut text, f, "frame")
+      run text.append("  ")
+      run number(&mut text, f, "layoutMs")
+      run text.append(
+        if flag(f, "layoutSkipped") {
+          " (skipped)  "
+        } else {
+          "  "
+        },
+      )
+      run number(&mut text, f, "paintMs")
+      run text.append("  ")
+      run number(&mut text, f, "repainted")
+      run text.append("  ")
+      run number(&mut text, f, "replayed")
+      run text.append("  ")
+      run number(&mut text, f, "primitives")
+      run text.append("  ")
+      run number(&mut text, f, "glyphs")
+      run text.append("\n")
+      i = i + 1
+    }
+    run text.append("slowest ")
+    run number(&mut text, document, "slowestMs")
+    run text.append(" ms, average ")
+    run number(&mut text, document, "averageMs")
+    run text.append(" ms over ")
+    run number(&mut text, document, "count")
+    run text.append(" frames\n")
+  } else if cmd == "performance" {
+    if let Option<&Value>.Some { value: startup } = Json.field(document, "startup") {
+      run text.append("startup: window ")
+      run number(&mut text, startup, "windowMs")
+      run text.append(" ms, gpu ")
+      run number(&mut text, startup, "gpuMs")
+      run text.append(" ms, first frame ")
+      run number(&mut text, startup, "firstFrameMs")
+      run text.append(" ms\n")
+    }
+    run text.append("memory: ")
+    run number(&mut text, document, "memoryBytes")
+    run text.append(" bytes\n")
+    let list = items(document, "interactions")
+    run text.append("frame  total ms  handlers  layout  paint  input on target\n")
+    let mut i: usize = 0
+    while i < list.length {
+      let f = &list[i]
+      run number(&mut text, f, "frame")
+      run text.append("  ")
+      run number(&mut text, f, "totalMs")
+      run text.append("  ")
+      run number(&mut text, f, "handleMs")
+      run text.append("  ")
+      run number(&mut text, f, "layoutMs")
+      run text.append("  ")
+      run number(&mut text, f, "paintMs")
+      run text.append("  ")
+      run text.append(word(f, "input"))
+      run text.append(" on ")
+      run text.append(word(f, "target"))
+      run text.append("\n")
+      i = i + 1
+    }
+    run number(&mut text, document, "slow")
+    run text.append(" over 100 ms\n")
+  } else if cmd == "edits" {
+    let edits = items(document, "edits")
+    let mut i: usize = 0
+    while i < edits.length {
+      let e = &edits[i]
+      run entryHead(&mut text, e)
+      run text.append(word(e, "state"))
+      run text.append(" ")
+      run text.append(word(e, "property"))
+      run text.append(": ")
+      run valueOrNone(&mut text, e, "before")
+      run text.append(" -> ")
+      run valueOrNone(&mut text, e, "after")
+      if !flag(e, "applied") && word(e, "status") == "open" {
+        run text.append("  (not applied: the node is gone)")
+      }
+      run text.append("\n")
+      run targetLine(&mut text, e)
+      i = i + 1
+    }
+    let comments = items(document, "comments")
+    let mut c: usize = 0
+    while c < comments.length {
+      let e = &comments[c]
+      run entryHead(&mut text, e)
+      run text.append("\"")
+      run text.append(word(e, "text"))
+      run text.append("\"")
+      if word(e, "author") != "" {
+        run text.append(" (")
+        run text.append(word(e, "author"))
+        run text.append(")")
+      }
+      run text.append("\n")
+      run targetLine(&mut text, e)
+      let thread = items(e, "thread")
+      let mut t: usize = 0
+      while t < thread.length {
+        run text.append("    > ")
+        run text.append(word(&thread[t], "text"))
+        if word(&thread[t], "author") != "" {
+          run text.append(" (")
+          run text.append(word(&thread[t], "author"))
+          run text.append(")")
+        }
+        run text.append("\n")
+        t = t + 1
+      }
+      c = c + 1
+    }
+    if edits.length == 0 && comments.length == 0 {
+      run text.append("(no edits or comments)\n")
+    }
+    run number(&mut text, document, "open")
+    run text.append(" open, seq ")
+    run number(&mut text, document, "seq")
+    run text.append("\n")
+  } else if cmd == "audit" {
+    let list = items(document, "issues")
+    let mut i: usize = 0
+    while i < list.length {
+      let issue = &list[i]
+      let node = Json.field(issue, "node").unwrapOr(issue)
+      run text.append(word(issue, "rule"))
+      run text.append("  #")
+      run number(&mut text, node, "id")
+      run text.append(" ")
+      run text.append(word(node, "kind"))
+      if word(node, "role") != "" {
+        run text.append(" ")
+        run text.append(word(node, "role"))
+      }
+      if word(node, "name") != "" {
+        run text.append(" \"")
+        run text.append(word(node, "name"))
+        run text.append("\"")
+      }
+      run text.append(": ")
+      run text.append(word(issue, "message"))
+      run text.append("\n")
+      i = i + 1
+    }
+    run number(&mut text, document, "count")
+    run text.append(" issues in ")
+    run number(&mut text, document, "checked")
+    run text.append(" nodes\n")
+  } else {
+    return false
+  }
+  run out(String.view(&text))
+  return true
+}
+
+/// Writes the screenshot in `reply` to `file`. False when the reply has no PNG.
+effect fn saveScreenshot(document: &Value, file: string) -> bool
+  ! FileError | HostInputError | OutOfMemoryError
+  ? &mut Allocator | &mut HostInput {
+  let png = match move run replyPng(document) {
+    Option<Bytes>.Some { value } => move value
+    Option<Bytes>.None => {
+      return false
+    }
+  }
+  return run writeTo(file, png.asSlice())
+}
+
+/// Writes `data` to `file`, relative to the working directory unless it is absolute.
+effect fn writeTo(file: string, data: &[u8]) -> bool
+  ! FileError | HostInputError | OutOfMemoryError
+  ? &mut Allocator | &mut HostInput {
+  let path = if String.startsWith(file, "/") {
+    run Path.fromBytes(String.utf8Bytes(file))
+  } else {
+    let cwd = run HostInput.workingDirectory()
+    let base = run hostDirectory(cwd.asSlice())
+    run Path.resolveBytes(&base, String.utf8Bytes(file))
+  }
+  let mut files = run MachineFileSystem.make()
+  run FileSystem.writeFile(&path, data) |> Effect.provideMut<FileSystem>(&mut files)
+  return true
+}
+
+/// Runs one request and prints its result. Returns the exit code, or 3 for a `wait` that is
+/// not satisfied yet.
+effect fn serveOnce(address: &Address, c: &Command, line: &String) -> i32
+  ! NativeSocketError | ByteIoError | FileError | HostInputError | OutOfMemoryError
+  ? &mut MonotonicClock | &mut Allocator | &mut HostInput {
+  if String.view(&c.cmd) == "capture" {
+    return run captureSequence(address, c, line)
+  }
+  let mut connection = run connect(address)
+  let mut reply = Bytes.make()
+  run exchange(&mut connection, String.view(line), &mut reply)
+  drop run Effect.result(connection.close())
+  let parsed = run Effect.result(Json.parse(reply.asSlice()))
+  let document = match move parsed {
+    Result<Value, JsonError | OutOfMemoryError>.Success { value } => move value
+    Result<Value, JsonError | OutOfMemoryError>.Failure { error } => {
+      drop error
+      run err("ui-inspect-cli: the app's reply is not JSON\n")
+      return 2
+    }
+  }
+  let ok = match Json.field(&document, "ok") {
+    Option<&Value>.Some { value } => match &value.* {
+      Value.Bool { value: b } => b
+      _ => false
+    }
+    Option<&Value>.None => false
+  }
+  if !ok {
+    let pending = match Json.field(&document, "pending") {
+      Option<&Value>.Some { value } => match &value.* {
+        Value.Bool { value: b } => b
+        _ => false
+      }
+      Option<&Value>.None => false
+    }
+    if pending {
+      return 3
+    }
+    run err("ui-inspect-cli: ")
+    run err(
+      match Json.asString(Json.field(&document, "error")) {
+        Option<string>.Some { value } => value
+        Option<string>.None => "the command failed"
+      },
+    )
+    run err("\n")
+    return 1
+  }
+  let cmd = String.view(&c.cmd)
+  if cmd == "screenshot" || cmd == "capture" {
+    if !run saveScreenshot(&document, String.view(&c.file)) {
+      run err("ui-inspect-cli: the reply has no PNG\n")
+      return 1
+    }
+    let mut text = run String.copy("wrote ")
+    run text.append(String.view(&c.file))
+    run text.append("\n")
+    run out(String.view(&text))
+    return 0
+  }
+  if cmd == "snapshot" || cmd == "inspect" {
+    match Json.asString(Json.field(&document, "text")) {
+      Option<string>.Some { value } => {
+        if c.file.ownedByteLength() != 0 {
+          drop run writeTo(String.view(&c.file), String.utf8Bytes(value))
+          return 0
+        }
+        run out(value)
+        return 0
+      }
+      Option<string>.None => {}
+    }
+  }
+  if !c.json && run pretty(cmd, &document) {
+    return 0
+  }
+  run out(textOf(&reply))
+  run out("\n")
+  return 0
+}
+
+/// Uses the same capture implementation as the MCP tool, with a PNG file as the output.
+effect fn captureSequence(address: &Address, c: &Command, line: &String) -> i32
+  ! NativeSocketError | ByteIoError | FileError | HostInputError | OutOfMemoryError
+  ? &mut MonotonicClock | &mut Allocator | &mut HostInput {
+  let mut description = String.make()
+  run describeAddress(address, &mut description)
+  let mut bridge = run Bridge.make(String.view(&description))
+  let mut call = run String.copy(
+    "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"ui_capture\",\"arguments\":",
+  )
+  run call.append(String.view(line))
+  run call.append("}}")
+  let mut wire = String.make()
+  let mut action = run bridge.handle(call.ownedUtf8Bytes(), &mut wire)
+  let start = run MonotonicClock.now()
+  let mut reply = Bytes.make()
+  while action == Action.Ask || action == Action.Retry {
+    if action == Action.Retry {
+      let clockNow = run MonotonicClock.now()
+      let since = (clockNow.seconds() - start.seconds()) * 1000
+        + (u32.toI64(clockNow.subsecondNanoseconds()) - u32.toI64(start.subsecondNanoseconds())) / 1000000
+      run MonotonicClock.waitFor(bridge.retryDelay(i64.toU64(since)) * 1000000)
+    }
+    run client.request(address, String.view(&wire), &mut reply)
+    let now = run MonotonicClock.now()
+    let a = start.seconds() * 1000 + u32.toI64(start.subsecondNanoseconds()) / 1000000
+    let b = now.seconds() * 1000 + u32.toI64(now.subsecondNanoseconds()) / 1000000
+    action = run bridge.answer(reply.asSlice(), true, i64.toU64(b - a), &mut wire)
+  }
+  let parsed = run Effect.result(Json.parse(wire.ownedUtf8Bytes()))
+  if let Result<Value, JsonError | OutOfMemoryError>.Success { value } = move parsed {
+    let contents = Json.fieldAt(Json.field(&value, "result"), "content")
+    if let Option<&Value>.Some { value: array } = contents {
+      if let Value.Array { values } = &array.* {
+        let children = values.asSlice()
+        let mut i: usize = 0
+        let mut saved = false
+        let mut said = false
+        while i < children.length {
+          let item = &children[i]
+          let kind = Json.asString(Json.field(item, "type")).unwrapOr("")
+          if kind == "image" {
+            let mut wrapped = run String.copy("{\"png\":")
+            run writeString(&mut wrapped, Json.asString(Json.field(item, "data")).unwrapOr(""))
+            run wrapped.append("}")
+            let image = run Effect.result(Json.parse(wrapped.ownedUtf8Bytes()))
+            if let Result<Value, JsonError | OutOfMemoryError>.Success { value: png } = move image {
+              saved = run saveScreenshot(&png, String.view(&c.file))
+            }
+          } else if kind == "text" {
+            run out(Json.asString(Json.field(item, "text")).unwrapOr(""))
+            run out("\n")
+            said = true
+          }
+          i = i + 1
+        }
+        if saved {
+          return 0
+        }
+        if !said {
+          run err("ui-inspect-cli: capture failed: the app sent no image\n")
+          return 1
+        }
+        run err("ui-inspect-cli: capture failed (the reason is above)\n")
+        return 1
+      }
+    }
+    // Not a tool result: the bridge's own error, such as an argument it refused.
+    let message = Json.asString(Json.fieldAt(Json.field(&value, "error"), "message")).unwrapOr("")
+    if message != "" {
+      run err("ui-inspect-cli: capture failed: ")
+      run err(message)
+      run err("\n")
+      return 1
+    }
+  }
+  run err("ui-inspect-cli: capture failed: the inspector sent no reply it could read\n")
+  return 1
+}
+
+effect fn process() -> i32
+  ! HostInputError | OutOfMemoryError
+  ? &mut HostInput | &mut Allocator {
+  let args = run HostInput.arguments()
+  let mut words = List<String>.make()
+  let list = args.asSlice()
+  let mut a: usize = 1
+  while a < list.length {
+    run words.append(run String.copy(textOf(&list[a])))
+    a = a + 1
+  }
+  let mut problem = String.make()
+  let mut c = match run parseCommand(words.asSlice(), &mut problem) {
+    Option<Command>.Some { value } => move value
+    Option<Command>.None => {
+      if problem.ownedByteLength() == 0 {
+        run err("usage: ui-inspect-cli [--connect ADDRESS] COMMAND [OPTIONS] (see the README)\n")
+      } else {
+        run complain(String.view(&problem))
+      }
+      return 2
+    }
+  }
+  let mut line = String.make()
+  if !run requestLine(&mut c, &mut line, &mut problem) {
+    run complain(String.view(&problem))
+    return 2
+  }
+  let connectTo = if c.connect.ownedByteLength() != 0 {
+    run String.copy(String.view(&c.connect))
+  } else {
+    match run HostInput.variableNamed("SILK_UI_INSPECT") {
+      Option<Bytes>.Some { value } => run String.copy(textOf(&value))
+      Option<Bytes>.None => run String.copy("1")
+    }
+  }
+  let cwd = run HostInput.workingDirectory()
+  let address = match run parseAddress(String.view(&connectTo)) {
+    Option<Address>.Some { value } => run resolved(move value, cwd.asSlice())
+    Option<Address>.None => {
+      run err("ui-inspect-cli: the address is not 1, tcp:<port> or a socket path\n")
+      return 2
+    }
+  }
+  let mut clock = OsMonotonicClock.make()
+  let start = run MonotonicClock.now() |> Effect.provideMut<MonotonicClock>(&mut clock)
+  let waitLimit = MonotonicClock.deadlineAfter(&start, c.timeout * 1000000)
+  while true {
+    let result = run Effect.result(serveOnce(&address, &c, &line))
+      |> Effect.provideMut<MonotonicClock>(&mut clock)
+    let code = match move result {
+      Result<
+        i32,
+        NativeSocketError | ByteIoError | FileError | HostInputError | OutOfMemoryError
+      >.Success {
+        value,
+      } => value
+      Result<
+        i32,
+        NativeSocketError | ByteIoError | FileError | HostInputError | OutOfMemoryError
+      >.Failure {
+        error,
+      } => {
+        drop error
+        let mut text = run String.copy("ui-inspect-cli: could not talk to the app at ")
+        run describeAddress(&address, &mut text)
+        run text.append(" (is it running with SILK_UI_INSPECT set, in a debug build?)\n")
+        run err(String.view(&text))
+        return 2
+      }
+    }
+    if code != 3 {
+      return code
+    }
+
+    // A wait that does not hold yet: ask again until the timeout.
+    let now = run MonotonicClock.now() |> Effect.provideMut<MonotonicClock>(&mut clock)
+    if now.seconds() > waitLimit.seconds()
+      || now.seconds() == waitLimit.seconds()
+        && u32.toI64(now.subsecondNanoseconds()) >= u32.toI64(waitLimit.subsecondNanoseconds()) {
+      run err("ui-inspect-cli: timed out\n")
+      return 1
+    }
+    run MonotonicClock.waitFor(50000000) |> Effect.provideMut<MonotonicClock>(&mut clock)
+  }
+  return 2
+}
+
+effect fn complain(problem: string) -> () {
+  run err("ui-inspect-cli: ")
+  run err(problem)
+  run err("\n")
+}
+
+effect fn failed<E>(error: E) -> i32 {
+  drop error
+  run err("ui-inspect-cli: failed\n")
+  return 2
+}
+
+/// Runs the CLI on the process's arguments and returns its exit code. `ui-inspect-cli`'s
+/// main, and the inspector program a development build writes next to the app's host, which is
+/// built from the same Silk UI as the app.
+pub effect fn main() -> i32
+  ? &mut HostInput {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run Effect.catchAll(process(), failed) |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// The working directory arrives in host spelling: `C:\...`, or an extended `\\?\` name, on Windows,
+// which Path.fromBytes does not accept.
+effect fn hostDirectory(bytes: &[u8]) -> Path
+  ! FileError | OutOfMemoryError
+  ? &mut Allocator {
+  static if Intrinsic.targetOperatingSystem() == "windows" {
+    return run WindowsPath.fromNativeBytes(bytes)
+  } else {
+    return run Path.fromBytes(bytes)
+  }
+}

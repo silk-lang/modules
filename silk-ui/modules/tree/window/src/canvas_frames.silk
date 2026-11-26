@@ -1,0 +1,554 @@
+//! The frames of GPU canvases on their way to the renderer.
+//!
+//! A canvas node that shows a GPU surface (`Mutation.SetCanvasSurface`) is drawn by the app on
+//! a GPU device of its own, never on the renderer's: a canvas that takes long to draw must not
+//! hold the window's frames back. What the app finished drawing reaches the renderer through a
+//! [`CanvasPresenter`]: [`CanvasPresenter.open`] numbers a surface, [`CanvasPresenter.present`]
+//! hands over a frame of it, and the renderer shows the newest frame of each surface the next
+//! time it draws. A present wakes the renderer, which draws the window's last frame again with
+//! the new canvas: the UI thread paints nothing for it.
+//!
+//! A frame comes in one of two kinds:
+//!
+//! - Pixels in the process heap: the app read them back from its device and the renderer
+//!   uploads them into a texture of its own. That works on every adapter, software ones
+//!   included.
+//! - A [`SharedPicture`]: GPU memory both devices import (an IOSurface on macOS), with the
+//!   fences the app's device signals once it finished drawing. The renderer samples it where it
+//!   is, after those fences, and gives the image back ([`CanvasPresenter.giveBack`]) when a newer
+//!   frame replaces it. Nothing crosses the CPU.
+import silk.collections.list { List }
+import silk.concurrency.sync { Arc, Mutex, Unparker }
+import silk.concurrency.thread { Concurrent, Transferable }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f32
+import silk.num.u8
+import silk.num.u32
+import silk.num.usize
+import console { StderrWriter }
+import webgpu.shared_texture { SharedFence, SharedImage }
+
+/// One finished frame of surface `surface`, `width` by `height`: premultiplied RGBA8 pixels in
+/// rows from the top, without padding, or, when `shared` is set, an image both devices share
+/// (and `pixels` is empty).
+pub struct CanvasFrame {
+  pub surface: u32,
+  pub width: u32,
+  pub height: u32,
+  pub pixels: List<u8>,
+  pub shared: Option<SharedPicture>,
+}
+
+impl Transferable for CanvasFrame {}
+
+/// A shared image of a canvas's swap chain, kept alive by the app and the renderer alike.
+pub struct ChainImage {
+  pub image: SharedImage,
+}
+
+// The IOSurface behind a shared image may be used from any thread.
+impl Transferable for ChainImage {}
+
+impl Concurrent for ChainImage {}
+
+/// A frame the app drew into image `index` of its swap chain `chain` (a number a canvas's chain
+/// keeps until it is made again, at a resize): the renderer waits for `fences` (of the app's
+/// device) to reach `values` before it samples `image`.
+pub struct SharedPicture {
+  pub image: Arc<ChainImage>,
+  pub chain: u32,
+  pub index: u32,
+  pub fences: List<SharedFence>,
+  pub values: List<u64>,
+}
+
+// The fences are Metal shared events, which any thread may hold and release.
+impl Transferable for SharedPicture {}
+
+/// Image `index` of chain `chain` of surface `surface`, back with the app. When `fences` is not
+/// empty they belong to the renderer's device, and the app waits for them to reach `values`
+/// before it draws into the image again; when it is empty the renderer never sampled it.
+pub struct ReturnedImage {
+  pub surface: u32,
+  pub chain: u32,
+  pub index: u32,
+  pub fences: List<SharedFence>,
+  pub values: List<u64>,
+}
+
+impl Transferable for ReturnedImage {}
+
+/// What is known of whether the renderer's device imports shared images.
+pub const SHARING_UNKNOWN: u32 = 0
+
+pub const SHARING_YES: u32 = 1
+
+pub const SHARING_NO: u32 = 2
+
+struct Table {
+  /// The number the next surface gets. Numbers start at 1 and are not reused.
+  next: u32,
+  /// The newest frame of each surface the renderer has not taken yet.
+  pending: List<CanvasFrame>,
+  /// Surfaces closed since the renderer last looked.
+  closed: List<u32>,
+  /// Whether a copy of each surface's newest frame is kept in `latest` (check mode: the
+  /// reference image of a frame shows the canvases too).
+  keeps: bool,
+  latest: List<CanvasFrame>,
+  /// Shared images back with the app, for [`CanvasPresenter.reclaim`].
+  returned: List<ReturnedImage>,
+  /// Whether the renderer's device imports shared images (`SHARING_*`).
+  sharing: u32,
+  /// Whether to say on standard error which way frames go (see [`CanvasPresenter.announce`]).
+  announces: bool,
+  /// Frames presented so far, by kind.
+  sharedFrames: u64,
+  copiedFrames: u64,
+  /// Pictures shown in a canvas's layer of its own (render thread, `layerShown`).
+  layeredFrames: u64,
+  /// Canvas frames the renderer actually showed, in the window or in a layer (`noteShown`).
+  shownFrames: u64,
+}
+
+impl Transferable for Table {}
+
+/// What the renderer took: the frames to show, oldest first, and the surfaces to forget.
+pub struct TakenCanvases {
+  pub frames: List<CanvasFrame>,
+  pub closed: List<u32>,
+}
+
+/// The app's and the renderer's handle to the canvas frames of a window host. Clones share
+/// one table.
+pub struct CanvasPresenter {
+  table: Arc<Mutex<Table>>,
+  /// Wakes the renderer, where it sleeps on another thread.
+  wake: Option<Unparker>,
+}
+
+impl Transferable for CanvasPresenter {}
+
+impl CanvasPresenter {
+  /// A table of its own. `wake` wakes the renderer after a present.
+  pub effect fn make(wake: Option<Unparker>) -> CanvasPresenter
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let hasRenderer = wake.isSome()
+    let table = Table {
+      next: 1,
+      pending: List<CanvasFrame>.make(),
+      closed: List<u32>.make(),
+      keeps: false,
+      latest: List<CanvasFrame>.make(),
+      returned: List<ReturnedImage>.make(),
+      sharing: if hasRenderer { SHARING_UNKNOWN } else { SHARING_NO },
+      announces: false,
+      sharedFrames: 0,
+      copiedFrames: 0,
+      layeredFrames: 0,
+      shownFrames: 0,
+    }
+    return CanvasPresenter {
+      table: run Arc<Mutex<Table>>.make(run Mutex<Table>.make(move table)),
+      wake: move wake,
+    }
+  }
+
+  /// A table no renderer on another thread sleeps for.
+  pub effect fn detached() -> CanvasPresenter
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return run CanvasPresenter.make(Option<Unparker>.None)
+  }
+
+  pub fn clone(self: &Self) -> CanvasPresenter {
+    return CanvasPresenter {
+      table: self.table.clone(),
+      wake: match &self.wake {
+        Option<Unparker>.Some { value } => Option<Unparker>.some(value.clone())
+        Option<Unparker>.None => Option<Unparker>.None
+      },
+    }
+  }
+
+  /// Numbers a new surface, for `Mutation.SetCanvasSurface` and [`CanvasPresenter.present`].
+  pub fn open(self: &Self) -> u32 {
+    let mut guard = self.table.get().lock()
+    let table = guard.getMut()
+    let id = table.next
+    table.next = table.next + 1
+    return id
+  }
+
+  /// Hands `frame` to the renderer, in place of a frame of its surface the renderer has not
+  /// taken yet (a shared image so replaced goes back to the app). A pixel frame whose pixels do
+  /// not fill its size is dropped.
+  pub effect fn present(self: &Self, frame: CanvasFrame) -> ()
+    ! OutOfMemoryError {
+    let wanted = u32.toUsize(frame.width) * u32.toUsize(frame.height) * 4
+    if frame.width == 0 || frame.height == 0 || (frame.shared.isNone() && frame.pixels.length() != wanted) {
+      return ()
+    }
+    let mut heap = Allocator.systemAllocatorProvider()
+    run store(&self.table, move frame) |> Effect.provideMut<Allocator>(&mut heap)
+    self.wakeRenderer()
+  }
+
+  /// Forgets surface `surface`: the renderer releases its texture, and nodes still naming it
+  /// draw nothing.
+  pub effect fn close(self: &Self, surface: u32) -> ()
+    ! OutOfMemoryError {
+    let mut heap = Allocator.systemAllocatorProvider()
+    run forget(&self.table, surface) |> Effect.provideMut<Allocator>(&mut heap)
+    self.wakeRenderer()
+  }
+
+  fn wakeRenderer(self: &Self) -> () {
+    if let Option<Unparker>.Some { value } = &self.wake {
+      value.unpark()
+    }
+  }
+
+  /// The renderer's: whether its device imports shared images. A renderer that has none to
+  /// say so is taken as one that does not.
+  pub fn setSharing(self: &Self, shares: bool) -> () {
+    let mut guard = self.table.get().lock()
+    let table = guard.getMut()
+    table.sharing = if shares { SHARING_YES } else { SHARING_NO }
+  }
+
+  /// Whether the renderer's device imports shared images (`SHARING_*`): unknown until the
+  /// renderer made its device.
+  pub fn sharing(self: &Self) -> u32 {
+    let guard = self.table.get().lock()
+    return guard.get().sharing
+  }
+
+  /// The renderer's: gives image `index` of chain `chain` of `surface` back to the app, to draw
+  /// into once `fences` (of the renderer's device) reached `values`.
+  pub effect fn giveBack(self: &Self, image: ReturnedImage) -> ()
+    ! OutOfMemoryError {
+    let mut heap = Allocator.systemAllocatorProvider()
+    let mut guard = self.table.get().lock()
+    let table = guard.getMut()
+    run table.returned.append(move image) |> Effect.provideMut<Allocator>(&mut heap)
+  }
+
+  /// The app's: takes the shared images of `surface` given back since it last asked.
+  pub effect fn reclaim(self: &Self, surface: u32) -> List<ReturnedImage>
+    ! OutOfMemoryError {
+    let mut heap = Allocator.systemAllocatorProvider()
+    let mut out = List<ReturnedImage>.make()
+    let mut guard = self.table.get().lock()
+    let table = guard.getMut()
+    let mut i: usize = 0
+    while i < table.returned.length() {
+      if table.returned.asSlice()[i].surface == surface {
+        run out.append(table.returned.remove(i)) |> Effect.provideMut<Allocator>(&mut heap)
+      } else {
+        i = i + 1
+      }
+    }
+    return move out
+  }
+
+  /// Whether a copy of each surface's newest frame is kept (see [`CanvasPresenter.keepLatest`]):
+  /// then a shared frame's pixels are wanted too, through [`CanvasPresenter.keepPixels`].
+  pub fn keeps(self: &Self) -> bool {
+    let guard = self.table.get().lock()
+    return guard.get().keeps
+  }
+
+  /// Keeps `pixels` as the newest frame of `surface` for [`CanvasPresenter.compose`], when
+  /// frames are kept, without handing anything to the renderer.
+  pub effect fn keepPixels(self: &Self, surface: u32, width: u32, height: u32, pixels: List<u8>) -> ()
+    ! OutOfMemoryError {
+    let mut heap = Allocator.systemAllocatorProvider()
+    run keep(&self.table, CanvasFrame {
+      surface: surface,
+      width: width,
+      height: height,
+      pixels: move pixels,
+      shared: Option<SharedPicture>.None,
+    }) |> Effect.provideMut<Allocator>(&mut heap)
+  }
+
+  /// From now on says on standard error, the first time a frame of each kind is presented,
+  /// whether canvas frames reach the renderer without a copy or through the CPU
+  /// (`SILK_UI_TRACE_CANVAS`): a benchmark keeps the line as proof of the path its frames took.
+  pub fn announce(self: &Self) -> () {
+    let mut guard = self.table.get().lock()
+    let table = guard.getMut()
+    table.announces = true
+  }
+
+  /// The render thread's: a canvas's layer of its own showed a picture, with no window draw. The
+  /// first time, with [`CanvasPresenter.announce`], it says so on standard error.
+  pub fn layerShown(self: &Self) -> () {
+    let mut guard = self.table.get().lock()
+    let table = guard.getMut()
+    if table.layeredFrames == 0 && table.announces {
+      StderrWriter.print("silk-ui: canvas frames show in a layer of their own (no window draw)\n", &())
+    }
+    table.layeredFrames = table.layeredFrames + 1
+  }
+
+  /// The render thread's: `count` canvas frames reached the screen, drawn into a presented window
+  /// frame or shown by a layer. Frames a newer one replaced before the renderer took them are not
+  /// counted. With [`CanvasPresenter.announce`] it says the running total on standard error
+  /// (`silk-ui: canvas shown N`), so a benchmark can tell frames shown from frames presented.
+  pub fn noteShown(self: &Self, count: u64) -> () {
+    if count == 0 {
+      return ()
+    }
+    let mut guard = self.table.get().lock()
+    let table = guard.getMut()
+    table.shownFrames = table.shownFrames + count
+    if table.announces {
+      StderrWriter.print("silk-ui: canvas shown {}\n", &.(table.shownFrames))
+    }
+  }
+
+  /// Whether frames are announced on standard error ([`CanvasPresenter.announce`]).
+  pub fn announcing(self: &Self) -> bool {
+    let guard = self.table.get().lock()
+    return guard.get().announces
+  }
+
+  /// How many canvas frames the renderer showed so far ([`CanvasPresenter.noteShown`]).
+  pub fn shownFrames(self: &Self) -> u64 {
+    let guard = self.table.get().lock()
+    return guard.get().shownFrames
+  }
+
+  /// How many pictures canvas layers of their own showed so far.
+  pub fn layeredFrames(self: &Self) -> u64 {
+    let guard = self.table.get().lock()
+    return guard.get().layeredFrames
+  }
+
+  /// How many frames were presented so far as shared images.
+  pub fn sharedFrames(self: &Self) -> u64 {
+    let guard = self.table.get().lock()
+    return guard.get().sharedFrames
+  }
+
+  /// How many frames were presented so far as pixels copied through the CPU.
+  pub fn copiedFrames(self: &Self) -> u64 {
+    let guard = self.table.get().lock()
+    return guard.get().copiedFrames
+  }
+
+  /// Whether the renderer has frames to take or surfaces to forget.
+  pub fn waiting(self: &Self) -> bool {
+    let guard = self.table.get().lock()
+    let table = guard.get()
+    return table.pending.length() != 0 || table.closed.length() != 0
+  }
+
+  /// The renderer's: everything presented and closed since it last took.
+  pub fn take(self: &Self) -> TakenCanvases {
+    let mut guard = self.table.get().lock()
+    let table = guard.getMut()
+    return TakenCanvases {
+      frames: Intrinsic.replace(table.pending, List<CanvasFrame>.make()),
+      closed: Intrinsic.replace(table.closed, List<u32>.make()),
+    }
+  }
+
+  /// Keeps a copy of each surface's newest frame from now on, for [`CanvasPresenter.compose`].
+  pub fn keepLatest(self: &Self) -> () {
+    let mut guard = self.table.get().lock()
+    let table = guard.getMut()
+    table.keeps = true
+  }
+
+  /// Draws the newest frame of surface `surface` into `target`, `targetWidth` by
+  /// `targetHeight` RGBA8 pixels, stretched over the rectangle from (`left`, `top`) to
+  /// (`right`, `bottom`) in pixels and blended over what is there. Texels are picked nearest,
+  /// which is exact where the frame has the rectangle's size. Does nothing for a surface with
+  /// no kept frame (see [`CanvasPresenter.keepLatest`]).
+  pub fn compose(
+    self: &Self,
+    surface: u32,
+    target: &mut [u8],
+    targetWidth: u32,
+    targetHeight: u32,
+    left: f32,
+    top: f32,
+    right: f32,
+    bottom: f32,
+  ) -> () {
+    let guard = self.table.get().lock()
+    let table = guard.get()
+    let at = indexOf(&table.latest, surface)
+    if at == usize.MAX || right <= left || bottom <= top {
+      return ()
+    }
+    let frame = &table.latest.asSlice()[at]
+    let source = frame.pixels.asSlice()
+    let x0 = clampPixel(left, targetWidth)
+    let x1 = clampPixel(right, targetWidth)
+    let y0 = clampPixel(top, targetHeight)
+    let y1 = clampPixel(bottom, targetHeight)
+    let mut y = y0
+    while y < y1 {
+      let v = (u32.toF32(y) + 0.5 - top) / (bottom - top)
+      let sy = texel(v, frame.height)
+      let mut x = x0
+      while x < x1 {
+        let u = (u32.toF32(x) + 0.5 - left) / (right - left)
+        let sx = texel(u, frame.width)
+        let from = (u32.toUsize(sy) * u32.toUsize(frame.width) + u32.toUsize(sx)) * 4
+        let to = (u32.toUsize(y) * u32.toUsize(targetWidth) + u32.toUsize(x)) * 4
+        if to + 3 < target.length {
+          let alpha = u8.toU32(source[from + 3])
+          let mut c: usize = 0
+          while c < 4 {
+            // Premultiplied source over the target.
+            let under = u8.toU32(target[to + c]) * (255 - alpha)
+            let value = u8.toU32(source[from + c]) + (under + 127) / 255
+            target[to + c] = if value > 255 {
+              255
+            } else {
+              u32.toU8(value)
+            }
+            c = c + 1
+          }
+        }
+        x = x + 1
+      }
+      y = y + 1
+    }
+  }
+}
+
+effect fn store(shared: &Arc<Mutex<Table>>, frame: CanvasFrame) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut guard = shared.get().lock()
+  let table = guard.getMut()
+  if frame.shared.isSome() {
+    if table.sharedFrames == 0 && table.announces {
+      StderrWriter.print("silk-ui: canvas frames reach the window without a copy (shared images)\n", &())
+    }
+    table.sharedFrames = table.sharedFrames + 1
+  } else {
+    if table.copiedFrames == 0 && table.announces {
+      StderrWriter.print("silk-ui: canvas frames reach the window through the CPU (copied)\n", &())
+    }
+    table.copiedFrames = table.copiedFrames + 1
+  }
+  if table.keeps && frame.shared.isNone() {
+    let mut copy = List<u8>.make()
+    run copy.appendSlice(frame.pixels.asSlice())
+    let kept = CanvasFrame {
+      surface: frame.surface,
+      width: frame.width,
+      height: frame.height,
+      pixels: move copy,
+      shared: Option<SharedPicture>.None,
+    }
+    let old = indexOf(&table.latest, frame.surface)
+    if old != usize.MAX {
+      drop table.latest.remove(old)
+    }
+    run table.latest.append(move kept)
+  }
+  let at = indexOf(&table.pending, frame.surface)
+  if at != usize.MAX {
+    let replaced = table.pending.remove(at)
+    // The renderer never saw it: the image is the app's again, with nothing to wait for.
+    if let Option<SharedPicture>.Some { value } = move replaced.shared {
+      run table.returned.append(
+        ReturnedImage {
+          surface: replaced.surface,
+          chain: value.chain,
+          index: value.index,
+          fences: List<SharedFence>.make(),
+          values: List<u64>.make(),
+        },
+      )
+    }
+  }
+  run table.pending.append(move frame)
+}
+
+effect fn keep(shared: &Arc<Mutex<Table>>, frame: CanvasFrame) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut guard = shared.get().lock()
+  let table = guard.getMut()
+  if !table.keeps {
+    return ()
+  }
+  let old = indexOf(&table.latest, frame.surface)
+  if old != usize.MAX {
+    drop table.latest.remove(old)
+  }
+  run table.latest.append(move frame)
+}
+
+effect fn forget(shared: &Arc<Mutex<Table>>, surface: u32) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut guard = shared.get().lock()
+  let table = guard.getMut()
+  let at = indexOf(&table.pending, surface)
+  if at != usize.MAX {
+    drop table.pending.remove(at)
+  }
+  let kept = indexOf(&table.latest, surface)
+  if kept != usize.MAX {
+    drop table.latest.remove(kept)
+  }
+  let mut r: usize = 0
+  while r < table.returned.length() {
+    if table.returned.asSlice()[r].surface == surface {
+      drop table.returned.remove(r)
+    } else {
+      r = r + 1
+    }
+  }
+  run table.closed.append(surface)
+}
+
+fn indexOf(frames: &List<CanvasFrame>, surface: u32) -> usize {
+  let values = frames.asSlice()
+  let mut i: usize = 0
+  while i < values.length {
+    if values[i].surface == surface {
+      return i
+    }
+    i = i + 1
+  }
+  return usize.MAX
+}
+
+/// The pixel column or row at or after coordinate `value` whose center `value` is left of,
+/// within `0..=limit`.
+fn clampPixel(value: f32, limit: u32) -> u32 {
+  let rounded = f32.floor(value + 0.5)
+  if rounded <= 0.0 {
+    return 0
+  }
+  if rounded >= u32.toF32(limit) {
+    return limit
+  }
+  return f32.toU32(rounded)
+}
+
+/// The texel of `count` that fraction `at` of the way falls in.
+fn texel(at: f32, count: u32) -> u32 {
+  let scaled = f32.floor(at * u32.toF32(count))
+  if scaled <= 0.0 {
+    return 0
+  }
+  if scaled >= u32.toF32(count) {
+    return count - 1
+  }
+  return f32.toU32(scaled)
+}

@@ -1,0 +1,520 @@
+//! The model of a development build, kept across the restart that `silk task dev` does after an
+//! edit. silkui's watcher names the file in `SILKUI_KEEP`; a release build never keeps one.
+//!
+//! The model is saved after the messages of each turn of the window's loop, and put back onto
+//! the model `init` makes when the program starts again (see `loom.keep`). The window's size
+//! is kept with it, and so are the focused node and the scroll offsets, by their place in the
+//! tree. The file is `{"window": {"width", "height"}, "tree": {"focus", "scroll"}, "model": ...}`.
+import loom.keep { write, restoreValue }
+import loom_inspect.extension { fileText }
+import silk.core.result { Result }
+import silk.json.scanner { JsonError }
+import silk.json.value { Json, Value }
+import ui_tree_window.host { environmentVariable }
+import ui_inspect_server.server { debugBuild }
+import silk.core.option { Option }
+import silk.geometry.size { Size2 }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.text.string { String }
+import silk.collections.list { List }
+import silk.num.f32
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+import ui_tree.legacy { UiTree, TreeError, Mutation, NONE }
+
+/// Polls after which scroll offsets that never took stop being put back.
+const GIVE_UP: u32 = 120
+
+/// The variable that names the file.
+pub const VARIABLE: string<'static> = "SILKUI_KEEP"
+
+/// The variable that names a state file (what `silk-ui.save` writes) to start from instead of
+/// the model `init` makes, in a debug build.
+pub const STATE_VARIABLE: string<'static> = "SILKUI_STATE"
+
+pub struct Keeper {
+  path: String,
+  /// The message count of the model last saved.
+  saved: u64,
+  last: String,
+  /// The window's content size in logical points, 0 until known.
+  width: f64,
+  height: f64,
+  savedWidth: f64,
+  savedHeight: f64,
+  /// The focus and scroll offsets last seen, as the JSON of `"tree"`; empty until seen.
+  tree: String,
+  /// A digest of what `tree` says, to see a change without writing it again.
+  digest: u64,
+  savedDigest: u64,
+  /// The saved `"tree"` to put back once the first frame is laid out.
+  pending: Option<Value>,
+  /// Polls since the tree had a root. Scroll offsets go back once styles make the
+  /// containers scroll, which can take a few frames while stylesheets load.
+  tries: u32,
+}
+
+static if Intrinsic.targetArchitecture() != "wasm32" {
+  import ui_tree_window.console { StderrWriter }
+  import silk.core.effect { Effect }
+  import silk.collections.bytes { Bytes }
+  import silk.system.filesystem { FileSystem, FileError, AtomicWriteError, Path }
+  import silk.system.filesystem_machine { MachineFileSystem }
+
+  effect fn unread(error: FileError | OutOfMemoryError) -> Option<Bytes> {
+    drop error
+    return Option<Bytes>.None
+  }
+
+  effect fn unwritten(error: AtomicWriteError | FileError | OutOfMemoryError) -> () {
+    drop error
+  }
+
+  effect fn readSaved(path: string) -> Option<Bytes>
+    ! FileError | OutOfMemoryError
+    ? &mut Allocator | &mut FileSystem {
+    let file = run Path.make(path)
+    if !(run FileSystem.exists(&file)) {
+      return Option<Bytes>.None
+    }
+    return Option<Bytes>.some(run FileSystem.readFile(&file))
+  }
+
+  effect fn writeSaved(path: string, bytes: &[u8]) -> ()
+    ! AtomicWriteError | FileError | OutOfMemoryError
+    ? &mut Allocator | &mut FileSystem {
+    let file = run Path.make(path)
+    run FileSystem.writeFileAtomic(
+      &file,
+      bytes,
+      FileSystem.replaceExisting(),
+      FileSystem.buffered(),
+    )
+  }
+}
+
+impl Keeper {
+  pub fn off() -> Keeper {
+    return Keeper.at(String.make())
+  }
+
+  fn at(path: String) -> Keeper {
+    return Keeper {
+      path: move path,
+      saved: 0,
+      last: String.make(),
+      width: 0.0,
+      height: 0.0,
+      savedWidth: 0.0,
+      savedHeight: 0.0,
+      tree: String.make(),
+      digest: 0,
+      savedDigest: 0,
+      pending: Option<Value>.None,
+      tries: 0,
+    }
+  }
+
+  /// Keeps the model in the file `SILKUI_KEEP` names, in a debug build.
+  pub effect fn fromEnvironment() -> Keeper
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    static if Intrinsic.targetArchitecture() == "wasm32" {
+      return Keeper.off()
+    } else {
+      if !debugBuild() {
+        return Keeper.off()
+      }
+      return match move run environmentVariable(VARIABLE) {
+        Option<String>.Some { value } => Keeper.at(move value)
+        Option<String>.None => Keeper.off()
+      }
+    }
+  }
+
+  pub fn on(self: &Self) -> bool {
+    return String.byteLength(String.view(&self.path)) != 0
+  }
+
+  /// Puts the saved model, if there is one, onto `model`, and says on standard error what
+  /// started over. [`size`] has the saved window size after it. Without one, a debug build
+  /// starts from the state file `SILKUI_STATE` names, if any.
+  pub effect fn restore<P>(self: &mut Self, model: &mut P) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    static if Intrinsic.targetArchitecture() != "wasm32" {
+      if !run self.restoreKept(&mut model) {
+        run startFrom(&mut model)
+      }
+    }
+  }
+
+  /// Puts the kept model back; false when there was none to read.
+  effect fn restoreKept<P>(self: &mut Self, model: &mut P) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    static if Intrinsic.targetArchitecture() == "wasm32" {
+      return false
+    } else {
+      if !self.on() {
+        return false
+      }
+      let mut files = run MachineFileSystem.make()
+      let saved = run Effect.catchAll(readSaved(String.view(&self.path)), unread)
+        |> Effect.provideMut<FileSystem>(&mut files)
+      let bytes = match move saved {
+        Option<Bytes>.Some { value } => move value
+        Option<Bytes>.None => {
+          return false
+        }
+      }
+      let document = match move run Effect.result(Json.parse(bytes.asSlice())) {
+        Result<Value, JsonError | OutOfMemoryError>.Success { value } => move value
+        Result<Value, JsonError | OutOfMemoryError>.Failure { error } => {
+          drop error
+          StderrWriter.print("loom: the kept model could not be read; starting from init\n", &())
+          return true
+        }
+      }
+      let window = Json.field(&document, "window")
+      self.width = Json.asF64(Json.fieldAt(window, "width")) |> Option<f64>.unwrapOr(0.0)
+      self.height = Json.asF64(Json.fieldAt(window, "height")) |> Option<f64>.unwrapOr(0.0)
+      self.savedWidth = self.width
+      self.savedHeight = self.height
+      if let Option<&Value>.Some { value } = Json.field(&document, "tree") {
+        self.pending = Option<Value>.some(run Json.copy(value))
+      }
+      let kept = match Json.field(&document, "model") {
+        Option<&Value>.Some { value } => value
+        Option<&Value>.None => {
+          return true
+        }
+      }
+      let report = run restoreValue(&mut model, kept)
+      if report.whole() {
+        StderrWriter.print("loom: kept the model across the restart\n", &())
+        return true
+      }
+      let mut names = String.make()
+      let reset = report.reset.asSlice()
+      let mut i: usize = 0
+      while i < reset.length {
+        if i != 0 {
+          run names.append(", ")
+        }
+        run names.append(String.view(&reset[i]))
+        i = i + 1
+      }
+      StderrWriter.print(
+        "loom: kept the model across the restart; these no longer fit and start over: {}\n",
+        &.(String.view(&names)),
+      )
+      return true
+    }
+  }
+
+  /// The window size the last run ended with, if it was saved.
+  pub fn size(self: &Self) -> Option<Size2<f64>> {
+    if self.width <= 0.0 || self.height <= 0.0 {
+      return Option<Size2<f64>>.None
+    }
+    return Option<Size2<f64>>.some(Size2<f64> { width: self.width, height: self.height })
+  }
+
+  /// The window's content changed size.
+  pub fn resized(self: &mut Self, width: f64, height: f64) -> () {
+    self.width = width
+    self.height = height
+  }
+
+  /// Puts the saved focus and scroll offsets back once the first frame is laid out, then
+  /// notes them as they change, for [`save`]. Says whether it changed the tree.
+  pub effect fn track(self: &mut Self, tree: &mut UiTree<'_>) -> bool
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    static if Intrinsic.targetArchitecture() == "wasm32" {
+      return false
+    } else {
+      if !self.on() || tree.root == NONE {
+        return false
+      }
+      if let Option<Value>.Some { value } = &self.pending {
+        self.tries = self.tries + 1
+        if self.tries == 1 {
+          return false
+        }
+        let done = run putBack(&mut tree, &value, self.tries == 2)
+        if done || self.tries > GIVE_UP {
+          self.pending = Option<Value>.None
+        }
+        return true
+      }
+      let digest = digestOf(&tree.*)
+      if digest == self.digest && String.byteLength(String.view(&self.tree)) != 0 {
+        return false
+      }
+      self.digest = digest
+      self.tree = run stateOf(&tree.*)
+      return false
+    }
+  }
+
+  /// Saves `model` and the window size when messages were handled (`messages` counts them) or
+  /// the window was resized since the last save.
+  pub effect fn save<P>(self: &mut Self, model: &P, messages: u64) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    static if Intrinsic.targetArchitecture() != "wasm32" {
+      let resized = self.width != self.savedWidth || self.height != self.savedHeight
+      let moved = self.digest != self.savedDigest
+      if !self.on() || (messages == self.saved && !resized && !moved) {
+        return ()
+      }
+      self.saved = messages
+      self.savedWidth = self.width
+      self.savedHeight = self.height
+      self.savedDigest = self.digest
+      let mut text = run String.copy("{\"window\":{\"width\":")
+      run write(&self.width, &mut text)
+      run text.append(",\"height\":")
+      run write(&self.height, &mut text)
+      run text.append("},")
+      if String.byteLength(String.view(&self.tree)) != 0 {
+        run text.append("\"tree\":")
+        run text.append(String.view(&self.tree))
+        run text.append(",")
+      }
+      run text.append("\"model\":")
+      run write(model, &mut text)
+      run text.append("}")
+      if String.view(&text) == String.view(&self.last) {
+        return ()
+      }
+      let mut files = run MachineFileSystem.make()
+      run Effect.catchAll(writeSaved(String.view(&self.path), text.ownedUtf8Bytes()), unwritten)
+        |> Effect.provideMut<FileSystem>(&mut files)
+      self.last = move text
+    }
+  }
+}
+
+/// A digest of the focused node and every scroll offset.
+fn digestOf(tree: &UiTree<'_>) -> u64 {
+  let mut hash: u64 = (2166136261 ^ u32.toU64(tree.focused)) & 4294967295
+  let nodes = tree.nodes.asSlice()
+  let mut i: usize = 0
+  while i < nodes.length {
+    let node = &nodes[i]
+    if node.live && (node.scrollX() != 0.0 || node.scrollY() != 0.0) {
+      hash = ((hash ^ usize.toU64(i)) * 16777619) & 4294967295
+      hash = ((hash ^ u32.toU64(f32.toBits(node.scrollX()))) * 16777619) & 4294967295
+      hash = ((hash ^ u32.toU64(f32.toBits(node.scrollY()))) * 16777619) & 4294967295
+    }
+    i = i + 1
+  }
+  return hash
+}
+
+/// The children of `slot` a program made, in order: not generated ones such as `::before`.
+effect fn madeChildren(tree: &UiTree<'_>, slot: u32) -> List<u32>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut all = List<u32>.make()
+  run tree.childSlots(slot, &mut all)
+  let mut made = List<u32>.make()
+  let slots = all.asSlice()
+  let mut i: usize = 0
+  while i < slots.length {
+    if !tree.node(slots[i]).isGenerated() {
+      run made.append(slots[i])
+    }
+    i = i + 1
+  }
+  return move made
+}
+
+/// Writes where `slot` is: the child index at each level from the root, as JSON numbers
+/// after a comma each.
+effect fn writePlace(tree: &UiTree<'_>, slot: u32, out: &mut String) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut steps = List<u32>.make()
+  let mut at = slot
+  while at != tree.root && at != NONE {
+    let parent = tree.node(at).parent
+    if parent == NONE {
+      return ()
+    }
+    let siblings = run madeChildren(tree, parent)
+    let list = siblings.asSlice()
+    let mut index: usize = 0
+    while index < list.length && list[index] != at {
+      index = index + 1
+    }
+    run steps.append(usize.toU32(index))
+    at = parent
+  }
+  let taken = steps.asSlice()
+  let mut i = taken.length
+  while i > 0 {
+    i = i - 1
+    run out.append(",")
+    run write(&taken[i], &mut out)
+  }
+}
+
+/// `{"focus": [place], "scroll": [[x, y, place...], ...]}` for the tree as it is.
+effect fn stateOf(tree: &UiTree<'_>) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut out = run String.copy("{\"focus\":[")
+  if tree.focused != NONE {
+    run out.append("0")
+    run writePlace(tree, tree.focused, &mut out)
+  }
+  run out.append("],\"scroll\":[")
+  let nodes = tree.nodes.asSlice()
+  let mut first = true
+  let mut i: usize = 0
+  while i < nodes.length {
+    let node = &nodes[i]
+    if node.live && (node.scrollX() != 0.0 || node.scrollY() != 0.0) {
+      if !first {
+        run out.append(",")
+      }
+      first = false
+      run out.append("[")
+      let scrollX = node.scrollX()
+      run write(&scrollX, &mut out)
+      run out.append(",")
+      let scrollY = node.scrollY()
+      run write(&scrollY, &mut out)
+      run writePlace(tree, usize.toU32(i), &mut out)
+      run out.append("]")
+    }
+    i = i + 1
+  }
+  run out.append("]}")
+  return move out
+}
+
+/// The slot at the place `saved` gives from index `from` on, or NONE when the tree no longer
+/// has it.
+effect fn slotAt(tree: &UiTree<'_>, saved: &Value, from: usize) -> u32
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut slot = tree.root
+  let mut i = from
+  while true {
+    let step = match Json.asU64(Json.item(saved, i)) {
+      Option<u64>.Some { value } => value
+      Option<u64>.None => {
+        return slot
+      }
+    }
+    let children = run madeChildren(tree, slot)
+    if step >= usize.toU64(children.length()) {
+      return NONE
+    }
+    slot = children.asSlice()[u64.toUsize(step)]
+    i = i + 1
+  }
+  return NONE
+}
+
+/// Scrolls, and focuses when `focus`, what `saved` names, where the tree still has it. Says
+/// whether every offset took: a container scrolls only once its styles say so.
+effect fn putBack(tree: &mut UiTree<'_>, saved: &Value, focus: bool) -> bool
+  ! TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut batch = List<Mutation>.make()
+  let mut wanted = List<u32>.make()
+  let mut offsets = List<f32>.make()
+  if let Option<&Value>.Some { value } = Json.field(saved, "scroll") {
+    let mut i: usize = 0
+    while true {
+      let entry = match Json.item(value, i) {
+        Option<&Value>.Some { value: item } => item
+        Option<&Value>.None => {
+          break
+        }
+      }
+      let x = Json.asF32(Json.item(entry, 0)) |> Option<f32>.unwrapOr(0.0)
+      let y = Json.asF32(Json.item(entry, 1)) |> Option<f32>.unwrapOr(0.0)
+      let slot = run slotAt(&tree.*, entry, 2)
+      if slot != NONE {
+        run batch.append(Mutation.ScrollTo { id: tree.node(slot).id, x: x, y: y })
+        run wanted.append(slot)
+        run offsets.append(x)
+        run offsets.append(y)
+      }
+      i = i + 1
+    }
+  }
+  if !focus {
+    // Only the offsets are tried again.
+  } else if let Option<&Value>.Some { value } = Json.field(saved, "focus") {
+    // A place is the root's 0 followed by the steps below it.
+    if Json.item(value, 0).isSome() {
+      let slot = run slotAt(&tree.*, value, 1)
+      if slot != NONE {
+        run batch.append(Mutation.Focus { id: tree.node(slot).id })
+      }
+    }
+  }
+  run tree.apply(move batch)
+  let slots = wanted.asSlice()
+  let at = offsets.asSlice()
+  let mut i: usize = 0
+  while i < slots.length {
+    let node = tree.node(slots[i])
+    if node.scrollX() != at[2 * i] || node.scrollY() != at[2 * i + 1] {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+/// Starts `model` from the state file `SILKUI_STATE` names, in a debug build, and says so on
+/// standard error.
+effect fn startFrom<P>(model: &mut P) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  static if Intrinsic.targetArchitecture() != "wasm32" {
+    if !debugBuild() {
+      return ()
+    }
+    let path = match move run environmentVariable(STATE_VARIABLE) {
+      Option<String>.Some { value } => move value
+      Option<String>.None => {
+        return ()
+      }
+    }
+    let bytes = match move run fileText(String.view(&path)) {
+      Option<Bytes>.Some { value } => move value
+      Option<Bytes>.None => {
+        return StderrWriter.print("loom: no state file at {}\n", &.(String.view(&path)))
+      }
+    }
+    let document = match move run Effect.result(Json.parse(bytes.asSlice())) {
+      Result<Value, JsonError | OutOfMemoryError>.Success { value } => move value
+      Result<Value, JsonError | OutOfMemoryError>.Failure { error } => {
+        drop error
+        return StderrWriter.print("loom: {} is not a state file\n", &.(String.view(&path)))
+      }
+    }
+    if let Option<&Value>.Some { value } = Json.field(&document, "model") {
+      let report = run restoreValue(&mut model, value)
+      if report.whole() {
+        return StderrWriter.print("loom: started from {}\n", &.(String.view(&path)))
+      }
+      return StderrWriter.print(
+        "loom: started from {}; some fields no longer fit and keep their init value\n",
+        &.(String.view(&path)),
+      )
+    }
+    StderrWriter.print("loom: {} has no model\n", &.(String.view(&path)))
+  }
+}

@@ -1,0 +1,705 @@
+//! Runs a loom [`Runtime`] in a native window: modules/platform/window for the window and input,
+//! ui-tree-window to turn window events into tree input, and ui_renderer on WebGPU (Dawn) for
+//! the frames.
+//!
+//! The loop waits for window events, with a timeout at the runtime's next timer, or polls while
+//! the app subscribes to animation frames. Input goes to the tree, the tree's records go to the
+//! runtime, and a frame is drawn when the tree wants one.
+//!
+//! An app runs with the inspector (modules/inspect/server) when it passes one that is on to
+//! [`runWindowWith`]: requests are served from the loop, input they dispatch is pumped to the app
+//! like window input, the records the app takes go to the inspector's event log, and the
+//! highlight is drawn over the frame. The program itself is the `silk-ui` extension's to report
+//! (loom-inspect): this host registers it with the inspector and serves it from the loop, as
+//! any framework would its own.
+//!
+//! Every app run this way can also show the devtools in its own process, in a window of their
+//! own or docked in the app's window (`SILK_UI_DEVTOOLS`, F12; see ui-inspect-devtools'
+//! `embedded`). The app's code does not change for it.
+//!
+//! `check` mode ignores real input: after the first frame it clicks the node named
+//! `options.checkClick` and presses Tab through the same path a user's input takes, draws two
+//! more frames, reads the window's surface back and compares it with the CPU reference of the
+//! same frame. It returns 0 within tolerance, 1 outside and 2 on an error.
+import ui_scene.scene { Scene }
+import ui_tree.style_assets { StyleAssets }
+import ui_tree_window.style_watch { SheetWatch }
+
+static if Intrinsic.targetArchitecture() != "wasm32" {
+  import font_collection.system as systemFonts
+  import font_collection.system { Options as FontOptions }
+  import silk.system.host_input { HostInput }
+}
+
+import loom.app { App, Perform }
+import loom.runtime { Runtime, pump, tick, resize, drain }
+import loom_tree.lib { frame, frameRoot }
+import loom_tree.harness { click, press }
+import ui_tree.legacy { UiTree, TreeError, FrameInput, Mutation }
+import ui_inspect_server.lib { Inspector }
+import loom_inspect.lib { SilkUi, ID as SILK_UI }
+import ui_devtools.embedded { EmbeddedDevtools }
+import font_collection.lib { FontCollection }
+import atlas.atlas { AtlasError }
+import vector.geometry_error { GeometryError }
+import window.event { Event }
+import window.types { WindowError, WindowId, WindowOptions }
+import webgpu.runtime { GpuError }
+import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.num.u32
+import silk.num.f64
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.trace { Trace as Prof }
+
+/// Custom drawing integrated with the standard window, input, inspection and GPU lifecycle.
+/// `frame` runs after layout and before uploads. Its resources use the tree's atlas; `scene`
+/// supplies the finished composition, including UI chrome. `poll` collects background work.
+pub interface WindowContent<A, M, C> {
+  /// Initializes resources before the first view and configures native window options.
+  effect fn setup(self: &mut Self, tree: &mut UiTree<'_>) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {}
+
+  /// Gives `loader` the files the program carries, served for relative URLs.
+  effect fn files(self: &mut Self, loader: &mut Loader) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {}
+
+  fn configure(self: &Self, options: &mut WindowOptions<'_>) -> () {}
+
+  effect fn opened(self: &mut Self, platform: &mut HostPlatform, window: WindowId) -> ()
+    ! WindowError | OutOfMemoryError
+    ? &mut Allocator {}
+
+  /// Native menus and dialogs; true consumes the event before ordinary input dispatch.
+  effect fn event(
+    self: &mut Self,
+    app: &mut Runtime<A, M, C>,
+    tree: &mut UiTree<'_>,
+    event: &Event,
+  ) -> bool
+    ! WindowError | TreeError | AtlasError | GeometryError | OutOfMemoryError
+    ? &mut Allocator {
+    return false
+  }
+
+  effect fn update(
+    self: &mut Self,
+    app: &mut Runtime<A, M, C>,
+    tree: &mut UiTree<'_>,
+    platform: &mut HostPlatform,
+    window: WindowId,
+  ) -> bool
+    ! WindowError | TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    return false
+  }
+
+  /// Return false to keep the window open, for example when a document save fails.
+  effect fn closing(self: &mut Self, app: &mut Runtime<A, M, C>) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return true
+  }
+
+  /// Whether the app asked to end: the loop stops without asking `closing`.
+  fn quitting(self: &Self, app: &Runtime<A, M, C>) -> bool {
+    return false
+  }
+
+  fn needsFrame(self: &Self, app: &Runtime<A, M, C>, tree: &UiTree<'_>) -> bool {
+    return tree.needsFrame()
+  }
+
+  /// Takes the event records meant for nodes the content put in the tree itself, out of
+  /// `tree.events`, before the program takes the rest. The host calls it before every pump.
+  effect fn intercept(self: &mut Self, app: &mut Runtime<A, M, C>, tree: &mut UiTree<'_>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {}
+
+  effect fn prepare(self: &mut Self, app: &mut Runtime<A, M, C>, tree: &mut UiTree<'_>) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {}
+
+  fn profile(self: &Self) -> bool {
+    return false
+  }
+
+  effect fn poll(
+    self: &mut Self,
+    app: &mut Runtime<A, M, C>,
+    tree: &mut UiTree<'_>,
+    time: f64,
+  ) -> bool
+    ! WindowError | TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    return false
+  }
+
+  /// A maximum wait in seconds while work needs polling, or None to wait for ordinary events.
+  fn wakeAfter(self: &Self) -> Option<f64> {
+    return Option<f64>.None
+  }
+
+  effect fn frame(
+    self: &mut Self,
+    app: &Runtime<A, M, C>,
+    tree: &mut UiTree<'_>,
+    input: FrameInput,
+    inspector: &Inspector,
+  ) -> ()
+    ! TreeError | AtlasError | GeometryError | OutOfMemoryError
+    ? &mut Allocator {}
+
+  fn scene<'s>(self: &'s Self, tree: &'s UiTree<'_>) -> &'s Scene {
+    return tree.scene()
+  }
+
+  /// Whether the content runs the waiting commands that may leave the UI thread itself: it
+  /// takes them with `app.takeWorkOn(false)` in `poll` and ends each with `app.finish`. The
+  /// host then performs only the ones that ask for the UI thread. When false, the host
+  /// performs every waiting command on the UI thread, after the frame that shows the update
+  /// that asked for it.
+  fn runsCommands(self: &Self) -> bool {
+    return false
+  }
+}
+
+/// The ordinary UI-tree composition, without custom content.
+pub struct TreeContent {}
+
+impl<A, M, C> WindowContent<A, M, C> for TreeContent {}
+
+pub import ui_tree_window.host { RunOptions, StartedGpu, startGpu }
+pub import ui_tree_window.platform_thread { Driver, HostPlatform, Launched, launch }
+pub import ui_tree_window.host { startInspector }
+import ui_tree_window.host as host
+import ui_tree_window.host { WindowClient }
+pub import ui_tree_window.loader { Loader }
+
+// The browser has no system fonts: pass a collection to `runWindow` there.
+static if Intrinsic.targetArchitecture() != "wasm32" {
+  /// Runs an app using fonts discovered in standard system and user font directories.
+  /// Use `runWindow` when an application supplies its own bundled font collection.
+  pub effect fn runSystemWindow<A: App<M, C>, M, C: Perform<M, E, R>, E, ? R>(
+    app: &mut Runtime<A, M, C>,
+    resources: List<Mutation>,
+    options: RunOptions,
+  ) -> i32
+    ! E | WindowError | GpuError | TreeError | AtlasError | GeometryError | OutOfMemoryError
+    ? R | &mut HostInput | &mut Allocator {
+    let mut collection = FontCollection.make()
+    drop run systemFonts.load(&mut collection, FontOptions.defaults())
+    return run runWindow(&mut app, &collection, move resources, move options)
+  }
+}
+
+/// Runs `app` in a window until it is closed (or, in check mode, until the check is done).
+/// `resources` are the mutations that define fonts, images and icons, applied first. Returns
+/// the exit code.
+pub effect fn runWindow<A: App<M, C>, M, C: Perform<M, E, R>, E, ? R>(
+  app: &mut Runtime<A, M, C>,
+  collection: &FontCollection,
+  resources: List<Mutation>,
+  options: RunOptions,
+) -> i32
+  ! E | WindowError | GpuError | TreeError | AtlasError | GeometryError | OutOfMemoryError
+  ? R | &mut Allocator {
+  return run runWindowWith(&mut app, collection, move resources, move options, Inspector.off())
+}
+
+/// [`runWindow`] serving `inspector` (from `Inspector.start`, which is off unless the build and
+/// `SILK_UI_INSPECT` allow it). Check mode does not serve it.
+pub effect fn runWindowWith<A: App<M, C>, M, C: Perform<M, E, R>, E, ? R>(
+  app: &mut Runtime<A, M, C>,
+  collection: &FontCollection,
+  resources: List<Mutation>,
+  options: RunOptions,
+  inspector: Inspector,
+) -> i32
+  ! E | WindowError | GpuError | TreeError | AtlasError | GeometryError | OutOfMemoryError
+  ? R | &mut Allocator {
+  let mut content = TreeContent {}
+  return run runWindowHosted(
+    &mut app,
+    collection,
+    move resources,
+    move options,
+    move inspector,
+    &mut content,
+  )
+}
+
+/// Runs custom drawing and background work inside the standard window lifecycle.
+pub effect fn runWindowHosted<
+  H: WindowContent<A, M, C>,
+  A: App<M, C>,
+  M,
+  C: Perform<M, E, R>,
+  E,
+  ? R
+>(
+  app: &mut Runtime<A, M, C>,
+  collection: &FontCollection,
+  resources: List<Mutation>,
+  options: RunOptions,
+  inspector: Inspector,
+  content: &mut H,
+) -> i32
+  ! E | WindowError | GpuError | TreeError | AtlasError | GeometryError | OutOfMemoryError
+  ? R | &mut Allocator {
+  return run runWindowHostedWithSheets(&mut app, collection, move resources, move options, move inspector, &mut content, StyleAssets.make())
+}
+
+pub effect fn runWindowHostedWithSheets<
+  H: WindowContent<A, M, C>,
+  A: App<M, C>,
+  M,
+  C: Perform<M, E, R>,
+  E,
+  ? R
+>(
+  app: &mut Runtime<A, M, C>,
+  collection: &FontCollection,
+  resources: List<Mutation>,
+  options: RunOptions,
+  inspector: Inspector,
+  content: &mut H,
+  stylesheets: StyleAssets,
+) -> i32
+  ! E | WindowError | GpuError | TreeError | AtlasError | GeometryError | OutOfMemoryError
+  ? R | &mut Allocator {
+  return run runWindowHostedWithSheetUpdates(&mut app, collection, move resources, move options, move inspector, &mut content, move stylesheets, SheetWatch.make())
+}
+
+pub effect fn runWindowHostedWithSheetUpdates<
+  H: WindowContent<A, M, C>,
+  A: App<M, C>,
+  M,
+  C: Perform<M, E, R>,
+  E,
+  ? R
+>(
+  app: &mut Runtime<A, M, C>,
+  collection: &FontCollection,
+  resources: List<Mutation>,
+  options: RunOptions,
+  inspector: Inspector,
+  content: &mut H,
+  stylesheets: StyleAssets,
+  updates: SheetWatch,
+) -> i32
+  ! E | WindowError | GpuError | TreeError | AtlasError | GeometryError | OutOfMemoryError
+  ? R | &mut Allocator {
+  let mut client: AppClient<A, M, C, H> = AppClient<A, M, C, H> {
+    content: &mut content,
+    silkUi: SilkUi.make(),
+    loader: Loader.make(),
+    stylesheets: move stylesheets,
+    stylesheetUpdates: move updates,
+    issued: 0,
+    framed: false,
+    due: false,
+    since: -1.0,
+  }
+  let mut inspector = move inspector
+  run inspector.extend(run SilkUi.extension())
+  let mut devtools = run EmbeddedDevtools.fromEnvironment()
+  return run host.runWindowWith<AppClient<A, M, C, H>, EmbeddedDevtools, Runtime<A, M, C>, E, R>(
+    &mut app,
+    collection,
+    move resources,
+    move options,
+    move inspector,
+    &mut client,
+    &mut devtools,
+  )
+}
+
+struct AppClient<'a, A, M, C, H> {
+  content: &'a mut H,
+  /// The `silk-ui` inspector extension: the program's messages and model.
+  silkUi: SilkUi,
+  /// Loads the image and icon URLs the views name.
+  loader: Loader,
+  stylesheets: StyleAssets,
+  stylesheetUpdates: SheetWatch,
+  /// `Runtime.issued` when the waiting commands were last looked at.
+  issued: u64,
+  /// A frame was drawn since the newest waiting command came.
+  framed: bool,
+  /// The waiting commands may be performed: the frame that shows their update is out.
+  due: bool,
+  /// When the commands that wait began to, or negative while none does.
+  since: f64,
+}
+
+/// How long commands wait for a frame that does not come (a hidden window draws none).
+const FRAME_PATIENCE: f64 = 0.25
+
+impl<'a, A, M, C, H> AppClient<'a, A, M, C, H> {
+  /// Starts the loads the last batch asked for; the ones the loader has at hand are installed
+  /// before the frame that shows them.
+  effect fn load(self: &mut Self, tree: &mut UiTree<'_>) -> bool
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    return run self.loader.serve(&mut tree)
+  }
+}
+
+/// `loader.serve`, then the `load` and `error` records of what ended go to the app at once.
+effect fn loadNow<A: App<M, C>, M, C: Perform<M, E, R>, E, ? R>(
+  loader: &mut Loader,
+  state: &mut Runtime<A, M, C>,
+  tree: &mut UiTree<'_>,
+) -> ()
+  ! E | TreeError | OutOfMemoryError
+  ? R | &mut Allocator {
+  if run loader.serve(&mut tree) {
+    drop run pump(&mut state, &mut tree)
+  }
+}
+
+impl<'a, A: App<M, C>, M, C, H: WindowContent<A, M, C>> AppClient<'a, A, M, C, H> {
+  /// How many waiting commands are this host's to perform.
+  fn waiting(self: &Self, state: &Runtime<A, M, C>) -> usize {
+    return if WindowContent<A, M, C>.runsCommands(&self.content.*) {
+      state.deferredOn(true)
+    } else {
+      state.deferred()
+    }
+  }
+
+  /// Looks at the waiting commands after anything that may have added one or drawn a frame.
+  fn note(self: &mut Self, state: &Runtime<A, M, C>, tree: &UiTree<'_>) -> () {
+    let issued = state.issued()
+    if issued != self.issued {
+      // The update that asked for the new command is not on screen yet.
+      self.issued = issued
+      self.framed = false
+    }
+    if self.waiting(state) == 0 {
+      self.due = false
+      self.since = -1.0
+      return ()
+    }
+    self.due = self.framed || !WindowContent<A, M, C>.needsFrame(&self.content.*, state, tree)
+  }
+}
+
+/// Performs the commands that waited for their frame, on the UI thread, then handles their
+/// messages. The commands those updates ask for wait for the next frame in turn.
+effect fn work<'a, A: App<M, C>, M, C: Perform<M, E, R>, H: WindowContent<A, M, C>, E, ? R>(
+  client: &mut AppClient<'a, A, M, C, H>,
+  state: &mut Runtime<A, M, C>,
+  tree: &mut UiTree<'_>,
+  time: f64,
+) -> ()
+  ! E | TreeError | OutOfMemoryError
+  ? R | &mut Allocator {
+  client.note(&state.*, &tree.*)
+  let mut left = client.waiting(&state.*)
+  if left == 0 {
+    return ()
+  }
+  if client.since < 0.0 {
+    client.since = time
+  }
+  if !client.due && time - client.since < FRAME_PATIENCE {
+    return ()
+  }
+  let _span = Prof.span("loom.window.work")
+  Prof.set("commands", &left)
+  let all = !WindowContent<A, M, C>.runsCommands(&client.content.*)
+  while left != 0 {
+    let held = if all {
+      run state.takeWork()
+    } else {
+      run state.takeWorkOn(true)
+    }
+    let message = run Perform<M, E, R>.perform(move held.command)
+    drop state.finish(held.ticket, move message)
+    left = left - 1
+  }
+  client.since = -1.0
+  run drain(&mut state, &mut tree)
+  run loadNow(&mut client.loader, &mut state, &mut tree)
+  client.note(&state.*, &tree.*)
+}
+
+impl<'a, A: App<M, C>, M, C: Perform<M, E, R>, H: WindowContent<A, M, C>, E, ? R> WindowClient<
+  Runtime<A, M, C>,
+  E,
+  R
+> for AppClient<'a, A, M, C, H> {
+  effect fn setup(self: &mut Self, state: &mut Runtime<A, M, C>, tree: &mut UiTree<'_>) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    run WindowContent<A, M, C>.files(&mut self.content.*, &mut self.loader)
+    return run WindowContent<A, M, C>.setup(&mut self.content.*, &mut tree)
+  }
+
+  fn configure(self: &Self, state: &Runtime<A, M, C>, options: &mut WindowOptions<'_>) -> () {
+    return WindowContent<A, M, C>.configure(&self.content.*, &mut options)
+  }
+
+  effect fn opened(
+    self: &mut Self,
+    state: &mut Runtime<A, M, C>,
+    platform: &mut HostPlatform,
+    window: WindowId,
+  ) -> ()
+    ! WindowError | OutOfMemoryError
+    ? &mut Allocator {
+    return run WindowContent<A, M, C>.opened(&mut self.content.*, &mut platform, window)
+  }
+
+  effect fn event(
+    self: &mut Self,
+    state: &mut Runtime<A, M, C>,
+    tree: &mut UiTree<'_>,
+    event: &Event,
+  ) -> bool
+    ! WindowError | TreeError | AtlasError | GeometryError | OutOfMemoryError
+    ? &mut Allocator {
+    return run WindowContent<A, M, C>.event(&mut self.content.*, &mut state, &mut tree, event)
+  }
+
+  effect fn update(
+    self: &mut Self,
+    state: &mut Runtime<A, M, C>,
+    tree: &mut UiTree<'_>,
+    platform: &mut HostPlatform,
+    window: WindowId,
+  ) -> bool
+    ! WindowError | TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    return run WindowContent<A, M, C>.update(
+      &mut self.content.*,
+      &mut state,
+      &mut tree,
+      &mut platform,
+      window,
+    )
+  }
+
+  effect fn closing(self: &mut Self, state: &mut Runtime<A, M, C>) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return run WindowContent<A, M, C>.closing(&mut self.content.*, &mut state)
+  }
+
+  fn quitting(self: &Self, state: &Runtime<A, M, C>) -> bool {
+    return WindowContent<A, M, C>.quitting(&self.content.*, &state.*)
+  }
+
+  fn needsFrame(self: &Self, state: &Runtime<A, M, C>, tree: &UiTree<'_>) -> bool {
+    return WindowContent<A, M, C>.needsFrame(&self.content.*, &state.*, tree)
+  }
+
+  effect fn prepare(self: &mut Self, state: &mut Runtime<A, M, C>, tree: &mut UiTree<'_>) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    return run WindowContent<A, M, C>.prepare(&mut self.content.*, &mut state, &mut tree)
+  }
+
+  fn profile(self: &Self, state: &Runtime<A, M, C>) -> bool {
+    return WindowContent<A, M, C>.profile(&self.content.*)
+  }
+
+  effect fn poll(
+    self: &mut Self,
+    state: &mut Runtime<A, M, C>,
+    tree: &mut UiTree<'_>,
+    time: f64,
+  ) -> bool
+    ! WindowError | TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    let _span = Prof.span("loom.window.poll")
+    let styled = run self.stylesheetUpdates.poll(&mut self.stylesheets, &mut tree, time)
+    run self.loader.watch(time)
+    let loaded = run self.load(&mut tree)
+    let restored = run self.silkUi.apply(&mut state, &mut tree)
+    let polled = run WindowContent<A, M, C>.poll(&mut self.content.*, &mut state, &mut tree, time)
+    return styled || loaded || restored || polled
+  }
+
+  fn wakeAfter(self: &Self, state: &Runtime<A, M, C>) -> Option<f64> {
+    let mut wanted = self.loader.watchAfter(self.stylesheetUpdates.wakeAfter(WindowContent<A, M, C>.wakeAfter(&self.content.*)))
+    if self.waiting(state) != 0 {
+      // Commands wait for their frame: at once when it is out, soon when none comes.
+      let soon = if self.due { 0.0 } else { FRAME_PATIENCE }
+      wanted = match wanted {
+        Option<f64>.Some { value } => Option<f64>.some(f64.min(value, soon))
+        Option<f64>.None => Option<f64>.some(soon)
+      }
+    }
+    if !self.loader.pending() {
+      return wanted
+    }
+    // Collect running loads about once a frame.
+    return match wanted {
+      Option<f64>.Some { value } => Option<f64>.some(f64.min(value, 0.016))
+      Option<f64>.None => Option<f64>.some(0.016)
+    }
+  }
+
+  effect fn frame(
+    self: &mut Self,
+    state: &mut Runtime<A, M, C>,
+    tree: &mut UiTree<'_>,
+    input: FrameInput,
+    inspector: &Inspector,
+  ) -> ()
+    ! TreeError | AtlasError | GeometryError | OutOfMemoryError
+    ? &mut Allocator {
+    run WindowContent<A, M, C>.frame(
+      &mut self.content.*,
+      &state.*,
+      &mut tree,
+      input,
+      inspector,
+    )
+    self.note(&state.*, &tree.*)
+  }
+
+  fn shown(self: &mut Self, state: &Runtime<A, M, C>) -> () {
+    // The commands that waited for this frame may run: what asked for them is on its way
+    // to the screen. A frame only the inspector read does not get here.
+    self.issued = state.issued()
+    if self.waiting(state) != 0 {
+      self.framed = true
+      self.due = true
+    }
+  }
+
+  fn scene<'s>(self: &'s Self, state: &'s Runtime<A, M, C>, tree: &'s UiTree<'_>) -> &'s Scene {
+    return WindowContent<A, M, C>.scene(&self.content.*, tree)
+  }
+
+  /// Serves the `silk-ui` extension: the journal's new steps go to its log, and it answers
+  /// what waits for it.
+  effect fn report(self: &mut Self, state: &mut Runtime<A, M, C>, inspector: &mut Inspector) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.silkUi.record(&mut state)
+    run inspector.serveExtension(SILK_UI, &mut self.silkUi)
+  }
+
+  effect fn start(self: &mut Self, state: &mut Runtime<A, M, C>, tree: &mut UiTree<'_>) -> ()
+    ! E | TreeError | OutOfMemoryError
+    ? R | &mut Allocator {
+    run state.start(&mut tree, 0.0)
+    run loadNow(&mut self.loader, &mut state, &mut tree)
+  }
+
+  effect fn pump(self: &mut Self, state: &mut Runtime<A, M, C>, tree: &mut UiTree<'_>) -> ()
+    ! E | TreeError | OutOfMemoryError
+    ? R | &mut Allocator {
+    let _span = Prof.span("loom.window.pump")
+    run WindowContent<A, M, C>.intercept(&mut self.content.*, &mut state, &mut tree)
+    drop run pump(&mut state, &mut tree)
+    // These records come after their input's default ran (a click, a change): there is
+    // nothing left to prevent, and the answer must not fall on the next input.
+    drop state.takePrevented()
+    run loadNow(&mut self.loader, &mut state, &mut tree)
+    self.note(&state.*, &tree.*)
+  }
+
+  effect fn decide(self: &mut Self, state: &mut Runtime<A, M, C>, tree: &mut UiTree<'_>) -> bool
+    ! E | TreeError | OutOfMemoryError
+    ? R | &mut Allocator {
+    let _span = Prof.span("loom.window.decide")
+    run WindowContent<A, M, C>.intercept(&mut self.content.*, &mut state, &mut tree)
+    drop run pump(&mut state, &mut tree)
+    run loadNow(&mut self.loader, &mut state, &mut tree)
+    self.note(&state.*, &tree.*)
+    return state.takePrevented()
+  }
+
+  effect fn tick(
+    self: &mut Self,
+    state: &mut Runtime<A, M, C>,
+    tree: &mut UiTree<'_>,
+    time: f64,
+    animation: bool,
+  ) -> ()
+    ! E | TreeError | OutOfMemoryError
+    ? R | &mut Allocator {
+    let _span = Prof.span("loom.window.tick")
+    run tick(&mut state, &mut tree, time, animation)
+    run loadNow(&mut self.loader, &mut state, &mut tree)
+    if animation {
+      self.note(&state.*, &tree.*)
+    } else {
+      // The loop's own tick comes once a turn, after the frame of the turn before.
+      run work<A, M, C, H, E, R>(&mut self, &mut state, &mut tree, time)
+    }
+  }
+
+  effect fn resize(
+    self: &mut Self,
+    state: &mut Runtime<A, M, C>,
+    tree: &mut UiTree<'_>,
+    width: f32,
+    height: f32,
+  ) -> ()
+    ! E | TreeError | OutOfMemoryError
+    ? R | &mut Allocator {
+    let _span = Prof.span("loom.window.resize")
+    run resize(&mut state, &mut tree, width, height)
+    run loadNow(&mut self.loader, &mut state, &mut tree)
+  }
+
+  effect fn layout(
+    self: &mut Self,
+    state: &mut Runtime<A, M, C>,
+    tree: &mut UiTree<'_>,
+    input: FrameInput,
+  ) -> ()
+    ! E | TreeError | OutOfMemoryError
+    ? R | &mut Allocator {
+    let _span = Prof.span("loom.window.layout")
+    let root = tree.current
+    drop run self.stylesheets.serve(&mut tree, root)
+    run frame(&mut state, &mut tree, input)
+    run loadNow(&mut self.loader, &mut state, &mut tree)
+  }
+
+  effect fn layoutRoot(
+    self: &mut Self,
+    state: &mut Runtime<A, M, C>,
+    tree: &mut UiTree<'_>,
+    root: u32,
+    input: FrameInput,
+  ) -> ()
+    ! E | TreeError | OutOfMemoryError
+    ? R | &mut Allocator {
+    let _span = Prof.span("loom.window.layoutRoot")
+    drop run self.stylesheets.serve(&mut tree, root)
+    run frameRoot(&mut state, &mut tree, root, input)
+    run loadNow(&mut self.loader, &mut state, &mut tree)
+  }
+
+  fn nextDeadline(self: &Self, state: &Runtime<A, M, C>) -> Option<f64> {
+    return state.nextDeadline()
+  }
+
+  fn wantsFrames(self: &Self, state: &Runtime<A, M, C>) -> bool {
+    return state.wantsFrames()
+  }
+
+  effect fn checkInput(
+    self: &mut Self,
+    state: &mut Runtime<A, M, C>,
+    tree: &mut UiTree<'_>,
+    input: FrameInput,
+    name: string,
+  ) -> ()
+    ! E | TreeError | OutOfMemoryError
+    ? R | &mut Allocator {
+    drop run click(&mut state, &mut tree, input, name)
+    run press(&mut state, &mut tree, input, "Tab", 0)
+  }
+}

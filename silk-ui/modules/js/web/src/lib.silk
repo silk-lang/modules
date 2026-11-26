@@ -1,0 +1,368 @@
+//! A ui-js application on the browser's own JavaScript engine, against a wasm build of the UI
+//! tree: the web-canvas target of JavaScript frameworks.
+//!
+//! The application, `@silkui/core` and its framework run in the page as they are. The page's
+//! `__ui` (browser/js-host.js) writes each node call into one buffer instead of calling a
+//! native function. [`WebJsClient`] is the window client in the wasm: on each turn of the
+//! window's loop it takes that buffer and applies it as one batch, it hands each event record
+//! to `__ui.dispatch` between the tree's `begin` and `finish`. It never waits for JavaScript except
+//! through suspending imports (JSPI), so the page's code never runs inside the loop's state.
+//!
+//! ```silk
+//! let mut state = WebJs.make()
+//! let mut client = WebJsClient.make()
+//! let status = run runWindow(&mut state, &fonts, List<Mutation>.make(), options, Inspector.off(), &mut client)
+//! ```
+import wire
+import wire { Unknown }
+import ui_tree.legacy { UiTree, TreeError, Batch, Keyframe, FrameInput }
+import ui_tree.node { Event as RawEvent }
+import ui_tree.lib { EventRecord }
+import ui_tree_window.host { WindowClient }
+import ui_tree_window.loader { Loader }
+import ui_tree_window.console { StderrWriter }
+import ui_js_calls.lib { kindCode, numbersOf, eventStrings }
+import ui_js_calls.markdown as markdown
+import ui_tree.live_svg
+import silk.collections.list { List }
+import silk.collections.bytes { Bytes }
+import silk.core.effect { Effect }
+import silk.io.writer { Writer }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.text.string { String, InvalidUtf8 }
+import silk.core.result { Result }
+import silk.mem.pointer { Pointer }
+import silk.core.option { Option }
+import silk.num.u32
+import silk.num.usize
+
+static if Intrinsic.targetArchitecture() == "wasm32" {
+  import webgpu.host_memory as hostMemory
+
+  /// How many bytes of calls the page wrote since the last `take`.
+  unsafe extern "C" fn hostPending() -> u32 as "silkui#pending"
+
+  @foreign(noCapture: ("indices"))
+  unsafe extern "C" fn virtualRequest(port: u32, indices: ?[*]const usize, count: usize) -> () as "silkui#virtualRequest"
+
+  /// Copies the page's calls to `into` and empties its buffer.
+  @foreign(noCapture: ("into"))
+  unsafe extern "C" fn hostTake(into: ?[*]mut u8, length: usize) -> () as "silkui#take"
+
+  /// `__ui.dispatch` for one record; `strings` holds the record's four strings back to back.
+  /// Returns 1 when a listener prevented the default.
+  @foreign(noCapture: ("strings"))
+  unsafe extern "C" fn hostDispatch(
+    kind: u32, target: u32, a: f64, b: f64, modifiers: f64, d: f64, e: f64,
+    strings: ?[*]const u8, first: usize, second: usize, third: usize, fourth: usize, present: u32,
+  ) -> u32 as "silkui#dispatch"
+
+  /// Suspends until the application module has run (the first time), then returns.
+  unsafe extern "C" fn hostReady() -> () as "silkui#ready"
+
+  /// Suspends until the promise jobs that the last dispatches queued have run.
+  unsafe extern "C" fn hostSettle() -> () as "silkui#settle"
+}
+
+/// What the client keeps between turns.
+pub struct WebJs {
+  /// The frames of a `@keyframes` rule the page is still adding.
+  frames: List<Keyframe>,
+  /// Role and ARIA texts already reported, so each is reported once.
+  reported: List<String>,
+  /// Whether records went to the page since its promise jobs last ran.
+  dispatched: bool,
+}
+
+impl WebJs {
+  pub fn make() -> WebJs {
+    return WebJs { frames: List<Keyframe>.make(), reported: List<String>.make(), dispatched: false }
+  }
+
+  /// Applies the calls the page wrote since the last time. Says whether there were any.
+  pub effect fn apply(self: &mut Self, tree: &mut UiTree<'_>) -> bool ! TreeError | OutOfMemoryError ? &mut Allocator {
+    static if Intrinsic.targetArchitecture() == "wasm32" {
+      let length = u32.toUsize(unsafe hostPending())
+      if length == 0 { return false }
+      let mut bytes = run Bytes.zeroed(length)
+      unsafe hostTake(Pointer.fromMutSlice(bytes.asMutSlice()), length)
+      let mut batch = Batch.make()
+      let unknown = run wire.decode(bytes.asSlice(), &mut batch, &mut self.frames)
+      run self.report(unknown.asSlice())
+      run tree.apply(run batch.take())
+      return true
+    } else {
+      return false
+    }
+  }
+
+  effect fn report(self: &mut Self, unknown: &[Unknown]) -> () ! OutOfMemoryError ? &mut Allocator {
+    let mut i: usize = 0
+    while i < unknown.length {
+      let mut line = String.make()
+      if String.view(&unknown[i].name) == "role" {
+        run line.append("the tree has no role '")
+        run line.append(String.view(&unknown[i].value))
+        run line.append("': it is ignored")
+      } else {
+        run line.append("the tree has no ARIA attribute ")
+        run line.append(String.view(&unknown[i].name))
+        run line.append("=\"")
+        run line.append(String.view(&unknown[i].value))
+        run line.append("\": it is ignored")
+      }
+      if !self.seen(String.view(&line)) {
+        warn(String.view(&line))
+        run self.reported.append(move line)
+      }
+      i = i + 1
+    }
+  }
+
+  fn seen(self: &Self, line: string) -> bool {
+    let items = self.reported.asSlice()
+    let mut i: usize = 0
+    while i < items.length {
+      if String.view(&items[i]) == line { return true }
+      i = i + 1
+    }
+    return false
+  }
+
+  /// Hands the tree's queued records to the page and applies what its listeners did. Says
+  /// whether a listener prevented a default.
+  pub effect fn deliver(self: &mut Self, tree: &mut UiTree<'_>) -> bool ! TreeError | OutOfMemoryError ? &mut Allocator {
+    let mut raw = List<RawEvent>.make()
+    run tree.takeEvents(&mut raw)
+    let items = raw.asSlice()
+    let mut prevented = false
+    let mut i: usize = 0
+    while i < items.length {
+      let record = run EventRecord.lift(&items[i])
+      if run dispatch(&record) { prevented = true }
+      self.dispatched = true
+      i = i + 1
+    }
+    drop run self.apply(&mut tree)
+    return prevented
+  }
+
+  /// Lets the page run the promise jobs its listeners queued (a framework's render after a
+  /// click), then applies what they did.
+  pub effect fn settle(self: &mut Self, tree: &mut UiTree<'_>) -> bool ! TreeError | OutOfMemoryError ? &mut Allocator {
+    if !self.dispatched { return false }
+    self.dispatched = false
+    static if Intrinsic.targetArchitecture() == "wasm32" { unsafe hostSettle() }
+    return run self.apply(&mut tree)
+  }
+}
+
+/// A console warning, on the page's console.
+fn warn(line: string) -> () {
+  let mut out = StderrWriter.make()
+  drop run Writer.writeString(line) |> Effect.provideMut<Writer>(&mut out) |> Effect.result
+  drop run Writer.writeString("\n") |> Effect.provideMut<Writer>(&mut out) |> Effect.result
+}
+
+effect fn dispatch(record: &EventRecord) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let numbers = numbersOf(&record.event)
+  let strings = run eventStrings(&record.event)
+  static if Intrinsic.targetArchitecture() == "wasm32" {
+    let mut packed = List<u8>.make()
+    let mut lengths: [usize; 4] = [0, 0, 0, 0]
+    let mut i: usize = 0
+    while i < 4 {
+      let bytes = String.utf8Bytes(String.view(&strings.texts[i]))
+      lengths[i] = bytes.length
+      run packed.appendSlice(bytes)
+      i = i + 1
+    }
+    let mut present: u32 = 0
+    if strings.present[0] { present = present + 1 }
+    if strings.present[1] { present = present + 2 }
+    let prevented = unsafe hostDispatch(
+      kindCode(record.event.kind()), record.target.raw(),
+      numbers[0], numbers[1], numbers[2], numbers[3], numbers[4],
+      Pointer.fromSlice(packed.asSlice()), lengths[0], lengths[1], lengths[2], lengths[3], present,
+    )
+    return prevented != 0
+  } else {
+    return false
+  }
+}
+
+/// The window client of a page's JavaScript application.
+pub struct WebJsClient {
+  /// Loads the image, icon and `url()` addresses the application names. In a page that is
+  /// `data:` URLs and the files the program carries.
+  pub loader: Loader,
+}
+
+impl WebJsClient {
+  pub fn make() -> WebJsClient {
+    return WebJsClient { loader: Loader.make() }
+  }
+
+  /// Starts the loads the last batch asked for; the `load` and `error` records of what ended
+  /// go to the page at once.
+  effect fn load(self: &mut Self, state: &mut WebJs, tree: &mut UiTree<'_>) -> bool
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    if !(run self.loader.serve(&mut tree)) { return false }
+    drop run state.deliver(&mut tree)
+    return true
+  }
+}
+
+impl WindowClient<WebJs, never, never> for WebJsClient {
+  effect fn layout(self: &mut Self, state: &mut WebJs, tree: &mut UiTree<'_>, input: FrameInput) -> ()
+    ! TreeError | OutOfMemoryError ? &mut Allocator {
+    run tree.frame(input)
+    static if Intrinsic.targetArchitecture() == "wasm32" {
+      let mut at: usize = 0
+      while at < tree.virtualLists.length() {
+        if let Option.Some { value } = move run tree.changedVirtualIndices(at) {
+          unsafe virtualRequest(tree.virtualLists.asSlice()[at].port, Pointer.fromSlice(value.asSlice()), value.length())
+        }
+        at = at + 1
+      }
+      if tree.virtualLists.length() != 0 && run state.apply(&mut tree) { run tree.frame(input) }
+    }
+  }
+
+  effect fn start(self: &mut Self, state: &mut WebJs, tree: &mut UiTree<'_>) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    static if Intrinsic.targetArchitecture() == "wasm32" { unsafe hostReady() }
+    drop run state.apply(&mut tree)
+    drop run self.load(&mut state, &mut tree)
+  }
+
+  effect fn prepare(self: &mut Self, state: &mut WebJs, tree: &mut UiTree<'_>) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    drop run state.settle(&mut tree)
+    drop run state.apply(&mut tree)
+    drop run self.load(&mut state, &mut tree)
+  }
+
+  effect fn poll(self: &mut Self, state: &mut WebJs, tree: &mut UiTree<'_>, time: f64) -> bool
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    let settled = run state.settle(&mut tree)
+    let applied = run state.apply(&mut tree)
+    let loaded = run self.load(&mut state, &mut tree)
+    return settled || applied || loaded
+  }
+
+  effect fn pump(self: &mut Self, state: &mut WebJs, tree: &mut UiTree<'_>) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    drop run state.deliver(&mut tree)
+  }
+
+  effect fn decide(self: &mut Self, state: &mut WebJs, tree: &mut UiTree<'_>) -> bool
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    return run state.deliver(&mut tree)
+  }
+
+  effect fn tick(self: &mut Self, state: &mut WebJs, tree: &mut UiTree<'_>, time: f64, animation: bool) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    drop run state.settle(&mut tree)
+    drop run state.apply(&mut tree)
+    drop run self.load(&mut state, &mut tree)
+  }
+}
+
+/// `__ui.markdown(text, flags)` for the page: the mdast JSON of the `length` UTF-8 bytes at
+/// `source`, in a new allocation that starts with its length as a little-endian u32, or null
+/// when memory ran out. The page frees it with `webgpu_free` (length + 4). An app's root
+/// package exports this as `silkui_markdown`, beside the WebGPU host's allocation exports.
+pub unsafe fn markdownJson(source: ?[*]const u8, length: usize, flags: u32) -> ?*mut u8 {
+  static if Intrinsic.targetArchitecture() == "wasm32" {
+    let mut heap = Allocator.systemAllocatorProvider()
+    let out = run Effect.result(markdownOf(source, length, flags)) |> Effect.provideMut<Allocator>(&mut heap)
+    let json = match move out {
+      Result<List<u8>, OutOfMemoryError>.Success { value } => move value
+      Result<List<u8>, OutOfMemoryError>.Failure { .. } => { return Pointer.null<u8>() }
+    }
+    return unsafe prefixed(json.asSlice())
+  } else {
+    return Pointer.null<u8>()
+  }
+}
+
+/// `__ui.svgMeasure(op, packed, distance)` for the page (see `ui_tree.live_svg.measure`): the
+/// answer for the `length` UTF-8 bytes at `source`, allocated and freed as `markdownJson`'s.
+/// An app's root package exports this as `silkui_svg_measure`.
+pub unsafe fn svgMeasure(source: ?[*]const u8, length: usize, op: u32, distance: f64) -> ?*mut u8 {
+  static if Intrinsic.targetArchitecture() == "wasm32" {
+    let mut heap = Allocator.systemAllocatorProvider()
+    let out = run Effect.result(measured(source, length, op, distance)) |> Effect.provideMut<Allocator>(&mut heap)
+    return match move out {
+      Result<List<u8>, OutOfMemoryError>.Success { value } => unsafe prefixed(value.asSlice())
+      Result<List<u8>, OutOfMemoryError>.Failure { .. } => Pointer.null<u8>()
+    }
+  } else {
+    return Pointer.null<u8>()
+  }
+}
+
+/// `bytes` in a new host allocation after their length as a little-endian u32, or null.
+unsafe fn prefixed(bytes: &[u8]) -> ?*mut u8 {
+  static if Intrinsic.targetArchitecture() == "wasm32" {
+    let pointer = hostMemory.hostAllocate(bytes.length + 4)
+    if Pointer.isNull(pointer) { return pointer }
+    let many = unsafe Intrinsic.pointerRequalify<?*mut u8, [*]mut u8>(pointer)
+    let size = usize.toU32(bytes.length)
+    let mut i: usize = 0
+    while i < 4 {
+      unsafe Pointer.put(unsafe Pointer.atMut(many, i), u32.toU8(u32.bitAnd(u32.shiftRight(size, usize.toU32(i) * 8), 255)))
+      i = i + 1
+    }
+    i = 0
+    while i < bytes.length {
+      unsafe Pointer.put(unsafe Pointer.atMut(many, i + 4), bytes[i])
+      i = i + 1
+    }
+    return pointer
+  } else {
+    return Pointer.null<u8>()
+  }
+}
+
+static if Intrinsic.targetArchitecture() == "wasm32" {
+  effect fn measured(source: ?[*]const u8, length: usize, op: u32, distance: f64) -> List<u8> ! OutOfMemoryError ? &mut Allocator {
+    let mut bytes = List<u8>.make()
+    if let Option<[*]const u8>.Some { value: many } = Pointer.nonNullMany(source) {
+      let mut i: usize = 0
+      while i < length {
+        run bytes.append(unsafe Pointer.read(unsafe Pointer.at(many, i)))
+        i = i + 1
+      }
+    }
+    let mut out = List<u8>.make()
+    run live_svg.measure(bytes.asSlice(), op, distance, &mut out)
+    return move out
+  }
+
+  effect fn markdownOf(source: ?[*]const u8, length: usize, flags: u32) -> List<u8> ! OutOfMemoryError ? &mut Allocator {
+    let mut bytes = List<u8>.make()
+    match Pointer.nonNullMany(source) {
+      Option<[*]const u8>.Some { value: many } => {
+        let mut i: usize = 0
+        while i < length {
+          run bytes.append(unsafe Pointer.read(unsafe Pointer.at(many, i)))
+          i = i + 1
+        }
+      }
+      Option<[*]const u8>.None => ()
+    }
+    return match run String.copyUtf8(bytes.asSlice()) {
+      Result<String, InvalidUtf8>.Success { value } => run markdown.json(String.view(&value), flags)
+      Result<String, InvalidUtf8>.Failure { .. } => List<u8>.make()
+    }
+  }
+}

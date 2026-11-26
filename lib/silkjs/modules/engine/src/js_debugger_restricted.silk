@@ -1,0 +1,208 @@
+//! Pre-effect debugger evaluation policy. A rejection is sticky and never becomes
+//! a catchable JavaScript exception. No exception value or interrupt state is changed.
+import silk.mem.pointer { Pointer }
+import silk.core.option { Option }
+import silk.num.u8
+import silk.num.u16
+import silk.num.u32
+import silk.num.i32
+import js_atoms { ATOM_INTEGER_TAG }
+import js_heap { HeapCell, HeapHeader }
+import js_core_types { RuntimeState, ObjectData, ObjectPayload, ShapeData, PropertySlot, NativeFunctionId, refreshObservation }
+import js_debugger_side_effects as effects
+import js_debugger_side_effects { BuiltinEffect }
+import js_value { ValueBits }
+import js_exceptions { JsException }
+import js_runtime as runtime
+import js_realm { Realm, lendRealm }
+import js_shapes as shapes
+import js_class_data as classes
+import js_opcode_data as op
+import js_vm_state { Machine }
+
+pub fn active<'a>(realm: Realm<'a>) -> bool {
+  let anchor = () let state = realm.runtimeState(&anchor)
+  return state.debugger.restricted
+}
+// The owning evaluator saves/restores exception/evaluating state. Nested eval must
+// inherit this session, not call begin/finish. Epochs are never reused, even on failure.
+pub unsafe fn begin(rt: *mut HeapHeader) -> bool {
+  let mut anchor = () let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, rt)
+  if state.debugger.restricted || state.debugger.restrictedEpoch == 18446744073709551615 { return false }
+  state.debugger.restrictedEpoch = state.debugger.restrictedEpoch + 1
+  state.debugger.freshCount = 0
+  state.debugger.rejected = false state.debugger.restricted = true
+  state.observeFresh = true
+  refreshObservation(&mut state)
+  return true
+}
+pub unsafe fn finish(rt: *mut HeapHeader) -> bool {
+  let mut anchor = () let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, rt)
+  let rejected = state.debugger.rejected state.debugger.restricted = false
+  state.observeFresh = state.allocationRealmsUsed
+  refreshObservation(&mut state)
+  return rejected
+}
+pub effect fn deny<'a>(realm: Realm<'a>) -> () ! JsException {
+  let mut anchor = () let state = realm.runtimeStateMut(&mut anchor)
+  if state.debugger.restricted { state.debugger.rejected = true fail JsException {} }
+}
+pub unsafe fn rejected(rt: *mut HeapHeader) -> bool {
+  let anchor = () let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, rt)
+  return state.debugger.restricted && state.debugger.rejected
+}
+// Only newly allocated ordinary storage is writable. Mapped arguments, typed
+// views, proxies and host classes may alias older storage or invoke host hooks.
+pub unsafe effect fn write<'a>(realm: Realm<'a>, value: ValueBits) -> () ! JsException {
+  if !active(realm) { return () }
+  let reference = match value { ValueBits.Object { reference } => reference _ => { run deny(realm) return () } }
+  let anchor = () let state = realm.runtimeState(&anchor)
+  let fresh = state.debugger.isFresh(Pointer.address<HeapHeader>(reference)) drop state
+  let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, reference)
+  let id = object.classId()
+  let ordinary = id == classes.JS_CLASS_OBJECT || id == classes.JS_CLASS_ARRAY || id == classes.JS_CLASS_BYTECODE_FUNCTION
+    || id == classes.JS_CLASS_ERROR
+  drop object
+  if !fresh || !ordinary { run deny(realm) }
+}
+// Assignment may traverse old prototypes. Inspect without invoking any accessors,
+// lazy initialization or exotic hooks, even when the receiver itself is fresh.
+pub unsafe effect fn set<'a>(realm: Realm<'a>, object: ValueBits, atom: u32, receiver: ValueBits) -> () ! JsException {
+  if !active(realm) { return () }
+  run unsafe write(realm, receiver)
+  let mut node = match object { ValueBits.Object { reference } => reference _ => { run deny(realm) return () } }
+  while true {
+    let anchor = () let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, node)
+    if data.isExotic() && data.classId() != classes.JS_CLASS_ARRAY { drop data run deny(realm) return () }
+    match unsafe shapes.lookup(data.shape, atom) {
+      Option<usize>.Some { value: index } => {
+        let plain = match data.slot(index).view(unsafe shapes.slotFlags(data.shape, index)) { PropertySlot.Value { .. } => true _ => false }
+        drop data
+        if !plain { run deny(realm) }
+        return ()
+      }
+      Option<usize>.None => ()
+    }
+    let shape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, data.shape)
+    match Pointer.nonNullMut<HeapHeader>(shape.prototype) {
+      Option<*mut HeapHeader>.Some { value } => { node = value }
+      Option<*mut HeapHeader>.None => { return () }
+    }
+  }
+}
+// JS bodies are checked transitively by the interpreter. Bound, proxy, generator,
+// async and host dispatch have effects before their first JS instruction, so only
+// bytecode and the built-ins js_debugger_side_effects classifies may be called.
+// receiver is the call's this value (Undefined for a plain call or construct).
+pub unsafe effect fn call<'a>(realm: Realm<'a>, function: ValueBits, receiver: ValueBits) -> () ! JsException {
+  if !active(realm) { return () }
+  let node = match function { ValueBits.Object { reference } => reference _ => { return () } }
+  let anchor = () let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, node)
+  if object.classId() == classes.JS_CLASS_BYTECODE_FUNCTION { return () }
+  let mut id = NativeFunctionId.Host { id: 0 } let mut builtin = false
+  match &object.payload {
+    ObjectPayload.NativeFunction { function: native } => { id = native.function builtin = true }
+    _ => ()
+  }
+  drop object
+  if !builtin { run deny(realm) return () }
+  run unsafe native(realm, id, receiver)
+}
+// A native entry, checked again where the receiver is known for certain. Calls
+// that reach a native function without passing the interpreter come through here.
+pub unsafe effect fn native<'a>(realm: Realm<'a>, id: NativeFunctionId, receiver: ValueBits) -> () ! JsException {
+  if !active(realm) { return () }
+  match effects.classify(id) {
+    BuiltinEffect.Pure => ()
+    BuiltinEffect.ReceiverWrite => { run unsafe write(realm, receiver) }
+    BuiltinEffect.Denied => { run deny(realm) }
+  }
+}
+// Called after reading the opcode, before consuming operands. Unknown/new opcodes
+// fail closed. Operand ownership and PC are untouched on rejection.
+pub unsafe effect fn instruction(machine: &Machine, opcode: u8) -> () ! JsException {
+  let realm = unsafe lendRealm(machine, machine.context)
+  let anchor = () let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, machine.runtime)
+  if !state.debugger.restricted { return () }
+  if state.debugger.rejected { fail JsException {} }
+  drop state
+  // Inline and frameless dispatch can bypass the ordinary call entrypoint.
+  // Inspect the callee before either path can run a native/exotic hook.
+  if opcode >= op.OP_call_constructor && opcode <= op.OP_tail_call_method {
+    let count = u16.toUsize(unsafe machine.peekU16())
+    let extra: usize = if opcode == op.OP_call_constructor { 2 } else { 1 }
+    let mut receiver = ValueBits.Undefined
+    if opcode == op.OP_call_method || opcode == op.OP_tail_call_method { receiver = unsafe machine.top(count + 2) }
+    run unsafe call(realm, unsafe machine.top(count + extra), receiver)
+    return ()
+  }
+  if opcode >= op.OP_call0 && opcode <= op.OP_call3 {
+    let count = u8.toUsize(opcode - op.OP_call0)
+    run unsafe call(realm, unsafe machine.top(count + 1), ValueBits.Undefined)
+    return ()
+  }
+  if opcode == op.OP_put_field {
+    let object = unsafe machine.top(2)
+    let atom = u16.toU32(unsafe machine.peekU16()) | u32.shiftLeft(u16.toU32(unsafe machine.peekU16At(2)), 16)
+    run unsafe set(realm, object, atom, object)
+    return ()
+  }
+  if opcode == op.OP_put_loc_field_loc8 || opcode == op.OP_put_loc_field_arg8 {
+    let object = unsafe machine.local(u8.toUsize(unsafe machine.peekU8(4 + u8.toUsize(op.FIELD_KEY_BYTES))))
+    let atom = u16.toU32(unsafe machine.peekU16()) | u32.shiftLeft(u16.toU32(unsafe machine.peekU16At(2)), 16)
+    run unsafe set(realm, object, atom, object)
+    return ()
+  }
+  if opcode == op.OP_put_array_el {
+    let object = unsafe machine.top(3)
+    run unsafe write(realm, object)
+    if let ValueBits.Int { value: index } = unsafe machine.top(2) {
+      if index >= 0 { run unsafe set(realm, object, i32.toU32(index) | ATOM_INTEGER_TAG, object) }
+    }
+    return ()
+  }
+  if opcode == op.OP_define_field || opcode == op.OP_define_method { run unsafe write(realm, unsafe machine.top(2)) return () }
+  if opcode == op.OP_define_array_el || opcode == op.OP_define_method_computed { run unsafe write(realm, unsafe machine.top(3)) return () }
+  if opcode == op.OP_set_name || opcode == op.OP_set_name_computed || opcode == op.OP_set_home_object {
+    run unsafe write(realm, unsafe machine.top(1)) return ()
+  }
+  if opcode == op.OP_special_object {
+    let kind = unsafe machine.peekU8(0)
+    if kind <= 5 { return () }
+  }
+  // Behind OP_extended only the stack permutations are allowed (the extended
+  // number itself sits in the drop to call_method range below).
+  if opcode == op.OP_extended {
+    let moved = unsafe machine.peekU8(0)
+    if moved >= op.OP_dup && moved <= op.OP_rot5l { return () }
+    run deny(realm) return ()
+  }
+  if (opcode >= op.OP_push_i32 && opcode <= op.OP_object)
+    || opcode == op.OP_rest
+    || (opcode >= op.OP_drop && opcode <= op.OP_call_method)
+    || opcode == op.OP_tail_call_method || opcode == op.OP_array_from
+    || opcode == op.OP_return || opcode == op.OP_return_undef
+    || opcode == op.OP_check_ctor_return || opcode == op.OP_check_ctor || opcode == op.OP_init_ctor
+    || opcode == op.OP_throw || opcode == op.OP_throw_error || opcode == op.OP_eval
+    || opcode == op.OP_get_var_undef || opcode == op.OP_get_var
+    || opcode == op.OP_with_get_var || opcode == op.OP_with_get_ref
+    || opcode == op.OP_get_field || opcode == op.OP_get_field2
+    || (opcode >= op.OP_get_array_el && opcode <= op.OP_get_array_el3)
+    || (opcode >= op.OP_get_loc && opcode <= op.OP_get_var_ref)
+    || (opcode >= op.OP_set_loc_uninitialized && opcode <= op.OP_get_var_ref_check)
+    || (opcode >= op.OP_close_loc && opcode <= op.OP_to_propkey)
+    || (opcode >= op.OP_neg && opcode <= op.OP_typeof)
+    || (opcode >= op.OP_mul && opcode <= op.OP_gte)
+    || (opcode >= op.OP_eq && opcode <= op.OP_is_undefined_or_null)
+    || opcode == op.OP_push_bigint_i32
+    || (opcode >= op.OP_nop && opcode <= op.OP_get_scope0) || opcode == op.OP_get_scope0_check
+    || (opcode >= op.OP_add_imm && opcode <= op.OP_or_imm)
+    || (opcode >= op.OP_get_length && opcode <= op.OP_call3)
+    || opcode == op.OP_is_undefined || opcode == op.OP_is_null || opcode == op.OP_typeof_is_undefined || opcode == op.OP_typeof_is_function
+    || opcode == op.OP_typeof_is || opcode == op.OP_strict_eq_imm8 || opcode == op.OP_strict_neq_imm8
+    // Fused local/argument reads of a field, length or element (250-255): get_loc + get_field and friends.
+    || opcode >= op.OP_get_loc_field8 {
+    return ()
+  }
+  run deny(realm)
+}

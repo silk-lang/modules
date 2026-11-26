@@ -1,0 +1,552 @@
+//! Owned execution-frame snapshots, independent of Error.stack formatting.
+//! Capture invokes no JS or GC. Strings own themselves; private native/error
+//! values are retained only after traversal succeeds. Pair those snapshots with
+//! release before dropping their native List; util snapshots carry no JS edges.
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.option { Option }
+import silk.core.effect { Effect }
+import silk.core.result { Result }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.mem.pointer { Pointer }
+import silk.core.ownership { Copy }
+import silk.num.u32
+import silk.num.i32
+import silk.num.u16
+import silk.num.usize
+import silk.num.u8
+import dtoa { Dtoa }
+import js_heap { HeapCell, HeapHeader }
+import js_value { ValueBits }
+import js_owned_value { Value, lendBits }
+import js_promise as promise
+import js_vm_activation as activation
+import js_vm_state { frameLocals }
+import js_core_types { ForeignFrame, ForeignFrameSource, AsyncFrame, JS_MODE_ASYNC, NO_PC, ContextState, RuntimeState, ObjectData, ObjectPayload, NativeFunctionId, ShapeData, PropertySlot, StackFrame, FunctionBytecode, FunctionDebugInfo, JS_MODE_BACKTRACE_BARRIER, JS_MODE_STRICT, hostScriptMetadataView }
+import js_string_types { StringOwner, StringLengthError }
+import js_strings { Strings }
+import js_primitives { EqualityMode, equal }
+import js_debug_positions { FUNCTION_DEFINITION_PC }
+import js_atom_data as atoms
+import js_backtrace as backtrace
+import js_class_data as classes
+import js_invariant { present }
+
+pub struct FrameSnapshot {
+  pub functionName: StringOwner,
+  pub scriptName: StringOwner,
+  pub isToplevel: bool,
+  pub scriptId: u64,
+  pub scriptMetadata: Value,
+  pub lineNumber: i32,
+  pub columnNumber: i32,
+  pub callLineNumber: i32,
+  pub callColumnNumber: i32,
+  /// The statement position (the legacy line table) even for node:vm code,
+  /// where lineNumber holds the call position: where a throw statement is.
+  pub statementLineNumber: i32,
+  pub statementColumnNumber: i32,
+  pub sourceLineNumber: i32,
+  pub sourceColumnNumber: i32,
+  pub isScript: bool,
+  pub isNative: bool,
+  pub isBuiltin: bool,
+  pub function: Value,
+  pub receiver: Value,
+  pub isConstructor: bool,
+  pub enclosingLineNumber: i32,
+  pub enclosingColumnNumber: i32,
+  pub isEval: bool,
+  /// A frame of the async stack trace: a suspended async function awaiting.
+  pub isAsync: bool,
+  /// The receiver and function of a frame that is not a construct call, even in
+  /// strict code: its type and method names are looked up from them when the stack
+  /// is formatted (presentation). Undefined where a script could not hold the value.
+  pub methodReceiver: Value,
+  pub methodFunction: Value,
+  /// A frame of the async stack trace that stands for a promise combinator waiting on the
+  /// previous frame's promise (V8's "Promise.all (index N)"): promise.COMBINATOR_ALL,
+  /// COMBINATOR_ALL_SETTLED or COMBINATOR_ANY, else -1; and the element's index.
+  pub promiseCombinator: i32,
+  pub promiseIndex: i32,
+  /// A foreign frame (RuntimeState.foreignFrames): its function index, else -1,
+  /// and its module's name. functionName, scriptName and the 1-based column of
+  /// its byte offset (line 1) describe it as V8's CallSite does a Wasm frame.
+  pub foreignFunction: i32,
+  pub foreignModule: StringOwner
+}
+
+/// How many promises the async stack trace follows between two frames.
+const ASYNC_CHAIN_STEPS: usize = 64
+/// The promise `node`'s own completion settles, or undefined once its body completed.
+unsafe fn outerPromise(node: *mut HeapHeader) -> ValueBits {
+  let anchor = () let data = unsafe HeapCell.payload<AsyncFrame, ()>(&anchor, node)
+  if data.isCompleted { return ValueBits.Undefined }
+  let resolve = data.resolvingFunctions[0].view() drop data
+  return promise.settledBy(unsafe lendBits(&anchor, resolve)).view()
+}
+/// The async function awaiting `settled`, when it is still suspended.
+unsafe fn awaitingCaller(settled: ValueBits) -> ?*mut HeapHeader {
+  if !settled.isObject() { return Pointer.null<HeapHeader>() }
+  let anchor = ()
+  let caller = unsafe promise.awaitingFunction(unsafe lendBits(&anchor, settled))
+  match Pointer.nonNullMut<HeapHeader>(caller) {
+    Option<*mut HeapHeader>.Some { value } => {
+      let awaiting = unsafe HeapCell.payload<AsyncFrame, ()>(&anchor, value)
+      if awaiting.isCompleted { return Pointer.null<HeapHeader>() }
+    }
+    _ => ()
+  }
+  return caller
+}
+/// The async stack frame of a promise combinator step: no function or location, only
+/// which combinator waits and at which index.
+fn combinatorFrame(step: promise.CombinatorStep, empty: ValueBits) -> FrameSnapshot {
+  return FrameSnapshot {
+    functionName: StringOwner.borrowed(empty), scriptName: StringOwner.borrowed(empty),
+    isToplevel: false, scriptId: 0, lineNumber: 0, columnNumber: 0, callLineNumber: 0,
+    scriptMetadata: Value.immediate(ValueBits.Undefined),
+    callColumnNumber: 0, statementLineNumber: 0, statementColumnNumber: 0, isScript: false, isNative: true, isEval: false, isBuiltin: true,
+    sourceLineNumber: 0, sourceColumnNumber: 0,
+    function: Value.immediate(ValueBits.Undefined), receiver: Value.immediate(ValueBits.Undefined),
+    isConstructor: false, enclosingLineNumber: 0, enclosingColumnNumber: 0, isAsync: true,
+    methodReceiver: Value.immediate(ValueBits.Undefined), methodFunction: Value.immediate(ValueBits.Undefined),
+    promiseCombinator: step.combinator, promiseIndex: step.index,
+    foreignFunction: -1, foreignModule: StringOwner.borrowed(empty)
+  }
+}
+unsafe fn asyncStackFrame(node: *mut HeapHeader) -> *mut StackFrame {
+  let mut anchor = () let data = unsafe HeapCell.payloadMut<AsyncFrame, ()>(&mut anchor, node)
+  return data.frame.address()
+}
+/// Where a suspended async body waits: its script name atom (borrowed from the
+/// function's debug info) and the 1-based location of the await.
+pub struct StalledAwait { pub filename: u32, pub line: i32, pub column: i32 }
+impl Copy for StalledAwait {}
+/// The await the AsyncFrame node is suspended at, or none when its body
+/// completed or keeps no locations.
+pub unsafe fn suspendedAt(node: *mut HeapHeader) -> Option<StalledAwait> {
+  let anchor = () let data = unsafe HeapCell.payload<AsyncFrame, ()>(&anchor, node)
+  if data.isCompleted { return Option<StalledAwait>.none() } drop data
+  let frame = unsafe Pointer.borrow<(), StackFrame>(&anchor, present(unsafe asyncStackFrame(node)))
+  if frame.currentPc == NO_PC { return Option<StalledAwait>.none() }
+  let code = match unsafe backtrace.bytecode(frame.currentFunction) { Option<*mut HeapHeader>.Some { value } => value _ => { return Option<StalledAwait>.none() } }
+  let pc = u32.wrappingSubtract(usize.toU32(frame.currentPc), 1)
+  let function = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, code)
+  return match &function.debug {
+    Option<FunctionDebugInfo>.Some { value: debug } => {
+      // The await's own position, which its suspension records (recordCallPosition).
+      let at = unsafe backtrace.callLocation(&debug, pc)
+      Option<StalledAwait>.some(StalledAwait { filename: debug.filename, line: at.line, column: at.column })
+    }
+    _ => Option<StalledAwait>.none()
+  }
+}
+unsafe fn hostNative(callee: ValueBits) -> bool {
+  let anchor = ()
+  if let ValueBits.Object { reference } = callee {
+    let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, reference)
+    return match &data.payload {
+      ObjectPayload.NativeFunction { function: native } => match native.function {
+        NativeFunctionId.Host { .. } => true
+        _ => false
+      }
+      _ => false
+    }
+  }
+  return false
+}
+/// Undefined skipThrough captures from the current frame; an object excludes
+/// every frame through that exact function identity. An absent identity returns
+/// no frames. includeNative determines whether actual native frames count toward
+/// limit. A backtrace barrier always terminates traversal, including skipping.
+pub unsafe effect fn capture(runtime: *mut HeapHeader, limit: usize,
+  skipThrough: ValueBits, includeNative: bool) -> List<FrameSnapshot>
+  ! OutOfMemoryError | StringLengthError ? &mut Allocator {
+  let anchor = ()
+  let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
+  let mut pointer = state.currentStackFrame
+  let resumed = state.awaitResumed
+  let reaction = state.reactionResolve
+  let empty = StringOwner.adopt(state.atoms.emptyString())
+  let hiding = state.hiddenScripts.length() != 0
+  let foreign = match &state.foreignFrames {
+    Option<ForeignFrameSource>.Some { value } => Option<ForeignFrameSource>.some(ForeignFrameSource { frame: value.frame, opaque: value.opaque })
+    _ => Option<ForeignFrameSource>.none()
+  }
+  drop state
+  let mut frames = List<FrameSnapshot>.make()
+  let mut skipping = skipThrough.isObject()
+  let mut restricted = false
+  // Node stacks continue past the synchronous frames as V8's async stack trace:
+  // from the async function an await settlement resumed, each async function
+  // awaiting the previous one's promise ("at async name").
+  let mut chain = Pointer.null<HeapHeader>()
+  let mut asyncFrame = false
+  while frames.length() < limit {
+    if Pointer.isNull<StackFrame>(pointer) {
+      if !includeNative { break }
+      // Past a generic reaction job's handler, the chain starts at the async
+      // function awaiting the promise that handler settles.
+      let mut settled = match Pointer.nonNullMut<HeapHeader>(chain) {
+        Option<*mut HeapHeader>.Some { value } => unsafe outerPromise(value)
+        _ => promise.settledBy(unsafe lendBits(&anchor, reaction)).view()
+      }
+      // A combinator waiting on that promise is a frame of its own, as V8 writes it
+      // ("at async Promise.all (index 3)"); the chain goes on from the promise it returned.
+      // A `then` chain or a Promise.race between them is followed to the next promise,
+      // as V8 does for native promise chains; steps bounds a chain that loops.
+      let mut caller = Pointer.null<HeapHeader>()
+      let mut steps: usize = 0
+      while frames.length() < limit && steps < ASYNC_CHAIN_STEPS && settled.isObject() {
+        steps = steps + 1
+        caller = unsafe awaitingCaller(settled)
+        if !Pointer.isNull<HeapHeader>(caller) { break }
+        match unsafe promise.combinatorStep(unsafe lendBits(&anchor, settled)) {
+          Option<promise.CombinatorStep>.Some { value: step } => {
+            run frames.append(combinatorFrame(step, empty.get()))
+            settled = step.combined
+          }
+          _ => { settled = unsafe promise.chainedPromise(unsafe lendBits(&anchor, settled)) }
+        }
+      }
+      let next = match Pointer.nonNullMut<HeapHeader>(caller) { Option<*mut HeapHeader>.Some { value } => value _ => { break } }
+      chain = next
+      pointer = unsafe asyncStackFrame(next)
+      asyncFrame = true
+    }
+    let here = Pointer.address(pointer)
+    let frame = unsafe Pointer.borrow<(), StackFrame>(&anchor,
+      present(pointer))
+    if !asyncFrame && (frame.mode & u8.toU32(JS_MODE_BACKTRACE_BARRIER)) != 0 {
+      pointer = Pointer.null<StackFrame>()
+      continue
+    }
+    // A suspended frame's previous link is stale: the chain gives the next one.
+    pointer = if asyncFrame { Pointer.null<StackFrame>() } else { frame.previous }
+    if !asyncFrame && includeNative && (frame.mode & u8.toU32(JS_MODE_ASYNC)) != 0 && !Pointer.isNull<HeapHeader>(resumed) &&
+      Pointer.address(frame.asyncOwner) == Pointer.address(resumed) { chain = resumed }
+    // Foreign frames entered from this frame run above it (a native call may push no
+    // frame). V8 shows Wasm frames even while skipping, and the call that entered
+    // them is where a skipped function's frame ends.
+    if let Option<ForeignFrameSource>.Some { value: source } = &foreign {
+      let entry = run unsafe foreignFrames(&source, here, &mut frames, limit, empty.get())
+      if skipping { if let ValueBits.Object { reference } = skipThrough { if Pointer.address(reference) == Pointer.address(entry) { skipping = false } } }
+      if frames.length() >= limit { break }
+    }
+    if skipping {
+      if unsafe equal(frame.currentFunction, skipThrough, EqualityMode.Strict) { skipping = false }
+      continue
+    }
+    if unsafe backtrace.hiddenFrame(frame.currentFunction) { continue }
+    let compiled = unsafe backtrace.bytecode(frame.currentFunction)
+    if hiding { if let Option<*mut HeapHeader>.Some { value: code } = &compiled { if unsafe hiddenScript(runtime, code) { continue } } }
+    let native = match &compiled { Option<*mut HeapHeader>.Some { .. } => false _ => true }
+    if native && !includeNative { continue }
+    // An embedder's native is a V8 API callback, which Node stacks never show.
+    if native && unsafe hostNative(frame.currentFunction) { continue }
+    restricted = restricted || (frame.mode & u8.toU32(JS_MODE_STRICT)) != 0
+    let mut hasName = false
+    let name = match unsafe backtrace.frameName(runtime, frame.currentFunction) {
+      Option<ValueBits>.Some { value } => { hasName = true value }
+      Option<ValueBits>.None => empty.get()
+    }
+    let receiver = unsafe activation.frameThis(Pointer.fromRef<StackFrame>(frame))
+    // Raw views while the frame is inspected; retained into the snapshot below.
+    let mut receiverBits = receiver
+    // A known local function has no function object to show (KnownCall).
+    let mut functionBits = if restricted || native || !frame.currentFunction.isObject() { ValueBits.Undefined } else { frame.currentFunction }
+    let mut metadataBits = ValueBits.Undefined
+    let mut snapshot = FrameSnapshot {
+      functionName: StringOwner.borrowed(name), scriptName: StringOwner.borrowed(empty.get()),
+      isToplevel: receiver.tag() == 2 || receiver.tag() == 3,
+      scriptId: 0, lineNumber: 0, columnNumber: 0, callLineNumber: 0,
+      scriptMetadata: Value.immediate(ValueBits.Undefined),
+      callColumnNumber: 0, statementLineNumber: 0, statementColumnNumber: 0, isScript: false, isNative: native, isEval: false,
+      isBuiltin: false,
+      sourceLineNumber: 0, sourceColumnNumber: 0,
+      function: Value.immediate(ValueBits.Undefined),
+      receiver: Value.immediate(ValueBits.Undefined),
+      isConstructor: !asyncFrame && (unsafe activation.frameNewTarget(Pointer.fromRef<StackFrame>(frame))).isObject(), enclosingLineNumber: 0, enclosingColumnNumber: 0,
+      isAsync: asyncFrame,
+      methodReceiver: Value.immediate(ValueBits.Undefined), methodFunction: Value.immediate(ValueBits.Undefined),
+      promiseCombinator: -1, promiseIndex: 0,
+      foreignFunction: -1, foreignModule: StringOwner.borrowed(empty.get())
+    }
+    if native {
+      if let ValueBits.Object { reference } = frame.currentFunction {
+        let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, reference)
+        match &data.payload {
+          ObjectPayload.NativeFunction { function } => match function.function {
+            NativeFunctionId.Builtin { .. } => { snapshot.isBuiltin = true }
+            _ => ()
+          }
+          _ => ()
+        }
+      }
+    }
+    match move compiled {
+      Option<*mut HeapHeader>.Some { value: function } => {
+        run unsafe backtrace.ensureLines(function)
+        let mut pc = FUNCTION_DEFINITION_PC
+        if frame.currentPc != NO_PC { pc = u32.wrappingSubtract(usize.toU32(frame.currentPc), 1) }
+        let positions = unsafe backtrace.framePositions(function, pc, includeNative)
+        let code = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, function)
+        snapshot.scriptId = code.scriptId
+        snapshot.isEval = code.scriptIsEval
+        snapshot.isScript = code.name == atoms.JS_ATOM__eval_
+        if includeNative {
+          metadataBits = hostScriptMetadataView(&code)
+          if (frame.mode & u8.toU32(JS_MODE_STRICT)) == 0 && (receiverBits.tag() == 2 || receiverBits.tag() == 3) {
+            let realm = unsafe HeapCell.payload<ContextState, ()>(&anchor, code.realm)
+            receiverBits = realm.globalObject.view()
+          }
+          let definitions = code.varDefs.asSlice()
+          let mut local: usize = 0
+          let locals = unsafe frameLocals(Pointer.fromRef<StackFrame>(frame))
+          while local < locals.length() && local + u16.toUsize(code.argumentCount) < definitions.length {
+            if definitions[local + u16.toUsize(code.argumentCount)].name == atoms.JS_ATOM_this {
+              let receiver = unsafe frame.locals.get(local)
+              if receiver.tag() != 3 && receiver.tag() != 4 { receiverBits = receiver }
+              break
+            }
+            local = local + 1
+          }
+          let realm = unsafe HeapCell.payload<ContextState, ()>(&anchor, code.realm)
+          snapshot.isToplevel = receiverBits.tag() == 2 || receiverBits.tag() == 3 ||
+            unsafe equal(receiverBits, realm.globalObject.view(), EqualityMode.Strict)
+        }
+        if !hasName && code.name != 0 {
+          let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
+          snapshot.functionName = StringOwner.adopt(run state.atoms.toValue(code.name, true))
+        }
+        match &code.debug {
+          Option<FunctionDebugInfo>.Some { value: debug } => {
+            if includeNative {
+              snapshot.enclosingLineNumber = positions.enclosing.line
+              snapshot.enclosingColumnNumber = positions.enclosing.column
+            }
+            let position = if debug.nodeVm { positions.call } else { positions.line }
+            snapshot.lineNumber = position.line
+            snapshot.columnNumber = position.column
+            let statement = positions.line
+            snapshot.statementLineNumber = statement.line
+            snapshot.statementColumnNumber = statement.column
+            let callPosition = positions.call
+            snapshot.callLineNumber = callPosition.line
+            snapshot.callColumnNumber = callPosition.column
+            if includeNative || debug.nodeSourceURL {
+              snapshot.sourceLineNumber = i32.wrappingSubtract(callPosition.line, debug.lineOffset)
+              snapshot.sourceColumnNumber = if snapshot.sourceLineNumber == 1 {
+                i32.wrappingSubtract(callPosition.column, debug.columnOffset)
+              } else { callPosition.column }
+            }
+            if debug.nodeSourceURL {
+              snapshot.lineNumber = snapshot.sourceLineNumber
+              snapshot.columnNumber = snapshot.sourceColumnNumber
+              snapshot.callLineNumber = snapshot.sourceLineNumber
+              snapshot.callColumnNumber = snapshot.sourceColumnNumber
+              snapshot.statementLineNumber = i32.wrappingSubtract(statement.line, debug.lineOffset)
+              snapshot.statementColumnNumber = if snapshot.statementLineNumber == 1 {
+                i32.wrappingSubtract(statement.column, debug.columnOffset)
+              } else { statement.column }
+            }
+            let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
+            snapshot.scriptName = StringOwner.adopt(run state.atoms.toValue(debug.filename, true))
+          }
+          Option<FunctionDebugInfo>.None => ()
+        }
+      }
+      Option<*mut HeapHeader>.None => ()
+    }
+    if includeNative && !snapshot.isConstructor {
+      // Only values a script may hold: an uninitialized `this` and a known local
+      // function (bare bytecode) name nothing.
+      let tag = receiverBits.tag()
+      if tag != 4 && tag != 5 && tag != 6 && tag != -2 && tag != -3 { snapshot.methodReceiver = unsafe Value.retain(receiverBits) }
+      if frame.currentFunction.isObject() { snapshot.methodFunction = unsafe Value.retain(frame.currentFunction) }
+    }
+    if restricted || native { receiverBits = ValueBits.Undefined }
+    if snapshot.isScript { functionBits = ValueBits.Undefined }
+    if includeNative {
+      snapshot.function = unsafe Value.retain(functionBits)
+      snapshot.receiver = unsafe Value.retain(receiverBits)
+      snapshot.scriptMetadata = unsafe Value.retain(metadataBits)
+    }
+    run frames.append(move snapshot)
+  }
+  return move frames
+}
+
+/// Whether code belongs to a script RuntimeState.hiddenScripts names.
+unsafe fn hiddenScript(runtime: *mut HeapHeader, code: *mut HeapHeader) -> bool {
+  let anchor = ()
+  let function = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, code)
+  let filename = match &function.debug { Option<FunctionDebugInfo>.Some { value: debug } => debug.filename _ => { return false } }
+  drop function
+  let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
+  let hidden = state.hiddenScripts.asSlice()
+  let mut index: usize = 0
+  while index < hidden.length { if hidden[index] == filename { return true } index = index + 1 }
+  return false
+}
+/// Hides the frames of the script of the innermost frame running bytecode (the
+/// caller of the native asking) from every later capture.
+pub unsafe effect fn hideCallerScript(runtime: *mut HeapHeader) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut anchor = ()
+  let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
+  let mut pointer = state.currentStackFrame drop state
+  while !Pointer.isNull<StackFrame>(pointer) {
+    let frame = unsafe Pointer.borrow<(), StackFrame>(&anchor, present(pointer))
+    pointer = frame.previous
+    if let Option<*mut HeapHeader>.Some { value: code } = unsafe backtrace.bytecode(frame.currentFunction) {
+      if unsafe hiddenScript(runtime, code) { return () }
+      let function = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, code)
+      let filename = match &function.debug { Option<FunctionDebugInfo>.Some { value: debug } => debug.filename _ => { return () } }
+      drop function
+      let owner = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+      let atom = owner.atoms.duplicate(filename)
+      let appended = run Effect.result(owner.hiddenScripts.append(atom))
+      match move appended {
+        Result<(), OutOfMemoryError>.Failure { error } => { owner.atoms.release(atom) fail move error }
+        _ => ()
+      }
+      return ()
+    }
+  }
+}
+/// The foreign frames entered while the StackFrame at `entered` was current, and
+/// the function object whose call entered them (null when there are none).
+unsafe effect fn foreignFrames(source: &ForeignFrameSource, entered: usize, frames: &mut List<FrameSnapshot>,
+  limit: usize, empty: ValueBits) -> ?*mut u8 ! OutOfMemoryError | StringLengthError ? &mut Allocator {
+  let mut index: u32 = 0
+  let mut entry = Pointer.null<u8>()
+  while frames.length() < limit {
+    let mut out = ForeignFrame { functionIndex: 0, offset: 0, enclosing: 0, url: Pointer.null<u8>(), urlLength: 0,
+      name: Pointer.null<u8>(), nameLength: 0, module: Pointer.null<u8>(), moduleLength: 0, entry: Pointer.null<u8>() }
+    let produce = source.frame
+    if unsafe produce(source.opaque, entered, index, Pointer.fromMutRef<ForeignFrame>(&mut out)) == 0 { return entry }
+    index = index + 1
+    entry = out.entry
+    let column = i32.wrappingAdd(u32.toI32(out.offset), 1)
+    let mut snapshot = FrameSnapshot {
+      functionName: StringOwner.borrowed(empty), scriptName: StringOwner.borrowed(empty),
+        isToplevel: false, scriptId: 0, lineNumber: 1, columnNumber: column, callLineNumber: 1,
+      scriptMetadata: Value.immediate(ValueBits.Undefined),
+      callColumnNumber: column, statementLineNumber: 1, statementColumnNumber: column, isScript: false, isNative: false, isEval: false, isBuiltin: false,
+      sourceLineNumber: 1, sourceColumnNumber: column,
+      function: Value.immediate(ValueBits.Undefined), receiver: Value.immediate(ValueBits.Undefined),
+      isConstructor: false, enclosingLineNumber: 1, enclosingColumnNumber: u32.toI32(out.enclosing), isAsync: false,
+      methodReceiver: Value.immediate(ValueBits.Undefined), methodFunction: Value.immediate(ValueBits.Undefined),
+      promiseCombinator: -1, promiseIndex: 0,
+      foreignFunction: u32.toI32(out.functionIndex), foreignModule: StringOwner.borrowed(empty)
+    }
+    if let Option<*const u8>.Some { value } = Pointer.nonNull<u8>(out.name) { snapshot.functionName = StringOwner.adopt(run unsafe Strings.fromUtf8Pointer(value, out.nameLength)) }
+    if let Option<*const u8>.Some { value } = Pointer.nonNull<u8>(out.url) { snapshot.scriptName = StringOwner.adopt(run unsafe Strings.fromUtf8Pointer(value, out.urlLength)) }
+    if let Option<*const u8>.Some { value } = Pointer.nonNull<u8>(out.module) { snapshot.foreignModule = StringOwner.adopt(run unsafe Strings.fromUtf8Pointer(value, out.moduleLength)) }
+    run frames.append(move snapshot)
+  }  return entry
+}
+unsafe fn functionObject(value: ValueBits) -> bool {
+  let anchor = ()
+  if let ValueBits.Object { reference } = value {
+    let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, reference)
+    return match &data.payload {
+      ObjectPayload.BytecodeFunction { .. } => true
+      ObjectPayload.NativeFunction { .. } => true
+      _ => false
+    }
+  }
+  return false
+}
+/// A frame's type and method names as V8's CallSite gives them; the empty string is none.
+pub struct Presentation { pub typeName: StringOwner, pub methodName: StringOwner }
+/// The names of a frame that ran function with receiver (FrameSnapshot.methodFunction
+/// and methodReceiver; Undefined is none). They are looked up when a stack is
+/// formatted, as V8 does, not when it is captured: the lookup walks every property
+/// of the receiver's prototype chain, and most captured stacks are never read.
+/// Names are read from engine descriptors, never by running user getters/proxies.
+pub unsafe effect fn presentation(runtime: *mut HeapHeader, function: ValueBits, frameReceiver: ValueBits, toplevel: bool) -> Presentation
+  ! OutOfMemoryError | StringLengthError ? &mut Allocator {
+  let anchor = ()
+  let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
+  let mut result = Presentation { typeName: StringOwner.adopt(state.atoms.emptyString()), methodName: StringOwner.adopt(state.atoms.emptyString()) }
+  drop state
+  let mut receiver = frameReceiver
+  if !receiver.isObject() && receiver.tag() != 2 && receiver.tag() != 3 {
+    let name: &[u8] = if receiver.isNumber() { b"Number" } else if receiver.isString() { b"String" }
+      else if receiver.isBigInt() { b"BigInt" } else if receiver.tag() == 1 { b"Boolean" } else { b"Symbol" }
+    result.typeName = StringOwner.adopt(run Strings.fromLatin1(name))
+  }
+  let mut methodAtom: u32 = 0
+  let mut ambiguous = false
+  let mut foundType = false
+  // V8's GetTypeName: a function receiver (a static method's class) is named by
+  // its own name ("ok.rejects", "Module._load").
+  if !toplevel && unsafe functionObject(receiver) {
+    match unsafe backtrace.propertyString(receiver, atoms.JS_ATOM_name) {
+      Option<ValueBits>.Some { value: name } => {
+        if Strings.length(name) != 0 { result.typeName = StringOwner.borrowed(name) foundType = true }
+      }
+      _ => ()
+    }
+  }
+  // 0 when the frame has no function object, which then matches nothing.
+  let target = match function { ValueBits.Object { reference } => Pointer.address<HeapHeader>(reference) _ => 0 }
+  while receiver.isObject() {
+    let node = match receiver { ValueBits.Object { reference } => reference _ => Intrinsic.trap("frame receiver") }
+    let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, node)
+    if data.classId() == classes.JS_CLASS_PROXY { break }
+    let shape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, data.shape)
+    let properties = shape.properties.asSlice()
+    let mut index: usize = 0
+    while index < properties.length {
+      let atom = properties[index].atom
+      if atom != 0 {
+        let value = match data.slot(index).view(properties[index].flags) {
+          PropertySlot.Value { value } => value
+          _ => ValueBits.Undefined
+        }
+        if !toplevel && !foundType && atom == atoms.JS_ATOM_constructor {
+          match unsafe backtrace.propertyString(value, atoms.JS_ATOM_name) {
+            Option<ValueBits>.Some { value: name } => { result.typeName = StringOwner.borrowed(name) foundType = true }
+            _ => ()
+          }
+        }
+        // The frame's function is an object, so strict equality is identity.
+        let mut matches = sameObject(value, target)
+        match data.slot(index).view(properties[index].flags) {
+          PropertySlot.GetterSetter { getter, setter } => {
+            matches = matches || (target != 0 && (Pointer.address<HeapHeader>(getter) == target || Pointer.address<HeapHeader>(setter) == target))
+          }
+          _ => ()
+        }
+        if matches {
+          if methodAtom != 0 && methodAtom != atom { ambiguous = true }
+          methodAtom = atom
+        }
+      }
+      index = index + 1
+    }
+    receiver = match Pointer.nonNullMut<HeapHeader>(shape.prototype) {
+      Option<*mut HeapHeader>.Some { value } => ValueBits.Object { reference: value }
+      _ => ValueBits.Null
+    }
+  }
+  if methodAtom != 0 && !ambiguous {
+    let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
+    result.methodName = StringOwner.adopt(run state.atoms.toValue(methodAtom, true))
+  }
+  return move result
+}
+
+fn sameObject(value: ValueBits, target: usize) -> bool {
+  return match value { ValueBits.Object { reference } => Pointer.address<HeapHeader>(reference) == target _ => false }
+}
+/// Decimal identity conversion without floating-point rounding or user coercion.
+pub effect fn scriptIdString(id: u64) -> Value
+  ! OutOfMemoryError | StringLengthError ? &mut Allocator {
+  let mut bytes: [u8; 20] = [0; 20]
+  let length = Dtoa.u64toa(&mut bytes, id)
+  return unsafe Value.adoptBits(run Strings.fromLatin1(Slice.view<u8>(&bytes, 0, length)))
+}

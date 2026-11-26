@@ -1,0 +1,548 @@
+// Shared parser cursor and diagnostics, quickjs.c:22567-22829,23177-23226.
+// Parser.make is the one unsafe entry: its caller grants the parser exclusive live access
+// to the context and runtime until it is dropped. The parser borrows the function tree,
+// so grammar functions that take only a Parser and plain values are safe.
+// This owner never frees the transient function tree; the compile entry point does.
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.collections.slice { Slice }
+import silk.num.u32
+import silk.num.u8
+import js_heap { HeapCell, HeapHeader }
+import js_core_types { RuntimeState, FunctionKind, SourceText, NameSlot }
+import js_strings { Strings }
+import js_value { ValueBits }
+import byte_buffer { ByteBuffer }
+import js_compiler_types { FunctionDef, FunctionId, FunctionTree, ParseFunctionKind, LazyBody, LazyName }
+import silk.collections.list { List }
+import js_lexer { Lexer, LexicalContext, LexerPosition, SkipParensResult, SkipCache }
+import js_tokens { Token, LexError }
+import js_tokens as tok
+import js_bigint { BigIntError }
+import js_string_types { StringOwner, StringLengthError }
+import js_parser_diagnostics { DiagnosticMessage, SyntaxError }
+import js_runtime { checkStackOverflow }
+import native_stack { currentFrameAddress }
+import silk.core.option { Option }
+import js_debug_positions { SourcePositionCache }
+import silk.mem.pointer { Pointer }
+import js_compiler_state as state
+import js_gc { HeapHooks }
+import js_preparse_tables { PreparseTables, NameMarks }
+import js_preparse { Preparse }
+import silk.mem.box { Box }
+
+pub const PF_IN_ACCEPTED: i32 = 1
+pub const PF_POSTFIX_CALL: i32 = 2
+pub const PF_POW_ALLOWED: i32 = 4
+pub const PF_POW_FORBIDDEN: i32 = 8
+pub struct ParserStackOverflow {}
+
+/// Disjoint borrows of the parser's current function and runtime, for callers needing both.
+pub struct ParserCells<'a> { pub function: &'a mut FunctionDef, pub runtime: &'a mut RuntimeState }
+
+pub struct Parser<'src> {
+  pub lexer: Lexer<'src>,
+  pub token: Token,
+  tree: &'src mut FunctionTree,
+  currentFunction: FunctionId,
+  // The lexer context already matches currentFunction (synchronize).
+  contextSynced: bool,
+  context: *mut HeapHeader,
+  runtime: *mut HeapHeader,
+  pub filename: StringOwner,
+  skipCache: SkipCache,
+  bracketCache: SkipCache,
+  // The parse input as one Latin-1 string cell, made at the first function that keeps
+  // its source; every function's source text is a span of it.
+  sharedSource: StringOwner,
+  // The input is plain (js_core_types.SourceText): read from the root's position
+  // cache when the source is shared, and passed on to every span.
+  plainSource: bool,
+  // Set by finishLazy: the next function parsed is the one it finishes, and
+  // the preparse records of the bodies inside it (names borrowed from its stub).
+  pub lazyFinish: bool,
+  // Set by a direct eval call or a with statement: an eagerly parsed IIFE
+  // (js_parser_functions.parenthesizedCall) whose body has one parses again.
+  pub dynamicScopeSeen: bool,
+  pub skips: List<LazyBody>, pub skipFree: List<LazyName>,
+  /// The preparser's tables, kept between skipped bodies.
+  pub preparseTables: PreparseTables,
+  /// The preparse skipBody reuses for every body of this parse; its tables
+  /// go back to preparseTables at keepMarks.
+  pub preparser: Option<Box<Preparse>>,
+  /// A skipped body's emptied code buffer, for the next definition's code
+  /// (js_parser_functions.skipBody): most stubs need none of theirs.
+  pub spareBytecode: ByteBuffer,
+  /// The start of the token before this one: where V8 reports a redeclared
+  /// name, which the parser finds out only once past it.
+  pub previousStart: usize,
+  /// The js_preparse_pool batch of this parse (a Batch), or null.
+  pub pool: ?*mut u8,
+  /// Object and array literals parsed before knowing whether they are
+  /// assignment patterns (js_parser_expressions.parseAssignment): how many are
+  /// open, and the first error a pattern would allow (coverError: offset + 1,
+  /// 0 for none; coverErrorKind: COVER_*), reported if no `=` follows.
+  pub speculation: i32, pub coverError: usize, pub coverErrorKind: u8,
+  /// The last object or array literal closed: its `{`/`[` offset and the start
+  /// of the token after its closing bracket.
+  pub literalStart: usize, pub literalNext: usize
+}
+/// Atom references a kept identifier cache may hold (Parser.keepNames).
+const NAME_ATOMS_KEPT: usize = 8192
+/// The largest preparse mark arrays keepMarks leaves to the runtime (entries).
+const MARKS_KEPT: usize = 0x40000
+impl<'src> Parser<'src> {
+  pub unsafe effect fn make(source: &'src [u8], tree: &'src mut FunctionTree, root: FunctionId, module: bool, allowHtmlComments: bool) -> Self
+    ! OutOfMemoryError | StringLengthError ? &mut Allocator {
+    let anchor = ()
+    let fd = tree.get(root)
+    let rt = fd.runtimeState(&anchor)
+    let filename = StringOwner.adopt(run rt.atoms.toValue(fd.filename, true))
+    let context = fd.context let runtime = fd.runtime drop rt drop fd
+    let mut lexical = LexicalContext.script()
+    lexical.module = module lexical.allowHtmlComments = allowHtmlComments
+    let mut lexer = Lexer.make(source, lexical)
+    let mut stateAnchor = ()
+    let kept = tree.get(root).runtimeStateMut(&mut stateAnchor)
+    lexer.adoptNames(Intrinsic.replace(kept.lexerNames, List<NameSlot>.make()), Intrinsic.replace(kept.lexerNameAtoms, List<StringOwner>.make()))
+    let mut tables = PreparseTables.make()
+    tables.binders = NameMarks.adopt(Intrinsic.replace(kept.preparseBinderStamps, List<u32>.make()),
+      Intrinsic.replace(kept.preparseBinderValues, List<u32>.make()), kept.preparseBinderRound)
+    tables.marks = NameMarks.adopt(Intrinsic.replace(kept.preparseMarkStamps, List<u32>.make()),
+      Intrinsic.replace(kept.preparseMarkValues, List<u32>.make()), kept.preparseMarkRound)
+    drop kept
+    return Self { lexer: move lexer, token: Token.empty(32, 0, 0), tree: &mut tree,
+      currentFunction: root, contextSynced: false, context: context, runtime: runtime, filename: move filename,
+      skipCache: SkipCache.make(), bracketCache: SkipCache.make(), sharedSource: StringOwner.adopt(ValueBits.Undefined), plainSource: false, lazyFinish: false, dynamicScopeSeen: false, skips: List<LazyBody>.make(), skipFree: List<LazyName>.make(), preparseTables: move tables, preparser: Option<Box<Preparse>>.none(), spareBytecode: ByteBuffer.make(), previousStart: 0, pool: Pointer.null<u8>(),
+      speculation: 0, coverError: 0, coverErrorKind: 0, literalStart: 0, literalNext: 0 }
+  }
+  /// After a parse: leaves the lexer's identifier cache to the runtime for the
+  /// next parse, unless its atom references have grown past NAME_ATOMS_KEPT
+  /// (then they go with the lexer, and the next parse starts empty).
+  pub fn keepNames(self: &mut Self) -> () {
+    self.keepMarks()
+    let names = self.lexer.takeNames()
+    let held = self.lexer.takeHeld()
+    if held.length() > NAME_ATOMS_KEPT { return () }
+    let mut anchor = ()
+    let state = self.runtimeStateWith(&mut anchor)
+    if state.lexerNames.length() != 0 { return () }
+    state.lexerNames = move names
+    state.lexerNameAtoms = move held
+  }
+  /// After a parse: leaves the preparser's per-atom mark arrays to the runtime
+  /// for the next parse, unless they have grown past MARKS_KEPT entries.
+  fn keepMarks(self: &mut Self) -> () {
+    match Intrinsic.replace(self.preparser, Option<Box<Preparse>>.none()) {
+      Option<Box<Preparse>>.Some { value } => { let mut boxed = move value self.preparseTables = boxed.getMut()[0].takeTables() }
+      _ => ()
+    }
+    if self.preparseTables.binders.size() > MARKS_KEPT || self.preparseTables.marks.size() > MARKS_KEPT { return () }
+    let mut anchor = ()
+    let state = self.runtimeStateWith(&mut anchor)
+    if state.preparseBinderStamps.length() == 0 {
+      state.preparseBinderStamps = self.preparseTables.binders.takeStamps()
+      state.preparseBinderValues = self.preparseTables.binders.takeValues()
+      state.preparseBinderRound = self.preparseTables.binders.currentRound()
+    }
+    if state.preparseMarkStamps.length() == 0 {
+      state.preparseMarkStamps = self.preparseTables.marks.takeStamps()
+      state.preparseMarkValues = self.preparseTables.marks.takeValues()
+      state.preparseMarkRound = self.preparseTables.marks.currentRound()
+    }
+  }
+  pub fn functionCell(self: &Self) -> FunctionId { return self.currentFunction }
+  pub fn contextCell(self: &Self) -> *mut HeapHeader { return self.context }
+  pub fn runtimeCell(self: &Self) -> *mut HeapHeader { return self.runtime }
+  /// Makes `id`, a definition of this parser's tree, the function being parsed.
+  pub fn enterFunction(self: &mut Self, id: FunctionId) -> () { self.currentFunction = id self.contextSynced = false }
+  /// A function's strict mode, kind or body state changed: the next token
+  /// step recomputes the lexer context.
+  pub fn contextChanged(self: &mut Self) -> () { self.contextSynced = false }
+  /// The function being parsed. make's caller grants the parser exclusive use of the
+  /// context and runtime; these borrows are tied to the parser borrow, so no second
+  /// alias can be taken while they live.
+  pub fn function(self: &mut Self) -> &mut FunctionDef { return self.tree.getMut(self.currentFunction) }
+  pub fn functionView(self: &Self) -> &FunctionDef { return self.tree.get(self.currentFunction) }
+  /// Any definition of the parser's tree.
+  pub fn functionAt(self: &Self, id: FunctionId) -> &FunctionDef { return self.tree.get(id) }
+  pub fn functionAtMut(self: &mut Self, id: FunctionId) -> &mut FunctionDef { return self.tree.getMut(id) }
+  /// Destroys definition id and its descendants, unlinking it from its parent.
+  pub fn destroyFunction<H: HeapHooks>(self: &mut Self, hooks: &mut H, id: FunctionId) -> () {
+    state.destroyFunction(&mut hooks, &mut self.tree, id)
+  }
+  /// Adds a definition to the tree, linked as the last child of `parent`.
+  pub effect fn newFunction(self: &mut Self, parent: Option<FunctionId>, isEval: bool, isFuncExpr: bool, filename: u32,
+    sourcePosition: u32, cache: ?*mut SourcePositionCache) -> FunctionId ! OutOfMemoryError ? &mut Allocator {
+    let id = run unsafe state.newFunction(&mut self.tree, self.context, parent, isEval, isFuncExpr, filename, sourcePosition, cache)
+    if self.spareBytecode.capacity() != 0 {
+      let spare = Intrinsic.replace(self.spareBytecode, ByteBuffer.make())
+      let fd = self.tree.getMut(id)
+      if fd.bytecode.capacity() == 0 { fd.bytecode = move spare }
+    }
+    return id
+  }
+  /// The runtime's state, borrowed through `owner` rather than the parser, so the
+  /// parser's own fields stay usable meanwhile; make's caller granted exclusive use.
+  @inlineAlways fn runtimeStateWith<'b, A>(self: &Self, owner: &'b mut A) -> &'b mut RuntimeState {
+    return unsafe HeapCell.payloadMut<RuntimeState, A>(&mut owner.*, self.runtime)
+  }
+  @inlineAlways fn runtimeStateView<'b, A>(self: &Self, owner: &'b A) -> &'b RuntimeState {
+    return unsafe HeapCell.payload<RuntimeState, A>(owner, self.runtime)
+  }
+  pub fn runtimeState(self: &mut Self) -> &mut RuntimeState {
+    let cell = self.runtime
+    return unsafe HeapCell.payloadMut<RuntimeState, Self>(&mut self, cell)
+  }
+  pub fn cells<'a>(self: &'a mut Self) -> ParserCells<'a> {
+    let functionCell = self.currentFunction let runtimeCell = self.runtime
+    // The tree and the RuntimeState never share storage. The disjoint filename field
+    // anchors the runtime borrow so both last as long as the parser borrow.
+    return ParserCells { function: self.tree.getMut(functionCell),
+      runtime: unsafe HeapCell.payloadMut<RuntimeState, StringOwner>(&mut self.filename, runtimeCell) }
+  }
+  /// Disjoint borrows of the definition `id` and the runtime.
+  pub fn cellsAt<'a>(self: &'a mut Self, id: FunctionId) -> ParserCells<'a> {
+    let runtimeCell = self.runtime
+    return ParserCells { function: self.tree.getMut(id),
+      runtime: unsafe HeapCell.payloadMut<RuntimeState, StringOwner>(&mut self.filename, runtimeCell) }
+  }
+  pub fn sourceBytes(self: &Self) -> &'src [u8] { return self.lexer.sourceBytes() }
+  /// The atom of the plain ASCII identifier at source[start..start+length], held
+  /// by the lexer for the parse, as lexing it would give.
+  pub effect fn spanAtom(self: &mut Self, start: usize, length: usize) -> u32 ! OutOfMemoryError | StringLengthError ? &mut Allocator {
+    let mut anchor = ()
+    let rt = self.runtimeStateWith(&mut anchor)
+    return run self.lexer.spanName(&mut rt.atoms, start, length)
+  }
+  /// Makes `text`, a live string whose Latin-1 bytes are exactly this parser's input,
+  /// the text that functions' source spans share; undefined keeps the default copy.
+  pub fn shareSource(self: &mut Self, text: ValueBits) -> () {
+    match text { ValueBits.String { .. } => { self.sharedSource = StringOwner.borrowed(text) } _ => () }
+    let fd = self.tree.get(self.currentFunction)
+    let cache = fd.sourceCache drop fd
+    match Pointer.nonNullMut<SourcePositionCache>(cache) {
+      Option<*mut SourcePositionCache>.Some { value } => {
+        let mut anchor = ()
+        // The root's cache outlives the parse (js_compiler_state.newFunction).
+        let held = unsafe Pointer.borrowMut<(), SourcePositionCache>(&mut anchor, value)
+        let plain = held.plainText drop held
+        self.plainSource = plain
+      }
+      _ => ()
+    }
+  }
+  /// The source text of bytes [start, end) of the input, sharing one copy of the input.
+  pub effect fn sourceSpan(self: &mut Self, start: usize, end: usize) -> SourceText ! OutOfMemoryError ? &mut Allocator {
+    let missing = match self.sharedSource.get() { ValueBits.Undefined => true _ => false }
+    if missing {
+      let bytes = self.lexer.sourceBytes()
+      self.sharedSource = StringOwner.adopt(run Strings.joinLatin1(bytes, Slice.view(bytes, 0, 0)))
+    }
+    return SourceText.Shared { text: StringOwner.borrowed(self.sharedSource.get()), start: start, length: end - start, plain: self.plainSource }
+  }
+  /// Whether functions' source spans will share a string as long as the input,
+  /// which a deferred compile's line table needs (js_compiler_finish.deferrable).
+  pub fn sharedSourceFits(self: &Self) -> bool {
+    return match self.sharedSource.get() {
+      ValueBits.Undefined => true
+      ValueBits.String { .. } => Strings.length(self.sharedSource.get()) == self.lexer.sourceBytes().length
+      _ => false
+    }
+  }
+  pub fn save(self: &Self) -> LexerPosition { return self.lexer.save(&self.token) }
+  pub fn peek(self: &Self, noLineTerminator: bool) -> i32 { return self.lexer.peek(noLineTerminator) }
+  @inlineAlways
+  pub fn synchronize(self: &mut Self) -> () {
+    if self.contextSynced { return () }
+    self.contextSynced = true
+    // Common case: the current function is not an arrow's parameter list, so its
+    // own flags are the lexer's.
+    let current = self.tree.get(self.currentFunction)
+    if current.functionType != ParseFunctionKind.Arrow || current.inFunctionBody {
+      let kind = current.functionKind
+      self.lexer.context.strict = (current.jsMode & 1) != 0
+      self.lexer.context.generator = kind == FunctionKind.Generator || kind == FunctionKind.AsyncGenerator
+      self.lexer.context.asyncFunction = kind == FunctionKind.Async || kind == FunctionKind.AsyncGenerator
+        || current.functionType == ParseFunctionKind.ClassStaticInit
+      return ()
+    }
+    drop current
+    self.synchronizeArrow()
+  }
+  @inlineNever
+  fn synchronizeArrow(self: &mut Self) -> () {
+    let mut id = self.currentFunction
+    let mut first = true
+    let mut generator = false let mut asynchronous = false
+    while true {
+      let fd = self.tree.get(id)
+      if first { self.lexer.context.strict = (fd.jsMode & 1) != 0 first = false }
+      generator = generator || fd.functionKind == FunctionKind.Generator || fd.functionKind == FunctionKind.AsyncGenerator
+      asynchronous = asynchronous || fd.functionKind == FunctionKind.Async || fd.functionKind == FunctionKind.AsyncGenerator
+        || fd.functionType == ParseFunctionKind.ClassStaticInit
+      if fd.functionType != ParseFunctionKind.Arrow || fd.inFunctionBody { break }
+      id = match fd.parent { Option<FunctionId>.Some { value } => value _ => { break } }
+    }
+    self.lexer.context.generator = generator self.lexer.context.asyncFunction = asynchronous
+  }
+  @inlineAlways
+  pub effect fn checkStack(self: &Self) -> () ! ParserStackOverflow {
+    if unsafe checkStackOverflow(self.runtime, currentFrameAddress(), 0, true) {
+      fail ParserStackOverflow {}
+    }
+  }
+  @inlineAlways
+  pub effect fn advance(self: &mut Self) -> ()
+    ! ParserStackOverflow | LexError | BigIntError | OutOfMemoryError | StringLengthError ? &mut Allocator {
+    if self.advanceFast() { return () }
+    run self.advanceSlow()
+  }
+  /// Non-effect fast path for Parser.advance: shares the single Lexer.quickToken
+  /// code body with js_preparse and avoids effect-handler setup on ~98% of tokens.
+  /// Writing previousStart before calling quickToken allows a zero-frame tail jump
+  /// (advanceSlow overwrites previousStart again on the rare false path, and
+  /// quickToken leaves self.token untouched when returning false).
+  @inlineNever
+  fn advanceFast(self: &mut Self) -> bool {
+    if !self.contextSynced { return false }
+    self.previousStart = self.token.start
+    if self.lexer.quickPunctuator(&mut self.token) { return true }
+    return self.lexer.quickToken(&mut self.token)
+  }
+  @inlineNever
+  effect fn advanceSlow(self: &mut Self) -> ()
+    ! ParserStackOverflow | LexError | BigIntError | OutOfMemoryError | StringLengthError ? &mut Allocator {
+    // No stack check here: the parser checks where it recurses (parseStatement,
+    // parseAssignment, parseUnaryInline, parsePostfixInline, parseDestructuring,
+    // parseLiteralAssignment) and advanceSyncedSlow checks on the slow path.
+    self.synchronize()
+    self.previousStart = self.token.start
+    if self.lexer.quickToken(&mut self.token) { return () }
+    run self.advanceSyncedSlow()
+  }
+  /// advance without synchronize, with the token fast path inline, for the
+  /// preparser (it never changes the current function or the lexer context).
+  /// No stack check on the fast path: the preparser checks at its recursion
+  /// points (js_preparse statement, assignment, newExpression).
+  @inlineAlways
+  pub effect fn advanceSyncedHot(self: &mut Self) -> ()
+    ! ParserStackOverflow | LexError | BigIntError | OutOfMemoryError | StringLengthError ? &mut Allocator {
+    if self.lexer.quickTokenHot(&mut self.token) { return () }
+    run self.advanceSyncedSlow()
+  }
+  @inlineNever
+  pub effect fn advanceSyncedSlow(self: &mut Self) -> ()
+    ! ParserStackOverflow | LexError | BigIntError | OutOfMemoryError | StringLengthError ? &mut Allocator {
+    run self.checkStack()
+    let mut anchor = ()
+    let rt = self.runtimeStateWith(&mut anchor)
+    let next = run self.lexer.next(&mut rt.atoms)
+    self.token = next
+  }
+  pub effect fn seek(self: &mut Self, position: LexerPosition) -> ()
+    ! ParserStackOverflow | LexError | BigIntError | OutOfMemoryError | StringLengthError ? &mut Allocator {
+    run self.checkStack()
+    self.synchronize()
+    let mut anchor = ()
+    let rt = self.runtimeStateWith(&mut anchor)
+    self.token = run self.lexer.seek(position, &mut rt.atoms)
+  }
+  /// seek to a `{` or `}` the caller knows is at position.
+  pub fn seekBrace(self: &mut Self, position: LexerPosition) -> () {
+    self.synchronize()
+    self.token = self.lexer.seekBrace(position.offset, position.gotLineFeed)
+  }
+  pub effect fn skipParens(self: &mut Self, noLineTerminator: bool) -> SkipParensResult
+    ! ParserStackOverflow | LexError | BigIntError | OutOfMemoryError | StringLengthError ? &mut Allocator {
+    run self.checkStack()
+    self.synchronize()
+    let mut anchor = ()
+    let rt = self.runtimeStateWith(&mut anchor)
+    return run self.lexer.skipParens(&self.token, &mut rt.atoms, &mut self.skipCache, noLineTerminator)
+  }  pub effect fn classicForHead(self: &mut Self) -> bool
+    ! ParserStackOverflow | LexError | BigIntError | OutOfMemoryError | StringLengthError ? &mut Allocator {
+    run self.checkStack()
+    self.synchronize()
+    let mut anchor = ()
+    let rt = self.runtimeStateWith(&mut anchor)
+    return run self.lexer.classicForHead(&self.token, &mut rt.atoms)
+  }
+  pub effect fn plainParameters(self: &mut Self) -> bool
+    ! ParserStackOverflow | LexError | BigIntError | OutOfMemoryError | StringLengthError ? &mut Allocator {
+    run self.checkStack()
+    self.synchronize()
+    let mut anchor = ()
+    let rt = self.runtimeStateWith(&mut anchor)
+    return run self.lexer.plainParameters(&self.token, &mut rt.atoms)
+  }
+  /// Whether the `(` at current certainly does not open arrow parameters; see
+  /// Lexer.notArrowHead.
+  pub fn notArrowHead(self: &mut Self) -> bool {
+    self.synchronize()
+    let mut anchor = ()
+    let rt = self.runtimeStateWith(&mut anchor)
+    return self.lexer.notArrowHead(&self.token, &mut rt.atoms)
+  }
+  /// What follows the bracket span the token at current opens; see
+  /// Lexer.bracketAhead.
+  pub effect fn bracketAhead(self: &mut Self, noLineTerminator: bool) -> i32 ! OutOfMemoryError ? &mut Allocator {
+    self.synchronize()
+    return run self.lexer.bracketAhead(&self.token, &mut self.bracketCache, &self.skipCache, self.skips.asSlice(), noLineTerminator)
+  }
+  pub fn letAhead(self: &mut Self) -> i32 {
+    self.synchronize()
+    let mut anchor = ()
+    let rt = self.runtimeStateWith(&mut anchor)
+    return self.lexer.letAhead(&self.token, &mut rt.atoms)
+  }
+  pub effect fn literalObjectStart(self: &mut Self) -> bool
+    ! ParserStackOverflow | LexError | BigIntError | OutOfMemoryError | StringLengthError ? &mut Allocator {
+    run self.checkStack()
+    self.synchronize()
+    let mut anchor = ()
+    let rt = self.runtimeStateWith(&mut anchor)
+    return run self.lexer.literalObjectStart(&self.token, &mut rt.atoms)
+  }
+
+  pub fn reparseIdentifier(self: &mut Self, forcedFunctionKind: i32) -> () {
+    self.synchronize()
+    let previous = Intrinsic.replace(self.token, Token.empty(32, 0, 0))
+    self.token = self.lexer.reparseIdentifier(move previous, forcedFunctionKind)
+  }
+  pub effect fn rescanRegExp(self: &mut Self) -> ()
+    ! LexError | OutOfMemoryError | StringLengthError ? &mut Allocator {
+    self.token = run self.lexer.rescanRegExp(&self.token)
+  }
+  pub effect fn continueTemplate(self: &mut Self) -> ()
+    ! LexError | OutOfMemoryError | StringLengthError ? &mut Allocator {
+    self.token = run self.lexer.continueTemplate(&self.token)
+  }
+  // Syntax errors are rare: their calls stay out of the parser's hot paths.
+  @cold
+  pub effect fn syntaxAt<T>(self: &mut Self, offset: usize, text: &[u8]) -> T
+    ! SyntaxError | OutOfMemoryError | StringLengthError ? &mut Allocator {
+    let mut message = DiagnosticMessage.make() message.append(text)
+    let location = self.lexer.location(offset)
+    fail run message.error(self.filename.get(), offset, location)
+  }
+  @cold
+  pub effect fn syntax<T>(self: &mut Self, text: &[u8]) -> T
+    ! SyntaxError | OutOfMemoryError | StringLengthError ? &mut Allocator {
+    let offset = self.token.start
+    return run self.syntaxAt<T>(offset, text)
+  }
+  @cold
+  pub effect fn moduleSyntax<T>(self: &mut Self, text: &[u8]) -> T
+    ! SyntaxError | OutOfMemoryError | StringLengthError ? &mut Allocator {
+    let mut message = DiagnosticMessage.make() message.append(text)
+    let offset = self.token.start let location = self.lexer.location(offset)
+    let mut error = run message.error(self.filename.get(), offset, location)
+    error.moduleSyntax = true
+    fail move error
+  }
+  @cold
+  pub effect fn syntaxWithoutLocation<T>(self: &mut Self, text: &[u8]) -> T
+    ! SyntaxError | OutOfMemoryError | StringLengthError ? &mut Allocator {
+    let mut message = DiagnosticMessage.make() message.append(text)
+    fail run message.errorWithoutLocation(self.filename.get())
+  }
+  @cold
+  pub effect fn syntaxAtom<T>(self: &mut Self, prefix: &[u8], atom: u32, suffix: &[u8]) -> T
+    ! SyntaxError | OutOfMemoryError | StringLengthError ? &mut Allocator {
+    let offset = self.token.start
+    return run self.syntaxAtomAt<T>(prefix, atom, suffix, offset)
+  }
+  /// syntaxAtom reported at the name just passed (V8's position for a redeclaration).
+  pub effect fn syntaxPreviousAtom<T>(self: &mut Self, prefix: &[u8], atom: u32, suffix: &[u8]) -> T
+    ! SyntaxError | OutOfMemoryError | StringLengthError ? &mut Allocator {
+    let offset = self.previousStart
+    return run self.syntaxAtomAt<T>(prefix, atom, suffix, offset)
+  }
+  pub effect fn syntaxAtomAt<T>(self: &mut Self, prefix: &[u8], atom: u32, suffix: &[u8], offset: usize) -> T
+    ! SyntaxError | OutOfMemoryError | StringLengthError ? &mut Allocator {
+    let mut message = DiagnosticMessage.make() message.append(prefix)
+    let anchor = () let rt = self.runtimeStateView(&anchor)
+    message.appendAtom(&rt.atoms, atom) drop rt
+    message.append(suffix)
+    let location = self.lexer.location(offset)
+    fail run message.error(self.filename.get(), offset, location)
+  }
+  // V8's message for the token at hand when the grammar has no use for it:
+  // "Unexpected identifier 'x'", "Unexpected number", "Unexpected end of input".
+  fn appendUnexpected(self: &mut Self, message: &mut DiagnosticMessage) -> () {
+    let kind = self.token.kind
+    if kind == tok.TOK_EOF { message.append(b"Unexpected end of input") return () }
+    if kind == tok.TOK_NUMBER { message.append(b"Unexpected number") return () }
+    if kind == tok.TOK_STRING { message.append(b"Unexpected string") return () }
+    if kind == tok.TOK_TEMPLATE { message.append(b"Unexpected template string") return () }
+    if kind == tok.TOK_REGEXP { message.append(b"Unexpected regular expression") return () }
+    // A character no token starts with: V8 does not quote it.
+    if kind >= 0 {
+      let punctuators = b"(){}[];,<>+-*/%&|^!~?:=."
+      let mut known = false
+      let mut index: usize = 0
+      while index < punctuators.length {
+        if u8.toI32(punctuators[index]) == kind { known = true }
+        index = index + 1
+      }
+      if !known { message.append(b"Invalid or unexpected token") return () }
+    }
+    let offset = self.token.start
+    if kind == tok.TOK_IDENT { message.append(b"Unexpected identifier '") }
+    else { message.append(b"Unexpected token '") }
+    message.append(Slice.view(self.lexer.sourceBytes(), offset, self.token.end - offset))
+    message.append(b"'")
+  }
+  @cold
+  pub effect fn unexpected<T>(self: &mut Self) -> T
+    ! SyntaxError | OutOfMemoryError | StringLengthError ? &mut Allocator {
+    let mut message = DiagnosticMessage.make()
+    self.appendUnexpected(&mut message)
+    let offset = self.token.start
+    let location = self.lexer.location(offset)
+    fail run message.error(self.filename.get(), offset, location)
+  }
+  @cold
+  pub effect fn reserved<T>(self: &mut Self) -> T
+    ! SyntaxError | OutOfMemoryError | StringLengthError ? &mut Allocator {
+    if self.lexer.context.strict { return run self.syntax<T>(b"Unexpected strict mode reserved word") }
+    return run self.syntax<T>(b"Unexpected reserved word")
+  }
+  @inlineAlways
+  pub effect fn expect(self: &mut Self, kind: i32) -> ()
+    ! ParserStackOverflow | SyntaxError | LexError | BigIntError | OutOfMemoryError | StringLengthError ? &mut Allocator {
+    if self.token.kind != kind { return run self.unexpected<()>() }
+    run self.advance()
+  }
+  // A call's arguments end at ')' or go on after ','; V8 names the paren.
+  pub effect fn argumentComma(self: &mut Self) -> ()
+    ! ParserStackOverflow | SyntaxError | LexError | BigIntError | OutOfMemoryError | StringLengthError ? &mut Allocator {
+    if self.token.kind != 44 { return run self.syntax<()>(b"missing ) after argument list") }
+    run self.advance()
+  }
+  pub effect fn semicolon(self: &mut Self) -> ()
+    ! ParserStackOverflow | SyntaxError | LexError | BigIntError | OutOfMemoryError | StringLengthError ? &mut Allocator {
+    if self.token.kind == 59 { run self.advance() return () }
+    if !self.lexer.canInsertSemicolon(&self.token) { return run self.missingSemicolon<()>() }
+  }
+  @cold
+  effect fn missingSemicolon<T>(self: &mut Self) -> T
+    ! SyntaxError | OutOfMemoryError | StringLengthError ? &mut Allocator {
+    // An `await` operand where await is an identifier, as V8 words it.
+    let awaitAt = self.lexer.awaitBefore(self.token.start)
+    if awaitAt != 0 { return run self.syntaxAt<T>(awaitAt - 1, b"await is only valid in async functions and the top level bodies of modules") }
+    return run self.unexpected<T>()
+  }
+  // Compile entry points translate lexical failures before dropping this owner.
+  pub effect fn lexicalError(self: &mut Self, error: LexError) -> SyntaxError
+    ! OutOfMemoryError | StringLengthError ? &mut Allocator {
+    let mut message = DiagnosticMessage.make()
+    if error.message == "Unexpected token '%c'" {
+      message.append(b"Unexpected token '") message.appendCharacter(u32.toI32(error.detail)) message.append(b"'")
+    } else { message.append(Intrinsic.stringUtf8Bytes(error.message)) }
+    let location = self.lexer.location(error.offset)
+    return run message.error(self.filename.get(), error.offset, location)
+  }
+}
+

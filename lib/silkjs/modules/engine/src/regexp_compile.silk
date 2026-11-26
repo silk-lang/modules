@@ -1,0 +1,1181 @@
+// Native port of QuickJS libregexp.c, revision 7d1c13c5d8f8c6b32893786ed35cdcebd88194d2.
+// Copyright (c) 2017-2018 Fabrice Bellard. See LICENSE.quickjs.
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.num.u8
+import silk.num.u16
+import silk.num.u32
+import silk.num.u64
+import silk.num.i32
+import silk.num.usize
+import byte_buffer { ByteBuffer, readU16, readU32 }
+import regexp_opcodes as op
+import regexp_types as re
+import regexp_types { RegExpProgram, RegExpSyntaxError, RegExpStackOverflow }
+import regexp_parse_escape { GroupName, parseDigits, parseGroupName, tryGroupName }
+import regexp_parse_sets { parseClass, parseClassAtom }
+import regexp_strings { RegExpStrings }
+import unicode_ranges { CharRange }
+import unicode_case { UnicodeCase }
+import native_stack { currentFrameAddress }
+import ascii { digit }
+
+pub struct RegExpCompiler {}
+
+struct CompilerState {
+  code: ByteBuffer,
+  names: ByteBuffer,
+  cursor: usize,
+  flags: u32,
+  captures: usize,
+  totalCaptures: usize,
+  hasNamed: bool,
+  scope: u8,
+  depth: usize,
+  maxDepth: usize,
+  stackLimit: usize
+}
+
+fn byte(input: &[u8], at: usize) -> u8 {
+  if at >= input.length { return 0 }
+  return input[at]
+}
+fn unicode(flags: u32) -> bool { return (flags & (re.FLAG_UNICODE | re.FLAG_UNICODE_SETS)) != 0 }
+fn relative(target: usize, after: usize) -> u32 { return u32.wrappingSubtract(usize.toU32(target), usize.toU32(after)) }
+
+impl RegExpCompiler {
+  // maxDepth bounds logical nesting. stackLimit is the downward native-frame
+  // bound; zero disables the physical check without changing the depth policy.
+  pub effect fn compile(pattern: &[u8], flags: u32, maxDepth: usize, stackLimit: usize) -> RegExpProgram
+  ! OutOfMemoryError | RegExpSyntaxError | RegExpStackOverflow ? &mut Allocator {
+    let mut state = CompilerState {
+      code: ByteBuffer.make(), names: ByteBuffer.make(), cursor: 0, flags: flags,
+      captures: 1, totalCaptures: 0, hasNamed: false, scope: 0, depth: 0, maxDepth: maxDepth, stackLimit: stackLimit
+    }
+    run state.code.writeU16(u32.toU16(flags))
+    run state.code.append(0)
+    run state.code.append(0)
+    run state.code.writeU32(0)
+    if (flags & re.FLAG_STICKY) == 0 {
+      let _unused = run state.emit32(op.REOP_split_goto_first, 6)
+      run state.code.append(op.REOP_any)
+      let _jump = run state.emit32(op.REOP_goto, u32.wrappingSubtract(0, 11))
+    }
+    run state.emit8(op.REOP_save_start, 0)
+    run state.disjunction(pattern, false)
+    run state.emit8(op.REOP_save_end, 0)
+    run state.code.append(op.REOP_match)
+    if state.cursor != pattern.length { fail RegExpSyntaxError { message: "Unmatched ')'", offset: state.cursor } }
+    let registers = run allocateRegisters(&mut state.code)
+    let programEnd = state.code.length()
+    state.code.set(op.RE_HEADER_CAPTURE_COUNT, usize.toU8(state.captures))
+    state.code.set(op.RE_HEADER_REGISTER_COUNT, usize.toU8(registers))
+    if (flags & re.FLAG_STICKY) == 0 {
+      let mut hint = searchHint(state.code.asSlice())
+      // The count shares its u16 with the pivot, so runs are capped at 255
+      // units; a capped whole-pattern literal is only required.
+      if hint.count > 255 {
+        hint.count = 255
+        if hint.kind == re.HINT_LITERAL { hint.kind = re.HINT_REQUIRED }
+      }
+      let mut kind = hint.kind
+      let mut set = FirstSet { bits: [0; 4], visits: 0 }
+      let withSet = kind != re.HINT_ANCHORED && kind != re.HINT_LITERAL &&
+        firstSet(state.code.asSlice(), op.RE_HEADER_LEN + 11, &mut set) && set.useful()
+      if kind == re.HINT_LITERAL || kind == re.HINT_REQUIRED {
+        let mut latin = true
+        let mut k: usize = 0
+        while k < hint.count {
+          if readU16(state.code.asSlice(), hint.at + k * 3 + 1) > 255 { latin = false }
+          k = k + 1
+        }
+        if latin {
+          k = 0
+          while k < hint.count {
+            let unit = u16.toU8(readU16(state.code.asSlice(), hint.at + k * 3 + 1))
+            run state.code.append(unit)
+            k = k + 1
+          }
+          kind = u8.bitOr(kind, re.HINT_RUN_BYTES)
+        } else {
+          k = 0
+          while k < hint.count {
+            let unit = readU16(state.code.asSlice(), hint.at + k * 3 + 1)
+            run state.code.writeU16(unit)
+            k = k + 1
+          }
+          kind = u8.bitOr(kind, re.HINT_RUN_UNITS)
+        }
+      }
+      if withSet {
+        let mut word: usize = 0
+        while word < 4 {
+          let mut b: usize = 0
+          while b < 8 { run state.code.append(u64.toU8(u64.bitAnd(u64.shiftRight(set.bits[word], usize.toU64(b * 8)), 255))) b = b + 1 }
+          word = word + 1
+        }
+        let members = u32.wrappingAdd(
+          u32.wrappingAdd(u64.countOnes(set.bits[0]), u64.countOnes(set.bits[1])),
+          u32.wrappingAdd(u64.countOnes(set.bits[2]), u64.countOnes(set.bits[3])),
+        )
+        if members >= 1 && members <= 3 {
+          let mut units: [u8; 3] = [0; 3]
+          let mut found: usize = 0
+          word = 0
+          while word < 4 {
+            let mut rest = set.bits[word]
+            while rest != 0 {
+              units[found] = u32.toU8(u32.wrappingAdd(usize.wrappingToU32(usize.shiftLeft(word, 6)), u64.trailingZeros(rest)))
+              found = usize.wrappingAdd(found, 1)
+              rest = u64.bitAnd(rest, u64.wrappingSubtract(rest, 1))
+            }
+            word = usize.wrappingAdd(word, 1)
+          }
+          if found < 2 { units[1] = units[0] }
+          if found < 3 { units[2] = units[0] }
+          run state.code.append(1)
+          run state.code.append(units[0])
+          run state.code.append(units[1])
+          run state.code.append(units[2])
+        } else {
+          run state.code.append(2)
+          run state.code.append(0)
+          run state.code.append(0)
+          run state.code.append(0)
+        }
+        kind = u8.bitOr(kind, re.HINT_FIRST_SET)
+      }
+      let plan = skipPlan(state.code.asSlice())
+
+      // The trailer stores offsets as u16; a longer program searches without a hint and drops
+      // the run bytes and bitmap above, so it ends at its final REOP_match as validation expects.
+      if hint.at > 65535 || plan.first > 65535 {
+        state.code.truncate(programEnd)
+      } else if kind != 0 || plan.first != 0 {
+        let pivot = literalPivot(state.code.asSlice(), hint.at, hint.count)
+        run state.code.append(re.HINT_OPCODE)
+        run state.code.append(kind)
+        run state.code.writeU16(usize.toU16(hint.at))
+        run state.code.writeU16(usize.toU16(hint.count + pivot * 256))
+        run state.code.writeU16(usize.toU16(plan.first))
+        run state.code.append(plan.opcode)
+        state.code.patchU16(op.RE_HEADER_FLAGS, u32.toU16(flags | re.FLAG_HINT))
+      }
+    }
+    // Last, since the walks above read the plain splits.
+    markStars(&mut state.code, programEnd)
+    let bytecodeLength = usize.toU32(state.code.length() - op.RE_HEADER_LEN)
+    state.code.patchU32(op.RE_HEADER_BYTECODE_LEN, bytecodeLength)
+    if state.names.length() > (state.captures - 1) * 2 {
+      run state.code.appendSlice(state.names.asSlice())
+      let current = u16.toU32(readU16(state.code.asSlice(), op.RE_HEADER_FLAGS))
+      state.code.patchU16(op.RE_HEADER_FLAGS, u32.toU16(current | re.FLAG_NAMED_GROUPS))
+    }
+    let CompilerState { code, names: _names, cursor: _cursor, flags: _savedFlags, captures: _captures, totalCaptures: _totalCaptures, hasNamed: _hasNamed, scope: _scope, depth: _depth, maxDepth: _savedMaxDepth, stackLimit: _savedStackLimit } = move state
+    return RegExpProgram { bytecode: code.intoList() }
+  }
+}
+
+impl CompilerState {
+  effect fn emit8(self: &mut Self, opcode: u8, value: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.code.append(opcode)
+    run self.code.append(value)
+  }
+  effect fn emit32(self: &mut Self, opcode: u8, value: u32) -> usize ! OutOfMemoryError ? &mut Allocator {
+    run self.code.append(opcode)
+    let at = self.code.length()
+    run self.code.writeU32(value)
+    return at
+  }
+  effect fn jump(self: &mut Self, opcode: u8, target: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+    let offset = relative(target, self.code.length() + 5)
+    let _unused = run self.emit32(opcode, offset)
+  }
+  fn patchEnd(self: &mut Self, at: usize) -> () {
+    let offset = relative(self.code.length(), at + 4)
+    self.code.patchU32(at, offset)
+  }
+  effect fn emitChar(self: &mut Self, value: u32) -> () ! OutOfMemoryError ? &mut Allocator {
+    let mut opcode = op.REOP_char
+    if value > 65535 { opcode = op.REOP_char32 }
+    // No other character folds to an ASCII non-letter, so ignoring case
+    // changes nothing for one: the plain step joins literal runs and searches.
+    let caseless = value < 128 && !((value >= 0x41 && value <= 0x5a) || (value >= 0x61 && value <= 0x7a))
+    if (self.flags & re.FLAG_IGNORECASE) != 0 && !caseless { opcode = opcode + 1 }
+    run self.code.append(opcode)
+    if value <= 65535 { run self.code.writeU16(u32.toU16(value)) }
+    else { run self.code.writeU32(value) }
+  }
+  effect fn emitRange(self: &mut Self, range: &CharRange) -> () ! OutOfMemoryError | RegExpSyntaxError ? &mut Allocator {
+    let points = range.points()
+    let count = points.length / 2
+    if count >= 65535 { fail RegExpSyntaxError { message: "Regular expression too large", offset: self.cursor } }
+    if count == 0 {
+      let _unused = run self.emit32(op.REOP_char32, u32.MAX)
+      return 
+    }
+    let mut high = points[points.length - 1]
+    if high == u32.MAX { high = points[points.length - 2] }
+    let narrow = high <= 65535
+    let mut opcode = op.REOP_range32
+    if narrow { opcode = op.REOP_range }
+    if (self.flags & re.FLAG_IGNORECASE) != 0 { opcode = opcode + 1 }
+    if narrow {
+      opcode = re.REOP_CLASS
+      if (self.flags & re.FLAG_IGNORECASE) != 0 { opcode = re.REOP_CLASS_I }
+    }
+    run self.code.append(opcode)
+    run self.code.writeU16(usize.toU16(count))
+    let mut i: usize = 0
+    while i < points.length {
+      high = points[i + 1] - 1
+      if narrow {
+        if high == u32.MAX - 1 { high = 65535 }
+        run self.code.writeU16(u32.toU16(points[i]))
+        run self.code.writeU16(u32.toU16(high))
+      } else {
+        run self.code.writeU32(points[i])
+        run self.code.writeU32(high)
+      }
+      i = i + 2
+    }
+    if narrow {
+      // The Latin-1 bitmap: unit c matches when its folded form (what the
+      // executor's classRange tests) is in the table.
+      let unicode = (self.flags & (re.FLAG_UNICODE | re.FLAG_UNICODE_SETS)) != 0
+      let fold = (self.flags & re.FLAG_IGNORECASE) != 0
+      let mut map: [u8; 32] = [0; 32]
+      if !fold {
+        // Unfolded units match their own ranges: fill each range's Latin-1 part.
+        let mut k: usize = 0
+        while k + 1 < points.length && points[k] < 256 {
+          let mut end = points[k + 1]
+          if end > 256 { end = 256 }
+          let mut c = points[k]
+          while c < end {
+            let at = u32.toUsize(u32.shiftRight(c, 3))
+            map[at] = map[at] | u32.toU8(u32.shiftLeft(1, c & 7))
+            c = c + 1
+          }
+          k = k + 2
+        }
+      } else {
+        let mut c: u32 = 0
+        while c < 256 {
+          if pointsContain(points, UnicodeCase.canonicalize(c, unicode)) {
+            let at = u32.toUsize(u32.shiftRight(c, 3))
+            map[at] = map[at] | u32.toU8(u32.shiftLeft(1, c & 7))
+          }
+          c = c + 1
+        }
+      }
+      let mut byte: usize = 0
+      while byte < 32 { run self.code.append(map[byte]) byte = byte + 1 }
+    }
+  }
+  effect fn emitStrings(self: &mut Self, set: &RegExpStrings) -> () ! OutOfMemoryError | RegExpSyntaxError ? &mut Allocator {
+    if set.strings.length() == 0 { return run self.emitRange(&set.ranges) }
+    // Sort indices, not owned strings. Longest alternatives precede shorter ones.
+    let strings = set.strings.asSlice()
+    let mut order = List<usize>.make()
+    let mut empty = false
+    let mut i: usize = 0
+    while i < strings.length {
+      if strings[i].length() == 0 { empty = true }
+      else { run order.append(i) }
+      i = i + 1
+    }
+    sortStringIndices(&mut order, strings)
+    let hasRange = set.ranges.points().length != 0
+    let mut chain: u32 = u32.MAX
+    i = 0
+    while i < order.length() {
+      let last = !empty && !hasRange && i + 1 == order.length()
+      let mut split: usize = 0
+      if !last { split = run self.emit32(op.REOP_split_next_first, 0) }
+      let text = strings[order.get(i)].asSlice()
+      let mut j: usize = 0
+      while j < text.length {
+        run self.emitChar(text[j])
+        j = j + 1
+      }
+      if !last {
+        let at = run self.emit32(op.REOP_goto, chain)
+        chain = usize.toU32(at)
+        self.patchEnd(split)
+      }
+      i = i + 1
+    }
+    if hasRange {
+      let mut split: usize = 0
+      if empty { split = run self.emit32(op.REOP_split_next_first, 0) }
+      run self.emitRange(&set.ranges)
+      if empty { self.patchEnd(split) }
+    }
+    while chain != u32.MAX {
+      let at = u32.toUsize(chain)
+      chain = readU32(self.code.asSlice(), at)
+      self.patchEnd(at)
+    }
+  }
+  effect fn expect(self: &mut Self, input: &[u8], value: u8) -> () ! RegExpSyntaxError {
+    if byte(input, self.cursor) != value {
+      let message = match value {
+        41 => "Unterminated group"
+        58 => "Invalid group"
+        _ => "Incomplete quantifier"
+      }
+      fail RegExpSyntaxError { message: message, offset: self.cursor }
+    }
+    self.cursor = self.cursor + 1
+  }
+  effect fn modifiers(self: &mut Self, input: &[u8]) -> u32 ! RegExpSyntaxError {
+    let mut mask: u32 = 0
+    while true {
+      let c = byte(input, self.cursor)
+      let value = match c {
+        105 => re.FLAG_IGNORECASE
+        109 => re.FLAG_MULTILINE
+        115 => re.FLAG_DOTALL
+        _ => 0
+      }
+      if value == 0 { return mask }
+      if (mask & value) != 0 {
+        fail RegExpSyntaxError { message: "Repeated flag in flag group", offset: self.cursor }
+      }
+      mask = mask | value
+      self.cursor = self.cursor + 1
+    }
+  }
+  effect fn countCaptures(self: &mut Self, input: &[u8]) -> () ! OutOfMemoryError ? &mut Allocator {
+    if self.totalCaptures != 0 { return () }
+    let mut count: usize = 1
+    let mut p: usize = 0
+    while p < input.length {
+      let c = input[p]
+      if c == 40 {
+        if byte(input, p + 1) != 63 { count = count + 1 }
+        else if byte(input, p + 2) == 60 && byte(input, p + 3) != 61 && byte(input, p + 3) != 33 {
+          self.hasNamed = true
+          count = count + 1
+        }
+        if count >= op.CAPTURE_COUNT_MAX { break }
+      } else if c == 92 { p = p + 1 }
+      else if c == 91 {
+        p = p + 1
+        while p < input.length && input[p] != 93 {
+          if input[p] == 92 { p = p + 1 }
+          p = p + 1
+        }
+      }
+      p = p + 1
+    }
+    self.totalCaptures = count
+  }
+  fn duplicateName(self: &Self, name: &[u8]) -> bool {
+    let data = self.names.asSlice()
+    let mut p: usize = 0
+    while p < data.length {
+      let start = p
+      while data[p] != 0 { p = p + 1 }
+      let mut equal = p - start == name.length
+      let mut i: usize = 0
+      while equal && i < name.length {
+        equal = data[start + i] == name[i]
+        i = i + 1
+      }
+      if equal && data[p + 1] == self.scope { return true }
+      p = p + 2
+    }
+    return false
+  }
+  effect fn namedIndices(self: &mut Self, input: &[u8], name: &[u8]) -> List<u8> ! OutOfMemoryError ? &mut Allocator {
+    let mut result = List<u8>.make()
+    let data = self.names.asSlice()
+    let mut index: usize = 1
+    let mut p: usize = 0
+    while p < data.length {
+      let start = p
+      while data[p] != 0 { p = p + 1 }
+      let mut equal = p - start == name.length
+      let mut i: usize = 0
+      while equal && i < name.length {
+        equal = data[start + i] == name[i]
+        i = i + 1
+      }
+      if equal { run result.append(usize.toU8(index)) }
+      p = p + 2
+      index = index + 1
+    }
+    if result.length() != 0 { return move result }
+    index = 1
+    p = 0
+    while p < input.length {
+      let c = input[p]
+      if c == 40 {
+        if byte(input, p + 1) != 63 { index = index + 1 }
+        else if byte(input, p + 2) == 60 && byte(input, p + 3) != 61 && byte(input, p + 3) != 33 {
+          let parsed = run tryGroupName(input, p + 3)
+          match move parsed {
+            Option<GroupName>.Some { value } => {
+              if (value.bytes.asSlice() == name) { run result.append(usize.toU8(index)) }
+              p = value.next
+            }
+            Option<GroupName>.None => { p = p + 3 }
+          }
+          index = index + 1
+        }
+        if index >= op.CAPTURE_COUNT_MAX { break }
+      } else if c == 92 { p = p + 1 }
+      else if c == 91 {
+        p = p + 1
+        while p < input.length && input[p] != 93 {
+          if input[p] == 92 { p = p + 1 }
+          p = p + 1
+        }
+      }
+      p = p + 1
+    }
+    return move result
+  }
+}
+
+impl CompilerState {
+  effect fn disjunction(self: &mut Self, input: &[u8], backward: bool) -> ()
+  ! OutOfMemoryError | RegExpSyntaxError | RegExpStackOverflow ? &mut Allocator {
+    if self.depth >= self.maxDepth || (self.stackLimit != 0 && currentFrameAddress() < self.stackLimit) { fail RegExpStackOverflow {} }
+    self.depth = self.depth + 1
+    // a|b|c becomes split(b) a goto(end) split(c) b goto(end) c: each choice
+    // pushes one frame, and the first alternative runs after one split, not
+    // one per alternative. Until the end is known, each goto's operand holds
+    // the previous goto's operand offset plus one (0 for none).
+    let mut altStart = self.code.length()
+    let mut lastJump: usize = 0
+    run self.alternative(input, backward)
+    while byte(input, self.cursor) == 124 {
+      self.cursor = self.cursor + 1
+      let length = self.code.length() - altStart
+      run self.code.insertZeroes(altStart, 5)
+      self.code.set(altStart, op.REOP_split_next_first)
+      self.code.patchU32(altStart + 1, usize.toU32(length + 5))
+      let jump = run self.emit32(op.REOP_goto, usize.toU32(lastJump))
+      lastJump = jump + 1
+      altStart = self.code.length()
+      self.scope = u8.wrappingAdd(self.scope, 1)
+      run self.alternative(input, backward)
+    }
+    while lastJump != 0 {
+      let jump = lastJump - 1
+      lastJump = u32.toUsize(readU32(self.code.asSlice(), jump))
+      self.patchEnd(jump)
+    }
+    self.depth = self.depth - 1
+  }
+
+  effect fn alternative(self: &mut Self, input: &[u8], backward: bool) -> ()
+  ! OutOfMemoryError | RegExpSyntaxError | RegExpStackOverflow ? &mut Allocator {
+    let start = self.code.length()
+    while self.cursor < input.length && byte(input, self.cursor) != 124 && byte(input, self.cursor) != 41 {
+      let termStart = self.code.length()
+      run self.term(input, backward)
+      if backward {
+        // Rotate the newly compiled term to the front without a temporary allocation.
+        let end = self.code.length()
+        reverseBytes(&mut self.code, start, termStart)
+        reverseBytes(&mut self.code, termStart, end)
+        reverseBytes(&mut self.code, start, end)
+      }
+    }
+  }
+
+  effect fn normalAtom(self: &mut Self, input: &[u8], backward: bool) -> ()
+  ! OutOfMemoryError | RegExpSyntaxError ? &mut Allocator {
+    let at = self.cursor
+    let atom = run parseClassAtom(input, at, self.flags, false, true)
+    self.cursor = atom.next
+    if backward { run self.code.append(op.REOP_prev) }
+    if atom.isSet {
+      if byte(input, at) == 92 && byte(input, at + 1) == 115 { run self.code.append(op.REOP_space) }
+      else if byte(input, at) == 92 && byte(input, at + 1) == 83 { run self.code.append(op.REOP_not_space) }
+      else { run self.emitStrings(&atom.set) }
+    } else {
+      let mut value = atom.codePoint
+      if (self.flags & re.FLAG_IGNORECASE) != 0 { value = UnicodeCase.canonicalize(value, unicode(self.flags)) }
+      run self.emitChar(value)
+    }
+    if backward { run self.code.append(op.REOP_prev) }
+  }
+
+  effect fn reference(self: &mut Self, indices: &[u8], backward: bool) -> () ! OutOfMemoryError ? &mut Allocator {
+    let mut opcode = op.REOP_back_reference
+    if backward { opcode = op.REOP_backward_back_reference }
+    if (self.flags & re.FLAG_IGNORECASE) != 0 { opcode = opcode + 1 }
+    run self.emit8(opcode, usize.toU8(indices.length))
+    run self.code.appendSlice(indices)
+  }
+
+  effect fn namedReference(self: &mut Self, input: &[u8], backward: bool) -> ()
+  ! OutOfMemoryError | RegExpSyntaxError ? &mut Allocator {
+    run self.countCaptures(input)
+    let strict = unicode(self.flags) || self.hasNamed
+    if byte(input, self.cursor + 2) != 60 {
+      if strict { fail RegExpSyntaxError { message: "Invalid named reference", offset: self.cursor } }
+      return run self.normalAtom(input, backward)
+    }
+    let parsed = run tryGroupName(input, self.cursor + 3)
+    match move parsed {
+      Option<GroupName>.None => {
+        if strict { fail RegExpSyntaxError { message: "Invalid capture group name", offset: self.cursor } }
+        return run self.normalAtom(input, backward)
+      }
+      Option<GroupName>.Some { value } => {
+        let indices = run self.namedIndices(input, value.bytes.asSlice())
+        if indices.length() == 0 {
+          if strict { fail RegExpSyntaxError { message: "Invalid named capture referenced", offset: self.cursor } }
+          return run self.normalAtom(input, backward)
+        }
+        run self.reference(indices.asSlice(), backward)
+        self.cursor = value.next
+      }
+    }
+  }
+
+  effect fn group(self: &mut Self, input: &[u8], backward: bool) -> bool
+  ! OutOfMemoryError | RegExpSyntaxError | RegExpStackOverflow ? &mut Allocator {
+    let p = self.cursor
+    let mut capture = true
+    let mut named = false
+    let savedFlags = self.flags
+    if byte(input, p + 1) == 63 {
+      let c = byte(input, p + 2)
+      if c == 58 {
+        self.cursor = p + 3
+        capture = false
+      }
+      else if c == 105 || c == 109 || c == 115 || c == 45 {
+        self.cursor = p + 2
+        let add = run self.modifiers(input)
+        let mut remove: u32 = 0
+        if byte(input, self.cursor) == 45 {
+          self.cursor = self.cursor + 1
+          remove = run self.modifiers(input)
+        }
+        if add == 0 && remove == 0 { fail RegExpSyntaxError { message: "Invalid flag group", offset: self.cursor } }
+        if (add & remove) != 0 { fail RegExpSyntaxError { message: "Repeated flag in flag group", offset: self.cursor } }
+        run self.expect(input, 58)
+        self.flags = (self.flags | add) & (u32.MAX ^ remove)
+        capture = false
+      } else if c == 61 || c == 33 || (c == 60 && (byte(input, p + 3) == 61 || byte(input, p + 3) == 33)) {
+        let behind = c == 60
+        let mut negative = c == 33
+        self.cursor = p + 3
+        if behind {
+          negative = byte(input, p + 3) == 33
+          self.cursor = p + 4
+        }
+        let mut opcode = op.REOP_lookahead
+        let mut endOpcode = op.REOP_lookahead_match
+        if negative {
+          opcode = op.REOP_negative_lookahead
+          endOpcode = op.REOP_negative_lookahead_match
+        }
+        let jump = run self.emit32(opcode, 0)
+        run self.disjunction(input, behind)
+        run self.expect(input, 41)
+        run self.code.append(endOpcode)
+        self.patchEnd(jump)
+        if unicode(self.flags) || behind {
+          let next = byte(input, self.cursor)
+          if next == 42 || next == 43 || next == 63 || (next == 123 && digit(byte(input, self.cursor + 1))) {
+            fail RegExpSyntaxError { message: "Invalid quantifier", offset: self.cursor }
+          }
+        }
+        return !unicode(self.flags) && !behind
+      } else if c == 60 {
+        let name = run parseGroupName(input, p + 3)
+        if self.duplicateName(name.bytes.asSlice()) { fail RegExpSyntaxError { message: "Duplicate capture group name", offset: p } }
+        run self.names.appendSlice(name.bytes.asSlice())
+        run self.names.append(0)
+        run self.names.append(self.scope)
+        self.hasNamed = true
+        self.cursor = name.next
+        named = true
+      } else { fail RegExpSyntaxError { message: "Invalid group", offset: p } }
+    } else { self.cursor = p + 1 }
+    let index = self.captures
+    if capture {
+      if !named {
+        run self.names.append(0)
+        run self.names.append(0)
+      }
+      if index >= op.CAPTURE_COUNT_MAX { fail RegExpSyntaxError { message: "Too many captures", offset: p } }
+      self.captures = self.captures + 1
+      let mut opcode = op.REOP_save_start
+      if backward { opcode = op.REOP_save_end }
+      run self.emit8(opcode, usize.toU8(index))
+    }
+    run self.disjunction(input, backward)
+    if capture {
+      let mut opcode = op.REOP_save_end
+      if backward { opcode = op.REOP_save_start }
+      run self.emit8(opcode, usize.toU8(index))
+    }
+    run self.expect(input, 41)
+    self.flags = savedFlags
+    return true
+  }
+
+  effect fn term(self: &mut Self, input: &[u8], backward: bool) -> ()
+  ! OutOfMemoryError | RegExpSyntaxError | RegExpStackOverflow ? &mut Allocator {
+    let start = self.code.length()
+    let captures = self.captures
+    let p = self.cursor
+    let c = byte(input, p)
+    let mut quantifiable = true
+    if c == 94 || c == 36 {
+      let mut opcode = op.REOP_line_start
+      if c == 36 { opcode = op.REOP_line_end }
+      if (self.flags & re.FLAG_MULTILINE) != 0 { opcode = opcode + 1 }
+      run self.code.append(opcode)
+      self.cursor = p + 1
+      quantifiable = false
+    } else if c == 46 {
+      if backward { run self.code.append(op.REOP_prev) }
+      let mut opcode = op.REOP_dot
+      if (self.flags & re.FLAG_DOTALL) != 0 { opcode = op.REOP_any }
+      run self.code.append(opcode)
+      if backward { run self.code.append(op.REOP_prev) }
+      self.cursor = p + 1
+    } else if c == 42 || c == 43 || c == 63 {
+      fail RegExpSyntaxError { message: "Nothing to repeat", offset: p }
+    } else if c == 123 {
+      if digit(byte(input, p + 1)) {
+        let number = parseDigits(input, p + 1, true)
+        let mut end = number.next
+        if byte(input, end) == 44 {
+          end = end + 1
+          if digit(byte(input, end)) {
+            let maximum = parseDigits(input, end, true)
+            end = maximum.next
+          }
+        }
+        if byte(input, end) == 125 { fail RegExpSyntaxError { message: "Nothing to repeat", offset: p } }
+      }
+      if unicode(self.flags) { fail RegExpSyntaxError { message: "Lone quantifier brackets", offset: p } }
+      run self.normalAtom(input, backward)
+    } else if c == 40 { quantifiable = run self.group(input, backward) }
+    else if c == 91 {
+      let parsed = run parseClass(input, p, self.flags, self.maxDepth - self.depth, self.stackLimit)
+      self.cursor = parsed.next
+      if backward { run self.code.append(op.REOP_prev) }
+      run self.emitStrings(&parsed.set)
+      if backward { run self.code.append(op.REOP_prev) }
+    } else if c == 92 && (byte(input, p + 1) == 98 || byte(input, p + 1) == 66) {
+      let mut opcode = op.REOP_word_boundary
+      if byte(input, p + 1) == 66 { opcode = op.REOP_not_word_boundary }
+      if unicode(self.flags) && (self.flags & re.FLAG_IGNORECASE) != 0 { opcode = opcode + 1 }
+      run self.code.append(opcode)
+      self.cursor = p + 2
+      quantifiable = false
+    } else if c == 92 && byte(input, p + 1) == 107 { run self.namedReference(input, backward) }
+    else if c == 92 && byte(input, p + 1) >= 49 && byte(input, p + 1) <= 57 {
+      let number = parseDigits(input, p + 1, false)
+      if number.value < 0 || i32.toUsize(number.value) >= self.captures { run self.countCaptures(input) }
+      if number.value < 0 || (i32.toUsize(number.value) >= self.captures && i32.toUsize(number.value) >= self.totalCaptures) {
+        if unicode(self.flags) { fail RegExpSyntaxError { message: "Invalid escape", offset: p } }
+        run self.normalAtom(input, backward)
+      } else {
+        let index = i32.toU8(number.value)
+        run self.reference(&[index], backward)
+        self.cursor = number.next
+      }
+    } else {
+      if (c == 93 || c == 125) && unicode(self.flags) { fail RegExpSyntaxError { message: "Lone quantifier brackets", offset: p } }
+      if c == 92 && byte(input, p + 1) == 48 && unicode(self.flags) && digit(byte(input, p + 2)) {
+        fail RegExpSyntaxError { message: "Invalid decimal escape", offset: p }
+      }
+      run self.normalAtom(input, backward)
+    }
+    if quantifiable { run self.quantifier(input, start, captures) }
+    if self.code.length() > 1073741823 { fail OutOfMemoryError {} }
+  }
+}
+
+fn reverseBytes(code: &mut ByteBuffer, start: usize, end: usize) -> () {
+  let mut left = start
+  let mut right = end
+  while left < right {
+    right = right - 1
+    if left >= right { break }
+    let value = code.get(left)
+    let opposite = code.get(right)
+    code.set(left, opposite)
+    code.set(right, value)
+    left = left + 1
+  }
+}
+
+struct AtomAnalysis { advanceCheck: bool, captureReset: bool }
+
+/// Whether c is in the [start, end) pairs of a CharRange's points.
+fn pointsContain(points: &[u32], c: u32) -> bool {
+  let mut i: usize = 0
+  while i + 1 < points.length {
+    if c < points[i] { return false }
+    if c < points[i + 1] { return true }
+    i = i + 2
+  }
+  return false
+}
+
+fn instructionLength(bytes: &[u8], at: usize) -> usize {
+  let opcode = bytes[at]
+  if opcode == re.REOP_CLASS || opcode == re.REOP_CLASS_I { return 3 + u16.toUsize(readU16(bytes, at + 1)) * 4 + re.CLASS_BITS_LENGTH }
+  let mut length = op.opcodeSize(opcode)
+  if opcode == op.REOP_range || opcode == op.REOP_range_i { length = length + u16.toUsize(readU16(bytes, at + 1)) * 4 }
+  else if opcode == op.REOP_range32 || opcode == op.REOP_range32_i { length = length + u16.toUsize(readU16(bytes, at + 1)) * 8 }
+  else if opcode >= op.REOP_back_reference && opcode <= op.REOP_backward_back_reference_i { length = length + u8.toUsize(bytes[at + 1]) }
+  return length
+}
+
+fn analyzeAtom(bytes: &[u8], start: usize) -> AtomAnalysis {
+  let mut at = start
+  let mut advance = true
+  let mut capture = false
+  while at < bytes.length {
+    let opcode = bytes[at]
+    if (opcode >= op.REOP_char && opcode <= op.REOP_not_space) || (opcode >= op.REOP_range && opcode <= op.REOP_range32_i) ||
+      opcode == re.REOP_CLASS || opcode == re.REOP_CLASS_I {
+      advance = false
+    } else if opcode >= op.REOP_back_reference && opcode <= op.REOP_backward_back_reference_i {
+      capture = true
+    } else if !((opcode >= op.REOP_line_start && opcode <= op.REOP_line_end_m) ||
+      (opcode >= op.REOP_save_start && opcode <= op.REOP_save_reset) ||
+      (opcode >= op.REOP_word_boundary && opcode <= op.REOP_not_word_boundary_i) ||
+      opcode == op.REOP_set_i32 || opcode == op.REOP_set_char_pos || opcode == op.REOP_prev) {
+      capture = true
+      break
+    }
+    at = at + instructionLength(bytes, at)
+  }
+  return AtomAnalysis { advanceCheck: advance, captureReset: capture }
+}
+
+/// The Latin-1 units a search program's match can start with, gathered by
+/// firstSet; units above 255 are never excluded.
+struct FirstSet { bits: [u64; 4], visits: usize }
+impl FirstSet {
+  fn add(self: &mut Self, unit: usize) -> () {
+    if unit > 255 { return () }
+    self.bits[unit / 64] = u64.bitOr(self.bits[unit / 64], u64.shiftLeft(1, usize.toU64(unit & 63)))
+  }
+  fn addRange(self: &mut Self, low: usize, high: usize) -> () {
+    let mut unit = low
+    while unit <= high && unit <= 255 { self.add(unit) unit = unit + 1 }
+  }
+  /// Whether skipping by the set can pay: it leaves out enough units.
+  fn useful(self: &Self) -> bool {
+    let mut count: usize = 0
+    let mut unit: usize = 0
+    while unit < 256 {
+      if u64.bitAnd(u64.shiftRight(self.bits[unit / 64], usize.toU64(unit & 63)), 1) != 0 { count = count + 1 }
+      unit = unit + 1
+    }
+    return count <= 160
+  }
+}
+/// The target of the jump at at (goto or a split).
+/// The size of the step at at when it matches exactly one character (one unit
+/// when the input's characters are), so a greedy loop over it can run in
+/// place, else 0.
+fn starStep(code: &[u8], at: usize) -> usize {
+  if at >= code.length { return 0 }
+  let opcode = code[at]
+  if opcode == op.REOP_char || opcode == op.REOP_char_i { return 3 }
+  if opcode >= op.REOP_dot && opcode <= op.REOP_not_space { return 1 }
+  if opcode == re.REOP_CLASS || opcode == re.REOP_CLASS_I || opcode == op.REOP_range || opcode == op.REOP_range_i ||
+    opcode == op.REOP_range32 || opcode == op.REOP_range32_i { return instructionLength(code, at) }
+  return 0
+}
+/// Marks the program's greedy loops over one one-character step (re.REOP_STAR,
+/// re.REOP_PLUS), so the executor need not recognize them on every dispatch.
+fn markStars(code: &mut ByteBuffer, end: usize) {
+  let mut at = op.RE_HEADER_LEN
+  while at < end {
+    let bytes = code.asSlice()
+    let opcode = bytes[at]
+    let length = instructionLength(bytes, at)
+    let mut mark: u8 = 0
+    if opcode == op.REOP_split_next_first {
+      let size = starStep(bytes, at + 5)
+      let jump = at + 5 + size
+      if size != 0 && jumpTarget(bytes, at) == jump + 5 && jump < end && bytes[jump] == op.REOP_goto && jumpTarget(bytes, jump) == at { mark = re.REOP_STAR }
+    } else if opcode == op.REOP_split_goto_first {
+      let target = jumpTarget(bytes, at)
+      if target < at {
+        let size = starStep(bytes, target)
+        if size != 0 && target + size == at { mark = re.REOP_PLUS }
+      }
+    }
+    if mark != 0 { code.set(at, mark) }
+    at = at + length
+  }
+}
+fn jumpTarget(code: &[u8], at: usize) -> usize {
+  let displacement = readU32(code, at + 1)
+  if displacement < 0x80000000 { return usize.wrappingAdd(at + 5, u32.toUsize(displacement)) }
+  return usize.wrappingSubtract(at + 5, u32.toUsize(0xffffffff - displacement) + 1)
+}
+/// Adds to set every Latin-1 unit a match can consume first from at, the
+/// program's save_start 0 or any step after it. False when that is not a
+/// bounded set: the path can match empty, or meets a step this walk does not
+/// follow (lookaround, loops, back references, folded or 32-bit classes).
+fn firstSet(code: &[u8], start: usize, set: &mut FirstSet) -> bool {
+  let mut at = start
+  while at < code.length {
+    set.visits = set.visits + 1
+    if set.visits > 64 { return false }
+    let opcode = code[at]
+    if opcode == op.REOP_char { set.add(u16.toUsize(readU16(code, at + 1))) return true }
+    if opcode == op.REOP_char_i {
+      let unit = u16.toUsize(readU16(code, at + 1))
+      if unit >= 128 { return false }
+      set.add(unit)
+      if unit >= 0x41 && unit <= 0x5a { set.add(unit + 0x20) }
+      if unit >= 0x61 && unit <= 0x7a { set.add(unit - 0x20) }
+      return true
+    }
+    if opcode == op.REOP_char32 { return true }
+    if opcode == op.REOP_space || opcode == op.REOP_not_space {
+      let mut unit: usize = 0
+      while unit < 256 {
+        let space = (unit >= 9 && unit <= 13) || unit == 32 || unit == 0xa0
+        if space == (opcode == op.REOP_space) { set.add(unit) }
+        unit = unit + 1
+      }
+      return true
+    }
+    if opcode == re.REOP_CLASS || opcode == re.REOP_CLASS_I {
+      // The bitmap is exactly the Latin-1 units the class matches.
+      let bitsAt = at + 3 + u16.toUsize(readU16(code, at + 1)) * 4
+      let mut unit: usize = 0
+      while unit < 256 {
+        if (u8.toU32(code[bitsAt + unit / 8]) & u32.shiftLeft(1, usize.toU32(unit & 7))) != 0 { set.add(unit) }
+        unit = unit + 1
+      }
+      return true
+    }
+    if opcode == op.REOP_range {
+      let count = u16.toUsize(readU16(code, at + 1))
+      let mut i: usize = 0
+      while i < count {
+        set.addRange(u16.toUsize(readU16(code, at + 3 + i * 4)), u16.toUsize(readU16(code, at + 5 + i * 4)))
+        i = i + 1
+      }
+      return true
+    }
+    // $ matches only at the end, which a search always tries. ^ matches only at
+    // the input's start, which the search tries before it skips at all.
+    if opcode == op.REOP_line_end || opcode == op.REOP_line_start { return true }
+    if opcode == op.REOP_line_end_m { set.add(10) set.add(13) return true }
+    if opcode == op.REOP_save_start || opcode == op.REOP_save_end || opcode == op.REOP_save_reset ||
+      (opcode >= op.REOP_word_boundary && opcode <= op.REOP_not_word_boundary_i) {
+      at = at + instructionLength(code, at)
+    } else if opcode == op.REOP_goto {
+      at = jumpTarget(code, at)
+    } else if opcode == op.REOP_split_goto_first || opcode == op.REOP_split_next_first {
+      if !firstSet(code, at + 5, &mut set) { return false }
+      at = jumpTarget(code, at)
+    } else { return false }
+  }
+  return false
+}
+struct SearchHint { kind: u8, at: usize, count: usize }
+/// The index in the count REOP_char steps at at of the least common unit (the
+/// first of the rarest), which a long search scans for.
+fn literalPivot(code: &[u8], at: usize, count: usize) -> usize {
+  let mut pivot: usize = 0
+  if count < 2 { return 0 }
+  let mut best = rarity(u16.toU32(readU16(code, at + 1)))
+  let mut k: usize = 1
+  while k < count {
+    let score = rarity(u16.toU32(readU16(code, at + k * 3 + 1)))
+    if score < best { best = score pivot = k }
+    k = k + 1
+  }
+  return pivot
+}
+/// How common unit is in typical text, markup and JSON, from 2 (rare) to 9.
+fn rarity(unit: u32) -> u32 {
+  if unit == 32 || unit == 0x65 || unit == 0x74 || unit == 0x61 || unit == 0x6f || unit == 0x69 || unit == 0x6e || unit == 0x73 || unit == 0x72 { return 9 }
+  if unit >= 0x61 && unit <= 0x7a { return 7 }
+  if unit == 0x22 || unit == 0x2c || unit == 0x2e || unit == 0x3a || unit == 0x2f || unit == 0x2d || unit == 0x5f || unit == 0x27 || unit == 0x3d { return 7 }
+  if unit >= 0x30 && unit <= 0x39 { return 6 }
+  if unit >= 0x41 && unit <= 0x5a { return 4 }
+  if unit > 0x20 && unit < 0x7f { return 3 }
+  return 2
+}
+
+/// The forward target of a jumping instruction at at, or 0 when it does not jump.
+fn forwardTarget(code: &[u8], at: usize) -> usize {
+  let opcode = code[at]
+  let mut after: usize = 0
+  if opcode == op.REOP_goto || opcode == op.REOP_split_goto_first || opcode == op.REOP_split_next_first ||
+    opcode == op.REOP_lookahead || opcode == op.REOP_negative_lookahead { after = at + 5 }
+  else if opcode >= op.REOP_loop && opcode <= op.REOP_loop_check_adv_split_next_first { after = at + 6 }
+  else { return 0 }
+  let displacement = readU32(code, after - 4)
+  if displacement >= 0x80000000 { return 0 }
+  return after + u32.toUsize(displacement)
+}
+/// A search program's hint (see regexp_types.FLAG_HINT): the longest run of
+/// REOP_char steps that every match executes, that is, that no earlier forward
+/// jump skips (lookaround bodies sit behind one too). Kind 0 when there is no
+/// useful one: none, or a run that is already the first step (the search
+/// prefix skips to it). A pattern anchored at ^ gets HINT_ANCHORED instead.
+struct SkipPlan { first: usize, opcode: u8 }
+/// The search prefix's plan (regexp_types.FLAG_HINT): after the prefix
+/// (split_goto_first, any, goto, save_start 0), zero-width steps (a group's
+/// start, \b, \B) leave the position where the first consuming step must
+/// match. The program ends in save_end and match, so the walk stays inside it.
+fn skipPlan(code: &[u8]) -> SkipPlan {
+  let base = op.RE_HEADER_LEN
+  let mut first = base + 13
+  if !(code.length > first + 3 && code[base] == op.REOP_split_goto_first && code[base + 5] == op.REOP_any &&
+    code[base + 6] == op.REOP_goto && code[base + 11] == op.REOP_save_start) { return SkipPlan { first: 0, opcode: 0 } }
+  let mut opcode = code[first]
+  while opcode == op.REOP_save_start || (opcode >= op.REOP_word_boundary && opcode <= op.REOP_not_word_boundary_i) {
+    if opcode == op.REOP_save_start { first = first + 2 } else { first = first + 1 }
+    opcode = code[first]
+  }
+  if (opcode == op.REOP_char || opcode == op.REOP_char_i || opcode == op.REOP_line_start ||
+    opcode == op.REOP_space || opcode == op.REOP_not_space || opcode == re.REOP_CLASS || opcode == re.REOP_CLASS_I ||
+    (opcode >= op.REOP_range && opcode <= op.REOP_range32_i)) && code.length > first + 3 {
+    return SkipPlan { first: first, opcode: opcode }
+  }
+  return SkipPlan { first: first, opcode: 0 }
+}
+
+fn searchHint(code: &[u8]) -> SearchHint {
+  let base = op.RE_HEADER_LEN
+  let first = base + 13
+  if code.length <= first + 3 || code[base] != op.REOP_split_goto_first || code[base + 11] != op.REOP_save_start || code[base + 12] != 0 { return SearchHint { kind: 0, at: 0, count: 0 } }
+  let mut reach = base
+  let mut at = base
+  let mut best = SearchHint { kind: 0, at: 0, count: 0 }
+  let mut runAt: usize = 0
+  let mut runCount: usize = 0
+  while at < code.length {
+    let opcode = code[at]
+    if opcode == op.REOP_char && at >= reach {
+      if runCount == 0 { runAt = at }
+      runCount = runCount + 1
+      if runCount > best.count { best = SearchHint { kind: re.HINT_REQUIRED, at: runAt, count: runCount } }
+    } else { runCount = 0 }
+    if opcode == op.REOP_match { break }
+    let target = forwardTarget(code, at)
+    if target > reach { reach = target }
+    at = at + instructionLength(code, at)
+  }
+  if code[first] == op.REOP_line_start { return SearchHint { kind: re.HINT_ANCHORED, at: 0, count: 0 } }
+  if best.count == 0 || best.count > 0xffff { return SearchHint { kind: 0, at: 0, count: 0 } }
+  let end = best.at + best.count * 3
+  if best.at == first && end + 3 <= code.length && code[end] == op.REOP_save_end && code[end + 1] == 0 && code[end + 2] == op.REOP_match {
+    return SearchHint { kind: re.HINT_LITERAL, at: best.at, count: best.count }
+  }
+  if best.at == first { return SearchHint { kind: 0, at: 0, count: 0 } }
+  return move best
+}
+
+effect fn allocateRegisters(code: &mut ByteBuffer) -> usize ! RegExpSyntaxError {
+  let mut size: usize = 0
+  let mut maximum: usize = 0
+  let mut at = op.RE_HEADER_LEN
+  while at < code.length() {
+    let opcode = code.get(at)
+    let length = instructionLength(code.asSlice(), at)
+    if opcode == op.REOP_set_i32 || opcode == op.REOP_set_char_pos {
+      if size >= op.REGISTER_COUNT_MAX { fail RegExpSyntaxError { message: "Regular expression too large", offset: 0 } }
+      code.set(at + 1, usize.toU8(size))
+      size = size + 1
+      if size > maximum { maximum = size }
+    } else if opcode == op.REOP_check_advance || opcode == op.REOP_loop ||
+      opcode == op.REOP_loop_split_goto_first || opcode == op.REOP_loop_split_next_first {
+      size = size - 1
+      code.set(at + 1, usize.toU8(size))
+    } else if opcode == op.REOP_loop_check_adv_split_goto_first || opcode == op.REOP_loop_check_adv_split_next_first {
+      size = size - 2
+      code.set(at + 1, usize.toU8(size))
+    }
+    at = at + length
+  }
+  return maximum
+}
+
+impl CompilerState {
+  effect fn quantifier(self: &mut Self, input: &[u8], atomStart: usize, captureStart: usize) -> ()
+  ! OutOfMemoryError | RegExpSyntaxError ? &mut Allocator {
+    let original = self.cursor
+    let c = byte(input, original)
+    let mut minimum: u32 = 0
+    let mut maximum: u32 = 0
+    if c == 42 {
+      maximum = 2147483647
+      self.cursor = original + 1
+    } else if c == 43 {
+      minimum = 1
+      maximum = 2147483647
+      self.cursor = original + 1
+    } else if c == 63 {
+      maximum = 1
+      self.cursor = original + 1
+    }
+    else if c == 123 {
+      if !digit(byte(input, original + 1)) {
+        if unicode(self.flags) { fail RegExpSyntaxError { message: "Incomplete quantifier", offset: original } }
+        return 
+      }
+      let low = parseDigits(input, original + 1, true)
+      minimum = i32.toU32(low.value)
+      maximum = minimum
+      self.cursor = low.next
+      let mut outOfOrder = false
+      if byte(input, self.cursor) == 44 {
+        self.cursor = self.cursor + 1
+        maximum = 2147483647
+        if digit(byte(input, self.cursor)) {
+          let high = parseDigits(input, self.cursor, true)
+          maximum = i32.toU32(high.value)
+          self.cursor = high.next
+          outOfOrder = maximum < minimum
+        }
+      }
+      if byte(input, self.cursor) != 125 && !unicode(self.flags) {
+        self.cursor = original
+        return 
+      }
+      run self.expect(input, 125)
+      if outOfOrder { fail RegExpSyntaxError { message: "numbers out of order in {} quantifier", offset: original } }
+    } else { return () }
+    let mut greedy = true
+    if byte(input, self.cursor) == 63 {
+      greedy = false
+      self.cursor = self.cursor + 1
+    }
+    let mut split = op.REOP_split_goto_first
+    if greedy { split = op.REOP_split_next_first }
+    let analysis = analyzeAtom(self.code.asSlice(), atomStart)
+    let mut advance = analysis.advanceCheck
+    let mut start = atomStart
+    // A quantifier that runs its atom at most once needs no capture reset: the
+    // captures inside it are still unset when it starts (only the atom sets
+    // them, and an enclosing repeat resets them per iteration), and undo
+    // restores them on backtracking.
+    let resets = captureStart != self.captures && maximum > 1
+    if analysis.captureReset && resets {
+      run self.code.insertZeroes(start, 3)
+      self.code.set(start, op.REOP_save_reset)
+      self.code.set(start + 1, usize.toU8(captureStart))
+      self.code.set(start + 2, usize.toU8(self.captures - 1))
+    }
+    let length = self.code.length() - start
+    if minimum == 0 {
+      if !analysis.captureReset && resets {
+        run self.code.insertZeroes(start, 3)
+        self.code.set(start, op.REOP_save_reset)
+        self.code.set(start + 1, usize.toU8(captureStart))
+        self.code.set(start + 2, usize.toU8(self.captures - 1))
+        start = start + 3
+      }
+      if maximum == 0 { self.code.truncate(start) }
+      else if maximum == 1 || maximum == 2147483647 {
+        let mut checkSize: usize = 0
+        if advance { checkSize = 2 }
+        let mut gotoSize: usize = 0
+        if maximum == 2147483647 { gotoSize = 5 }
+        run self.code.insertZeroes(start, 5 + checkSize)
+        self.code.set(start, split)
+        self.code.patchU32(start + 1, usize.toU32(length + gotoSize + checkSize * 2))
+        if advance {
+          self.code.set(start + 5, op.REOP_set_char_pos)
+          run self.emit8(op.REOP_check_advance, 0)
+        }
+        if gotoSize != 0 { run self.jump(op.REOP_goto, start) }
+      } else {
+        let mut checkSize: usize = 0
+        if advance { checkSize = 2 }
+        run self.code.insertZeroes(start, 11 + checkSize)
+        self.code.set(start, split)
+        self.code.patchU32(start + 1, usize.toU32(6 + checkSize + length + 10))
+        self.code.set(start + 5, op.REOP_set_i32)
+        self.code.patchU32(start + 7, maximum)
+        start = start + 11
+        if advance { self.code.set(start, op.REOP_set_char_pos) }
+        run self.loopSplit(start, maximum, advance, greedy)
+      }
+    } else if minimum == 1 && maximum == 2147483647 && !advance {
+      let mut opcode = op.REOP_split_next_first
+      if greedy { opcode = op.REOP_split_goto_first }
+      run self.jump(opcode, start)
+    } else {
+      if minimum == maximum { advance = false }
+      let mut checkSize: usize = 0
+      if advance { checkSize = 2 }
+      run self.code.insertZeroes(start, 6 + checkSize)
+      self.code.set(start, op.REOP_set_i32)
+      self.code.patchU32(start + 2, maximum)
+      start = start + 6
+      if advance { self.code.set(start, op.REOP_set_char_pos) }
+      if minimum == maximum {
+        run self.emit8(op.REOP_loop, 0)
+        let offset = relative(start, self.code.length() + 4)
+        run self.code.writeU32(offset)
+      } else { run self.loopSplit(start, maximum - minimum, advance, greedy) }
+    }
+  }
+
+  effect fn loopSplit(self: &mut Self, target: usize, limit: u32, advance: bool, greedy: bool) -> ()
+  ! OutOfMemoryError ? &mut Allocator {
+    let mut opcode = op.REOP_loop_split_next_first
+    if advance { opcode = op.REOP_loop_check_adv_split_next_first }
+    if greedy { opcode = opcode - 1 }
+    run self.emit8(opcode, 0)
+    run self.code.writeU32(limit)
+    let offset = relative(target, self.code.length() + 4)
+    run self.code.writeU32(offset)
+  }
+}
+
+// A min-heap yields descending lengths without copying strings or allocating sort scratch.
+fn sortStringIndices(order: &mut List<usize>, strings: &[List<u32>]) -> () {
+  let count = order.length()
+  let mut parent = order.length() / 2
+  while parent != 0 {
+    parent = parent - 1
+    siftStringIndex(&mut order, strings, parent, count)
+  }
+  let mut end = order.length()
+  while end > 1 {
+    end = end - 1
+    let first = order.get(0)
+    let last = order.get(end)
+    order.set(0, last)
+    order.set(end, first)
+    siftStringIndex(&mut order, strings, 0, end)
+  }
+}
+
+fn siftStringIndex(order: &mut List<usize>, strings: &[List<u32>], start: usize, end: usize) -> () {
+  let mut root = start
+  while root < end / 2 {
+    let mut child = root * 2 + 1
+    if child + 1 < end && strings[order.get(child + 1)].length() < strings[order.get(child)].length() { child = child + 1 }
+    if strings[order.get(root)].length() <= strings[order.get(child)].length() { return () }
+    let value = order.get(root)
+    let below = order.get(child)
+    order.set(root, below)
+    order.set(child, value)
+    root = child
+  }
+}

@@ -1,0 +1,678 @@
+// Native JSON parsing and source records, quickjs.c:51712-52101.
+// Source is borrowed, never copied. Runtime/context/intrinsics must remain live;
+// install the normal Object prototype and cached Array shape before calling.
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.effect { Effect }
+import silk.num.f64
+import silk.num.i32
+import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.core.result { Result }
+import silk.collections.slice { Slice }
+import silk.num.u32
+import silk.num.u8
+import silk.num.usize
+import js_heap { HeapCell, HeapHeader }
+import js_value { ValueBits }
+import js_owned_value { Value, ValueRef, lendBits }
+import js_object_ref { ObjectRef }
+import js_realm { Realm }
+import js_core_types { RuntimeState, SlotBits, JS_PROP_C_W_E, OwnedAtom }
+import js_gc { HeapHooks }
+import js_gc as gc
+import js_runtime { checkStackOverflow }
+import native_stack { currentFrameAddress }
+import runtime_memory { AllocationObserver }
+import js_object_allocate as objects
+import js_array_storage as arrays
+import js_array_storage { StorageOutcome }
+import js_shapes as shapes
+import js_lexer { Lexer, LexicalContext }
+import js_lexer_chars { decode }
+import js_tokens { Token, TokenPayload, LexError }
+import js_tokens as tok
+import js_atom_data as atoms
+import js_bigint { BigIntError }
+import js_unit_strings as unitStrings
+import js_string_types { StringOwner, StringLengthError }
+import js_parser_diagnostics { DiagnosticMessage, SyntaxError }
+import js_parser_core { ParserStackOverflow }
+
+const NO_RECORD: usize = usize.MAX
+pub const JS_PARSE_JSON_EXT: i32 = 1
+pub enum JsonRecordKind { Empty, Primitive, Object, Array }
+pub struct JsonSourceSpan { pub start: usize, pub length: usize }
+impl Copy for JsonSourceSpan {}
+struct RecordEntry { atom: u32, record: usize, hashNext: usize }
+impl Copy for RecordEntry {}
+struct ParseRecord {
+  value: ValueBits,
+  kind: JsonRecordKind,
+  span: JsonSourceSpan,
+  entries: List<RecordEntry>,
+  hash: List<usize>
+}
+impl ParseRecord {
+  fn empty() -> Self {
+    return Self { value: ValueBits.Undefined, kind: JsonRecordKind.Empty,
+      span: JsonSourceSpan { start: 0, length: 0 }, entries: List<RecordEntry>.make(), hash: List<usize>.make() }
+  }
+}
+
+// Affine native owner. Call destroy before dropping, or transfer the whole owner
+// with move. Values returned by accessors are BORROWED, including original graph
+// edges displaced by duplicate keys or a later reviver. Record indices are stable.
+// The source lifetime is carried even after detaching from ParsedJson.
+pub struct JsonParseRecords<'src> {
+  runtime: *mut HeapHeader,
+  source: &'src [u8],
+  nodes: List<ParseRecord>
+}
+impl<'src> JsonParseRecords<'src> {
+  fn make(runtime: *mut HeapHeader, source: &'src [u8]) -> Self {
+    return Self { runtime: runtime, source: source, nodes: List<ParseRecord>.make() }
+  }
+  pub fn root(self: &Self) -> Option<usize> {
+    if self.nodes.length() == 0 { return Option<usize>.none() }
+    return Option<usize>.some(0)
+  }
+  pub fn originalValue(self: &Self, record: usize) -> ValueBits { return self.nodes.asSlice()[record].value }
+  pub fn kind(self: &Self, record: usize) -> JsonRecordKind { return self.nodes.asSlice()[record].kind }
+  pub fn sourceSpan(self: &Self, record: usize) -> Option<JsonSourceSpan> {
+    let node = &self.nodes.asSlice()[record]
+    if node.kind != JsonRecordKind.Primitive { return Option<JsonSourceSpan>.none() }
+    return Option<JsonSourceSpan>.some(node.span)
+  }
+  pub fn sourceBytes(self: &Self) -> &'src [u8] { return self.source }
+  pub fn primitiveSource(self: &Self, record: usize) -> Option<&'src [u8]> {
+    let node = &self.nodes.asSlice()[record]
+    if node.kind != JsonRecordKind.Primitive { return Option<&'src [u8]>.none() }
+    return Option<&'src [u8]>.some(Slice.view(self.source, node.span.start, node.span.length))
+  }
+  pub fn childCount(self: &Self, record: usize) -> usize { return self.nodes.asSlice()[record].entries.length() }
+  pub fn arrayElement(self: &Self, record: usize, index: usize) -> Option<usize> {
+    let node = &self.nodes.asSlice()[record]
+    if node.kind != JsonRecordKind.Array || index >= node.entries.length() { return Option<usize>.none() }
+    return Option<usize>.some(node.entries.get(index).record)
+  }
+  // Deliberately matches upstream's duplicate-key asymmetry: linear lookup
+  // returns the FIRST duplicate below nine entries, hashed lookup the LAST.
+  pub fn find(self: &Self, record: usize, key: u32) -> Option<usize> {
+    let node = &self.nodes.asSlice()[record]
+    if node.kind != JsonRecordKind.Object { return Option<usize>.none() }
+    if node.hash.length() == 0 {
+      let mut i: usize = 0
+      while i < node.entries.length() {
+        let entry = node.entries.get(i)
+        if entry.atom == key { return Option<usize>.some(entry.record) }
+        i = i + 1
+      }
+    } else {
+      let mut i = node.hash.get(u32.toUsize(key) & (node.hash.length() - 1))
+      while i != NO_RECORD {
+        let entry = node.entries.get(i)
+        if entry.atom == key { return Option<usize>.some(entry.record) }
+        i = entry.hashNext
+      }
+    }
+    return Option<usize>.none()
+  }
+  // Iterative teardown does not consume native stack proportional to JSON depth.
+  // Idempotent. No heap payload borrow survives a release/finalizer callback.
+  pub unsafe fn destroy<H: HeapHooks>(self: &mut Self, hooks: &mut H) -> () {
+    let mut i: usize = 0
+    while i < self.nodes.length() {
+      let node = &mut self.nodes.asMutSlice()[i]
+      let value = node.value
+      node.value = ValueBits.Undefined
+      drop node
+      unsafe gc.release(&mut hooks, self.runtime, value)
+      let mut j: usize = 0
+      while j < self.nodes.asSlice()[i].entries.length() {
+        let entry = self.nodes.asSlice()[i].entries.get(j)
+        let mut anchor = ()
+        let rt = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, self.runtime)
+        rt.atoms.release(entry.atom)
+        j = j + 1
+      }
+      i = i + 1
+    }
+    self.nodes = List<ParseRecord>.make()
+  }
+  fn initialize<'v>(self: &mut Self, record: usize, value: ValueRef<'v>, kind: JsonRecordKind,
+    start: usize, length: usize) -> () {
+    if record == NO_RECORD { return () }
+    let node = &mut self.nodes.asMutSlice()[record]
+    node.value = value.dup().intoBits()
+    node.kind = kind
+    node.span = JsonSourceSpan { start: start, length: length }
+  }
+  effect fn add(self: &mut Self, parent: usize, atom: u32) -> usize
+    ! OutOfMemoryError ? &mut Allocator {
+    if parent == NO_RECORD { return NO_RECORD }
+    run self.nodes.reserve(1)
+    let index = self.nodes.length()
+    let node = &mut self.nodes.asMutSlice()[parent]
+    run node.entries.reserve(1)
+    let count = node.entries.length()
+    if node.kind == JsonRecordKind.Object && count >= 8 && count + 1 > node.hash.length() {
+      let mut size: usize = 1
+      while size <= count { size = size * 2 }
+      let mut hash = List<usize>.make()
+      run hash.reserveExact(size)
+      let mut i: usize = 0
+      while i < size { run hash.append(NO_RECORD) i = i + 1 }
+      i = 0
+      while i < count {
+        let mut entry = node.entries.get(i)
+        let bucket = u32.toUsize(entry.atom) & (size - 1)
+        entry.hashNext = hash.get(bucket)
+        node.entries.set(i, entry)
+        hash.set(bucket, i)
+        i = i + 1
+      }
+      node.hash = move hash
+    }
+    let mut next = NO_RECORD
+    if node.hash.length() != 0 {
+      let bucket = u32.toUsize(atom) & (node.hash.length() - 1)
+      next = node.hash.get(bucket)
+      node.hash.set(bucket, count)
+    }
+    // All fallible reservations precede the new owned atom edge.
+    run node.entries.append(RecordEntry { atom: atom, record: index, hashNext: next })
+    drop node
+    let mut anchor = ()
+    let rt = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, self.runtime)
+    let _retained = rt.atoms.duplicate(atom)
+    drop rt
+    run self.nodes.append(ParseRecord.empty())
+    return index
+  }
+}
+
+// Owns one parsed value edge and, when requested, an independently retained
+// record graph. takeValue/takeRecords transfer each ownership independently.
+// destroy releases whatever has not been transferred, and is idempotent.
+pub struct ParsedJson<'src> {
+  runtime: *mut HeapHeader,
+  rootValue: Value,
+  sourceRecords: Option<JsonParseRecords<'src>>
+}
+impl<'src> ParsedJson<'src> {
+  pub fn value(self: &Self) -> ValueBits { return self.rootValue.view() }
+  pub fn records(self: &Self) -> &Option<JsonParseRecords<'src>> { return &self.sourceRecords }
+  pub fn takeValue(self: &mut Self) -> Value { return Intrinsic.replace(self.rootValue, Value.immediate(ValueBits.Undefined)) }
+  pub fn takeRecords(self: &mut Self) -> Option<JsonParseRecords<'src>> {
+    return Intrinsic.replace(self.sourceRecords, Option<JsonParseRecords<'src>>.none())
+  }
+  pub unsafe fn destroy<H: HeapHooks>(self: &mut Self, hooks: &mut H) -> () {
+    let value = self.takeValue()
+    unsafe value.release(&mut hooks, self.runtime)
+    match &mut self.sourceRecords {
+      Option<JsonParseRecords<'src>>.Some { value: records } => { unsafe records.destroy(&mut hooks) }
+      Option<JsonParseRecords<'src>>.None => ()
+    }
+    self.sourceRecords = Option<JsonParseRecords<'src>>.none()
+  }
+}
+
+// runtime caches realm.runtime(), so the parser reaches runtime state without
+// going through the context on every token.
+struct JsonParser<'src, 'r> {
+  lexer: Lexer<'src>, token: Token, runtime: *mut HeapHeader,
+  realm: Realm<'r>, filename: StringOwner, records: JsonParseRecords<'src>,
+  // Set by advanceKey when the key token was read as an atom.
+  key: OwnedAtom,
+  // A lexical failure waits in a TOK_ERROR token until the grammar reads it,
+  // as V8 decides by the token's first character before scanning it.
+  lexError: LexError
+}
+/// A lexer failure caught without wrapping each token in a Result (see js_caught).
+struct LexFailed { error: LexError | BigIntError | OutOfMemoryError | StringLengthError }
+effect fn lexFailed(error: LexError | BigIntError | OutOfMemoryError | StringLengthError) -> LexFailed {
+  return LexFailed { error: move error }
+}
+impl<'src, 'r> JsonParser<'src, 'r> {
+  fn runtimeState<'b, A>(self: &Self, owner: &'b mut A) -> &'b mut RuntimeState {
+    return unsafe HeapCell.payloadMut<RuntimeState, A>(&mut owner, self.runtime)
+  }
+  fn stackOverflow(self: &Self) -> bool { return unsafe checkStackOverflow(self.runtime, currentFrameAddress(), 0, true) }
+  effect fn diagnostic<T>(self: &mut Self, message: DiagnosticMessage, offset: usize) -> T
+    ! SyntaxError | OutOfMemoryError | StringLengthError ? &mut Allocator {
+    let location = self.lexer.location(offset)
+    fail run message.error(self.filename.get(), offset, location)
+  }
+  // Messages follow V8's JsonParser::ReportUnexpectedToken (json-parser.cc):
+  // positions and columns count UTF-16 units, lines end at \r, \n and \r\n.
+  effect fn positioned<T>(self: &mut Self, text: &[u8], offset: usize, inJson: bool) -> T
+    ! SyntaxError | OutOfMemoryError | StringLengthError ? &mut Allocator {
+    let source = self.lexer.sourceBytes()
+    let mut bounded = offset
+    if bounded > source.length { bounded = source.length }
+    let mut position: usize = 0
+    let mut line: usize = 1
+    let mut lineStart: usize = 0
+    let mut i: usize = 0
+    while i < bounded {
+      let mut b = source[i]
+      if b == 13 && i + 1 < bounded && source[i + 1] == 10 { i = i + 1 position = position + 1 b = 10 }
+      position = position + utf16Units(b)
+      i = i + 1
+      if b == 13 || b == 10 { line = line + 1 lineStart = position }
+    }
+    let mut message = DiagnosticMessage.make()
+    message.append(text)
+    if inJson { message.append(b" in JSON") }
+    message.append(b" at position ") appendDecimal(&mut message, position)
+    message.append(b" (line ") appendDecimal(&mut message, line)
+    message.append(b" column ") appendDecimal(&mut message, position - lineStart + 1) message.append(b")")
+    return run self.diagnostic<T>(move message, offset)
+  }
+  effect fn endOfInput<T>(self: &mut Self) -> T
+    ! SyntaxError | OutOfMemoryError | StringLengthError ? &mut Allocator {
+    let mut message = DiagnosticMessage.make() message.append(b"Unexpected end of JSON input")
+    let offset = self.lexer.sourceBytes().length
+    return run self.diagnostic<T>(move message, offset)
+  }
+  // The character at offset, quoted with up to ten units of source on each side.
+  effect fn unexpectedToken<T>(self: &mut Self, offset: usize) -> T
+    ! SyntaxError | OutOfMemoryError | StringLengthError ? &mut Allocator {
+    let source = self.lexer.sourceBytes()
+    if offset >= source.length { return run self.endOfInput<T>() }
+    let mut message = DiagnosticMessage.make()
+    if isSpecialSource(source) {
+      message.append(b"\"") message.append(source) message.append(b"\" is not valid JSON")
+      return run self.diagnostic<T>(move message, offset)
+    }
+    let end = decode(source, offset).end
+    message.append(b"Unexpected token '") message.append(Slice.view(source, offset, end - offset)) message.append(b"', ")
+    let total = unitsBefore(source, source.length)
+    let position = unitsBefore(source, offset)
+    if total < 2 * JSON_CONTEXT_UNITS + 1 {
+      message.append(b"\"") message.append(source) message.append(b"\"")
+    } else if position < JSON_CONTEXT_UNITS {
+      let last = byteAtUnit(source, position + JSON_CONTEXT_UNITS)
+      message.append(b"\"") message.append(Slice.view(source, 0, last)) message.append(b"\"...")
+    } else if position < total - JSON_CONTEXT_UNITS {
+      let first = byteAtUnit(source, position - JSON_CONTEXT_UNITS)
+      let last = byteAtUnit(source, position + JSON_CONTEXT_UNITS)
+      message.append(b"...\"") message.append(Slice.view(source, first, last - first)) message.append(b"\"...")
+    } else {
+      let first = byteAtUnit(source, position - JSON_CONTEXT_UNITS)
+      message.append(b"...\"") message.append(Slice.view(source, first, source.length - first)) message.append(b"\"")
+    }
+    message.append(b" is not valid JSON")
+    return run self.diagnostic<T>(move message, offset)
+  }
+  effect fn lexFailure<T>(self: &mut Self) -> T
+    ! SyntaxError | OutOfMemoryError | StringLengthError ? &mut Allocator {
+    let e = self.lexError
+    if e.message == "Unexpected end of JSON input" { return run self.endOfInput<T>() }
+    if e.message == "Unexpected token '%c'" || e.message == "Invalid or unexpected token" {
+      return run self.unexpectedToken<T>(e.offset)
+    }
+    return run self.positioned<T>(Intrinsic.stringUtf8Bytes(e.message), e.offset, true)
+  }
+  // Punctuators are most tokens: they rewrite the current token in place, and only
+  // a token with a payload releases the lexer's strings. Everything else is out of line.
+  @inlineAlways
+  effect fn advance(self: &mut Self) -> ()
+    ! OutOfMemoryError | StringLengthError | BigIntError | SyntaxError | ParserStackOverflow ? &mut Allocator {
+    if self.stackOverflow() { fail ParserStackOverflow {} }
+    let punctuator = self.lexer.jsonPunctuator()
+    if punctuator != 0 {
+      let empty = match &self.token.payload { TokenPayload.Empty => true _ => false }
+      if !empty { self.token.payload = TokenPayload.Empty self.lexer.releaseStrings() }
+      self.token.kind = punctuator
+      self.token.start = self.lexer.offset - 1
+      self.token.end = self.lexer.offset
+      self.token.gotLineFeed = self.lexer.gotLineFeed
+      return ()
+    }
+    return run self.lexToken()
+  }
+  @inlineNever
+  effect fn lexToken(self: &mut Self) -> ()
+    ! OutOfMemoryError | StringLengthError | BigIntError | SyntaxError | ParserStackOverflow ? &mut Allocator {
+    // The current token's value is read: the lexer keeps only the next one's.
+    self.lexer.releaseStrings()
+    let unit = self.lexer.jsonUnitString()
+    if unit >= 0 {
+      // One-unit strings share the runtime's cached cell instead of allocating.
+      let value = run self.lexer.holdString(StringOwner.adopt(run unsafe unitStrings.unit(self.runtime, i32.toU32(unit))))
+      let mut token = Token { kind: tok.TOK_STRING, start: self.lexer.offset - 3, end: self.lexer.offset,
+        gotLineFeed: false, payload: TokenPayload.String { value: value, separator: 34 } }
+      token.gotLineFeed = self.lexer.gotLineFeed
+      self.token = move token
+      return ()
+    }
+    let mut anchor = ()
+    let rt = self.runtimeState(&mut anchor)
+    let result = run Intrinsic.catchFailure<LexError | BigIntError | OutOfMemoryError | StringLengthError>(
+      self.lexer.next(&mut rt.atoms), lexFailed)
+    drop rt
+    match move result {
+      Token value => { self.token = move value }
+      LexFailed { error } => {
+        match move error {
+          LexError e => {
+            let empty = match &self.token.payload { TokenPayload.Empty => true _ => false }
+            if !empty { self.token.payload = TokenPayload.Empty self.lexer.releaseStrings() }
+            // The failed token starts after the JSON whitespace past the last one.
+            let source = self.lexer.sourceBytes()
+            let mut start = self.token.end
+            while start < e.offset && isJsonSpace(source[start]) { start = start + 1 }
+            self.token.kind = tok.TOK_ERROR
+            self.token.start = start
+            self.token.end = e.offset
+            self.lexError = e
+            return ()
+          }
+          BigIntError e => { fail move e }
+          OutOfMemoryError e => { fail move e }
+          StringLengthError e => { fail move e }
+        }
+      }
+    }
+  }
+  // Advances to a token that is usually a property name. Interned plain keys
+  // skip the token string; the atom waits in self.key for propertyName.
+  effect fn advanceKey(self: &mut Self) -> ()
+    ! OutOfMemoryError | StringLengthError | BigIntError | SyntaxError | ParserStackOverflow ? &mut Allocator {
+    let mut anchor = ()
+    let rt = self.runtimeState(&mut anchor)
+    let key = self.lexer.plainJsonKey(&rt.atoms)
+    drop rt
+    if key.atom == 0 { return run self.advance() }
+    let empty = match &self.token.payload { TokenPayload.Empty => true _ => false }
+    if !empty { self.token.payload = TokenPayload.Empty self.lexer.releaseStrings() }
+    self.token.kind = tok.TOK_STRING
+    self.token.start = key.start
+    self.token.end = key.end
+    self.token.gotLineFeed = false
+    self.key = unsafe OwnedAtom.adopt(self.runtime, key.atom)
+  }
+  effect fn expect(self: &mut Self, kind: i32, text: &[u8]) -> ()
+    ! OutOfMemoryError | StringLengthError | BigIntError | SyntaxError | ParserStackOverflow ? &mut Allocator {
+    if self.token.kind != kind {
+      let offset = self.token.start
+      return run self.positioned<()>(text, offset, true)
+    }
+    run self.advance()
+  }
+  effect fn propertyName(self: &mut Self, first: bool) -> OwnedAtom
+    ! OutOfMemoryError | StringLengthError | SyntaxError ? &mut Allocator {
+    if self.key.get() != 0 { return unsafe OwnedAtom.adopt(self.runtime, self.key.take()) }
+    match &self.token.payload {
+      TokenPayload.String { value: index, .. } => {
+        let value = self.lexer.heldValue(index)
+        let mut anchor = ()
+        let rt = self.runtimeState(&mut anchor)
+        let atom = run rt.atoms.intern(value)
+        return unsafe OwnedAtom.adopt(self.runtime, atom)
+      }
+      _ => ()
+    }
+    if self.lexer.context.extendedJson && self.token.kind == tok.TOK_IDENT {
+      return unsafe OwnedAtom.duplicate(self.runtime, self.token.atom())
+    }
+    let offset = self.token.start
+    if self.token.kind == tok.TOK_ERROR {
+      let c = self.lexer.sourceBytes()[offset]
+      if c == 34 || (c == 39 && self.lexer.context.extendedJson) { return run self.lexFailure<OwnedAtom>() }
+    }
+    if first { return run self.positioned<OwnedAtom>(b"Expected property name or '}'", offset, true) }
+    return run self.positioned<OwnedAtom>(b"Expected double-quoted property name", offset, true)
+  }
+}
+
+fn objectReference(value: ValueBits) -> *mut HeapHeader {
+  return match value { ValueBits.Object { reference } => reference _ => invalidObject() }
+}
+fn invalidObject() -> never { return Intrinsic.trap("QuickJS invariant violated") }
+struct FailedAdd { error: OutOfMemoryError }
+effect fn failedAdd(error: OutOfMemoryError) -> FailedAdd { return FailedAdd { error: move error } }
+// Only fresh ordinary objects: no accessor/proxy/prototype-setter dispatch.
+// Consumes incoming on every path. Duplicate definitions preserve slot order.
+effect fn defineProperty<'v, H: HeapHooks>(s: &JsonParser<'_, '_>, hooks: &mut H,
+  object: ValueRef<'v>, key: u32, incoming: ValueBits) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut anchor = ()
+  let data = ObjectRef.of(object).dataMut(&mut anchor)
+  match unsafe shapes.lookup(data.shape, key) {
+    Option<usize>.Some { value: index } => {
+      let old = unsafe data.slot(index).retire(unsafe shapes.slotFlags(data.shape, index))
+      data.setSlot(index, SlotBits.value(incoming))
+      drop data
+      unsafe gc.releaseProperty(&mut hooks, s.runtime, old)
+    }
+    Option<usize>.None => {
+      let result = run Intrinsic.catchFailure<OutOfMemoryError>(
+        unsafe shapes.addProperty(s.runtime, &mut data, key, u32.toU8(JS_PROP_C_W_E)), failedAdd)
+      match move result {
+        shapes.AddResult value => {
+          data.setSlot(value.index, SlotBits.value(incoming))
+          drop data
+          unsafe gc.releaseOptional(&mut hooks, s.runtime, value.retiredShape)
+        }
+        FailedAdd { error } => {
+          drop data unsafe gc.release(&mut hooks, s.runtime, incoming) fail move error
+        }
+      }
+    }
+  }
+}
+
+// V8's kMaxContextCharacters: source shown on each side of an unexpected token.
+const JSON_CONTEXT_UNITS: usize = 10
+fn isJsonSpace(b: u8) -> bool { return b == 32 || b == 9 || b == 10 || b == 13 }
+fn utf16Units(b: u8) -> usize {
+  if (b & 0xc0) == 0x80 { return 0 }
+  if b >= 0xf0 { return 2 }
+  return 1
+}
+fn unitsBefore(source: &[u8], end: usize) -> usize {
+  let mut units: usize = 0
+  let mut i: usize = 0
+  while i < end { units = units + utf16Units(source[i]) i = i + 1 }
+  return units
+}
+// The first character boundary at or after UTF-16 unit index units.
+fn byteAtUnit(source: &[u8], units: usize) -> usize {
+  let mut counted: usize = 0
+  let mut i: usize = 0
+  while i < source.length {
+    if utf16Units(source[i]) != 0 {
+      if counted >= units { return i }
+      counted = counted + utf16Units(source[i])
+    }
+    i = i + 1
+  }
+  return source.length
+}
+// V8 IsSpecialString: what JSON.parse sees for undefined, NaN, Infinity and {}.
+fn isSpecialSource(source: &[u8]) -> bool {
+  return sameBytes(source, b"undefined") || sameBytes(source, b"NaN") || sameBytes(source, b"Infinity")
+    || sameBytes(source, b"[object Object]")
+}
+fn sameBytes(a: &[u8], b: &[u8]) -> bool {
+  if a.length != b.length { return false }
+  let mut i: usize = 0
+  while i < a.length { if a[i] != b[i] { return false } i = i + 1 }
+  return true
+}
+// V8 scans true, false and null by comparing characters: an identifier that
+// starts like one fails where it stops matching.
+fn literalMismatch(source: &[u8], start: usize) -> usize {
+  let c = source[start]
+  let mut literal: &[u8] = b""
+  if c == 116 { literal = b"true" } else if c == 102 { literal = b"false" } else if c == 110 { literal = b"null" }
+  let mut i: usize = 0
+  while i < literal.length {
+    if start + i >= source.length || source[start + i] != literal[i] { return start + i }
+    i = i + 1
+  }
+  return start + literal.length
+}
+fn appendDecimal(message: &mut DiagnosticMessage, value: usize) -> () {
+  let mut digits: [u8; 20] = [0; 20]
+  let mut count: usize = 0
+  let mut rest = value
+  while true {
+    digits[count] = usize.toU8(rest % 10) + 48
+    count = count + 1
+    rest = rest / 10
+    if rest == 0 { break }
+  }
+  while count > 0 { count = count - 1 message.appendCharacter(u8.toI32(digits[count])) }
+}
+
+struct FailedValue { error: OutOfMemoryError | StringLengthError | BigIntError | SyntaxError | ParserStackOverflow }
+effect fn failedValue(error: OutOfMemoryError | StringLengthError | BigIntError | SyntaxError | ParserStackOverflow) -> FailedValue {
+  return FailedValue { error: move error }
+}
+effect fn parseValue<H: HeapHooks>(s: &mut JsonParser<'_, '_>, hooks: &mut H,
+  memory: &AllocationObserver, record: usize) -> ValueBits
+  ! OutOfMemoryError | StringLengthError | BigIntError | SyntaxError | ParserStackOverflow ? &mut Allocator {
+  let mut value = ValueBits.Undefined
+  let result = run Intrinsic.catchFailure<OutOfMemoryError | StringLengthError | BigIntError | SyntaxError | ParserStackOverflow>(
+    parseValueInto(&mut s, &mut hooks, memory, record, &mut value), failedValue)
+  match move result {
+    FailedValue { error } => {
+      unsafe gc.release(&mut hooks, s.runtime, value)
+      fail move error
+    }
+    _ => { return value }
+  }
+}
+effect fn parseValueInto<H: HeapHooks>(s: &mut JsonParser<'_, '_>, hooks: &mut H,
+  memory: &AllocationObserver, record: usize, value: &mut ValueBits) -> ()
+  ! OutOfMemoryError | StringLengthError | BigIntError | SyntaxError | ParserStackOverflow ? &mut Allocator {
+  if s.stackOverflow() { fail ParserStackOverflow {} }
+  if s.token.kind == 123 {
+    run s.advanceKey()
+    value.* = run objects.object(&mut hooks, memory, s.realm)
+    s.records.initialize(record, unsafe lendBits(&value, value.*), JsonRecordKind.Object, 0, 0)
+    if s.token.kind != 125 {
+      let mut first = true
+      while true {
+        let name = run s.propertyName(first)
+        first = false
+        run s.advance()
+        run s.expect(58, b"Expected ':' after property name")
+        let child = run s.records.add(record, name.get())
+        let property = run parseValue(&mut s, &mut hooks, memory, child)
+        run defineProperty(&s.*, &mut hooks, unsafe lendBits(&value, value.*), name.get(), property)
+        if s.token.kind != 44 { break }
+        run s.advanceKey()
+        if s.lexer.context.extendedJson && s.token.kind == 125 { break }
+      }
+    }
+    run s.expect(125, b"Expected ',' or '}' after property value")
+    return ()
+  }
+  if s.token.kind == 91 {
+    run s.advance()
+    value.* = run objects.array(&mut hooks, memory, s.realm)
+    s.records.initialize(record, unsafe lendBits(&value, value.*), JsonRecordKind.Array, 0, 0)
+    if s.token.kind != 93 {
+      while true {
+        let child = run s.records.add(record, 0)
+        let element = run parseValue(&mut s, &mut hooks, memory, child)
+        let accepted = run unsafe arrays.appendFastElement(&mut hooks, s.realm, objectReference(value.*), element)
+        // The new private array has an unmodified writable length descriptor.
+        if accepted != StorageOutcome.Accepted { return invalidObject() }
+        if s.token.kind != 44 { break }
+        run s.advance()
+        if s.lexer.context.extendedJson && s.token.kind == 93 { break }
+      }
+    }
+    run s.expect(93, b"Expected ',' or ']' after array element")
+    return ()
+  }
+  let mut primitive = false
+  let mut accepted = true
+  match &s.token.payload {
+    TokenPayload.String { value: string, .. } => { value.* = unsafe s.lexer.heldValue(string).retained() primitive = true }
+    TokenPayload.Number { value: number } => { value.* = ValueBits.number(number) primitive = true }
+    _ => {
+      if s.token.kind == tok.TOK_IDENT {
+        let name = s.token.atom()
+        if name == atoms.JS_ATOM_false || name == atoms.JS_ATOM_true {
+          value.* = ValueBits.Bool { value: name == atoms.JS_ATOM_true } primitive = true
+        } else if name == atoms.JS_ATOM_null { value.* = ValueBits.Null primitive = true }
+        else if name == atoms.JS_ATOM_NaN && s.lexer.context.extendedJson {
+          value.* = ValueBits.Float64 { value: f64.fromBits(0x7ff8000000000000) }
+        } else if name == atoms.JS_ATOM_Infinity && s.lexer.context.extendedJson {
+          value.* = ValueBits.Float64 { value: f64.fromBits(0x7ff0000000000000) }
+        } else { accepted = false }
+      } else { accepted = false }
+    }
+  }
+  if !accepted {
+    if s.token.kind == tok.TOK_EOF { return run s.endOfInput<()>() }
+    if s.token.kind == tok.TOK_ERROR { return run s.lexFailure<()>() }
+    let mut offset = s.token.start
+    if s.token.kind == tok.TOK_IDENT { offset = literalMismatch(s.lexer.sourceBytes(), offset) }
+    return run s.unexpectedToken<()>(offset)
+  }
+  // As in the pinned source, bare extended NaN/Infinity identifiers leave the
+  // record Empty/Undefined. Signed numeric forms have ordinary primitive spans.
+  if primitive {
+    s.records.initialize(record, unsafe lendBits(&value, value.*), JsonRecordKind.Primitive, s.token.start, s.lexer.offset - s.token.start)
+  }
+  run s.advance()
+}
+
+effect fn parseDocument<H: HeapHooks>(s: &mut JsonParser<'_, '_>, hooks: &mut H,
+  memory: &AllocationObserver, captureRecords: bool, value: &mut ValueBits) -> ()
+  ! OutOfMemoryError | StringLengthError | BigIntError | SyntaxError | ParserStackOverflow ? &mut Allocator {
+  run s.advance()
+  let mut record = NO_RECORD
+  if captureRecords { run s.records.nodes.append(ParseRecord.empty()) record = 0 }
+  value.* = run parseValue(&mut s, &mut hooks, memory, record)
+  if s.token.kind != tok.TOK_EOF {
+    let offset = s.token.start
+    return run s.positioned<()>(b"Unexpected non-whitespace character after JSON", offset, false)
+  }
+}
+
+// JS_ParseJSON3: filename is a borrowed string ValueBits, source is borrowed UTF-8.
+// Success transfers owned value/records; all failures clean every acquired edge.
+// Lexical failures become SyntaxError with filename and one-based coordinates.
+// No FunctionDef, bytecode compiler state, reviver, or intrinsic fallback is used.
+pub effect fn parse<'a, 'b, 'src, H: HeapHooks>(hooks: &mut H, memory: &AllocationObserver,realm: Realm<'a>, source: &'src [u8], filename: ValueRef<'b>,
+  extended: bool, captureRecords: bool) -> ParsedJson<'src>
+  ! OutOfMemoryError | StringLengthError | BigIntError | SyntaxError | ParserStackOverflow ? &mut Allocator {
+  let runtime = realm.runtime()
+  let mut s = JsonParser { lexer: Lexer.make(source, LexicalContext.jsonSource(extended)),
+    token: Token.empty(32, 0, 0), runtime: runtime, realm: realm,
+    filename: StringOwner.borrowed(filename.view()), records: JsonParseRecords.make(runtime, source),
+    key: OwnedAtom.none(), lexError: LexError.at(0, "") }
+  let mut value = ValueBits.Undefined
+  let result = run Effect.result(parseDocument(&mut s, &mut hooks, memory, captureRecords, &mut value))
+  match move result {
+    Result<(), OutOfMemoryError | StringLengthError | BigIntError | SyntaxError | ParserStackOverflow>.Success { .. } => {
+      let records = Intrinsic.replace(s.records, JsonParseRecords.make(runtime, source))
+      let mut captured = Option<JsonParseRecords<'src>>.none()
+      if captureRecords { captured = Option<JsonParseRecords<'src>>.some(move records) }
+      return ParsedJson { runtime: runtime, rootValue: unsafe Value.adoptBits(value), sourceRecords: move captured }
+    }
+    Result<(), OutOfMemoryError | StringLengthError | BigIntError | SyntaxError | ParserStackOverflow>.Failure { error } => {
+      unsafe s.records.destroy(&mut hooks)
+      unsafe gc.release(&mut hooks, runtime, value)
+      fail move error
+    }
+  }
+}
+// JS_ParseJSON2 / JS_ParseJSON wrappers return the single owned parsed edge.
+pub effect fn parseJSON2<'a, 'b, H: HeapHooks>(hooks: &mut H, memory: &AllocationObserver,realm: Realm<'a>, source: &[u8], filename: ValueRef<'b>, flags: i32) -> Value
+  ! OutOfMemoryError | StringLengthError | BigIntError | SyntaxError | ParserStackOverflow ? &mut Allocator {
+  let mut parsed = run parse(&mut hooks, memory, realm, source, filename, (flags & JS_PARSE_JSON_EXT) != 0, false)
+  return parsed.takeValue()
+}
+pub effect fn parseJSON<'a, 'b, H: HeapHooks>(hooks: &mut H, memory: &AllocationObserver,realm: Realm<'a>, source: &[u8], filename: ValueRef<'b>) -> Value
+  ! OutOfMemoryError | StringLengthError | BigIntError | SyntaxError | ParserStackOverflow ? &mut Allocator {
+  return run parseJSON2(&mut hooks, memory, realm, source, filename, 0)
+}

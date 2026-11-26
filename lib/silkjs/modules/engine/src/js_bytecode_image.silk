@@ -1,0 +1,226 @@
+//! Scripts compiled ahead of time: a launch that parses nothing.
+//!
+//! An embedder that ships a fixed bundle (a UI app's JavaScript) compiles it once,
+//! when the app is built, into an image: the bytecode of every function in the
+//! bundle, the ones a launch never calls included. At launch it hands the image's
+//! bytes to evaluate (or load) in place of the bundle's text.
+//!
+//!   build time   let image = run image.write(&mut engine, memory, realm, source, b"app.js", TYPE_GLOBAL)
+//!                // store image.asSlice() beside the app, or embed it in the executable
+//!   launch       if image.loadable(bytes) { run unsafe image.evaluate(&mut engine, memory, realm, data, length) }
+//!                else { run evaluation.evaluate(&mut engine, memory, realm, source, b"app.js", TYPE_GLOBAL) }
+//!
+//! The shell does both: `--write-image app.bin app.js` and `--image app.bin`.
+//!
+//! Loading reads only what the top level needs. Each function's variables, code
+//! and constants stay in the image's bytes until the function is first called
+//! (js_binary_object_reader.DEFER), so a function never called costs a stub, and
+//! the bytes must stay readable and unchanged until the runtime is destroyed:
+//! embed them, map them, or keep the buffer for the life of the process.
+//!
+//! A module's import.meta is the embedder's to fill, as after any compile: load
+//! the image, set it on the module, then evaluation.evaluateFunction (the shell
+//! does; evaluate() here leaves it empty).
+//!
+//! An image carries its script's text once, for Function.prototype.toString and
+//! stack traces: scripts see no difference from an evaluate of the source.
+//!
+//! Layout, integers LE u64: "SILKJSBI", identity(), the payload's length, then
+//! the payload in the code-cache wire (js_binary_object_writer, BYTECODE | LAZY |
+//! DEFER). An image is tied to the engine build that wrote it: identity() covers
+//! the opcode and predefined-atom tables the wire refers to by number, and FORMAT
+//! is raised by hand when compiled code changes meaning without changing those.
+//! Images are trusted: only the embedder's own build writes them, and loadable
+//! turns away one from another engine build, never a corrupted one.
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.effect { Effect }
+import silk.core.result { Result }
+import silk.core.option { Option }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.mem.pointer { Pointer }
+import silk.num.u8
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+import js_heap { CellRef, HeapCell }
+import js_value { ValueBits }
+import js_owned_value { Value }
+import js_realm { Realm }
+import js_engine { Engine }
+import js_engine_host { EngineServices }
+import js_exceptions { JsException }
+import js_coercion_host { CoercionHooks }
+import js_core_types { ModuleDef, NativeErrorKind, RuntimeState, FunctionBytecode, FunctionDebugInfo }
+import js_compiler_finish as finish
+import js_string_types { StringLengthError }
+import runtime_memory { AllocationObserver }
+import byte_buffer { readU64 }
+import js_atom_data as atoms
+import js_opcode_data as opcodes
+import js_binary_object_reader as reader
+import js_binary_object_writer as writer
+import js_eval as evaluation
+import js_eval_compile as compile
+import js_eval_errors as errors
+import js_module_loader as loader
+import js_gc as gc
+
+const MAGIC: &'static [u8] = b"SILKJSBI"
+/// Raised when compiled code changes meaning with the same opcode and atom tables.
+const FORMAT: u64 = 1
+const HEADER: usize = 24
+
+fn mix(hash: u64, bytes: &[u8]) -> u64 {
+  let mut h = u64.wrappingMultiply(hash ^ usize.toU64(bytes.length), 0x9e3779b97f4a7c15)
+  let mut index: usize = 0
+  while index < bytes.length {
+    h = u64.wrappingMultiply(h ^ u8.toU64(bytes[index]), 0x100000001b3)
+    index = index + 1
+  }
+  return h ^ u64.shiftRight(h, 29)
+}
+/// What an image must have been written with to load here: the format, and every
+/// opcode and predefined atom by number, name and size.
+pub fn identity() -> u64 {
+  let mut h: u64 = u64.wrappingMultiply(FORMAT, 0xff51afd7ed558ccd)
+  let mut opcode: usize = 0
+  while opcode < opcodes.OP_COUNT {
+    let code = usize.toU8(opcode)
+    h = mix(h, opcodes.opcodeName(code, true))
+    h = mix(h, opcodes.opcodeName(code, false))
+    h = u64.wrappingMultiply(h ^ u8.toU64(opcodes.opcodeInfo(code, true).size), 0x9e3779b97f4a7c15)
+    opcode = opcode + 1
+  }
+  let mut atom: u32 = 1
+  while atom < atoms.JS_ATOM_END {
+    h = mix(h, atoms.atomName(atom))
+    atom = atom + 1
+  }
+  return h
+}
+effect fn quad(bytes: &mut List<u8>, value: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut i: u64 = 0
+  while i < 8 { run bytes.append(u64.wrappingToU8(u64.shiftRight(value, i * 8))) i = i + 1 }
+}
+/// Whether bytes is an image this engine build can load.
+pub fn loadable(bytes: &[u8]) -> bool {
+  if bytes.length <= HEADER || Slice.view(bytes, 0, 8) != MAGIC { return false }
+  return readU64(bytes, 8) == identity() && readU64(bytes, 16) == usize.toU64(bytes.length - HEADER)
+}
+/// Compiles source, a global script (compile.TYPE_GLOBAL) or a module
+/// (compile.TYPE_MODULE; its imports must resolve in realm), into an image.
+/// Every function is compiled, whatever the realm would leave for a first call.
+pub effect fn write<'a, 'm, S: EngineServices>(engine: &mut Engine<'m, S>, memory: &AllocationObserver, realm: Realm<'a>,
+  source: &[u8], filename: &[u8], flags: i32) -> List<u8> ! JsException ? &mut Allocator {
+  let kind = flags & compile.TYPE_MASK
+  if kind != compile.TYPE_GLOBAL && kind != compile.TYPE_MODULE {
+    return run CoercionHooks.throwError(&mut engine, realm, NativeErrorKind.Type, b"an image holds a global script or a module")
+  }
+  let compiled = run evaluation.evaluate(&mut engine, memory, realm, source, filename,
+    (flags & ~compile.FLAG_LAZY_BODIES) | compile.FLAG_COMPILE_ONLY)
+  let written = run Effect.result(writer.writeObject(&mut engine, realm, compiled.borrow(),
+    writer.JS_WRITE_OBJ_BYTECODE | writer.JS_WRITE_OBJ_LAZY | writer.JS_WRITE_OBJ_DEFER))
+  realm.release(&mut engine, move compiled)
+  let payload = match move written {
+    Result<List<u8>, JsException>.Success { value } => move value
+    Result<List<u8>, JsException>.Failure { error } => { fail move error }
+  }
+  let assembled = run Effect.result(assemble(payload.asSlice()))
+  return match move assembled {
+    Result<List<u8>, OutOfMemoryError>.Success { value } => move value
+    Result<List<u8>, OutOfMemoryError>.Failure { error } => run errors.materialize<List<u8>, Engine<'m, S>>(&mut engine, realm, move error)
+  }
+}
+effect fn assemble(payload: &[u8]) -> List<u8> ! OutOfMemoryError ? &mut Allocator {
+  let mut bytes = List<u8>.make()
+  run bytes.reserveExact(HEADER + payload.length)
+  run bytes.appendSlice(MAGIC)
+  run quad(&mut bytes, identity())
+  run quad(&mut bytes, usize.toU64(payload.length))
+  run bytes.appendSlice(payload)
+  return move bytes
+}
+/// The compiled script or module of the image at data: what an evaluate of its
+/// source with FLAG_COMPILE_ONLY returns, with nothing parsed. Throws a TypeError
+/// for bytes that are not loadable.
+///
+/// Safety: the length bytes at data stay readable and unchanged until the
+/// runtime is destroyed; they are an image this embedder's build wrote.
+pub unsafe effect fn load<'a, 'm, S: EngineServices>(engine: &mut Engine<'m, S>, realm: Realm<'a>,
+  data: *const u8, length: usize) -> Value ! JsException ? &mut Allocator {
+  return run unsafe loadNamed(&mut engine, realm, data, length, b"")
+}
+/// Gives a decoded script or module the file name `name`: its functions' (the ones
+/// still in the image's bytes take it when a call reads them) and, for a module,
+/// the name its imports resolve from.
+unsafe effect fn rename<'a, 'm, S: EngineServices>(engine: &mut Engine<'m, S>, realm: Realm<'a>, value: ValueBits, name: &[u8])
+  -> () ! OutOfMemoryError | StringLengthError ? &mut Allocator {
+  let mut anchor = ()
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, realm.runtime())
+  let atom = run state.atoms.internUtf8(name)
+  let code = match value {
+    ValueBits.Module { reference } => {
+      let mut moduleAnchor = ()
+      let module = unsafe HeapCell.payloadMut<ModuleDef, ()>(&mut moduleAnchor, reference)
+      let previous = Intrinsic.replace(module.name, state.atoms.duplicate(atom))
+      let function = module.functionObject.view() drop module
+      state.atoms.release(previous)
+      function
+    }
+    _ => value
+  }
+  if let ValueBits.FunctionBytecode { reference } = code {
+    let mut codeAnchor = ()
+    let top = unsafe HeapCell.payloadMut<FunctionBytecode, ()>(&mut codeAnchor, reference)
+    if let Option<FunctionDebugInfo>.Some { value: debug } = &mut top.debug {
+      let previous = Intrinsic.replace(debug.filename, state.atoms.duplicate(atom))
+      state.atoms.release(previous)
+    }
+    drop top
+    unsafe finish.spreadHostDebug(&mut state, reference, finish.HostDebug { filename: atom, nodeVm: false, nodeSourceURL: false,
+      lineOffset: 0, columnOffset: 0, sourceColumnOffset: 0 })
+  }
+  state.atoms.release(atom)
+}
+/// load, for an image whose script runs under another name than it was written
+/// with: an app's bundle is named by where the app is installed, which the build
+/// that wrote its image did not know. An empty name keeps the image's own.
+///
+/// Safety: as for load.
+pub unsafe effect fn loadNamed<'a, 'm, S: EngineServices>(engine: &mut Engine<'m, S>, realm: Realm<'a>,
+  data: *const u8, length: usize, name: &[u8]) -> Value ! JsException ? &mut Allocator {
+  let held = ()
+  if length == 0 || !loadable(unsafe Pointer.borrowMany<(), u8>(&held, unsafe Pointer.assumeMany<u8>(data), length)) {
+    return run CoercionHooks.throwError(&mut engine, realm, NativeErrorKind.Type, b"not a bytecode image of this engine build")
+  }
+  let payload = unsafe Pointer.at<u8>(unsafe Pointer.assumeMany<u8>(data), HEADER)
+  let value = run reader.readObjectTrusted(&mut engine, realm, payload, length - HEADER,
+    reader.BYTECODE | reader.LAZY | reader.DEFER | reader.LEND_TEXT)
+  if name.length != 0 {
+    let renamed = run Effect.result(unsafe rename(&mut engine, realm, value, name))
+    if let Result<(), OutOfMemoryError | StringLengthError>.Failure { error } = move renamed {
+      if let ValueBits.Module { reference } = value { unsafe gc.detachModule(&mut engine, realm.runtime(), reference) }
+      unsafe gc.release(&mut engine, realm.runtime(), value)
+      return unsafe Value.adoptBits(run errors.materialize<ValueBits, Engine<'m, S>>(&mut engine, realm, move error))
+    }
+  }
+  if let ValueBits.Module { reference } = value {
+    // A decoded module comes back unresolved, as a bundled one does.
+    let resolved = run Effect.result(loader.resolveModule(&mut engine, realm, unsafe CellRef<ModuleDef>.of(reference)))
+    if let Result<(), OutOfMemoryError | StringLengthError | JsException>.Failure { error } = move resolved {
+      unsafe gc.releaseHeader(&mut engine, realm.runtime(), reference)
+      return unsafe Value.adoptBits(run errors.materialize<ValueBits, Engine<'m, S>>(&mut engine, realm, move error))
+    }
+  }
+  return unsafe Value.adoptBits(value)
+}
+/// Runs the image at data as evaluation.evaluate runs its source: a script's
+/// completion value, or a module's evaluation promise.
+///
+/// Safety: as for load.
+pub unsafe effect fn evaluate<'a, 'm, S: EngineServices>(engine: &mut Engine<'m, S>, memory: &AllocationObserver, realm: Realm<'a>,
+  data: *const u8, length: usize) -> Value ! JsException ? &mut Allocator {
+  let compiled = run unsafe load(&mut engine, realm, data, length)
+  return run evaluation.evaluateFunction(&mut engine, memory, realm, move compiled)
+}

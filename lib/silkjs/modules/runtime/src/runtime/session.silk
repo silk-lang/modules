@@ -1,0 +1,288 @@
+//! A started runtime, as its driver sees it: the loop in turns, and what an embedder runs in it.
+//!
+//! The executable drives it the way Node's SpinEventLoop does (`turn(-1.0)` until it finishes);
+//! an embedder turns it from its own loop with a bounded wait (see `runtime.embed`).
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.effect { Effect }
+import silk.core.result { Result }
+import silk.io.reactor { Waker }
+import silkjs.js_owned_value { Value, lendFor }
+import silkjs.js_realm { lendRealm }
+import silkjs.js_engine { Engine }
+import silkjs.js_heap { HeapHeader }
+import silkjs.js_value { ValueBits }
+import silkjs.js_exceptions { JsException }
+import silkjs.js_exceptions as exceptions
+import silkjs.js_runtime as runtime
+import silkjs.js_gc as gc
+import silkjs.js_promise as promise
+import silkjs.js_eval as evaluation
+import silkjs.js_bytecode_image as image
+import libs.core.common as common
+import libs.core.host { Services }
+import libs.core.capabilities { Composition }
+import silk.collections.list { List }
+import silk.mem.pointer { Pointer }
+import ext.fs_async
+import ext.module_cache
+import libs.core.modules
+import ext.worker_native
+
+/// What a turn of the loop left.
+pub union Turn {
+  /// The loop has more to do, or (with keep-alive) may get more.
+  Running,
+  /// The loop ended and the runtime ran its exit work: process.exit, or no referenced work left.
+  /// Nothing more runs in it; its driver returns.
+  Finished { pub status: i32 },
+}
+
+/// What runs the loop once the bootstrap has started the program.
+pub interface Driver {
+  /// Turns the loop until the runtime finishes, and returns its exit status.
+  effect fn drive<'e, 'm, C: Composition>(self: &mut Self, runtime: &mut Runtime<'e, 'm, C>) -> i32 ! OutOfMemoryError | JsException ? &mut Allocator
+}
+
+/// The executable's loop, and a worker thread's: Node's SpinEventLoop.
+pub struct NodeLoop {}
+impl Driver for NodeLoop {
+  effect fn drive<'e, 'm, C: Composition>(self: &mut Self, runtime: &mut Runtime<'e, 'm, C>) -> i32 ! OutOfMemoryError | JsException ? &mut Allocator {
+    while true {
+      match run runtime.spin() {
+        Turn.Running => ()
+        Turn.Finished { status } => { return status }
+      }
+    }
+    return 0
+  }
+}
+
+/// A runtime whose bootstrap has run: the loop, turned one pass at a time.
+/// `C` is the capabilities the runtime was started with (`embed.start`).
+pub struct Runtime<'e, 'm, C> {
+  engine: &'e mut Engine<'m, Services<C>>,
+  context: *mut HeapHeader,
+  // Borrowed: the realm keeps it until the driver returns.
+  bootstrap: ValueBits,
+  keepAlive: bool,
+  embedded: bool,
+  started: bool,
+  finished: bool,
+  status: i32,
+}
+
+impl<'e, 'm, C: Composition> Runtime<'e, 'm, C> {
+  pub fn make(engine: &'e mut Engine<'m, Services<C>>, context: *mut HeapHeader, bootstrap: ValueBits, keepAlive: bool, embedded: bool) -> Runtime<'e, 'm, C> {
+    return Runtime { engine: move engine, context: context, bootstrap: bootstrap, keepAlive: keepAlive, embedded: embedded, started: false, finished: false, status: 0 }
+  }
+
+  /// Calls the bootstrap's function `name` and returns what it returned (owned).
+  effect fn call(self: &mut Self, name: &[u8], arguments: &[ValueBits]) -> ValueBits ! JsException ? &mut Allocator {
+    let context = self.context
+    let rt = unsafe runtime.contextRuntime(context)
+    let function = run unsafe common.get(&mut self.engine.*, context, self.bootstrap, name)
+    let called = run Effect.result(promise.call(&mut self.engine.*, unsafe lendRealm(&context, context), unsafe lendFor(function), unsafe lendFor(ValueBits.Undefined), arguments))
+    unsafe gc.release(&mut self.engine.*, rt, function)
+    return match move called {
+      Result<Value, JsException>.Success { value } => value.intoBits()
+      Result<Value, JsException>.Failure { error } => { fail move error }
+    }
+  }
+
+  /// One pass of the loop: timers, a poll for native completions that waits at most
+  /// `milliseconds`, then the immediates. A negative wait polls as the executable does: it
+  /// blocks until the next timer or completion while referenced work is pending.
+  ///
+  /// A turn after the runtime finished does nothing and reports the same status again.
+  pub effect fn turn(self: &mut Self, milliseconds: f64) -> Turn ! OutOfMemoryError | JsException ? &mut Allocator {
+    if self.finished { return Turn.Finished { status: self.status } }
+    if !self.started {
+      self.started = true
+      let started = run self.call(b"loopStart", &[])
+      unsafe gc.release(&mut self.engine.*, unsafe runtime.contextRuntime(self.context), started)
+    }
+    let limit = if milliseconds < 0.0 { ValueBits.Undefined } else { ValueBits.number(milliseconds) }
+    let keepAlive = ValueBits.Bool { value: self.keepAlive }
+    let stepped = run Effect.result(self.call(b"loopStep", &[limit, keepAlive]))
+    let more = match move stepped {
+      Result<ValueBits, JsException>.Success { value } => match value { ValueBits.Bool { value: flag } => flag _ => true }
+      Result<ValueBits, JsException>.Failure { error } => {
+        if !self.ended() { fail move error }
+        drop error
+        return self.finishRequested()
+      }
+    }
+    if more { return Turn.Running }
+    return run self.finish()
+  }
+
+  /// Every turn of the loop, as turn(-1.0) repeated until the runtime finishes, in one call
+  /// into the bootstrap (its loopRun). A worker turns one step per call: its process.exit
+  /// interrupt must unwind straight into this driver, with no bootstrap frame between.
+  pub effect fn spin(self: &mut Self) -> Turn ! OutOfMemoryError | JsException ? &mut Allocator {
+    if self.finished { return Turn.Finished { status: self.status } }
+    if unsafe worker_native.isChild(self.engine.services.workers) { return run self.turn(-1.0) }
+    if !self.started {
+      self.started = true
+      let started = run self.call(b"loopStart", &[])
+      unsafe gc.release(&mut self.engine.*, unsafe runtime.contextRuntime(self.context), started)
+    }
+    let keepAlive = ValueBits.Bool { value: self.keepAlive }
+    let ran = run Effect.result(self.call(b"loopRun", &[keepAlive]))
+    let more = match move ran {
+      Result<ValueBits, JsException>.Success { value } => match value { ValueBits.Bool { value: flag } => flag _ => true }
+      Result<ValueBits, JsException>.Failure { error } => {
+        if !self.ended() { fail move error }
+        drop error
+        return self.finishRequested()
+      }
+    }
+    if more { return Turn.Running }
+    return run self.finish()
+  }
+
+  /// Ends the runtime: 'exit' listeners, then the runtime's exit work, as when its loop ends.
+  /// Returns the exit status (process.exitCode). An embedder calls it when its own work is
+  /// done, such as when its last window closed; a finished runtime returns its status again.
+  pub effect fn finish(self: &mut Self) -> Turn ! OutOfMemoryError | JsException ? &mut Allocator {
+    if self.finished { return Turn.Finished { status: self.status } }
+    if !self.started {
+      self.started = true
+      let started = run self.call(b"loopStart", &[])
+      unsafe gc.release(&mut self.engine.*, unsafe runtime.contextRuntime(self.context), started)
+    }
+    let ended = run Effect.result(self.call(b"loopEnd", &[]))
+    match move ended {
+      Result<ValueBits, JsException>.Success { value } => {
+        self.finished = true
+        self.status = match value { ValueBits.Int { value: status } => status _ => 0 }
+        unsafe gc.release(&mut self.engine.*, unsafe runtime.contextRuntime(self.context), value)
+        return Turn.Finished { status: self.status }
+      }
+      Result<ValueBits, JsException>.Failure { error } => {
+        if !self.ended() { fail move error }
+        drop error
+        return self.finishRequested()
+      }
+    }
+  }
+
+  /// Whether this embedded runtime asked to end (process.exit): its JavaScript is interrupted.
+  fn ended(self: &Self) -> bool {
+    return self.embedded && unsafe worker_native.shouldInterrupt(self.engine.services.workers)
+  }
+
+  /// process.exit in an embedded runtime: the interrupt that unwound the turn is not an error.
+  fn finishRequested(self: &mut Self) -> Turn {
+    let rt = unsafe runtime.contextRuntime(self.context)
+    if unsafe exceptions.has(rt) { let pending = unsafe exceptions.take(rt) unsafe gc.release(&mut self.engine.*, rt, pending) }
+    let workers = unsafe Intrinsic.pointerRequalify<?*mut worker_native.State, *mut worker_native.State>(self.engine.services.workers)
+    self.finished = true
+    self.status = unsafe worker_native.exitCode(workers, 0)
+    return Turn.Finished { status: self.status }
+  }
+
+  /// Whether the runtime finished.
+  pub fn isFinished(self: &Self) -> bool { return self.finished }
+
+  /// Milliseconds until the loop has work to run: 0 when JavaScript is ready, the delay to the
+  /// next timer, or -1 when only a native completion can bring work, which ends a wait itself.
+  pub effect fn timeout(self: &mut Self) -> f64 ! OutOfMemoryError | JsException ? &mut Allocator {
+    if self.finished { return -1.0 }
+    let value = run self.call(b"loopTimeout", &[])
+    let milliseconds = if value.isNumber() { value.numericValue() } else { -1.0 }
+    unsafe gc.release(&mut self.engine.*, unsafe runtime.contextRuntime(self.context), value)
+    return milliseconds
+  }
+
+  /// A waker that ends the current or next wait of a turn, from any thread. A host whose own
+  /// events arrive on another thread wakes the runtime with it and turns it again.
+  pub fn waker(self: &Self) -> Waker {
+    let io = unsafe Intrinsic.pointerRequalify<?*mut fs_async.State, *mut fs_async.State>(self.engine.services.io)
+    return unsafe fs_async.waker(io)
+  }
+
+  /// The waker's address, for [`wakeAt`] on targets whose hosts cannot name a `Waker`. It
+  /// stays valid until the runtime closes.
+  pub fn wakerAddress(self: &Self) -> usize {
+    let io = unsafe Intrinsic.pointerRequalify<?*mut fs_async.State, *mut fs_async.State>(self.engine.services.io)
+    return Pointer.address(unsafe fs_async.wakerAddress(io))
+  }
+
+  /// Evaluates `source` as an ES module named `name` (an absolute path or a URL, which its own
+  /// imports resolve from). Its top-level await settles in later turns; an error it throws is
+  /// an unhandled rejection, which ends the runtime as Node's would.
+  pub effect fn evaluateModule(self: &mut Self, name: &[u8], source: &[u8]) -> () ! OutOfMemoryError | JsException ? &mut Allocator {
+    let context = self.context
+    let memory = self.engine.memory
+    let rt = unsafe runtime.contextRuntime(context)
+    // As the runtime's own entry module: compiled through the module cache, with the loader's
+    // import.meta (url, filename, dirname) for its name.
+    let compiled = run unsafe module_cache.compileModule(&mut self.engine.*, context, source, name)
+    let module = match compiled { ValueBits.Module { reference } => reference _ => Intrinsic.trap("module compiler returned non-module") }
+    let callback = self.engine.services.meta
+    let metadata = run Effect.result(unsafe modules.setMeta(&mut self.engine.*, context, module, callback, name))
+    match move metadata { Result<(), JsException>.Failure { error } => { unsafe gc.release(&mut self.engine.*, rt, compiled) fail move error } _ => () }
+    let evaluated = run evaluation.evaluateFunction(&mut self.engine.*, memory, unsafe lendRealm(&context, context), unsafe Value.adoptBits(compiled))
+    unsafe gc.release(&mut self.engine.*, rt, evaluated.intoBits())
+  }
+
+  /// Compiles the ES module `source` named `name` into a bytecode image without running it:
+  /// every function compiled, the ones a launch never calls included. A build step's call;
+  /// [`evaluateModuleImage`] runs the image in the runtime build that wrote it. The module's
+  /// static imports must resolve in this runtime.
+  pub effect fn writeModuleImage(self: &mut Self, name: &[u8], source: &[u8]) -> List<u8> ! OutOfMemoryError | JsException ? &mut Allocator {
+    let context = self.context
+    return run unsafe module_cache.writeModuleImage(&mut self.engine.*, context, source, name)
+  }
+
+  /// [`evaluateModule`] from the image [`writeModuleImage`] made of `source`, with nothing
+  /// parsed: each function's code stays in the image's bytes until its first call. `name` is
+  /// the module's name now, whatever name the image was written with. `source` is only
+  /// looked at for its source map comment, so a text that is part of the program is never
+  /// paged in.
+  ///
+  /// Safety: [`moduleImageLoadable`] accepted the `length` bytes at `data`, this program's
+  /// build wrote them from `source`, and they stay readable and unchanged until the runtime
+  /// ends: embed them, map them, or keep the buffer for the life of the process.
+  pub unsafe effect fn evaluateModuleImage(self: &mut Self, name: &[u8], source: &[u8], data: *const u8, length: usize) -> () ! OutOfMemoryError | JsException ? &mut Allocator {
+    let context = self.context
+    let memory = self.engine.memory
+    let rt = unsafe runtime.contextRuntime(context)
+    let compiled = run unsafe module_cache.compileModuleImage(&mut self.engine.*, context, source, name, data, length)
+    let module = match compiled { ValueBits.Module { reference } => reference _ => Intrinsic.trap("a module image held no module") }
+    let callback = self.engine.services.meta
+    let metadata = run Effect.result(unsafe modules.setMeta(&mut self.engine.*, context, module, callback, name))
+    match move metadata { Result<(), JsException>.Failure { error } => { unsafe gc.release(&mut self.engine.*, rt, compiled) fail move error } _ => () }
+    let evaluated = run evaluation.evaluateFunction(&mut self.engine.*, memory, unsafe lendRealm(&context, context), unsafe Value.adoptBits(compiled))
+    unsafe gc.release(&mut self.engine.*, rt, evaluated.intoBits())
+  }
+
+  /// Calls `function` with `receiver` and `arguments` from the host, as the runtime calls a
+  /// callback of its own: then promise jobs and process.nextTick callbacks run. Returns what
+  /// it returned (owned); an exception it threw reaches the host after those ran.
+  pub effect fn callback(self: &mut Self, function: ValueBits, receiver: ValueBits, arguments: &[ValueBits]) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
+    let mut all = List<ValueBits>.make()
+    run all.append(function)
+    run all.append(receiver)
+    run all.appendSlice(arguments)
+    return run self.call(b"callback", all.asSlice())
+  }
+
+  /// The engine and realm, for an embedder's own native calls until the embedding API covers them.
+  pub fn rawEngine(self: &mut Self) -> &mut Engine<'m, Services<C>> { return &mut self.engine.* }
+  pub fn rawContext(self: &Self) -> *mut HeapHeader { return self.context }
+}
+
+/// Whether `bytes` is a module image ([`Runtime.writeModuleImage`]) the engine linked into this
+/// program can load: one its own build wrote.
+pub fn moduleImageLoadable(bytes: &[u8]) -> bool {
+  return image.loadable(bytes)
+}
+
+/// Wakes the runtime whose waker is at `address`, from `Runtime.wakerAddress`, from any thread.
+pub fn wakeAt(address: usize) -> () {
+  let word = address
+  let waker = unsafe Pointer.read<*mut u8>(unsafe Intrinsic.pointerReinterpret<*const usize, *const *mut u8>(Pointer.fromRef<usize>(&word)))
+  unsafe fs_async.silk_runtime_wake(waker)
+}

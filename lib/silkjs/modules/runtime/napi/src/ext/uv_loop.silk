@@ -1,0 +1,3068 @@
+//! The native handle loop, in Silk: what the runtime used libuv's loop for. A loop owns a kernel
+//! queue (epoll on Linux, kqueue on Darwin) and the handles that wait on it: async wakeups, signal
+//! watchers, child processes, descriptor polls (child IPC sockets), file-system event watchers and
+//! file-system stat polls. The functions keep libuv's names, statuses and ordering, so a caller
+//! reads as it did against libuv 1.51: handles are caller-allocated (`uv_handle_size`), start
+//! referenced, and a closed handle gets its close callback in the closing phase of a later run.
+//!
+//! One iteration of `uv_run` is: update the clock, run due timers, wait on the kernel queue (not at
+//! all for `UV_RUN_NOWAIT`), dispatch what it reported, run close callbacks. Callbacks are
+//! `extern "C"` functions and run only inside `uv_run`, on the thread that runs the loop.
+//! `uv_async_send` is the only function another thread, or a signal handler, may call.
+//!
+//! Signals follow libuv: one process-wide handler writes a message into the pipe of every loop that
+//! watches the signal, under a spin lock that non-handler code takes with all signals blocked.
+import silk.mem.pointer { Pointer }
+import silk.mem.layout { Layout }
+import silk.concurrency.atomic { Atomic, MemoryOrder }
+import silk.num.i32
+import silk.num.i64
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+import silk.num.isize
+import silk.num.u16
+import silk.num.u8
+import silk.core.ownership { Copy }
+import silkjsruntime.ext.uv_fs { UvStat, UvTimespec }
+import silk.concurrency.atomic { CompareExchange }
+import ext.uv_shapes { Options, Stdio }
+import ext.uv_os
+import ext.uv_fsevents as fsevents
+import ext.uv_spawn_darwin as spawn_darwin
+
+pub type CloseCallback = extern "C" fn(*mut u8) -> ()
+pub type AsyncCallback = extern "C" fn(*mut u8) -> ()
+pub type SignalCallback = extern "C" fn(*mut u8, i32) -> ()
+pub type PollCallback = extern "C" fn(*mut u8, i32, i32) -> ()
+pub type ExitCallback = extern "C" fn(*mut u8, i64, i32) -> ()
+pub type FsEventCallback = extern "C" fn(*mut u8, ?*const u8, i32, i32) -> ()
+pub type FsPollCallback = extern "C" fn(*mut u8, i32, *const UvStat, *const UvStat) -> ()
+pub type WalkCallback = extern "C" fn(*mut u8, *mut u8) -> ()
+
+// libuv's handle kinds (uv_handle_type), which Node reports by name.
+pub const UV_ASYNC: i32 = 1
+pub const UV_CHECK: i32 = 2
+pub const UV_FS_EVENT: i32 = 3
+pub const UV_FS_POLL: i32 = 4
+pub const UV_IDLE: i32 = 6
+pub const UV_POLL: i32 = 8
+pub const UV_PREPARE: i32 = 9
+pub const UV_PROCESS: i32 = 10
+pub const UV_TIMER: i32 = 13
+pub const UV_SIGNAL: i32 = 16
+pub const UV_RUN_DEFAULT: i32 = 0
+pub const UV_RUN_ONCE: i32 = 1
+pub const UV_RUN_NOWAIT: i32 = 2
+
+const ACTIVE: u32 = 1
+const REFERENCED: u32 = 2
+const CLOSING: u32 = 4
+const CLOSED: u32 = 8
+// A handle of the loop itself (the child watcher): uv_walk does not report it.
+const INTERNAL: u32 = 16
+// A handle that stands for a Node-API addon's own libuv record (ext.uv_api_loop): `data` points at
+// that record, and uv_walk reports the record.
+const ADDON: u32 = 32
+// A signal watcher started with uv_signal_start_oneshot.
+const ONESHOT: u32 = 64
+// A timer that is due and waits on the ready list of the running uv__run_timers.
+const READY: u32 = 128
+// A timer that has a callback (libuv's handle->timer_cb != NULL), for uv_timer_again.
+const HAS_CALLBACK: u32 = 256
+// A descriptor handle of another module (a TCP, pipe, TTY or UDP handle of ext.uv_api_stream): the
+// loop watches its descriptor and calls back, and the module decides when it is active.
+const IO: u32 = 512
+
+const TAG_WAKE: u64 = 1
+const TAG_SIGNAL: u64 = 2
+const TAG_INOTIFY: u64 = 3
+
+unsafe extern "C" fn calloc(count: usize, size: usize) -> ?*mut u8
+unsafe extern "C" fn realloc(pointer: ?*mut u8, size: usize) -> ?*mut u8
+unsafe extern "C" fn free(pointer: ?*mut u8) -> ()
+@foreign(noCapture: .("buffer"))
+unsafe extern "C" fn read(fd: i32, buffer: *mut u8, count: usize) -> isize
+@foreign(noCapture: .("buffer"))
+unsafe extern "C" fn write(fd: i32, buffer: *const u8, count: usize) -> isize
+unsafe extern "C" fn close(fd: i32) -> i32
+unsafe extern "C" fn fcntl(fd: i32, command: i32, ...) -> i32
+@foreign(noCapture: .("fds"))
+unsafe extern "C" fn pipe(fds: *mut i32) -> i32
+@foreign(noCapture: .("text"))
+unsafe extern "C" fn strlen(text: *const u8) -> usize
+@foreign(noCapture: .("dest", "source"))
+unsafe extern "C" fn memcpy(dest: *mut u8, source: *const u8, count: usize) -> *mut u8
+extern "C" struct TimeSpec { seconds: i64, nanoseconds: i64 }
+impl Copy for TimeSpec {}
+@foreign(noCapture: .("time"))
+unsafe extern "C" fn clock_gettime(clock: i32, time: *mut TimeSpec) -> i32
+unsafe extern "C" fn kill(pid: i32, signal: i32) -> i32
+@foreign(noCapture: .("status"))
+unsafe extern "C" fn waitpid(pid: i32, status: *mut i32, options: i32) -> i32
+unsafe extern "C" fn fork() -> i32
+unsafe extern "C" fn _exit(status: i32) -> ()
+unsafe extern "C" fn abort() -> ()
+unsafe extern "C" fn execvp(file: *const u8, args: *const ?*const u8) -> i32
+unsafe extern "C" fn dup2(from: i32, to: i32) -> i32
+unsafe extern "C" fn open(path: *const u8, flags: i32, ...) -> i32
+unsafe extern "C" fn chdir(path: *const u8) -> i32
+unsafe extern "C" fn setsid() -> i32
+unsafe extern "C" fn setgroups(count: usize, groups: ?*const u32) -> i32
+unsafe extern "C" fn setgid(gid: u32) -> i32
+unsafe extern "C" fn setuid(uid: u32) -> i32
+unsafe extern "C" fn signal(number: i32, handler: usize) -> usize
+unsafe extern "C" fn sigaction(number: i32, action: ?*const u8, previous: ?*mut u8) -> i32
+unsafe extern "C" fn pthread_sigmask(how: i32, set: ?*const u8, previous: ?*mut u8) -> i32
+unsafe extern "C" fn pthread_mutex_init(mutex: *mut u8, attributes: ?*const u8) -> i32
+unsafe extern "C" fn pthread_mutex_destroy(mutex: *mut u8) -> i32
+unsafe extern "C" fn pthread_mutex_lock(mutex: *mut u8) -> i32
+unsafe extern "C" fn pthread_mutex_unlock(mutex: *mut u8) -> i32
+unsafe extern "C" fn pthread_cond_init(condition: *mut u8, attributes: ?*const u8) -> i32
+unsafe extern "C" fn pthread_cond_wait(condition: *mut u8, mutex: *mut u8) -> i32
+unsafe extern "C" fn pthread_cond_signal(condition: *mut u8) -> i32
+@threadCallbacks("start")
+unsafe extern "C" fn pthread_create(thread: *mut usize, attributes: ?*const u8, start: extern "C" fn(?*mut u8) -> ?*mut u8, argument: ?*mut u8) -> i32
+unsafe extern "C" fn pthread_attr_init(attributes: *mut u8) -> i32
+unsafe extern "C" fn pthread_attr_setstacksize(attributes: *mut u8, size: usize) -> i32
+unsafe extern "C" fn pthread_attr_destroy(attributes: *mut u8) -> i32
+unsafe extern "C" fn pthread_detach(thread: usize) -> i32
+unsafe extern "C" fn pthread_self() -> usize
+unsafe extern "C" fn getenv(name: *const u8) -> ?*const u8
+unsafe extern "C" fn atoi(text: *const u8) -> i32
+// Room for a pthread mutex, condition variable or attribute set on both targets (Linux 40/48/56,
+// Darwin 64/48/64 bytes).
+const LOCK_BYTES: usize = 128
+
+static if Intrinsic.targetOperatingSystem() == "darwin" {
+  unsafe extern "C" fn __error() -> *mut i32
+  unsafe fn errno() -> i32 { return unsafe Pointer.read<i32>(unsafe __error()) }
+  unsafe fn setErrno(value: i32) -> () { unsafe Pointer.write<i32>(unsafe __error(), value) }
+  unsafe extern "C" fn _NSGetEnviron() -> *mut *const ?*const u8
+  unsafe fn environAddress() -> ?*mut *const ?*const u8 { return unsafe _NSGetEnviron() }
+  unsafe extern "C" fn pthread_setname_np(name: *const u8) -> i32
+  unsafe fn setThreadName(name: *const u8) -> () { let _ignored = unsafe pthread_setname_np(name) }
+  const MONOTONIC: i32 = 6
+  const EAGAIN: i32 = 35
+  const O_NONBLOCK: i32 = 4
+  const O_CLOEXEC: i32 = 16777216
+  const SA_RESTART: i32 = 2
+  const SA_RESETHAND: i32 = 4
+  const SIGCHLD: i32 = 20
+  const SIGSTOP: i32 = 17
+  const SIG_BLOCK: i32 = 1
+  const SIG_SETMASK: i32 = 3
+  const F_DUPFD_CLOEXEC: i32 = 67
+  const ECHILD: i32 = 10
+  // sigset_t is one 32-bit word; struct sigaction is { handler, mask, flags }.
+  const SIGSET_BYTES: usize = 4
+  extern "C" struct SignalAction { handler: extern "C" fn(i32) -> (), mask: u32, flags: i32 }
+  extern "C" struct DefaultAction { handler: usize, mask: u32, flags: i32 }
+  fn handlerAction(handler: extern "C" fn(i32) -> ()) -> SignalAction { return SignalAction { handler: handler, mask: 4294967295, flags: SA_RESTART } }
+  fn defaultAction() -> DefaultAction { return DefaultAction { handler: 0, mask: 0, flags: 0 } }
+  // The signals a forked child keeps deliverable until it resets them: KILL, STOP, TRAP, SEGV, BUS,
+  // ILL, SYS and ABRT, as in libuv.
+  fn forkMask(mask: &mut [u8; 128]) -> () {
+    let keep: u32 = u32.shiftLeft(1, 8) | u32.shiftLeft(1, 16) | u32.shiftLeft(1, 4) | u32.shiftLeft(1, 10) | u32.shiftLeft(1, 9) | u32.shiftLeft(1, 3) | u32.shiftLeft(1, 11) | u32.shiftLeft(1, 5)
+    let bits: u32 = 4294967295 ^ keep
+    mask[0] = u32.toU8(bits & 255) mask[1] = u32.toU8(u32.shiftRight(bits, 8) & 255) mask[2] = u32.toU8(u32.shiftRight(bits, 16) & 255) mask[3] = u32.toU8(u32.shiftRight(bits, 24) & 255)
+  }
+} else {
+  unsafe extern "C" fn __errno_location() -> *mut i32
+  unsafe fn errno() -> i32 { return unsafe Pointer.read<i32>(unsafe __errno_location()) }
+  unsafe fn setErrno(value: i32) -> () { unsafe Pointer.write<i32>(unsafe __errno_location(), value) }
+  @foreign(noCapture: .("name"))
+  unsafe extern "C" fn dlsym(handle: ?*mut u8, name: *const u8) -> ?*mut u8
+  unsafe extern "C" fn pthread_setname_np(thread: usize, name: *const u8) -> i32
+  unsafe fn setThreadName(name: *const u8) -> () { let _ignored = unsafe pthread_setname_np(unsafe pthread_self(), name) }
+  unsafe fn environAddress() -> ?*mut *const ?*const u8 {
+    let name = b"environ\0"
+    return unsafe Intrinsic.pointerReinterpret<?*mut u8, ?*mut *const ?*const u8>(unsafe dlsym(Pointer.null<u8>(), Pointer.fromRef<u8>(&name[0])))
+  }
+  const MONOTONIC: i32 = 1
+  const EAGAIN: i32 = 11
+  const O_NONBLOCK: i32 = 2048
+  const O_CLOEXEC: i32 = 524288
+  const SA_RESTART: i32 = 268435456
+  const SA_RESETHAND: i32 = -2147483648
+  const SIGCHLD: i32 = 17
+  const SIGSTOP: i32 = 19
+  const SIG_BLOCK: i32 = 0
+  const SIG_SETMASK: i32 = 2
+  const F_DUPFD_CLOEXEC: i32 = 1030
+  const ECHILD: i32 = 10
+  // glibc's sigset_t is 1024 bits; struct sigaction is { handler, mask, flags, restorer }.
+  const SIGSET_BYTES: usize = 128
+  extern "C" struct SignalAction { handler: extern "C" fn(i32) -> (), mask: [u64; 16], flags: i32, restorer: usize }
+  extern "C" struct DefaultAction { handler: usize, mask: [u64; 16], flags: i32, restorer: usize }
+  fn handlerAction(handler: extern "C" fn(i32) -> ()) -> SignalAction { return SignalAction { handler: handler, mask: [18446744073709551615; 16], flags: SA_RESTART, restorer: 0 } }
+  fn defaultAction() -> DefaultAction { return DefaultAction { handler: 0, mask: [0; 16], flags: 0, restorer: 0 } }
+  // The signals a forked child keeps deliverable until it resets them: KILL, STOP, TRAP, SEGV, BUS,
+  // ILL, SYS and ABRT, as in libuv. Bit n-1 of the set is signal n.
+  fn forkMask(mask: &mut [u8; 128]) -> () {
+    let keep: u64 = u64.shiftLeft(1, 8) | u64.shiftLeft(1, 18) | u64.shiftLeft(1, 4) | u64.shiftLeft(1, 10) | u64.shiftLeft(1, 6) | u64.shiftLeft(1, 3) | u64.shiftLeft(1, 30) | u64.shiftLeft(1, 5)
+    let bits: u64 = 18446744073709551615 ^ keep
+    let mut index: usize = 0
+    while index < 8 { mask[index] = u64.toU8(u64.shiftRight(bits, usize.toU64(index * 8)) & 255) index = index + 1 }
+  }
+}
+const EINTR: i32 = 4
+const F_GETFD: i32 = 1
+const F_SETFD: i32 = 2
+const F_GETFL: i32 = 3
+const F_SETFL: i32 = 4
+const FD_CLOEXEC: i32 = 1
+
+// uv_poll's event bits.
+const UV_READABLE: i32 = 1
+const UV_WRITABLE: i32 = 2
+const UV_DISCONNECT: i32 = 4
+const UV_PRIORITIZED: i32 = 8
+
+/// Every kind of handle is one record, so `uv_handle_size` is the same for all of them. `data`
+/// is the caller's; the rest belongs to the loop.
+struct Handle {
+  data: ?*mut u8, loop: *mut Loop, kind: i32, flags: u32,
+  previous: ?*mut Handle, next: ?*mut Handle, nextClosing: ?*mut Handle, closed: CloseCallback,
+  // The descriptor in the kernel queue (poll), and the events it is registered for.
+  fd: i32, registered: i32,
+  woke: AsyncCallback, pending: u32, nextAsync: ?*mut Handle,
+  caught: SignalCallback, signum: i32, caughtCount: u32, dispatchedCount: u32, nextSignal: ?*mut Handle,
+  polled: PollCallback,
+  exited: ExitCallback, pid: i32, status: i32, reaped: bool, nextProcess: ?*mut Handle,
+  changed: FsEventCallback, watch: i32, nextWatch: ?*mut Handle, path: ?*mut u8, serial: u64,
+  // A stat poll: its current context (PollContext), the newest first.
+  statChanged: FsPollCallback, context: ?*mut u8,
+  // A timer: its callback, when it is due, its repeat interval, its place among timers due at the
+  // same time, and the next timer. Idle, prepare and check handles keep their callback in `fired`
+  // and their place in `nextPhase`.
+  fired: AsyncCallback, due: u64, repeat: u64, order: u64, nextTimer: ?*mut Handle, nextPhase: ?*mut Handle
+}
+/// A unit of thread-pool work, laid out as libuv's struct uv__work (work, done, loop, and the two
+/// words of its queue node), so that it fits where a uv_work_t or uv_fs_t keeps one. The pool owns
+/// the record from `workSubmit` until it calls `done` on the loop's thread.
+pub extern "C" struct Work { pub work: ?extern "C" fn(*mut Work) -> (), pub done: ?extern "C" fn(*mut Work, i32) -> (), pub loop: ?*mut u8, pub next: ?*mut Work, pub previous: ?*mut Work }
+impl Copy for Work {}
+/// A deferred callback of the loop's pending phase (libuv's pending queue): `call(node)` runs at the
+/// start of the next iteration. The caller owns the node; it must stay valid while queued.
+pub extern "C" struct Pending { pub next: ?*mut Pending, pub call: ?extern "C" fn(*mut Pending) -> (), pub queued: u32, pub reserved: u32 }
+struct Loop {
+  // The embedder's word and the count of active referenced handles, first as in libuv's uv_loop_t.
+  data: ?*mut u8, active: u32, reqs: u32,
+  backend: i32, wakeRead: i32, wakeWrite: i32, signalRead: i32, signalWrite: i32, notify: i32,
+  time: u64, stopped: bool, idleMetrics: bool, blockProfile: bool, idleTime: u64, entryTime: u64, serial: u64, timerCount: u64,
+  loopCount: u64, events: u64, eventsWaiting: u64, waitTimeout: i32, waitReserved: i32,
+  first: ?*mut Handle, last: ?*mut Handle, closing: ?*mut Handle, asyncs: ?*mut Handle, processes: ?*mut Handle, watches: ?*mut Handle, timers: ?*mut Handle,
+  idles: ?*mut Handle, prepares: ?*mut Handle, checks: ?*mut Handle, ready: ?*mut Handle,
+  child: ?*mut Handle,
+  pendingFirst: ?*mut Pending, pendingLast: ?*mut Pending,
+  // Finished thread-pool work, under `workLock` (a pthread mutex in calloc'd memory), and whether
+  // the wake pipe was written for it.
+  workLock: ?*mut u8, workFirst: ?*mut Work, workLast: ?*mut Work, workPending: u32, reserved: u32,
+  // inotify watch descriptors to the first handle of each, open addressing (Linux).
+  watchSlots: ?*mut u8, watchCapacity: usize, watchCount: usize,
+  // Darwin: the kevent changes of poll and descriptor handles, applied by the next wait, as libuv's
+  // kqueue backend hands its watcher changes to the wait.
+  changes: ?*mut u8, changeCount: usize, changeCapacity: usize
+}
+
+export "C" fn silkUvNoClose(handle: *mut u8) -> () {}
+export "C" fn silkUvNoSignal(handle: *mut u8, signal: i32) -> () {}
+export "C" fn silkUvNoPoll(handle: *mut u8, status: i32, events: i32) -> () {}
+export "C" fn silkUvNoExit(handle: *mut u8, code: i64, signal: i32) -> () {}
+export "C" fn silkUvNoEvent(handle: *mut u8, name: ?*const u8, events: i32, status: i32) -> () {}
+export "C" fn silkUvNoStat(handle: *mut u8, status: i32, previous: *const UvStat, current: *const UvStat) -> () {}
+
+fn same(a: ?*mut Handle, b: *mut Handle) -> bool { return Pointer.address<Handle>(a) == Pointer.address<Handle>(b) }
+unsafe fn nn<T>(pointer: ?*mut T) -> *mut T { return unsafe Intrinsic.pointerRequalify<?*mut T, *mut T>(pointer) }
+unsafe fn handleOf(pointer: *mut u8) -> *mut Handle { return unsafe Intrinsic.pointerReinterpret<*mut u8, *mut Handle>(pointer) }
+unsafe fn handleOfConst(pointer: *const u8) -> *const Handle { return unsafe Intrinsic.pointerReinterpret<*const u8, *const Handle>(pointer) }
+unsafe fn loopOf(pointer: *mut u8) -> *mut Loop { return unsafe Intrinsic.pointerReinterpret<*mut u8, *mut Loop>(pointer) }
+unsafe fn bytesOf(pointer: *mut Handle) -> *mut u8 { return unsafe Intrinsic.pointerReinterpret<*mut Handle, *mut u8>(pointer) }
+fn zeroTime() -> UvTimespec { return UvTimespec { tv_sec: 0, tv_nsec: 0 } }
+fn zeroStat() -> UvStat {
+  return UvStat { st_dev: 0, st_mode: 0, st_nlink: 0, st_uid: 0, st_gid: 0, st_rdev: 0, st_ino: 0, st_size: 0, st_blksize: 0, st_blocks: 0, st_flags: 0, st_gen: 0, st_atim: zeroTime(), st_mtim: zeroTime(), st_ctim: zeroTime(), st_birthtim: zeroTime() }
+}
+
+/// Monotonic nanoseconds, libuv's uv_hrtime, which is also the loop's clock (libuv's uv__hrtime):
+/// on Darwin mach_continuous_time, as ext.uv_os, so that a timer never fires early by uv_hrtime.
+pub unsafe fn hrtime() -> u64 {
+  static if Intrinsic.targetOperatingSystem() == "darwin" { return unsafe uv_os.uv_hrtime() }
+  let mut now = TimeSpec { seconds: 0, nanoseconds: 0 }
+  let _ignored = unsafe clock_gettime(MONOTONIC, Pointer.fromMutRef<TimeSpec>(&mut now))
+  return i64.toU64(now.seconds) * 1000000000 + i64.toU64(now.nanoseconds)
+}
+unsafe fn cloexec(fd: i32) -> () {
+  let flags = unsafe fcntl(fd, F_GETFD)
+  if flags >= 0 { let _ignored = unsafe fcntl(fd, F_SETFD, flags | FD_CLOEXEC) }
+}
+unsafe fn nonblocking(fd: i32, on: bool) -> () {
+  let flags = unsafe fcntl(fd, F_GETFL)
+  if flags < 0 { return }
+  let wanted = if on { flags | O_NONBLOCK } else { flags & (O_NONBLOCK ^ -1) }
+  if wanted != flags { let _ignored = unsafe fcntl(fd, F_SETFL, wanted) }
+}
+// A close-on-exec pipe; both ends nonblocking when `nonblock`.
+unsafe fn makePipe(fds: &mut [i32; 2], nonblock: bool) -> i32 {
+  if unsafe pipe(Pointer.fromMutRef<i32>(&mut fds[0])) != 0 { return -(unsafe errno()) }
+  unsafe cloexec(fds[0]) unsafe cloexec(fds[1])
+  if nonblock { unsafe nonblocking(fds[0], true) unsafe nonblocking(fds[1], true) }
+  return 0
+}
+
+// ---- The kernel queue -------------------------------------------------------------------------
+// `queueSet` registers `fd` for the uv_poll events in `events` (0 removes it); `previous` is what it
+// was registered for. `queueWait` fills `ready` with (tag, events) pairs: events are uv_poll bits,
+// with QUEUE_ERROR for an error or hangup condition.
+const QUEUE_ERROR: i32 = 256
+struct Ready { tag: u64, events: i32 }
+impl Copy for Ready {}
+static if Intrinsic.targetOperatingSystem() == "darwin" {
+  extern "C" struct KernelEvent { ident: usize, filter: i16, flags: u16, fflags: u32, data: isize, udata: usize }
+  impl Copy for KernelEvent {}
+  unsafe extern "C" fn kqueue() -> i32
+  @foreign(noCapture: .("changes", "events", "timeout"))
+  unsafe extern "C" fn kevent(queue: i32, changes: ?[*]const KernelEvent, changeCount: i32, events: ?[*]mut KernelEvent, eventCount: i32, timeout: ?*const TimeSpec) -> i32
+  const FILTER_READ: i16 = -1
+  const FILTER_WRITE: i16 = -2
+  const FILTER_VNODE: i16 = -4
+  // libuv's kqueue.c registers UV_PRIORITIZED with EV_OOBAND (EV_FLAG1) in the filter slot. macOS
+  // refuses that filter, and libuv, which hands its changes to the wait, receives the refusal as an
+  // EV_ERROR event of that filter ahead of the ready events: one UV_PRIORITIZED callback. Poll
+  // handles register the same way here (queueSetLoop, applied by queueWait).
+  const FILTER_OOBAND: i16 = 8192
+  const EV_ADD: u16 = 1
+  const EV_DELETE: u16 = 2
+  const EV_CLEAR: u16 = 32
+  const EV_ONESHOT: u16 = 16
+  const EV_ERROR: u16 = 16384
+  const EV_EOF: u16 = 32768
+  fn kernelEvent(ident: usize, filter: i16, flags: u16, fflags: u32, udata: usize) -> KernelEvent { return KernelEvent { ident: ident, filter: filter, flags: flags, fflags: fflags, data: 0, udata: udata } }
+  unsafe fn queueOpen() -> i32 {
+    let queue = unsafe kqueue()
+    if queue < 0 { return -(unsafe errno()) }
+    unsafe cloexec(queue)
+    return queue
+  }
+  unsafe fn queueChange(queue: i32, change: KernelEvent) -> i32 {
+    let changes = [change]
+    let mut none: [KernelEvent; 0] = []
+    if unsafe kevent(queue, Pointer.fromSlice<KernelEvent>(&changes), 1, Pointer.fromMutSlice<KernelEvent>(&mut none), 0, Pointer.null<TimeSpec>()) < 0 { return -(unsafe errno()) }
+    return 0
+  }
+  unsafe fn queueSet(queue: i32, fd: i32, tag: u64, previous: i32, events: i32) -> i32 {
+    let ident = i32.toUsize(fd) let data = u64.toUsize(tag)
+    let wasRead = (previous & (UV_READABLE | UV_DISCONNECT)) != 0 let wantRead = (events & (UV_READABLE | UV_DISCONNECT)) != 0
+    let wasWrite = (previous & UV_WRITABLE) != 0 let wantWrite = (events & UV_WRITABLE) != 0
+    let mut status: i32 = 0
+    if wantRead && !wasRead { status = unsafe queueChange(queue, kernelEvent(ident, FILTER_READ, EV_ADD, 0, data)) }
+    if !wantRead && wasRead { let _ignored = unsafe queueChange(queue, kernelEvent(ident, FILTER_READ, EV_DELETE, 0, data)) }
+    if status != 0 { return status }
+    if wantWrite && !wasWrite { status = unsafe queueChange(queue, kernelEvent(ident, FILTER_WRITE, EV_ADD, 0, data)) }
+    if !wantWrite && wasWrite { let _ignored = unsafe queueChange(queue, kernelEvent(ident, FILTER_WRITE, EV_DELETE, 0, data)) }
+    if status != 0 { return status }
+    return status
+  }
+  unsafe fn changeAt(l: &Loop, index: usize) -> *mut KernelEvent {
+    let base = unsafe Pointer.assumeManyMut<KernelEvent>(unsafe Intrinsic.pointerReinterpret<*mut u8, *mut KernelEvent>(unsafe nn(l.changes)))
+    return unsafe Pointer.atMut<KernelEvent>(base, index)
+  }
+  unsafe fn changesFrom(changes: *mut u8, offset: usize) -> [*]const KernelEvent {
+    let base = unsafe Pointer.assumeManyMut<KernelEvent>(unsafe Intrinsic.pointerReinterpret<*mut u8, *mut KernelEvent>(changes))
+    return unsafe Pointer.assumeMany<KernelEvent>(unsafe Intrinsic.pointerRequalify<*mut KernelEvent, *const KernelEvent>(unsafe Pointer.atMut<KernelEvent>(base, offset)))
+  }
+  unsafe fn pendChange(loop: *mut Loop, change: KernelEvent) -> i32 {
+    let mut anchor = () let l = unsafe Pointer.borrowMut<(), Loop>(&mut anchor, loop)
+    if l.changeCount == l.changeCapacity {
+      let capacity = if l.changeCapacity == 0 { 16 } else { l.changeCapacity * 2 }
+      let grown = unsafe realloc(l.changes, capacity * Layout.of<KernelEvent>().bytes)
+      if Pointer.isNull<u8>(grown) { return -12 }
+      l.changes = grown l.changeCapacity = capacity
+    }
+    unsafe Pointer.write<KernelEvent>(unsafe changeAt(&l, l.changeCount), change)
+    l.changeCount = l.changeCount + 1
+    return 0
+  }
+  // Drops the waiting changes of `ident`'s `filter`.
+  unsafe fn purgeChanges(loop: *mut Loop, ident: usize, filter: i16) -> () {
+    let mut anchor = () let l = unsafe Pointer.borrowMut<(), Loop>(&mut anchor, loop)
+    let mut kept: usize = 0 let mut index: usize = 0
+    while index < l.changeCount {
+      let change = unsafe Pointer.read<KernelEvent>(unsafe changeAt(&l, index))
+      if !(change.ident == ident && change.filter == filter) { unsafe Pointer.write<KernelEvent>(unsafe changeAt(&l, kept), change) kept = kept + 1 }
+      index = index + 1
+    }
+    l.changeCount = kept
+  }
+  /// queueSet for poll handles: additions wait for the next queueWait, as libuv's
+  /// uv__io_poll applies its watcher queue in the wait's change list; removals happen now, and drop
+  /// any addition still waiting.
+  unsafe fn queueSetLoop(loop: *mut Loop, fd: i32, tag: u64, previous: i32, events: i32) -> i32 {
+    let anchor = () let l = unsafe Pointer.borrow<(), Loop>(&anchor, loop) let queue = l.backend drop l
+    let ident = i32.toUsize(fd) let data = u64.toUsize(tag)
+    let bitsOf: [i32; 3] = [UV_READABLE | UV_DISCONNECT, UV_WRITABLE, UV_PRIORITIZED]
+    let filters: [i16; 3] = [FILTER_READ, FILTER_WRITE, FILTER_OOBAND]
+    let mut index: usize = 0
+    while index < 3 {
+      let bits = bitsOf[index] let filter = filters[index]
+      let was = (previous & bits) != 0 let want = (events & bits) != 0
+      if want && !was { let status = unsafe pendChange(loop, kernelEvent(ident, filter, EV_ADD, 0, data)) if status != 0 { return status } }
+      if !want && was {
+        unsafe purgeChanges(loop, ident, filter)
+        let _ignored = unsafe queueChange(queue, kernelEvent(ident, filter, EV_DELETE, 0, 0))
+      }
+      index = index + 1
+    }
+    return 0
+  }
+  // The events of one wait, or -1 when it was interrupted. With `blockProfile`, SIGPROF is blocked
+  // during the wait (libuv's UV_LOOP_BLOCK_SIGPROF). The loop's waiting changes go with it.
+  unsafe fn queueWait(loop: *mut Loop, queue: i32, ready: &mut [Ready; 64], timeout: i64, blockProfile: bool) -> i32 {
+    let mut raw: [KernelEvent; 64] = [kernelEvent(0, 0, 0, 0, 0); 64]
+    let mut pending = () let p = unsafe Pointer.borrowMut<(), Loop>(&mut pending, loop)
+    let changeCount = p.changeCount let changes = p.changes p.changeCount = 0 drop p
+    // More changes than events fit: the first ones go alone, as libuv flushes a full change list.
+    let mut offset: usize = 0
+    let mut none: [KernelEvent; 0] = []
+    while changeCount - offset > 64 {
+      let _flushed = unsafe kevent(queue, unsafe changesFrom(unsafe nn(changes), offset), 64, Pointer.fromMutSlice<KernelEvent>(&mut none), 0, Pointer.null<TimeSpec>())
+      offset = offset + 64
+    }
+    let span = TimeSpec { seconds: if timeout > 0 { timeout / 1000 } else { 0 }, nanoseconds: if timeout > 0 { (timeout % 1000) * 1000000 } else { 0 } }
+    let nothing: [KernelEvent; 0] = []
+    let changeList: ?[*]const KernelEvent = if changeCount - offset == 0 { Pointer.fromSlice<KernelEvent>(&nothing) } else { unsafe changesFrom(unsafe nn(changes), offset) }
+    let profile: [u8; 4] = [0, 0, 0, 4]
+    let mut saved: [u8; 128] = [0; 128]
+    if blockProfile { if unsafe pthread_sigmask(SIG_BLOCK, Pointer.fromRef<u8>(&profile[0]), Pointer.fromMutRef<u8>(&mut saved[0])) != 0 { unsafe abort() } }
+    let count = unsafe kevent(queue, changeList, usize.toI32(changeCount - offset), Pointer.fromMutSlice<KernelEvent>(&mut raw), 64, if timeout < 0 { Pointer.null<TimeSpec>() } else { Pointer.fromRef<TimeSpec>(&span) })
+    if blockProfile { let kept = unsafe errno() if unsafe pthread_sigmask(SIG_SETMASK, Pointer.fromRef<u8>(&saved[0]), Pointer.null<u8>()) != 0 { unsafe abort() } unsafe setErrno(kept) }
+    if count < 0 { if unsafe errno() == EINTR { return -1 } unsafe abort() }
+    let mut index: usize = 0
+    while index < i32.toUsize(count) {
+      let item = raw[index] let mut events: i32 = 0
+      if item.filter == FILTER_READ { events = UV_READABLE if (item.flags & EV_EOF) != 0 { events = events | UV_DISCONNECT } }
+      if item.filter == FILTER_WRITE { events = UV_WRITABLE if (item.flags & EV_EOF) != 0 { events = events | QUEUE_ERROR } }
+      if item.filter == FILTER_OOBAND { events = UV_PRIORITIZED }
+      // A vnode event carries its NOTE_* bits above the poll bits.
+      if item.filter == FILTER_VNODE { events = u32.toI32(u32.shiftLeft(item.fflags, 16)) }
+      // A refused change: libuv's POLLERR (the refused EV_OOBAND reads as UV_PRIORITIZED alone).
+      if (item.flags & EV_ERROR) != 0 && item.filter != FILTER_OOBAND { events = events | QUEUE_ERROR | QUEUE_FAULT }
+      ready[index] = Ready { tag: usize.toU64(item.udata), events: events }
+      index = index + 1
+    }
+    return count
+  }
+} else {
+  static if Intrinsic.targetArchitecture() == "x86_64" {
+    extern "C" struct PollEvent { events: u32, low: u32, high: u32 }
+    impl Copy for PollEvent {}
+    fn pollEvent(events: u32, tag: u64) -> PollEvent { return PollEvent { events: events, low: u64.toU32(tag & 4294967295), high: u64.toU32(u64.shiftRight(tag, 32)) } }
+    fn pollTag(event: &PollEvent) -> u64 { return u32.toU64(event.low) | u64.shiftLeft(u32.toU64(event.high), 32) }
+  } else {
+    extern "C" struct PollEvent { events: u32, padding: u32, data: u64 }
+    impl Copy for PollEvent {}
+    fn pollEvent(events: u32, tag: u64) -> PollEvent { return PollEvent { events: events, padding: 0, data: tag } }
+    fn pollTag(event: &PollEvent) -> u64 { return event.data }
+  }
+  unsafe extern "C" fn epoll_create1(flags: i32) -> i32
+  unsafe extern "C" fn syscall(number: i64, ...) -> i64
+  static if Intrinsic.targetArchitecture() == "x86_64" { const EPOLL_PWAIT: i64 = 281 } else { const EPOLL_PWAIT: i64 = 22 }
+  @foreign(noCapture: .("event"))
+  unsafe extern "C" fn epoll_ctl(queue: i32, operation: i32, fd: i32, event: ?*const PollEvent) -> i32
+  @foreign(noCapture: .("events"))
+  unsafe extern "C" fn epoll_wait(queue: i32, events: ?[*]mut PollEvent, count: i32, timeout: i32) -> i32
+  const POLL_IN: u32 = 1
+  const POLL_PRI: u32 = 2
+  const POLL_OUT: u32 = 4
+  const POLL_ERR: u32 = 8
+  const POLL_HUP: u32 = 16
+  const POLL_RDHUP: u32 = 8192
+  unsafe fn queueOpen() -> i32 {
+    let queue = unsafe epoll_create1(O_CLOEXEC)
+    if queue < 0 { return -(unsafe errno()) }
+    return queue
+  }
+  fn pollBits(events: i32) -> u32 {
+    let mut bits: u32 = 0
+    if (events & UV_READABLE) != 0 { bits = bits | POLL_IN }
+    if (events & UV_WRITABLE) != 0 { bits = bits | POLL_OUT }
+    if (events & UV_DISCONNECT) != 0 { bits = bits | POLL_RDHUP }
+    if (events & UV_PRIORITIZED) != 0 { bits = bits | POLL_PRI }
+    return bits
+  }
+  unsafe fn queueSet(queue: i32, fd: i32, tag: u64, previous: i32, events: i32) -> i32 {
+    if events == 0 {
+      if previous != 0 { let _ignored = unsafe epoll_ctl(queue, 2, fd, Pointer.null<PollEvent>()) }
+      return 0
+    }
+    let event = pollEvent(pollBits(events), tag)
+    if unsafe epoll_ctl(queue, if previous == 0 { 1 } else { 3 }, fd, Pointer.fromRef<PollEvent>(&event)) < 0 {
+      let code = unsafe errno()
+      // EEXIST: the descriptor is in the queue already (another handle's, or a stale entry).
+      if code == 17 && previous == 0 { if unsafe epoll_ctl(queue, 3, fd, Pointer.fromRef<PollEvent>(&event)) == 0 { return 0 } return -(unsafe errno()) }
+      return -code
+    }
+    return 0
+  }
+  unsafe fn queueSetLoop(loop: *mut Loop, fd: i32, tag: u64, previous: i32, events: i32) -> i32 {
+    let anchor = () let l = unsafe Pointer.borrow<(), Loop>(&anchor, loop) let queue = l.backend drop l
+    return unsafe queueSet(queue, fd, tag, previous, events)
+  }
+  // The events of one wait, or -1 when it was interrupted. With `blockProfile`, SIGPROF is blocked
+  // during the wait (libuv's UV_LOOP_BLOCK_SIGPROF, an epoll_pwait mask).
+  unsafe fn queueWait(loop: *mut Loop, queue: i32, ready: &mut [Ready; 64], timeout: i64, blockProfile: bool) -> i32 {
+    let mut raw: [PollEvent; 64] = [pollEvent(0, 0); 64]
+    let limit: i32 = if timeout < 0 { -1 } else { if timeout > 2147483647 { 2147483647 } else { i64.toI32(timeout) } }
+    // SIGPROF (27) is bit 26 of the kernel's 8-byte mask.
+    let profile: [u64; 1] = [67108864]
+    let count = if blockProfile { i64.toI32(unsafe syscall(EPOLL_PWAIT, queue, Pointer.fromMutSlice<PollEvent>(&mut raw), 64, limit, Pointer.fromRef<u64>(&profile[0]), 8)) } else { unsafe epoll_wait(queue, Pointer.fromMutSlice<PollEvent>(&mut raw), 64, limit) }
+    // libuv only asserts EINTR here, which a release build drops: any failure is an interruption.
+    if count < 0 { return -1 }
+    let mut index: usize = 0
+    while index < i32.toUsize(count) {
+      let item = raw[index] let mut events: i32 = 0
+      if (item.events & POLL_IN) != 0 { events = events | UV_READABLE }
+      if (item.events & POLL_OUT) != 0 { events = events | UV_WRITABLE }
+      if (item.events & POLL_RDHUP) != 0 { events = events | UV_DISCONNECT }
+      if (item.events & POLL_PRI) != 0 { events = events | UV_PRIORITIZED }
+      if (item.events & (POLL_ERR | POLL_HUP)) != 0 { events = events | QUEUE_ERROR if (item.events & POLL_ERR) != 0 { events = events | 512 } if (item.events & POLL_HUP) != 0 { events = events | IO_HANGUP } }
+      ready[index] = Ready { tag: pollTag(&item), events: events }
+      index = index + 1
+    }
+    return count
+  }
+}
+// queueWait marks a real error condition (POLLERR), as against a plain hangup, with this bit.
+const QUEUE_FAULT: i32 = 512
+
+// ---- Loop -------------------------------------------------------------------------------------
+pub unsafe fn uv_loop_size() -> usize { return Layout.of<Loop>().bytes }
+pub unsafe fn uv_handle_size(kind: i32) -> usize { return Layout.of<Handle>().bytes }
+
+unsafe fn updateTime(loop: *mut Loop) -> () {
+  let mut anchor = () let l = unsafe Pointer.borrowMut<(), Loop>(&mut anchor, loop)
+  l.time = unsafe hrtime() / 1000000
+}
+/// Initializes caller-allocated loop memory of `uv_loop_size()` bytes. 0, or a negative errno.
+pub unsafe fn uv_loop_init(memory: *mut u8) -> i32 {
+  let loop = unsafe loopOf(memory)
+  // The caller's data word survives, as in libuv.
+  let before = () let old = unsafe Pointer.borrow<(), Loop>(&before, loop) let kept = old.data drop old
+  let queue = unsafe queueOpen()
+  if queue < 0 { return queue }
+  let mut wake: [i32; 2] = [-1; 2]
+  let made = unsafe makePipe(&mut wake, true)
+  if made != 0 { let _ignored = unsafe close(queue) return made }
+  let registered = unsafe queueSet(queue, wake[0], TAG_WAKE, 0, UV_READABLE)
+  if registered != 0 { let _a = unsafe close(queue) let _b = unsafe close(wake[0]) let _c = unsafe close(wake[1]) return registered }
+  let lock = unsafe calloc(1, LOCK_BYTES)
+  if Pointer.isNull<u8>(lock) || unsafe pthread_mutex_init(unsafe nn(lock), Pointer.null<u8>()) != 0 {
+    unsafe free(lock) let _a = unsafe close(queue) let _b = unsafe close(wake[0]) let _c = unsafe close(wake[1]) return -12
+  }
+  unsafe Pointer.put<Loop>(loop, Loop {
+    data: kept, active: 0, reqs: 0,
+    backend: queue, wakeRead: wake[0], wakeWrite: wake[1], signalRead: -1, signalWrite: -1, notify: -1,
+    time: 0, stopped: false, idleMetrics: false, blockProfile: false, idleTime: 0, entryTime: 0, serial: 0, timerCount: 0,
+    loopCount: 0, events: 0, eventsWaiting: 0, waitTimeout: 0, waitReserved: 0,
+    first: Pointer.null<Handle>(), last: Pointer.null<Handle>(), closing: Pointer.null<Handle>(), asyncs: Pointer.null<Handle>(), processes: Pointer.null<Handle>(), watches: Pointer.null<Handle>(), timers: Pointer.null<Handle>(),
+    idles: Pointer.null<Handle>(), prepares: Pointer.null<Handle>(), checks: Pointer.null<Handle>(), ready: Pointer.null<Handle>(),
+    child: Pointer.null<Handle>(),
+    pendingFirst: Pointer.null<Pending>(), pendingLast: Pointer.null<Pending>(),
+    workLock: lock, workFirst: Pointer.null<Work>(), workLast: Pointer.null<Work>(), workPending: 0, reserved: 0,
+    watchSlots: Pointer.null<u8>(), watchCapacity: 0, watchCount: 0,
+    changes: Pointer.null<u8>(), changeCount: 0, changeCapacity: 0
+  })
+  unsafe updateTime(loop)
+  return 0
+}
+/// libuv's uv_loop_configure: UV_LOOP_BLOCK_SIGNAL (0) with SIGPROF is accepted and has no effect
+/// here (the loop never waits with a signal mask), UV_METRICS_IDLE_TIME (1) turns on idle-time
+/// accounting, anything else is UV_ENOSYS.
+pub unsafe fn uv_loop_configure(memory: *mut u8, option: i32, argument: i32) -> i32 {
+  let mut anchor = () let l = unsafe Pointer.borrowMut<(), Loop>(&mut anchor, unsafe loopOf(memory))
+  if option == 1 { l.idleMetrics = true return 0 }
+  // UV_LOOP_USE_IO_URING_SQPOLL: accepted on Linux, where libuv only records it.
+  static if Intrinsic.targetOperatingSystem() != "darwin" { if option == 2 { return 0 } }
+  if option != 0 { static if Intrinsic.targetOperatingSystem() == "darwin" { return -78 } else { return -38 } }
+  // UV_LOOP_BLOCK_SIGNAL takes only SIGPROF (27 on both targets): the wait then blocks it.
+  if argument != 27 { return -22 }
+  l.blockProfile = true
+  return 0
+}
+/// Nanoseconds the loop has spent waiting in the kernel queue, when idle metrics are on.
+pub unsafe fn uv_metrics_idle_time(memory: *mut u8) -> u64 {
+  let anchor = () let l = unsafe Pointer.borrow<(), Loop>(&anchor, unsafe loopOf(memory))
+  return l.idleTime
+}
+/// libuv's uv_metrics_info counters: iterations, events dispatched, and events that were waiting
+/// when a wait began.
+pub unsafe fn metrics(memory: *mut u8, loopCount: &mut u64, events: &mut u64, waiting: &mut u64) -> () {
+  let anchor = () let l = unsafe Pointer.borrow<(), Loop>(&anchor, unsafe loopOf(memory))
+  loopCount.* = l.loopCount events.* = l.events waiting.* = l.eventsWaiting
+}
+unsafe fn metricsEnter(loop: *mut Loop) -> () {
+  let mut anchor = () let l = unsafe Pointer.borrowMut<(), Loop>(&mut anchor, loop)
+  if l.idleMetrics { l.entryTime = unsafe hrtime() }
+}
+unsafe fn metricsLeave(loop: *mut Loop) -> () {
+  let mut anchor = () let l = unsafe Pointer.borrowMut<(), Loop>(&mut anchor, loop)
+  if !l.idleMetrics || l.entryTime == 0 { return }
+  l.idleTime = l.idleTime + (unsafe hrtime() - l.entryTime) l.entryTime = 0
+}
+pub unsafe fn uv_backend_fd(memory: *const u8) -> i32 {
+  let anchor = () let l = unsafe Pointer.borrow<(), Loop>(&anchor, unsafe Intrinsic.pointerReinterpret<*const u8, *const Loop>(memory))
+  return l.backend
+}
+/// The loop's cached clock, in milliseconds.
+pub unsafe fn uv_now(memory: *const u8) -> u64 {
+  let anchor = () let l = unsafe Pointer.borrow<(), Loop>(&anchor, unsafe Intrinsic.pointerReinterpret<*const u8, *const Loop>(memory))
+  return l.time
+}
+pub unsafe fn uv_update_time(memory: *mut u8) -> () { unsafe updateTime(unsafe loopOf(memory)) }
+pub unsafe fn uv_loop_get_data(memory: *const u8) -> ?*mut u8 {
+  let anchor = () let l = unsafe Pointer.borrow<(), Loop>(&anchor, unsafe Intrinsic.pointerReinterpret<*const u8, *const Loop>(memory))
+  return l.data
+}
+pub unsafe fn uv_loop_set_data(memory: *mut u8, data: ?*mut u8) -> () {
+  let mut anchor = () let l = unsafe Pointer.borrowMut<(), Loop>(&mut anchor, unsafe loopOf(memory))
+  l.data = data
+}
+unsafe fn alive(loop: *const Loop) -> bool {
+  let anchor = () let l = unsafe Pointer.borrow<(), Loop>(&anchor, loop)
+  return l.active > 0 || l.reqs > 0 || !Intrinsic.pointerIsNull<?*mut Pending>(l.pendingFirst) || !Pointer.isNull<Handle>(l.closing)
+}
+pub unsafe fn uv_loop_alive(memory: *const u8) -> i32 {
+  if unsafe alive(unsafe Intrinsic.pointerReinterpret<*const u8, *const Loop>(memory)) { return 1 }
+  return 0
+}
+pub unsafe fn uv_stop(memory: *mut u8) -> () {
+  let mut anchor = () let l = unsafe Pointer.borrowMut<(), Loop>(&mut anchor, unsafe loopOf(memory))
+  l.stopped = true
+}
+/// An active request (libuv's uv__req_register): it keeps the loop alive until `requestFinished`.
+pub unsafe fn requestStarted(memory: *mut u8) -> () {
+  let mut anchor = () let l = unsafe Pointer.borrowMut<(), Loop>(&mut anchor, unsafe loopOf(memory))
+  l.reqs = l.reqs + 1
+}
+pub unsafe fn requestFinished(memory: *mut u8) -> () {
+  let mut anchor = () let l = unsafe Pointer.borrowMut<(), Loop>(&mut anchor, unsafe loopOf(memory))
+  if l.reqs > 0 { l.reqs = l.reqs - 1 }
+}
+/// The count of active requests, as libuv's loop->active_reqs.count.
+pub unsafe fn activeRequests(memory: *const u8) -> u32 {
+  let anchor = () let l = unsafe Pointer.borrow<(), Loop>(&anchor, unsafe Intrinsic.pointerReinterpret<*const u8, *const Loop>(memory))
+  return l.reqs
+}
+/// Queues `node` for the pending phase of the next iteration; a queued node is not queued twice.
+pub unsafe fn pendingQueue(memory: *mut u8, node: *mut Pending) -> () {
+  let mut anchor = () let n = unsafe Pointer.borrowMut<(), Pending>(&mut anchor, node)
+  if n.queued != 0 { return }
+  n.queued = 1 n.next = Pointer.null<Pending>()
+  let mut second = () let l = unsafe Pointer.borrowMut<(), Loop>(&mut second, unsafe loopOf(memory))
+  if Intrinsic.pointerIsNull<?*mut Pending>(l.pendingLast) { l.pendingFirst = node } else { let mut third = () let last = unsafe Pointer.borrowMut<(), Pending>(&mut third, unsafe nn(l.pendingLast)) last.next = node }
+  l.pendingLast = node
+}
+/// Takes `node` out of the pending queue if it is there.
+pub unsafe fn pendingCancel(memory: *mut u8, node: *mut Pending) -> () {
+  let mut anchor = () let n = unsafe Pointer.borrowMut<(), Pending>(&mut anchor, node)
+  if n.queued == 0 { return }
+  n.queued = 0
+  let mut second = () let l = unsafe Pointer.borrowMut<(), Loop>(&mut second, unsafe loopOf(memory))
+  let mut previous: ?*mut Pending = Pointer.null<Pending>() let mut cursor = l.pendingFirst
+  while !Intrinsic.pointerIsNull<?*mut Pending>(cursor) {
+    let mut third = () let c = unsafe Pointer.borrowMut<(), Pending>(&mut third, unsafe nn(cursor))
+    if Pointer.address<Pending>(cursor) == Pointer.address<Pending>(node) {
+      if Intrinsic.pointerIsNull<?*mut Pending>(previous) { l.pendingFirst = c.next } else { let mut fourth = () let p = unsafe Pointer.borrowMut<(), Pending>(&mut fourth, unsafe nn(previous)) p.next = c.next }
+      if Pointer.address<Pending>(l.pendingLast) == Pointer.address<Pending>(node) { l.pendingLast = previous }
+      c.next = Pointer.null<Pending>()
+      return
+    }
+    previous = cursor cursor = c.next
+  }
+}
+// libuv's uv__run_pending: the nodes queued before it began, in order.
+unsafe fn runPending(loop: *mut Loop) -> () {
+  let mut anchor = () let l = unsafe Pointer.borrowMut<(), Loop>(&mut anchor, loop)
+  let mut node = l.pendingFirst
+  l.pendingFirst = Pointer.null<Pending>() l.pendingLast = Pointer.null<Pending>() drop l
+  while !Intrinsic.pointerIsNull<?*mut Pending>(node) {
+    let mut second = () let n = unsafe Pointer.borrowMut<(), Pending>(&mut second, unsafe nn(node))
+    let next = n.next let call = n.call
+    n.next = Pointer.null<Pending>() n.queued = 0 drop n
+    if !Intrinsic.pointerIsNull<?extern "C" fn(*mut Pending) -> ()>(call) {
+      let present = unsafe Intrinsic.pointerRequalify<?extern "C" fn(*mut Pending) -> (), extern "C" fn(*mut Pending) -> ()>(call)
+      unsafe present(unsafe nn(node))
+    }
+    node = next
+  }
+}
+unsafe fn hasPending(loop: *const Loop) -> bool {
+  let anchor = () let l = unsafe Pointer.borrow<(), Loop>(&anchor, loop)
+  return !Intrinsic.pointerIsNull<?*mut Pending>(l.pendingFirst)
+}
+// Milliseconds until the next timer, or -1 with none (libuv's uv__next_timeout).
+unsafe fn nextTimeout(loop: *const Loop) -> i64 {
+  let anchor = () let l = unsafe Pointer.borrow<(), Loop>(&anchor, loop)
+  let mut timer = l.timers let mut soonest: i64 = -1
+  while !Pointer.isNull<Handle>(timer) {
+    let h = unsafe Pointer.borrow<(), Handle>(&anchor, unsafe nn(timer))
+    let wait: i64 = if h.due <= l.time { 0 } else { if h.due - l.time > 2147483647 { 2147483647 } else { u64.toI64(h.due - l.time) } }
+    if soonest < 0 || wait < soonest { soonest = wait }
+    timer = h.nextTimer
+  }
+  return soonest
+}
+unsafe fn backendTimeout(loop: *const Loop) -> i32 {
+  let anchor = () let l = unsafe Pointer.borrow<(), Loop>(&anchor, loop)
+  if l.stopped || (l.active == 0 && l.reqs == 0) || !Intrinsic.pointerIsNull<?*mut Pending>(l.pendingFirst) || !Pointer.isNull<Handle>(l.idles) || !Pointer.isNull<Handle>(l.closing) { return 0 }
+  drop l
+  return i64.toI32(unsafe nextTimeout(loop))
+}
+/// How long a wait on `uv_backend_fd` may last before the loop needs a run: 0 when a run has work
+/// already, -1 when only the descriptor can bring work.
+pub unsafe fn uv_backend_timeout(memory: *const u8) -> i32 { return unsafe backendTimeout(unsafe Intrinsic.pointerReinterpret<*const u8, *const Loop>(memory)) }
+/// Closes an initialized loop. -16 (EBUSY) while a handle is still open or a request active.
+pub unsafe fn uv_loop_close(memory: *mut u8) -> i32 {
+  let loop = unsafe loopOf(memory)
+  let mut anchor = () let l = unsafe Pointer.borrowMut<(), Loop>(&mut anchor, loop)
+  if l.reqs > 0 { return -16 }
+  let mut handle = l.first let walk = ()
+  while !Pointer.isNull<Handle>(handle) {
+    let h = unsafe Pointer.borrow<(), Handle>(&walk, unsafe nn(handle))
+    if (h.flags & INTERNAL) == 0 { return -16 }
+    handle = h.next
+  }
+  // The loop's FSEvents thread ends (libuv's uv__platform_loop_delete).
+  static if Intrinsic.targetOperatingSystem() == "darwin" { unsafe fsevents.fseventsLoopDelete(memory) }
+  let child = l.child
+  if !Pointer.isNull<Handle>(child) { drop l unsafe signalStop(unsafe nn(child)) unsafe free(unsafe Intrinsic.pointerReinterpret<?*mut Handle, ?*mut u8>(child)) }
+  let l2 = unsafe Pointer.borrowMut<(), Loop>(&mut anchor, loop)
+  l2.child = Pointer.null<Handle>() l2.first = Pointer.null<Handle>() l2.last = Pointer.null<Handle>()
+  if l2.signalRead >= 0 { let _a = unsafe close(l2.signalRead) let _b = unsafe close(l2.signalWrite) l2.signalRead = -1 l2.signalWrite = -1 }
+  if l2.notify >= 0 { let _a = unsafe close(l2.notify) l2.notify = -1 }
+  let _a = unsafe close(l2.wakeRead) let _b = unsafe close(l2.wakeWrite) let _c = unsafe close(l2.backend)
+  l2.wakeRead = -1 l2.wakeWrite = -1 l2.backend = -1
+  if !Pointer.isNull<u8>(l2.workLock) { let _d = unsafe pthread_mutex_destroy(unsafe nn(l2.workLock)) unsafe free(l2.workLock) l2.workLock = Pointer.null<u8>() }
+  unsafe free(l2.watchSlots) l2.watchSlots = Pointer.null<u8>() l2.watchCapacity = 0 l2.watchCount = 0
+  unsafe free(l2.changes) l2.changes = Pointer.null<u8>() l2.changeCount = 0 l2.changeCapacity = 0
+  return 0
+}
+/// libuv's uv_loop_fork, in the child after fork(): a new kernel queue with every watched
+/// descriptor in it again, a new signal pipe, and a new inotify descriptor with its watches.
+pub unsafe fn uv_loop_fork(memory: *mut u8) -> i32 {
+  let loop = unsafe loopOf(memory)
+  let mut anchor = () let l = unsafe Pointer.borrowMut<(), Loop>(&mut anchor, loop)
+  // As libuv's uv__io_fork: epoll's descriptor is inherited and closed first; a kqueue is not
+  // inherited, so its old number may already be the new queue's and is only forgotten.
+  static if Intrinsic.targetOperatingSystem() != "darwin" { let _closed = unsafe close(l.backend) }
+  l.backend = -1 l.changeCount = 0
+  let queue = unsafe queueOpen()
+  if queue < 0 { return queue }
+  l.backend = queue
+  let mut wake: [i32; 2] = [-1; 2]
+  let made = unsafe makePipe(&mut wake, true)
+  if made != 0 { return made }
+  let _a = unsafe close(l.wakeRead) let _b = unsafe close(l.wakeWrite) l.wakeRead = wake[0] l.wakeWrite = wake[1]
+  let status = unsafe queueSet(queue, wake[0], TAG_WAKE, 0, UV_READABLE)
+  if status != 0 { return status }
+  if l.signalRead >= 0 {
+    let mut ends: [i32; 2] = [-1; 2]
+    let piped = unsafe makePipe(&mut ends, true)
+    if piped != 0 { return piped }
+    let _c = unsafe close(l.signalRead) let _d = unsafe close(l.signalWrite) l.signalRead = ends[0] l.signalWrite = ends[1]
+    let added = unsafe queueSet(queue, ends[0], TAG_SIGNAL, 0, UV_READABLE)
+    if added != 0 { return added }
+  }
+  drop l
+  // Descriptor watchers go back in the new queue with the events they waited for, and signal
+  // handles forget what the parent caught (libuv's uv__io_fork and uv__signal_loop_fork).
+  let walk = () let l2 = unsafe Pointer.borrow<(), Loop>(&walk, loop)
+  let mut handle = l2.first drop l2
+  while !Pointer.isNull<Handle>(handle) {
+    let mut second = () let h = unsafe Pointer.borrowMut<(), Handle>(&mut second, unsafe nn(handle))
+    if h.kind == UV_SIGNAL { h.caughtCount = 0 h.dispatchedCount = 0 }
+    if (h.kind == UV_POLL || (h.flags & IO) != 0) && h.registered != 0 {
+      let status2 = unsafe queueSet(queue, h.fd, usize.toU64(Pointer.address<Handle>(handle)), 0, h.registered)
+      if status2 != 0 { return status2 }
+    }
+    handle = h.next
+  }
+  return unsafe watchFork(loop)
+}
+
+// ---- Handles ----------------------------------------------------------------------------------
+unsafe fn blank(loop: *mut Loop, kind: i32) -> Handle {
+  return Handle {
+    data: Pointer.null<u8>(), loop: loop, kind: kind, flags: REFERENCED,
+    previous: Pointer.null<Handle>(), next: Pointer.null<Handle>(), nextClosing: Pointer.null<Handle>(), closed: silkUvNoClose,
+    fd: -1, registered: 0,
+    woke: silkUvNoClose, pending: 0, nextAsync: Pointer.null<Handle>(),
+    caught: silkUvNoSignal, signum: 0, caughtCount: 0, dispatchedCount: 0, nextSignal: Pointer.null<Handle>(),
+    polled: silkUvNoPoll,
+    exited: silkUvNoExit, pid: 0, status: 0, reaped: false, nextProcess: Pointer.null<Handle>(),
+    changed: silkUvNoEvent, watch: -1, nextWatch: Pointer.null<Handle>(), path: Pointer.null<u8>(), serial: 0,
+    statChanged: silkUvNoStat, context: Pointer.null<u8>(),
+    fired: silkUvNoClose, due: 0, repeat: 0, order: 0, nextTimer: Pointer.null<Handle>(), nextPhase: Pointer.null<Handle>()
+  }
+}
+// Writes a fresh handle of `kind` into `memory` (zeroed, or holding the caller's data word first)
+// and links it into the loop's list.
+unsafe fn initialize(loop: *mut Loop, memory: *mut u8, kind: i32) -> *mut Handle {
+  let handle = unsafe handleOf(memory)
+  // The caller's data word survives initialization, as in libuv: callers set it before or after.
+  let before = () let old = unsafe Pointer.borrow<(), Handle>(&before, handle) let kept = old.data drop old
+  let mut fresh = unsafe blank(loop, kind) fresh.data = kept
+  unsafe Pointer.put<Handle>(handle, move fresh)
+  // At the tail, as libuv's handle queue: uv_walk reports the oldest handle first.
+  let mut anchor = () let l = unsafe Pointer.borrowMut<(), Loop>(&mut anchor, loop)
+  let mut second = () let h = unsafe Pointer.borrowMut<(), Handle>(&mut second, handle)
+  h.previous = l.last
+  if Pointer.isNull<Handle>(l.last) { l.first = handle } else { let mut third = () let t = unsafe Pointer.borrowMut<(), Handle>(&mut third, unsafe nn(l.last)) t.next = handle }
+  l.last = handle
+  return handle
+}
+unsafe fn start(handle: *mut Handle) -> () {
+  let mut anchor = () let h = unsafe Pointer.borrowMut<(), Handle>(&mut anchor, handle)
+  if (h.flags & ACTIVE) != 0 { return }
+  h.flags = h.flags | ACTIVE
+  if (h.flags & REFERENCED) != 0 { let mut second = () let l = unsafe Pointer.borrowMut<(), Loop>(&mut second, h.loop) l.active = l.active + 1 }
+}
+unsafe fn stop(handle: *mut Handle) -> () {
+  let mut anchor = () let h = unsafe Pointer.borrowMut<(), Handle>(&mut anchor, handle)
+  if (h.flags & ACTIVE) == 0 { return }
+  h.flags = h.flags & (ACTIVE ^ 4294967295)
+  if (h.flags & REFERENCED) != 0 { let mut second = () let l = unsafe Pointer.borrowMut<(), Loop>(&mut second, h.loop) l.active = l.active - 1 }
+}
+pub unsafe fn uv_ref(memory: *mut u8) -> () {
+  let mut anchor = () let h = unsafe Pointer.borrowMut<(), Handle>(&mut anchor, unsafe handleOf(memory))
+  if (h.flags & REFERENCED) != 0 { return }
+  h.flags = h.flags | REFERENCED
+  if (h.flags & CLOSING) != 0 { return }
+  if (h.flags & ACTIVE) != 0 { let mut second = () let l = unsafe Pointer.borrowMut<(), Loop>(&mut second, h.loop) l.active = l.active + 1 }
+}
+pub unsafe fn uv_unref(memory: *mut u8) -> () {
+  let mut anchor = () let h = unsafe Pointer.borrowMut<(), Handle>(&mut anchor, unsafe handleOf(memory))
+  if (h.flags & REFERENCED) == 0 { return }
+  h.flags = h.flags & (REFERENCED ^ 4294967295)
+  if (h.flags & CLOSING) != 0 { return }
+  if (h.flags & ACTIVE) != 0 { let mut second = () let l = unsafe Pointer.borrowMut<(), Loop>(&mut second, h.loop) l.active = l.active - 1 }
+}
+pub unsafe fn uv_has_ref(memory: *const u8) -> i32 {
+  let anchor = () let h = unsafe Pointer.borrow<(), Handle>(&anchor, unsafe handleOfConst(memory))
+  if (h.flags & REFERENCED) != 0 { return 1 }
+  return 0
+}
+pub unsafe fn uv_is_active(memory: *const u8) -> i32 {
+  let anchor = () let h = unsafe Pointer.borrow<(), Handle>(&anchor, unsafe handleOfConst(memory))
+  if (h.flags & ACTIVE) != 0 { return 1 }
+  return 0
+}
+pub unsafe fn uv_is_closing(memory: *const u8) -> i32 {
+  let anchor = () let h = unsafe Pointer.borrow<(), Handle>(&anchor, unsafe handleOfConst(memory))
+  if (h.flags & (CLOSING | CLOSED)) != 0 { return 1 }
+  return 0
+}
+pub unsafe fn uv_handle_get_data(memory: *const u8) -> ?*mut u8 {
+  let anchor = () let h = unsafe Pointer.borrow<(), Handle>(&anchor, unsafe handleOfConst(memory))
+  return h.data
+}
+pub unsafe fn uv_handle_set_data(memory: *mut u8, data: ?*mut u8) -> () {
+  let mut anchor = () let h = unsafe Pointer.borrowMut<(), Handle>(&mut anchor, unsafe handleOf(memory))
+  h.data = data
+}
+pub unsafe fn uv_handle_get_type(memory: *const u8) -> i32 {
+  let anchor = () let h = unsafe Pointer.borrow<(), Handle>(&anchor, unsafe handleOfConst(memory))
+  return h.kind
+}
+/// libuv's name of a handle kind, NUL-terminated.
+pub unsafe fn uv_handle_type_name(kind: i32) -> *const u8 {
+  if kind == UV_TIMER { let timer = b"timer\0" return Pointer.fromRef<u8>(&timer[0]) }
+  let name: &[u8] = if kind == UV_ASYNC { b"async\0" } else { if kind == UV_FS_EVENT { b"fs_event\0" } else { if kind == UV_FS_POLL { b"fs_poll\0" } else { if kind == UV_POLL { b"poll\0" } else { if kind == UV_PROCESS { b"process\0" } else { if kind == UV_SIGNAL { b"signal\0" } else { b"unknown\0" } } } } } }
+  return Pointer.fromRef<u8>(&name[0])
+}
+/// The descriptor of a poll or descriptor handle, as libuv's uv_fileno: UV_EINVAL for the other
+/// kinds, UV_EBADF without a descriptor or once it closes.
+pub unsafe fn uv_fileno(memory: *const u8, fd: *mut i32) -> i32 {
+  let anchor = () let h = unsafe Pointer.borrow<(), Handle>(&anchor, unsafe handleOfConst(memory))
+  if h.kind != UV_POLL && (h.flags & IO) == 0 { return -22 }
+  if (h.flags & (CLOSING | CLOSED)) != 0 || h.fd < 0 { return -9 }
+  unsafe Pointer.write<i32>(fd, h.fd)
+  return 0
+}
+/// Calls `callback(handle, argument)` for each open handle of the loop, oldest first, as libuv. A
+/// handle that stands for an addon's record is reported as that record (its `data`).
+pub unsafe fn uv_walk(memory: *mut u8, callback: WalkCallback, argument: *mut u8) -> () {
+  let anchor = () let l = unsafe Pointer.borrow<(), Loop>(&anchor, unsafe loopOf(memory))
+  let mut handle = l.first drop l
+  while !Pointer.isNull<Handle>(handle) {
+    let h = unsafe Pointer.borrow<(), Handle>(&anchor, unsafe nn(handle))
+    let next = h.next let hidden = (h.flags & INTERNAL) != 0 let addon = (h.flags & ADDON) != 0 let outer = h.data drop h
+    if !hidden { if addon { unsafe callback(unsafe nn(outer), argument) } else { unsafe callback(unsafe bytesOf(unsafe nn(handle)), argument) } }
+    handle = next
+  }
+}
+unsafe fn unlinkAsync(handle: *mut Handle) -> () {
+  let mut anchor = () let h = unsafe Pointer.borrowMut<(), Handle>(&mut anchor, handle)
+  let mut second = () let l = unsafe Pointer.borrowMut<(), Loop>(&mut second, h.loop)
+  if same(l.asyncs, handle) { l.asyncs = h.nextAsync h.nextAsync = Pointer.null<Handle>() return }
+  let mut cursor = l.asyncs
+  while !Pointer.isNull<Handle>(cursor) {
+    let mut third = () let c = unsafe Pointer.borrowMut<(), Handle>(&mut third, unsafe nn(cursor))
+    if same(c.nextAsync, handle) { c.nextAsync = h.nextAsync h.nextAsync = Pointer.null<Handle>() return }
+    cursor = c.nextAsync
+  }
+}
+unsafe fn makeClosePending(handle: *mut Handle) -> () {
+  let mut anchor = () let h = unsafe Pointer.borrowMut<(), Handle>(&mut anchor, handle)
+  let mut second = () let l = unsafe Pointer.borrowMut<(), Loop>(&mut second, h.loop)
+  h.nextClosing = l.closing l.closing = handle
+}
+/// Stops the handle and asks for its close callback, which runs in the closing phase of the next
+/// `uv_run`. The memory must stay valid until then.
+pub unsafe fn uv_close(memory: *mut u8, callback: CloseCallback) -> () {
+  let handle = unsafe handleOf(memory)
+  let mut anchor = () let h = unsafe Pointer.borrowMut<(), Handle>(&mut anchor, handle)
+  if (h.flags & (CLOSING | CLOSED)) != 0 { return }
+  let kind = h.kind h.closed = callback drop h
+  if kind == UV_ASYNC { unsafe unlinkAsync(handle) unsafe stop(handle) }
+  if kind == UV_SIGNAL { unsafe signalStop(handle) }
+  if kind == UV_POLL { let _ignored = unsafe uv_poll_stop(memory) }
+  if kind == UV_PROCESS { unsafe processClose(handle) }
+  if kind == UV_FS_EVENT { let _ignored = unsafe uv_fs_event_stop(memory) }
+  if kind == UV_FS_POLL { let _ignored = unsafe uv_fs_poll_stop(memory) }
+  if kind == UV_TIMER { let _ignored = unsafe uv_timer_stop(memory) }
+  if kind == UV_IDLE || kind == UV_PREPARE || kind == UV_CHECK { unsafe phaseStop(handle) }
+  let io = (unsafe Pointer.borrow<(), Handle>(&anchor, handle)).flags & IO != 0
+  if io { let _unwatched = unsafe ioWatch(memory, 0, silkUvNoPoll) unsafe selectRelease(handle) unsafe stop(handle) }
+  let h2 = unsafe Pointer.borrowMut<(), Handle>(&mut anchor, handle)
+  h2.flags = h2.flags | CLOSING
+  // A stat poll closes once its last context is gone (libuv's uv__fs_poll_close).
+  let waits = kind == UV_FS_POLL && !Pointer.isNull<u8>(h2.context)
+  drop h2
+  if !waits { unsafe makeClosePending(handle) }
+}
+unsafe fn runClosing(loop: *mut Loop) -> () {
+  let mut anchor = () let l = unsafe Pointer.borrowMut<(), Loop>(&mut anchor, loop)
+  let mut handle = l.closing l.closing = Pointer.null<Handle>() drop l
+  while !Pointer.isNull<Handle>(handle) {
+    let pointer = unsafe nn(handle)
+    let h = unsafe Pointer.borrowMut<(), Handle>(&mut anchor, pointer)
+    let next = h.nextClosing
+    // Signals that the handler caught but the loop has not read yet still name this handle: it
+    // closes after they are read, and until then keeps the loop turning, as in libuv.
+    if h.kind == UV_SIGNAL && unsafe Atomic.load<u32>(Pointer.fromRef<u32>(&h.caughtCount), MemoryOrder.SequentiallyConsistent) != h.dispatchedCount {
+      drop h unsafe makeClosePending(pointer) handle = next continue
+    }
+    h.flags = h.flags | CLOSED
+    let before = h.previous let after = h.next let callback = h.closed
+    h.previous = Pointer.null<Handle>() h.next = Pointer.null<Handle>() drop h
+    if Pointer.isNull<Handle>(before) { let l2 = unsafe Pointer.borrowMut<(), Loop>(&mut anchor, loop) l2.first = after }
+    else { let b = unsafe Pointer.borrowMut<(), Handle>(&mut anchor, unsafe nn(before)) b.next = after }
+    if !Pointer.isNull<Handle>(after) { let a = unsafe Pointer.borrowMut<(), Handle>(&mut anchor, unsafe nn(after)) a.previous = before }
+    else { let l3 = unsafe Pointer.borrowMut<(), Loop>(&mut anchor, loop) l3.last = before }
+    unsafe callback(unsafe bytesOf(pointer))
+    handle = next
+  }
+}
+
+// ---- Async ------------------------------------------------------------------------------------
+/// An async handle is active from its initialization, and so holds the loop while referenced.
+pub unsafe fn uv_async_init(loopMemory: *mut u8, memory: *mut u8, callback: AsyncCallback) -> i32 {
+  let loop = unsafe loopOf(loopMemory)
+  let handle = unsafe initialize(loop, memory, UV_ASYNC)
+  let mut anchor = () let h = unsafe Pointer.borrowMut<(), Handle>(&mut anchor, handle)
+  let mut second = () let l = unsafe Pointer.borrowMut<(), Loop>(&mut second, loop)
+  // At the tail, as libuv's async handle queue: callbacks run oldest first.
+  h.woke = callback h.nextAsync = Pointer.null<Handle>()
+  if Pointer.isNull<Handle>(l.asyncs) { l.asyncs = handle }
+  else {
+    let mut cursor = unsafe nn(l.asyncs)
+    while true { let mut third = () let c = unsafe Pointer.borrowMut<(), Handle>(&mut third, cursor) if Pointer.isNull<Handle>(c.nextAsync) { c.nextAsync = handle break } cursor = unsafe nn(c.nextAsync) }
+  }
+  drop h drop l
+  unsafe start(handle)
+  return 0
+}
+/// Asks the loop to call the handle's callback. Any thread, or a signal handler, may call it; sends
+/// before the callback runs are one call.
+pub unsafe fn uv_async_send(memory: *mut u8) -> i32 {
+  let handle = unsafe handleOf(memory)
+  let mut anchor = () let h = unsafe Pointer.borrowMut<(), Handle>(&mut anchor, handle)
+  if unsafe Atomic.swap<u32>(Pointer.fromMutRef<u32>(&mut h.pending), 1, MemoryOrder.SequentiallyConsistent) != 0 { return 0 }
+  let second = () let l = unsafe Pointer.borrow<(), Loop>(&second, h.loop)
+  let fd = l.wakeWrite
+  let one: [u8; 1] = [1]
+  while true {
+    let written = unsafe write(fd, Pointer.fromRef<u8>(&one[0]), 1)
+    if written >= 0 { break }
+    if unsafe errno() != EINTR { break }
+  }
+  return 0
+}
+unsafe fn asyncReady(loop: *mut Loop) -> () {
+  let anchor = () let l = unsafe Pointer.borrow<(), Loop>(&anchor, loop)
+  let fd = l.wakeRead drop l
+  let mut buffer: [u8; 1024] = [0; 1024]
+  while true {
+    let count = unsafe read(fd, Pointer.fromMutRef<u8>(&mut buffer[0]), 1024)
+    if count == 1024 { continue }
+    if count >= 0 { break }
+    if unsafe errno() != EINTR { break }
+  }
+  // Finished thread-pool work first: libuv's wq_async is the loop's first async handle.
+  unsafe workDone(loop)
+  // A callback may close or start async handles, so each step looks for the next one afresh.
+  let mut second = () let l2 = unsafe Pointer.borrowMut<(), Loop>(&mut second, loop)
+  l2.serial = l2.serial + 1 let serial = l2.serial drop l2
+  while true {
+    let l3 = unsafe Pointer.borrow<(), Loop>(&anchor, loop)
+    let mut cursor = l3.asyncs drop l3
+    let mut found: ?*mut Handle = Pointer.null<Handle>()
+    while !Pointer.isNull<Handle>(cursor) {
+      let mut third = () let c = unsafe Pointer.borrowMut<(), Handle>(&mut third, unsafe nn(cursor))
+      if c.serial != serial { c.serial = serial found = cursor break }
+      cursor = c.nextAsync
+    }
+    if Pointer.isNull<Handle>(found) { return }
+    let pointer = unsafe nn(found)
+    let mut fourth = () let h = unsafe Pointer.borrowMut<(), Handle>(&mut fourth, pointer)
+    let callback = h.woke
+    let fired = unsafe Atomic.swap<u32>(Pointer.fromMutRef<u32>(&mut h.pending), 0, MemoryOrder.SequentiallyConsistent) != 0
+    drop h
+    if fired { unsafe callback(unsafe bytesOf(pointer)) }
+  }
+}
+
+// ---- Poll -------------------------------------------------------------------------------------
+/// Watches a socket descriptor, which it makes nonblocking, as libuv does.
+pub unsafe fn uv_poll_init_socket(loopMemory: *mut u8, memory: *mut u8, fd: i32) -> i32 {
+  if unsafe fcntl(fd, F_GETFL) < 0 { return -(unsafe errno()) }
+  unsafe nonblocking(fd, true)
+  let handle = unsafe initialize(unsafe loopOf(loopMemory), memory, UV_POLL)
+  let mut anchor = () let h = unsafe Pointer.borrowMut<(), Handle>(&mut anchor, handle)
+  h.fd = fd
+  return 0
+}
+/// Starts, or changes, the events (`UV_READABLE` 1, `UV_WRITABLE` 2, `UV_DISCONNECT` 4,
+/// `UV_PRIORITIZED` 8) that call `callback(handle, status, events)`. No events stops the handle.
+pub unsafe fn uv_poll_start(memory: *mut u8, events: i32, callback: PollCallback) -> i32 {
+  return unsafe pollStart(memory, events, callback, false)
+}
+/// uv_poll_start for addons (ext.uv_api_loop): on macOS the additions wait for the next wait's
+/// kevent call, as libuv's kqueue backend, so filters report in libuv's order and a refused
+/// EV_OOBAND arrives first. The runtime's own poll handles (process IPC) register at once: one may
+/// start from another thread than the one waiting, and must not wait for that wait to end.
+pub unsafe fn uv_poll_start_deferred(memory: *mut u8, events: i32, callback: PollCallback) -> i32 {
+  return unsafe pollStart(memory, events, callback, true)
+}
+unsafe fn pollStart(memory: *mut u8, events: i32, callback: PollCallback, deferred: bool) -> i32 {
+  let handle = unsafe handleOf(memory)
+  let mut anchor = () let h = unsafe Pointer.borrowMut<(), Handle>(&mut anchor, handle)
+  if (h.flags & (CLOSING | CLOSED)) != 0 { return -22 }
+  let wanted = events & (UV_READABLE | UV_WRITABLE | UV_DISCONNECT | UV_PRIORITIZED)
+  let loop = h.loop let fd = h.fd let previous = h.registered drop h
+  let tag = usize.toU64(Pointer.address<Handle>(handle))
+  let status = if deferred { unsafe queueSetLoop(loop, fd, tag, previous, wanted) } else {
+    let anchorLoop = () let l = unsafe Pointer.borrow<(), Loop>(&anchorLoop, loop) let queue = l.backend drop l
+    unsafe queueSet(queue, fd, tag, previous, wanted)
+  }
+  if status != 0 { return status }
+  let h2 = unsafe Pointer.borrowMut<(), Handle>(&mut anchor, handle)
+  h2.registered = wanted h2.polled = callback drop h2
+  if wanted == 0 { unsafe stop(handle) } else { unsafe start(handle) }
+  return 0
+}
+pub unsafe fn uv_poll_stop(memory: *mut u8) -> i32 {
+  let handle = unsafe handleOf(memory)
+  let mut anchor = () let h = unsafe Pointer.borrowMut<(), Handle>(&mut anchor, handle)
+  let loop = h.loop let fd = h.fd let previous = h.registered h.registered = 0 drop h
+  if previous != 0 { let _ignored = unsafe queueSetLoop(loop, fd, 0, previous, 0) }
+  unsafe stop(handle)
+  return 0
+}
+unsafe fn pollReady(loop: *mut Loop, handle: *mut Handle, ready: i32) -> bool {
+  let mut anchor = () let h = unsafe Pointer.borrowMut<(), Handle>(&mut anchor, handle)
+  if (h.flags & IO) != 0 {
+    if h.registered == 0 { return false }
+    let callback = h.polled let registered = h.registered
+    let mut events = ready & registered
+    // libuv's epoll quirk: an error or hangup alone wakes every event the watcher waits for.
+    if (ready & QUEUE_ERROR) != 0 { events = events | registered | IO_ERROR | (ready & IO_HANGUP) }
+    drop h
+    if events == 0 { return false }
+    unsafe metricsLeave(loop)
+    unsafe callback(unsafe bytesOf(handle), 0, events)
+    return true
+  }
+  if h.kind != UV_POLL || (h.flags & (CLOSING | CLOSED)) != 0 || h.registered == 0 { return false }
+  let callback = h.polled let registered = h.registered
+  let mut events = ready & registered
+  // An error or hangup alone reports every event the handle waits for, as libuv's io poll does.
+  if (ready & QUEUE_ERROR) != 0 { events = events | registered }
+  if (ready & QUEUE_FAULT) != 0 && (events & UV_PRIORITIZED) == 0 {
+    drop h
+    unsafe metricsLeave(loop)
+    let _ignored = unsafe uv_poll_stop(unsafe bytesOf(handle))
+    unsafe callback(unsafe bytesOf(handle), -9, 0)
+    return true
+  }
+  drop h
+  if events == 0 { return false }
+  unsafe metricsLeave(loop)
+  unsafe callback(unsafe bytesOf(handle), 0, events)
+  return true
+}
+
+// ---- Signals ----------------------------------------------------------------------------------
+// The process-wide table: per signal, the started handles of every loop. The handler and the
+// loops share it under `lock`; a thread that is not the handler blocks all signals before it takes
+// the lock, so the handler never interrupts a holder on its own thread.
+struct SignalTable { lock: u32, heads: [?*mut Handle; 65] }
+unsafe fn addressPointer(address: u64) -> ?*mut u8 {
+  let word = u64.toUsize(address)
+  return unsafe Pointer.read<?*mut u8>(unsafe Intrinsic.pointerReinterpret<*const usize, *const ?*mut u8>(Pointer.fromRef<usize>(&word)))
+}
+unsafe fn signalTable(create: bool) -> ?*mut SignalTable {
+  let word = Intrinsic.processWord()
+  let current = unsafe Atomic.load<u64>(word, MemoryOrder.Acquire)
+  if current != 0 { return unsafe Intrinsic.pointerReinterpret<?*mut u8, ?*mut SignalTable>(unsafe addressPointer(current)) }
+  if !create { return Pointer.null<SignalTable>() }
+  let made = unsafe calloc(1, Layout.of<SignalTable>().bytes)
+  if Pointer.isNull<u8>(made) { return Pointer.null<SignalTable>() }
+  let raced = unsafe Atomic.compareExchange<u64>(word, 0, usize.toU64(Pointer.address<u8>(made)), MemoryOrder.AcquireRelease, MemoryOrder.Acquire)
+  match move raced {
+    CompareExchange<u64>.Exchanged => { return unsafe Intrinsic.pointerReinterpret<?*mut u8, ?*mut SignalTable>(made) }
+    CompareExchange<u64>.Observed { value } => { unsafe free(made) return unsafe Intrinsic.pointerReinterpret<?*mut u8, ?*mut SignalTable>(unsafe addressPointer(value)) }
+  }
+}
+unsafe fn tableLock(table: *mut SignalTable) -> () {
+  let mut anchor = () let t = unsafe Pointer.borrowMut<(), SignalTable>(&mut anchor, table)
+  while unsafe Atomic.swap<u32>(Pointer.fromMutRef<u32>(&mut t.lock), 1, MemoryOrder.Acquire) != 0 {}
+}
+unsafe fn tableUnlock(table: *mut SignalTable) -> () {
+  let mut anchor = () let t = unsafe Pointer.borrowMut<(), SignalTable>(&mut anchor, table)
+  unsafe Atomic.store<u32>(Pointer.fromMutRef<u32>(&mut t.lock), 0, MemoryOrder.Release)
+}
+unsafe fn blockAndLock(table: *mut SignalTable, saved: &mut [u8; 128]) -> () {
+  let all: [u8; 128] = [255; 128]
+  if unsafe pthread_sigmask(SIG_SETMASK, Pointer.fromRef<u8>(&all[0]), Pointer.fromMutRef<u8>(&mut saved[0])) != 0 { unsafe abort() }
+  unsafe tableLock(table)
+}
+unsafe fn unlockAndRestore(table: *mut SignalTable, saved: &[u8; 128]) -> () {
+  unsafe tableUnlock(table)
+  if unsafe pthread_sigmask(SIG_SETMASK, Pointer.fromRef<u8>(&saved[0]), Pointer.null<u8>()) != 0 { unsafe abort() }
+}
+/// The one signal handler. It only writes: a 16-byte message (handle address, signal number) into
+/// the pipe of each watching handle's loop. A full pipe drops the message, as in libuv.
+export "C" fn silkUvSignalHandler(signum: i32) -> () {
+  if signum <= 0 || signum > 64 { return }
+  let saved = unsafe errno()
+  let found = unsafe signalTable(false)
+  if Pointer.isNull<SignalTable>(found) { return }
+  let table = unsafe nn(found)
+  unsafe tableLock(table)
+  let anchor = () let t = unsafe Pointer.borrow<(), SignalTable>(&anchor, table)
+  let mut handle = t.heads[i32.toUsize(signum)]
+  while !Pointer.isNull<Handle>(handle) {
+    let mut second = () let h = unsafe Pointer.borrowMut<(), Handle>(&mut second, unsafe nn(handle))
+    let l = unsafe Pointer.borrow<(), Loop>(&anchor, h.loop)
+    let message: [u64; 2] = [usize.toU64(Pointer.address<Handle>(handle)), i32.toU64(signum)]
+    let mut written: isize = -1
+    while true {
+      written = unsafe write(l.signalWrite, unsafe Intrinsic.pointerReinterpret<*const u64, *const u8>(Pointer.fromRef<u64>(&message[0])), 16)
+      if written >= 0 || unsafe errno() != EINTR { break }
+    }
+    if written == 16 { let _count = unsafe Atomic.fetchAdd<u32>(Pointer.fromMutRef<u32>(&mut h.caughtCount), 1, MemoryOrder.SequentiallyConsistent) }
+    handle = h.nextSignal
+  }
+  drop t
+  unsafe tableUnlock(table)
+  unsafe setErrno(saved)
+}
+pub unsafe fn uv_signal_init(loopMemory: *mut u8, memory: *mut u8) -> i32 {
+  let _handle = unsafe initialize(unsafe loopOf(loopMemory), memory, UV_SIGNAL)
+  return 0
+}
+// libuv's order of the watchers of one signal (uv__signal_compare): the repeating ones first, then
+// by loop address, then by handle address.
+unsafe fn signalBefore(a: *mut Handle, b: *mut Handle) -> bool {
+  let anchor = () let x = unsafe Pointer.borrow<(), Handle>(&anchor, a) let y = unsafe Pointer.borrow<(), Handle>(&anchor, b)
+  let fx = x.flags & ONESHOT let fy = y.flags & ONESHOT
+  if fx != fy { return fx < fy }
+  let lx = Pointer.address<Loop>(x.loop) let ly = Pointer.address<Loop>(y.loop)
+  if lx != ly { return lx < ly }
+  return Pointer.address<Handle>(a) < Pointer.address<Handle>(b)
+}
+// Installs the process handler for `signum`; a one-shot one resets itself after its first
+// delivery (SA_RESETHAND), as in libuv's uv__signal_register_handler.
+unsafe fn registerHandler(signum: i32, oneshot: bool) -> i32 {
+  let mut action = handlerAction(silkUvSignalHandler)
+  if oneshot { action.flags = action.flags | SA_RESETHAND }
+  if unsafe sigaction(signum, unsafe Intrinsic.pointerReinterpret<*const SignalAction, *const u8>(Pointer.fromRef<SignalAction>(&action)), Pointer.null<u8>()) != 0 { return -(unsafe errno()) }
+  return 0
+}
+unsafe fn signalStart(handle: *mut Handle, callback: SignalCallback, signum: i32, oneshot: bool) -> i32 {
+  if signum == 0 { return -22 }
+  let mut anchor = () let h = unsafe Pointer.borrowMut<(), Handle>(&mut anchor, handle)
+  // A started handle that changes only its callback keeps its place.
+  if h.signum == signum { h.caught = callback return 0 }
+  let loop = h.loop let previous = h.signum drop h
+  if previous != 0 { unsafe signalStop(handle) }
+  if signum < 0 || signum > 64 { return -22 }
+  let mut second = () let l = unsafe Pointer.borrowMut<(), Loop>(&mut second, loop)
+  if l.signalRead < 0 {
+    let mut ends: [i32; 2] = [-1; 2]
+    let made = unsafe makePipe(&mut ends, true)
+    if made != 0 { return made }
+    let registered = unsafe queueSet(l.backend, ends[0], TAG_SIGNAL, 0, UV_READABLE)
+    if registered != 0 { let _a = unsafe close(ends[0]) let _b = unsafe close(ends[1]) return registered }
+    l.signalRead = ends[0] l.signalWrite = ends[1]
+  }
+  drop l
+  let found = unsafe signalTable(true)
+  if Pointer.isNull<SignalTable>(found) { return -12 }
+  let table = unsafe nn(found)
+  let mut saved: [u8; 128] = [0; 128]
+  unsafe blockAndLock(table, &mut saved)
+  let mut third = () let t = unsafe Pointer.borrowMut<(), SignalTable>(&mut third, table)
+  let index = i32.toUsize(signum)
+  let first = t.heads[index]
+  let firstOneshot = !Pointer.isNull<Handle>(first) && (unsafe Pointer.borrow<(), Handle>(&anchor, unsafe nn(first))).flags & ONESHOT != 0
+  if Pointer.isNull<Handle>(first) || (!oneshot && firstOneshot) {
+    let status = unsafe registerHandler(signum, oneshot)
+    if status != 0 { drop t unsafe unlockAndRestore(table, &saved) return status }
+  }
+  let h2 = unsafe Pointer.borrowMut<(), Handle>(&mut anchor, handle)
+  h2.signum = signum
+  if oneshot { h2.flags = h2.flags | ONESHOT } else { h2.flags = h2.flags & (ONESHOT ^ 4294967295) }
+  drop h2
+  // Sorted insertion.
+  if Pointer.isNull<Handle>(first) || unsafe signalBefore(handle, unsafe nn(first)) {
+    let h3 = unsafe Pointer.borrowMut<(), Handle>(&mut anchor, handle) h3.nextSignal = first drop h3
+    t.heads[index] = handle
+  } else {
+    let mut cursor = unsafe nn(first)
+    while true {
+      let mut fourth = () let c = unsafe Pointer.borrowMut<(), Handle>(&mut fourth, cursor)
+      let next = c.nextSignal
+      if Pointer.isNull<Handle>(next) || unsafe signalBefore(handle, unsafe nn(next)) {
+        let h4 = unsafe Pointer.borrowMut<(), Handle>(&mut anchor, handle) h4.nextSignal = next drop h4
+        c.nextSignal = handle break
+      }
+      cursor = unsafe nn(next)
+    }
+  }
+  drop t
+  unsafe unlockAndRestore(table, &saved)
+  let h5 = unsafe Pointer.borrowMut<(), Handle>(&mut anchor, handle) h5.caught = callback drop h5
+  unsafe start(handle)
+  return 0
+}
+/// Calls `callback(handle, signal)` on the loop for each delivery of `signal` to the process.
+pub unsafe fn uv_signal_start(memory: *mut u8, callback: SignalCallback, signum: i32) -> i32 { return unsafe signalStart(unsafe handleOf(memory), callback, signum, false) }
+/// As uv_signal_start, for the next delivery only: the watcher then stops.
+pub unsafe fn uv_signal_start_oneshot(memory: *mut u8, callback: SignalCallback, signum: i32) -> i32 { return unsafe signalStart(unsafe handleOf(memory), callback, signum, true) }
+unsafe fn signalStop(handle: *mut Handle) -> () {
+  let mut anchor = () let h = unsafe Pointer.borrowMut<(), Handle>(&mut anchor, handle)
+  let signum = h.signum let wasOneshot = (h.flags & ONESHOT) != 0
+  if signum == 0 { return }
+  drop h
+  let found = unsafe signalTable(false)
+  if Pointer.isNull<SignalTable>(found) { return }
+  let table = unsafe nn(found)
+  let mut saved: [u8; 128] = [0; 128]
+  unsafe blockAndLock(table, &mut saved)
+  let mut second = () let t = unsafe Pointer.borrowMut<(), SignalTable>(&mut second, table)
+  let index = i32.toUsize(signum)
+  let h1 = unsafe Pointer.borrowMut<(), Handle>(&mut anchor, handle)
+  if same(t.heads[index], handle) { t.heads[index] = h1.nextSignal }
+  else {
+    let mut cursor = t.heads[index]
+    while !Pointer.isNull<Handle>(cursor) {
+      let mut third = () let c = unsafe Pointer.borrowMut<(), Handle>(&mut third, unsafe nn(cursor))
+      if same(c.nextSignal, handle) { c.nextSignal = h1.nextSignal break }
+      cursor = c.nextSignal
+    }
+  }
+  h1.nextSignal = Pointer.null<Handle>() drop h1
+  let first = t.heads[index]
+  if Pointer.isNull<Handle>(first) {
+    // The last watcher is gone: the signal gets its default action back, as in libuv.
+    let action = defaultAction()
+    if unsafe sigaction(signum, unsafe Intrinsic.pointerReinterpret<*const DefaultAction, *const u8>(Pointer.fromRef<DefaultAction>(&action)), Pointer.null<u8>()) != 0 { unsafe abort() }
+  } else {
+    // Only one-shot watchers are left: the handler resets itself again after a delivery.
+    let firstOneshot = (unsafe Pointer.borrow<(), Handle>(&anchor, unsafe nn(first))).flags & ONESHOT != 0
+    if firstOneshot && !wasOneshot { if unsafe registerHandler(signum, true) != 0 { unsafe abort() } }
+  }
+  drop t
+  unsafe unlockAndRestore(table, &saved)
+  let h2 = unsafe Pointer.borrowMut<(), Handle>(&mut anchor, handle) h2.signum = 0 drop h2
+  unsafe stop(handle)
+}
+pub unsafe fn uv_signal_stop(memory: *mut u8) -> i32 { unsafe signalStop(unsafe handleOf(memory)) return 0 }
+/// The signal a watcher watches, 0 when stopped (libuv's handle->signum).
+pub unsafe fn signalNumber(memory: *const u8) -> i32 {
+  let anchor = () let h = unsafe Pointer.borrow<(), Handle>(&anchor, unsafe handleOfConst(memory))
+  return h.signum
+}
+unsafe fn signalReady(loop: *mut Loop) -> () {
+  let anchor = () let l = unsafe Pointer.borrow<(), Loop>(&anchor, loop)
+  let fd = l.signalRead drop l
+  if fd < 0 { return }
+  let mut messages: [u64; 64] = [0; 64]
+  while true {
+    let count = unsafe read(fd, unsafe Intrinsic.pointerReinterpret<*mut u64, *mut u8>(Pointer.fromMutRef<u64>(&mut messages[0])), 512)
+    if count < 0 { if unsafe errno() == EINTR { continue } break }
+    if count == 0 { break }
+    let mut index: usize = 0
+    while index + 1 < isize.toUsize(count) / 8 {
+      let target = unsafe addressPointer(messages[index]) let signum = u64.toI32(messages[index + 1])
+      index = index + 2
+      if Pointer.isNull<u8>(target) { continue }
+      let handle = unsafe handleOf(unsafe nn(target))
+      let mut second = () let h = unsafe Pointer.borrowMut<(), Handle>(&mut second, handle)
+      let callback = h.caught let live = h.signum == signum
+      drop h
+      if live { unsafe callback(unsafe bytesOf(handle), signum) }
+      let h2 = unsafe Pointer.borrowMut<(), Handle>(&mut second, handle)
+      h2.dispatchedCount = h2.dispatchedCount + 1 let oneshot = (h2.flags & ONESHOT) != 0 drop h2
+      if oneshot { unsafe signalStop(handle) }
+    }
+    if count < 512 { break }
+  }
+}
+
+// ---- Child processes --------------------------------------------------------------------------
+unsafe fn writeError(fd: i32, value: i32) -> () {
+  let code: [i32; 1] = [value]
+  while true {
+    let written = unsafe write(fd, unsafe Intrinsic.pointerReinterpret<*const i32, *const u8>(Pointer.fromRef<i32>(&code[0])), 4)
+    if written >= 0 || unsafe errno() != EINTR { break }
+  }
+  unsafe _exit(127)
+}
+unsafe fn writeErrno(fd: i32) -> () { unsafe writeError(fd, -(unsafe errno())) }
+// Runs in the forked child, as libuv's uv__process_child_init: default signal dispositions, the
+// stdio descriptors in place, then the working directory, the ids, the environment, and exec. A
+// failure writes its negative errno to `errorFd` and exits.
+unsafe fn childInit(options: &Options, count: i32, use: [*]mut i32, errorFd: i32, environment: ?*mut *const ?*const u8) -> () {
+  let mut n: i32 = 1
+  while n < 32 {
+    if n != 9 && n != SIGSTOP { if unsafe signal(n, 0) == 18446744073709551615 { unsafe writeErrno(errorFd) } }
+    n = n + 1
+  }
+  if (options.flags & 8) != 0 { let _ignored = unsafe setsid() }
+  // Low descriptors that a later slot will overwrite move out of the way first.
+  let mut fd: i32 = 0
+  while fd < count {
+    let slot = unsafe Pointer.atMut<i32>(use, i32.toUsize(fd)) let wanted = unsafe Pointer.read<i32>(slot)
+    if wanted >= 0 && wanted < fd {
+      let moved = unsafe fcntl(wanted, F_DUPFD_CLOEXEC, count)
+      if moved == -1 { unsafe writeErrno(errorFd) }
+      unsafe Pointer.write<i32>(slot, moved)
+    }
+    fd = fd + 1
+  }
+  fd = 0
+  while fd < count {
+    let mut closing: i32 = -1
+    let mut wanted = unsafe Pointer.read<i32>(unsafe Pointer.atMut<i32>(use, i32.toUsize(fd)))
+    if wanted < 0 {
+      if fd >= 3 { fd = fd + 1 continue }
+      // stdin, stdout and stderr are /dev/null when the parent gives nothing.
+      let _closed = unsafe close(fd)
+      let null = b"/dev/null\0"
+      wanted = unsafe open(Pointer.fromRef<u8>(&null[0]), if fd == 0 { 0 } else { 2 })
+      closing = wanted
+      if wanted < 0 { unsafe writeErrno(errorFd) }
+    }
+    if fd == wanted {
+      if closing == -1 {
+        let flags = unsafe fcntl(wanted, F_GETFD)
+        if flags < 0 || unsafe fcntl(wanted, F_SETFD, flags & (FD_CLOEXEC ^ -1)) < 0 { unsafe writeErrno(errorFd) }
+      }
+    } else {
+      if unsafe dup2(wanted, fd) == -1 { unsafe writeErrno(errorFd) }
+    }
+    if fd <= 2 && closing == -1 { unsafe nonblocking(fd, false) }
+    if closing >= count { let _closed = unsafe close(closing) }
+    fd = fd + 1
+  }
+  if !Pointer.isNull<u8>(options.cwd) { if unsafe chdir(unsafe Intrinsic.pointerRequalify<?*const u8, *const u8>(options.cwd)) != 0 { unsafe writeErrno(errorFd) } }
+  if (options.flags & 3) != 0 {
+    // Dropping root also drops its supplementary groups; anyone else may not, which is fine.
+    let kept = unsafe errno() let _ignored = unsafe setgroups(0, Pointer.null<u32>()) unsafe setErrno(kept)
+  }
+  if (options.flags & 2) != 0 { if unsafe setgid(options.gid) != 0 { unsafe writeErrno(errorFd) } }
+  if (options.flags & 1) != 0 { if unsafe setuid(options.uid) != 0 { unsafe writeErrno(errorFd) } }
+  // execvp searches the PATH of the child's environment, so that replaces `environ` first.
+  // A null environment inherits the parent's, as in libuv.
+  if !Pointer.isNull<*const ?*const u8>(environment) && Pointer.address<?*const u8>(options.env) != 0 { unsafe Pointer.write<*const ?*const u8>(unsafe Intrinsic.pointerRequalify<?*mut *const ?*const u8, *mut *const ?*const u8>(environment), options.env) }
+  let none: [u8; 128] = [0; 128]
+  if unsafe pthread_sigmask(SIG_SETMASK, Pointer.fromRef<u8>(&none[0]), Pointer.null<u8>()) != 0 { unsafe abort() }
+  let _ignored = unsafe execvp(options.file, options.args)
+  unsafe writeErrno(errorFd)
+}
+export "C" fn silkUvChildSignal(memory: *mut u8, signum: i32) -> () {
+  let anchor = () let h = unsafe Pointer.borrow<(), Handle>(&anchor, unsafe handleOf(memory))
+  let loop = h.loop drop h
+  unsafe waitChildren(loop)
+}
+// Reaps the children that ended and calls their exit callbacks, as libuv's uv__wait_children.
+unsafe fn waitChildren(loop: *mut Loop) -> () {
+  let mut anchor = () let l = unsafe Pointer.borrowMut<(), Loop>(&mut anchor, loop)
+  let mut handle = l.processes let mut kept: ?*mut Handle = Pointer.null<Handle>() let mut ended: ?*mut Handle = Pointer.null<Handle>()
+  l.processes = Pointer.null<Handle>() drop l
+  while !Pointer.isNull<Handle>(handle) {
+    let pointer = unsafe nn(handle)
+    let mut second = () let h = unsafe Pointer.borrowMut<(), Handle>(&mut second, pointer)
+    let next = h.nextProcess
+    let mut status: i32 = 0 let mut pid: i32 = 0
+    while true {
+      pid = unsafe waitpid(h.pid, Pointer.fromMutRef<i32>(&mut status), 1)
+      if pid != -1 || unsafe errno() != EINTR { break }
+    }
+    if pid <= 0 { h.nextProcess = kept kept = handle }
+    else { h.status = status h.reaped = true h.nextProcess = ended ended = handle }
+    handle = next
+  }
+  let l2 = unsafe Pointer.borrowMut<(), Loop>(&mut anchor, loop)
+  // A spawn inside an exit callback links at the head; the survivors follow whatever is there.
+  l2.processes = kept drop l2
+  while !Pointer.isNull<Handle>(ended) {
+    let pointer = unsafe nn(ended)
+    let mut second = () let h = unsafe Pointer.borrowMut<(), Handle>(&mut second, pointer)
+    let next = h.nextProcess h.nextProcess = Pointer.null<Handle>()
+    let status = h.status let callback = h.exited drop h
+    unsafe stop(pointer)
+    let low = status & 127
+    let code: i64 = if low == 0 { i32.toI64((status / 256) & 255) } else { 0 }
+    let term: i32 = if low != 0 && low != 127 { low } else { 0 }
+    unsafe callback(unsafe bytesOf(pointer), code, term)
+    ended = next
+  }
+}
+unsafe fn processClose(handle: *mut Handle) -> () {
+  let mut anchor = () let h = unsafe Pointer.borrowMut<(), Handle>(&mut anchor, handle)
+  let loop = h.loop
+  let mut second = () let l = unsafe Pointer.borrowMut<(), Loop>(&mut second, loop)
+  if same(l.processes, handle) { l.processes = h.nextProcess }
+  else {
+    let mut cursor = l.processes
+    while !Pointer.isNull<Handle>(cursor) {
+      let mut third = () let c = unsafe Pointer.borrowMut<(), Handle>(&mut third, unsafe nn(cursor))
+      if same(c.nextProcess, handle) { c.nextProcess = h.nextProcess break }
+      cursor = c.nextProcess
+    }
+  }
+  h.nextProcess = Pointer.null<Handle>()
+  let last = Pointer.isNull<Handle>(l.processes) let child = l.child
+  drop h drop l
+  unsafe stop(handle)
+  if last && !Pointer.isNull<Handle>(child) { unsafe signalStop(unsafe nn(child)) }
+}
+/// Starts a child process, as libuv's uv_spawn: with posix_spawn on Darwin (ext.uv_spawn_darwin),
+/// else, or when that declines, on its fork path. `stdio` entries either inherit a
+/// descriptor (flags 2) or are ignored (0); libuv's stream and pipe containers are not offered, since
+/// the runtime's streams are not loop handles. The handle is initialized whatever the status, so the
+/// caller closes it; a negative status is the errno of the fork or of the child's setup or exec.
+pub unsafe fn uv_spawn(loopMemory: *mut u8, memory: *mut u8, options: *const Options) -> i32 {
+  let loop = unsafe loopOf(loopMemory)
+  let handle = unsafe initialize(loop, memory, UV_PROCESS)
+  let anchor = () let o = unsafe Pointer.borrow<(), Options>(&anchor, options)
+  let count: i32 = if o.stdioCount < 3 { 3 } else { o.stdioCount }
+  let storage = unsafe calloc(i32.toUsize(count), 4)
+  if Pointer.isNull<u8>(storage) { return -12 }
+  let use = unsafe Pointer.assumeManyMut<i32>(unsafe Intrinsic.pointerReinterpret<*mut u8, *mut i32>(unsafe nn(storage)))
+  let mut index: i32 = 0
+  while index < count { unsafe Pointer.write<i32>(unsafe Pointer.atMut<i32>(use, i32.toUsize(index)), -1) index = index + 1 }
+  index = 0
+  while index < o.stdioCount {
+    let entry = unsafe Pointer.borrow<(), Stdio>(&anchor, unsafe Pointer.at<Stdio>(unsafe Pointer.assumeMany<Stdio>(o.stdio), i32.toUsize(index)))
+    if (entry.flags & 2) != 0 {
+      let fd = u64.toI32(usize.toU64(entry.data) & 4294967295)
+      if fd == -1 { unsafe free(storage) return -22 }
+      unsafe Pointer.write<i32>(unsafe Pointer.atMut<i32>(use, i32.toUsize(index)), fd)
+    } else { if (entry.flags & 5) != 0 { unsafe free(storage) return -22 } }
+    index = index + 1
+  }
+  // The loop's own SIGCHLD watcher, made by the first spawn. It never holds the loop.
+  let mut second = () let l = unsafe Pointer.borrowMut<(), Loop>(&mut second, loop)
+  if Pointer.isNull<Handle>(l.child) {
+    let watcher = unsafe calloc(1, Layout.of<Handle>().bytes)
+    if Pointer.isNull<u8>(watcher) { unsafe free(storage) return -12 }
+    drop l
+    let made = unsafe initialize(loop, unsafe nn(watcher), UV_SIGNAL)
+    let mut third = () let w = unsafe Pointer.borrowMut<(), Handle>(&mut third, made)
+    w.flags = (w.flags | INTERNAL) & (REFERENCED ^ 4294967295) drop w
+    let l2 = unsafe Pointer.borrowMut<(), Loop>(&mut second, loop) l2.child = made
+  }
+  let l3 = unsafe Pointer.borrow<(), Loop>(&anchor, loop)
+  let child = unsafe nn(l3.child) drop l3
+  let watching = unsafe signalStart(child, silkUvChildSignal, SIGCHLD, false)
+  if watching != 0 { unsafe free(storage) return watching }
+  // Darwin starts the child with posix_spawn, as libuv; it forks only when that path declines
+  // (UV_ENOSYS: a user or group change, or a function the system lacks).
+  static if Intrinsic.targetOperatingSystem() == "darwin" {
+    let mut spawned: i32 = 0
+    let posix = unsafe spawn_darwin.spawnPosix(o, count, use, Pointer.fromMutRef<i32>(&mut spawned))
+    if posix != spawn_darwin.UV_ENOSYS {
+      unsafe free(storage)
+      if posix == 0 {
+        let mut fifth = () let h0 = unsafe Pointer.borrowMut<(), Handle>(&mut fifth, handle)
+        let l5 = unsafe Pointer.borrowMut<(), Loop>(&mut second, loop)
+        h0.pid = spawned h0.exited = o.exitCallback h0.nextProcess = l5.processes l5.processes = handle
+        drop h0 drop l5
+        unsafe start(handle)
+      }
+      return posix
+    }
+  }
+  // Both ends close on exec: the parent reads until the child has run exec, or reads its error.
+  let mut errorPipe: [i32; 2] = [-1; 2]
+  let piped = unsafe makePipe(&mut errorPipe, false)
+  if piped != 0 { unsafe free(storage) return piped }
+  let environment = unsafe environAddress()
+  let mut blocked: [u8; 128] = [0; 128] let mut saved: [u8; 128] = [0; 128]
+  let mut index2: usize = 0 while index2 < SIGSET_BYTES { blocked[index2] = 255 index2 = index2 + 1 }
+  forkMask(&mut blocked)
+  if unsafe pthread_sigmask(SIG_BLOCK, Pointer.fromRef<u8>(&blocked[0]), Pointer.fromMutRef<u8>(&mut saved[0])) != 0 { unsafe abort() }
+  let pid = unsafe fork()
+  if pid == 0 {
+    unsafe childInit(o, count, use, errorPipe[1], environment)
+    unsafe abort()
+  }
+  let forkError = unsafe errno()
+  if unsafe pthread_sigmask(SIG_SETMASK, Pointer.fromRef<u8>(&saved[0]), Pointer.null<u8>()) != 0 { unsafe abort() }
+  let _closed = unsafe close(errorPipe[1])
+  unsafe free(storage)
+  let mut status: i32 = 0
+  if pid == -1 { status = -forkError }
+  else {
+    let mut reported: [i32; 1] = [0] let mut count2: isize = 0
+    while true {
+      count2 = unsafe read(errorPipe[0], unsafe Intrinsic.pointerReinterpret<*mut i32, *mut u8>(Pointer.fromMutRef<i32>(&mut reported[0])), 4)
+      if count2 != -1 || unsafe errno() != EINTR { break }
+    }
+    if count2 != 0 {
+      // The child reported a failure (or died before exec): reap it here, it has no exit event.
+      let failed = if count2 == 4 { reported[0] } else { -32 }
+      let mut ignored: i32 = 0
+      while true { if unsafe waitpid(pid, Pointer.fromMutRef<i32>(&mut ignored), 0) != -1 || unsafe errno() != EINTR { break } }
+      status = failed
+    }
+  }
+  let _closed2 = unsafe close(errorPipe[0])
+  if status == 0 {
+    let mut fourth = () let h = unsafe Pointer.borrowMut<(), Handle>(&mut fourth, handle)
+    let l4 = unsafe Pointer.borrowMut<(), Loop>(&mut second, loop)
+    h.pid = pid h.exited = o.exitCallback h.nextProcess = l4.processes l4.processes = handle
+    drop h drop l4
+    unsafe start(handle)
+  }
+  return status
+}
+pub unsafe fn uv_process_get_pid(memory: *const u8) -> i32 {
+  let anchor = () let h = unsafe Pointer.borrow<(), Handle>(&anchor, unsafe handleOfConst(memory))
+  return h.pid
+}
+pub unsafe fn uv_process_kill(memory: *mut u8, signum: i32) -> i32 {
+  let anchor = () let h = unsafe Pointer.borrow<(), Handle>(&anchor, unsafe handleOf(memory))
+  if unsafe kill(h.pid, signum) != 0 { return -(unsafe errno()) }
+  return 0
+}
+
+// ---- File-system events -----------------------------------------------------------------------
+const UV_RENAME: i32 = 1
+const UV_CHANGE: i32 = 2
+unsafe fn copyText(text: *const u8) -> ?*mut u8 {
+  let length = unsafe strlen(text) + 1
+  let copy = unsafe calloc(1, length)
+  if !Pointer.isNull<u8>(copy) { let _ignored = unsafe memcpy(unsafe nn(copy), text, length) }
+  return copy
+}
+// The last component of a NUL-terminated path.
+unsafe fn baseName(path: *const u8) -> *const u8 {
+  let bytes = unsafe Pointer.assumeMany<u8>(path)
+  let length = unsafe strlen(path)
+  let mut index = length
+  while index > 0 {
+    if unsafe Pointer.read<u8>(unsafe Pointer.at<u8>(bytes, index - 1)) == 47 { return unsafe Pointer.at<u8>(bytes, index) }
+    index = index - 1
+  }
+  return path
+}
+pub unsafe fn uv_fs_event_init(loopMemory: *mut u8, memory: *mut u8) -> i32 {
+  let _handle = unsafe initialize(unsafe loopOf(loopMemory), memory, UV_FS_EVENT)
+  return 0
+}
+/// The path an active file-system event handle watches (libuv's handle->path), or null.
+pub unsafe fn fsEventPath(memory: *const u8) -> ?*const u8 {
+  let anchor = () let h = unsafe Pointer.borrow<(), Handle>(&anchor, unsafe handleOfConst(memory))
+  if (h.flags & ACTIVE) == 0 { return Pointer.null<u8>() }
+  return unsafe Intrinsic.pointerRequalify<?*mut u8, ?*const u8>(h.path)
+}
+static if Intrinsic.targetOperatingSystem() == "darwin" {
+  // Darwin, as libuv's kqueue.c: a directory is watched with FSEvents (ext.uv_fsevents), anything
+  // else with a one-shot kqueue vnode filter on the open file, re-armed after each event. The name
+  // reported for a vnode event is the file's current name (F_GETPATH).
+  const NOTE_FLAGS: u32 = 111
+  const F_GETPATH: i32 = 50
+  @foreign(noCapture: .("buffer"))
+  unsafe extern "C" fn fstat(fd: i32, buffer: *mut u8) -> i32
+  unsafe fn isDirectory(fd: i32) -> i32 {
+    // struct stat: dev_t (4 bytes) then mode_t (2 bytes); the whole record is 144 bytes.
+    let mut buffer: [u64; 24] = [0; 24]
+    if unsafe fstat(fd, unsafe Intrinsic.pointerReinterpret<*mut u64, *mut u8>(Pointer.fromMutRef<u64>(&mut buffer[0]))) != 0 { return -1 }
+    let mode = u64.toU32(u64.shiftRight(buffer[0], 32) & 65535)
+    if (mode & 61440) == 16384 { return 1 }
+    return 0
+  }
+  unsafe fn armVnode(queue: i32, fd: i32, tag: u64) -> i32 {
+    return unsafe queueChange(queue, kernelEvent(i32.toUsize(fd), FILTER_VNODE, EV_ADD | EV_ONESHOT, NOTE_FLAGS, u64.toUsize(tag)))
+  }
+  // The FSEvents stream of a directory watch posts here from its own thread; the internal async
+  // handle in the watch's `context` word then drains the stream's events on the loop's thread.
+  export "C" fn silkUvFseventsNotify(context: *mut u8) -> () { let _sent = unsafe uv_async_send(context) }
+  export "C" fn silkUvFseventsDrain(wake: *mut u8) -> () {
+    let handle = unsafe handleOf(unsafe nn(unsafe uv_handle_get_data(wake)))
+    while true {
+      let anchor = () let h = unsafe Pointer.borrow<(), Handle>(&anchor, handle)
+      if (h.flags & ACTIVE) == 0 || Pointer.isNull<u8>(h.path) { return }
+      let stream = unsafe nn(h.context)
+      let callback = h.changed drop h
+      let mut name: ?*const u8 = Pointer.null<u8>() let mut events: i32 = 0 let mut status: i32 = 0
+      if !unsafe fsevents.fseventsNext(stream, Pointer.fromMutRef<?*const u8>(&mut name), Pointer.fromMutRef<i32>(&mut events), Pointer.fromMutRef<i32>(&mut status)) { return }
+      unsafe callback(unsafe bytesOf(handle), name, events, status)
+    }
+  }
+  export "C" fn silkUvFseventsWakeClosed(wake: *mut u8) -> () { unsafe free(wake) }
+  /// Watches `path` and calls `callback(handle, name, events, status)` with UV_RENAME (1) and
+  /// UV_CHANGE (2) bits. `flags` may hold UV_FS_EVENT_RECURSIVE (4), which FSEvents honors.
+  pub unsafe fn uv_fs_event_start(memory: *mut u8, callback: FsEventCallback, path: *const u8, flags: u32) -> i32 {
+    let handle = unsafe handleOf(memory)
+    let mut anchor = () let h = unsafe Pointer.borrowMut<(), Handle>(&mut anchor, handle)
+    if (h.flags & ACTIVE) != 0 { return -22 }
+    let loop = h.loop drop h
+    let copy = unsafe copyText(path)
+    if Pointer.isNull<u8>(copy) { return -12 }
+    let fd = unsafe open(unsafe nn(copy), 0)
+    if fd < 0 { let code = unsafe errno() unsafe free(copy) return -code }
+    let h1 = unsafe Pointer.borrowMut<(), Handle>(&mut anchor, handle)
+    h1.changed = callback h1.path = copy drop h1
+    // A process that forked with a run-loop thread watches directories with kqueue, as libuv.
+    if unsafe isDirectory(fd) == 1 && !unsafe fsevents.fseventsForked() {
+      let _closed = unsafe close(fd)
+      let wakeMemory = unsafe calloc(1, Layout.of<Handle>().bytes)
+      if Pointer.isNull<u8>(wakeMemory) { unsafe free(copy) let h2 = unsafe Pointer.borrowMut<(), Handle>(&mut anchor, handle) h2.path = Pointer.null<u8>() return -12 }
+      let _initialized = unsafe uv_async_init(unsafe Intrinsic.pointerReinterpret<*mut Loop, *mut u8>(loop), unsafe nn(wakeMemory), silkUvFseventsDrain)
+      unsafe markInternal(unsafe nn(wakeMemory))
+      unsafe uv_handle_set_data(unsafe nn(wakeMemory), memory)
+      let mut stream: ?*mut u8 = Pointer.null<u8>()
+      let status = unsafe fsevents.fseventsStart(unsafe Intrinsic.pointerReinterpret<*mut Loop, *mut u8>(loop), unsafe nn(copy), flags, silkUvFseventsNotify, unsafe nn(wakeMemory), Pointer.fromMutRef<?*mut u8>(&mut stream))
+      if status != 0 {
+        unsafe uv_close(unsafe nn(wakeMemory), silkUvFseventsWakeClosed)
+        unsafe free(copy) let h3 = unsafe Pointer.borrowMut<(), Handle>(&mut anchor, handle) h3.path = Pointer.null<u8>()
+        return status
+      }
+      let h4 = unsafe Pointer.borrowMut<(), Handle>(&mut anchor, handle)
+      h4.watch = -1 h4.context = stream h4.nextWatch = unsafe Intrinsic.pointerReinterpret<?*mut u8, ?*mut Handle>(wakeMemory) drop h4
+      unsafe start(handle)
+      return 0
+    }
+    let second = () let l = unsafe Pointer.borrow<(), Loop>(&second, loop)
+    let status = unsafe armVnode(l.backend, fd, usize.toU64(Pointer.address<Handle>(handle)))
+    drop l
+    if status != 0 { let _ignored = unsafe close(fd) unsafe free(copy) let h5 = unsafe Pointer.borrowMut<(), Handle>(&mut anchor, handle) h5.path = Pointer.null<u8>() return status }
+    let h6 = unsafe Pointer.borrowMut<(), Handle>(&mut anchor, handle)
+    h6.watch = fd h6.context = Pointer.null<u8>() drop h6
+    unsafe start(handle)
+    return 0
+  }
+  pub unsafe fn uv_fs_event_stop(memory: *mut u8) -> i32 {
+    let handle = unsafe handleOf(memory)
+    let mut anchor = () let h = unsafe Pointer.borrowMut<(), Handle>(&mut anchor, handle)
+    if (h.flags & ACTIVE) == 0 || h.kind != UV_FS_EVENT { return 0 }
+    let fd = h.watch let stream = h.context let wake = h.nextWatch
+    h.watch = -1 h.context = Pointer.null<u8>() h.nextWatch = Pointer.null<Handle>() drop h
+    unsafe stop(handle)
+    if !Pointer.isNull<u8>(stream) {
+      // After a fork the run-loop thread is gone: the watch's state is left alone, as libuv does.
+      if !unsafe fsevents.fseventsForked() { unsafe fsevents.fseventsStop(unsafe nn(stream)) }
+      unsafe uv_close(unsafe nn(unsafe Intrinsic.pointerReinterpret<?*mut Handle, ?*mut u8>(wake)), silkUvFseventsWakeClosed)
+    }
+    // Closing the descriptor removes its kqueue filter.
+    if fd != -1 { let _ignored = unsafe close(fd) }
+    let h2 = unsafe Pointer.borrowMut<(), Handle>(&mut anchor, handle)
+    unsafe free(h2.path) h2.path = Pointer.null<u8>()
+    return 0
+  }
+  unsafe fn vnodeReady(handle: *mut Handle, noted: u32) -> () {
+    let anchor = () let h = unsafe Pointer.borrow<(), Handle>(&anchor, handle)
+    if (h.flags & ACTIVE) == 0 || h.watch < 0 { return }
+    let events = if (noted & 12) != 0 { UV_CHANGE } else { UV_RENAME }
+    let callback = h.changed let fd = h.watch let loop = h.loop drop h
+    let mut buffer: [u8; 1024] = [0; 1024]
+    let mut name: ?*const u8 = Pointer.null<u8>()
+    if unsafe fcntl(fd, F_GETPATH, Pointer.fromMutRef<u8>(&mut buffer[0])) == 0 { name = unsafe baseName(Pointer.fromRef<u8>(&buffer[0])) }
+    unsafe callback(unsafe bytesOf(handle), name, events, 0)
+    let h2 = unsafe Pointer.borrow<(), Handle>(&anchor, handle)
+    let still = h2.watch drop h2
+    if still == -1 { return }
+    let l = unsafe Pointer.borrow<(), Loop>(&anchor, loop)
+    if unsafe armVnode(l.backend, still, usize.toU64(Pointer.address<Handle>(handle))) != 0 { unsafe abort() }
+  }
+  unsafe fn notifyReady(loop: *mut Loop) -> () {}
+  // After fork the vnode filters are in the old queue; watch them again in the new one. The loop's
+  // FSEvents thread did not survive the fork (libuv's uv__io_fork).
+  unsafe fn watchFork(loop: *mut Loop) -> i32 {
+    unsafe fsevents.fseventsFork(unsafe Intrinsic.pointerReinterpret<*mut Loop, *mut u8>(loop))
+    let anchor = () let l = unsafe Pointer.borrow<(), Loop>(&anchor, loop)
+    let queue = l.backend let mut handle = l.first drop l
+    while !Pointer.isNull<Handle>(handle) {
+      let h = unsafe Pointer.borrow<(), Handle>(&anchor, unsafe nn(handle))
+      if h.kind == UV_FS_EVENT && (h.flags & ACTIVE) != 0 && h.watch >= 0 {
+        let status = unsafe armVnode(queue, h.watch, usize.toU64(Pointer.address<Handle>(handle)))
+        if status != 0 { return status }
+      }
+      handle = h.next
+    }
+    return 0
+  }
+} else {
+  unsafe extern "C" fn inotify_init1(flags: i32) -> i32
+  @foreign(noCapture: .("path"))
+  unsafe extern "C" fn inotify_add_watch(fd: i32, path: *const u8, mask: u32) -> i32
+  unsafe extern "C" fn inotify_rm_watch(fd: i32, watch: i32) -> i32
+  // IN_ATTRIB | IN_CREATE | IN_MODIFY | IN_DELETE | IN_DELETE_SELF | IN_MOVE_SELF | IN_MOVED_FROM | IN_MOVED_TO
+  const WATCH_MASK: u32 = 4038
+  // The watch table: open addressing from inotify watch descriptors to the first handle of each
+  // (libuv keeps a red-black tree). A slot is { wd, first handle }; wd -1 is empty, -2 deleted.
+  extern "C" struct WatchSlot { watch: i32, reserved: i32, first: ?*mut Handle }
+  impl Copy for WatchSlot {}
+  unsafe fn slotAt(loop: *mut Loop, index: usize) -> *mut WatchSlot {
+    let anchor = () let l = unsafe Pointer.borrow<(), Loop>(&anchor, loop)
+    let base = unsafe Pointer.assumeManyMut<WatchSlot>(unsafe Intrinsic.pointerReinterpret<*mut u8, *mut WatchSlot>(unsafe nn(l.watchSlots)))
+    return unsafe Pointer.atMut<WatchSlot>(base, index)
+  }
+  fn hashWatch(watch: i32, capacity: usize) -> usize { return (i32.toUsize(watch) * 2654435761) & (capacity - 1) }
+  // The slot of `watch`, or of the place to insert it when `insert`; null when absent.
+  unsafe fn findSlot(loop: *mut Loop, watch: i32, insert: bool) -> ?*mut WatchSlot {
+    let anchor = () let l = unsafe Pointer.borrow<(), Loop>(&anchor, loop)
+    let capacity = l.watchCapacity drop l
+    if capacity == 0 { return Pointer.null<WatchSlot>() }
+    let mut index = hashWatch(watch, capacity) let mut tomb: ?*mut WatchSlot = Pointer.null<WatchSlot>()
+    let mut probes: usize = 0
+    while probes < capacity {
+      let slot = unsafe slotAt(loop, index)
+      let value = unsafe Pointer.read<WatchSlot>(slot)
+      if value.watch == watch { return slot }
+      if value.watch == -1 { if insert { if !Pointer.isNull<WatchSlot>(tomb) { return tomb } return slot } return Pointer.null<WatchSlot>() }
+      if value.watch == -2 && Pointer.isNull<WatchSlot>(tomb) { tomb = slot }
+      index = (index + 1) & (capacity - 1) probes = probes + 1
+    }
+    if insert { return tomb }
+    return Pointer.null<WatchSlot>()
+  }
+  unsafe fn growWatches(loop: *mut Loop) -> i32 {
+    let mut anchor = () let l = unsafe Pointer.borrowMut<(), Loop>(&mut anchor, loop)
+    if (l.watchCount + 1) * 2 <= l.watchCapacity { return 0 }
+    let oldSlots = l.watchSlots let oldCapacity = l.watchCapacity
+    let capacity = if oldCapacity == 0 { 16 } else { oldCapacity * 2 }
+    let fresh = unsafe calloc(capacity, Layout.of<WatchSlot>().bytes)
+    if Pointer.isNull<u8>(fresh) { return -12 }
+    l.watchSlots = fresh l.watchCapacity = capacity drop l
+    let mut index: usize = 0
+    while index < capacity { unsafe Pointer.write<WatchSlot>(unsafe slotAt(loop, index), WatchSlot { watch: -1, reserved: 0, first: Pointer.null<Handle>() }) index = index + 1 }
+    if !Pointer.isNull<u8>(oldSlots) {
+      let base = unsafe Pointer.assumeManyMut<WatchSlot>(unsafe Intrinsic.pointerReinterpret<*mut u8, *mut WatchSlot>(unsafe nn(oldSlots)))
+      let mut old: usize = 0
+      while old < oldCapacity {
+        let value = unsafe Pointer.read<WatchSlot>(unsafe Pointer.atMut<WatchSlot>(base, old))
+        if value.watch >= 0 { let target = unsafe findSlot(loop, value.watch, true) unsafe Pointer.write<WatchSlot>(unsafe nn(target), value) }
+        old = old + 1
+      }
+      unsafe free(oldSlots)
+    }
+    return 0
+  }
+  // Appends `handle` to the handles of `watch`, which then run in start order as in libuv.
+  unsafe fn watchInsert(loop: *mut Loop, handle: *mut Handle, watch: i32) -> i32 {
+    let existing = unsafe findSlot(loop, watch, false)
+    if Pointer.isNull<WatchSlot>(existing) {
+      let grown = unsafe growWatches(loop)
+      if grown != 0 { return grown }
+      let slot = unsafe nn(unsafe findSlot(loop, watch, true))
+      unsafe Pointer.write<WatchSlot>(slot, WatchSlot { watch: watch, reserved: 0, first: handle })
+      let mut anchor = () let l = unsafe Pointer.borrowMut<(), Loop>(&mut anchor, loop) l.watchCount = l.watchCount + 1
+      return 0
+    }
+    let value = unsafe Pointer.read<WatchSlot>(unsafe nn(existing))
+    let mut cursor = unsafe nn(value.first)
+    while true {
+      let mut anchor = () let c = unsafe Pointer.borrowMut<(), Handle>(&mut anchor, cursor)
+      if Pointer.isNull<Handle>(c.nextWatch) { c.nextWatch = handle return 0 }
+      cursor = unsafe nn(c.nextWatch)
+    }
+    return 0
+  }
+  // Removes `handle`; true when it was the last of its watch.
+  unsafe fn watchRemove(loop: *mut Loop, handle: *mut Handle, watch: i32) -> bool {
+    let found = unsafe findSlot(loop, watch, false)
+    if Pointer.isNull<WatchSlot>(found) { return false }
+    let slot = unsafe nn(found)
+    let mut value = unsafe Pointer.read<WatchSlot>(slot)
+    let mut anchor = () let h = unsafe Pointer.borrowMut<(), Handle>(&mut anchor, handle)
+    let next = h.nextWatch h.nextWatch = Pointer.null<Handle>() drop h
+    if same(value.first, handle) { value.first = next }
+    else {
+      let mut cursor = value.first
+      while !Pointer.isNull<Handle>(cursor) {
+        let mut second = () let c = unsafe Pointer.borrowMut<(), Handle>(&mut second, unsafe nn(cursor))
+        if same(c.nextWatch, handle) { c.nextWatch = next break }
+        cursor = c.nextWatch
+      }
+    }
+    if Pointer.isNull<Handle>(value.first) {
+      unsafe Pointer.write<WatchSlot>(slot, WatchSlot { watch: -2, reserved: 0, first: Pointer.null<Handle>() })
+      let l = unsafe Pointer.borrowMut<(), Loop>(&mut anchor, loop) l.watchCount = l.watchCount - 1
+      return true
+    }
+    unsafe Pointer.write<WatchSlot>(slot, value)
+    return false
+  }
+  /// Watches `path` and calls `callback(handle, name, events, status)` with UV_RENAME (1) and
+  /// UV_CHANGE (2) bits. `name` is the changed entry of a directory, or the watched file's own name.
+  /// Handles of one inode share its kernel watch and libuv's path for it (the first handle's).
+  pub unsafe fn uv_fs_event_start(memory: *mut u8, callback: FsEventCallback, path: *const u8, flags: u32) -> i32 {
+    let handle = unsafe handleOf(memory)
+    let mut anchor = () let h = unsafe Pointer.borrowMut<(), Handle>(&mut anchor, handle)
+    if (h.flags & ACTIVE) != 0 { return -22 }
+    let loop = h.loop drop h
+    let mut second = () let l = unsafe Pointer.borrowMut<(), Loop>(&mut second, loop)
+    if l.notify < 0 {
+      let fd = unsafe inotify_init1(O_NONBLOCK | O_CLOEXEC)
+      if fd < 0 { return -(unsafe errno()) }
+      let registered = unsafe queueSet(l.backend, fd, TAG_INOTIFY, 0, UV_READABLE)
+      if registered != 0 { let _ignored = unsafe close(fd) return registered }
+      l.notify = fd
+    }
+    let watch = unsafe inotify_add_watch(l.notify, path, WATCH_MASK)
+    drop l
+    if watch == -1 { return -(unsafe errno()) }
+    let shared = unsafe findSlot(loop, watch, false)
+    let mut stored: ?*mut u8 = Pointer.null<u8>()
+    if Pointer.isNull<WatchSlot>(shared) { stored = unsafe copyText(path) if Pointer.isNull<u8>(stored) { return -12 } }
+    else {
+      let value = unsafe Pointer.read<WatchSlot>(unsafe nn(shared))
+      let first = unsafe Pointer.borrow<(), Handle>(&anchor, unsafe nn(value.first))
+      stored = unsafe copyText(unsafe nn(first.path)) drop first
+      if Pointer.isNull<u8>(stored) { return -12 }
+    }
+    let inserted = unsafe watchInsert(loop, handle, watch)
+    if inserted != 0 { unsafe free(stored) return inserted }
+    let h2 = unsafe Pointer.borrowMut<(), Handle>(&mut anchor, handle)
+    h2.watch = watch h2.path = stored h2.changed = callback drop h2
+    unsafe start(handle)
+    return 0
+  }
+  pub unsafe fn uv_fs_event_stop(memory: *mut u8) -> i32 {
+    let handle = unsafe handleOf(memory)
+    let anchor = () let h = unsafe Pointer.borrow<(), Handle>(&anchor, handle)
+    if (h.flags & ACTIVE) == 0 || h.kind != UV_FS_EVENT { return 0 }
+    let watch = h.watch let loop = h.loop drop h
+    // The kernel watch goes with the last handle that shares it.
+    if unsafe watchRemove(loop, handle, watch) {
+      let l = unsafe Pointer.borrow<(), Loop>(&anchor, loop)
+      let _ignored = unsafe inotify_rm_watch(l.notify, watch)
+    }
+    let mut second = () let h2 = unsafe Pointer.borrowMut<(), Handle>(&mut second, handle)
+    unsafe free(h2.path) h2.path = Pointer.null<u8>() h2.watch = -1 drop h2
+    unsafe stop(handle)
+    return 0
+  }
+  // A little-endian 32-bit field of an inotify record.
+  unsafe fn word(bytes: [*]mut u8, at: usize) -> u32 {
+    let mut value: u32 = 0 let mut index: usize = 4
+    while index > 0 { index = index - 1 value = u32.shiftLeft(value, 8) | u8.toU32(unsafe Pointer.read<u8>(unsafe Pointer.atMut<u8>(bytes, at + index))) }
+    return value
+  }
+  // The next handle of `watch` that this dispatch (`serial`) has not called yet. Callbacks may
+  // stop or start watchers, so each call searches the chain afresh.
+  unsafe fn nextWatcher(loop: *mut Loop, watch: i32, serial: u64) -> ?*mut Handle {
+    let slot = unsafe findSlot(loop, watch, false)
+    if Pointer.isNull<WatchSlot>(slot) { return Pointer.null<Handle>() }
+    let mut cursor = (unsafe Pointer.read<WatchSlot>(unsafe nn(slot))).first
+    while !Pointer.isNull<Handle>(cursor) {
+      let mut second = () let c = unsafe Pointer.borrowMut<(), Handle>(&mut second, unsafe nn(cursor))
+      if c.serial != serial { c.serial = serial return cursor }
+      cursor = c.nextWatch
+    }
+    return Pointer.null<Handle>()
+  }
+  // The path libuv reports for a watch of one file: the shared path of its watcher list (the first
+  // handle's).
+  unsafe fn watchPath(loop: *mut Loop, watch: i32) -> ?*mut u8 {
+    let slot = unsafe findSlot(loop, watch, false)
+    if Pointer.isNull<WatchSlot>(slot) { return Pointer.null<u8>() }
+    let first = (unsafe Pointer.read<WatchSlot>(unsafe nn(slot))).first
+    if Pointer.isNull<Handle>(first) { return Pointer.null<u8>() }
+    let anchor = () let h = unsafe Pointer.borrow<(), Handle>(&anchor, unsafe nn(first))
+    return h.path
+  }
+  unsafe fn notifyReady(loop: *mut Loop) -> () {
+    let mut buffer: [u64; 512] = [0; 512]
+    let base = unsafe Intrinsic.pointerReinterpret<*mut u64, *mut u8>(Pointer.fromMutRef<u64>(&mut buffer[0]))
+    while true {
+      let anchor = () let l = unsafe Pointer.borrow<(), Loop>(&anchor, loop)
+      let fd = l.notify drop l
+      if fd < 0 { return }
+      let size = unsafe read(fd, base, 4096)
+      if size < 0 { if unsafe errno() == EINTR { continue } return }
+      if size == 0 { return }
+      let bytes = unsafe Pointer.assumeManyMut<u8>(base)
+      let mut offset: usize = 0
+      while offset + 16 <= isize.toUsize(size) {
+        // struct inotify_event { int wd; uint32_t mask, cookie, len; char name[]; }
+        let watch = u32.toI32(unsafe word(bytes, offset))
+        let mask = unsafe word(bytes, offset + 4)
+        let length = unsafe word(bytes, offset + 12)
+        let name: *const u8 = unsafe Pointer.atMut<u8>(bytes, offset + 16)
+        offset = offset + 16 + u32.toUsize(length)
+        let mut events: i32 = 0
+        if (mask & 6) != 0 { events = events | UV_CHANGE }
+        if (mask & (6 ^ 4294967295)) != 0 { events = events | UV_RENAME }
+        let shared = unsafe watchPath(loop, watch)
+        // A stale event: no watcher left.
+        if Pointer.isNull<u8>(shared) { continue }
+        // inotify gives no name for a watch of one file: the base name of the watch's path stands in.
+        let reported = if length != 0 { name } else { unsafe baseName(unsafe nn(shared)) }
+        let mut second = () let l2 = unsafe Pointer.borrowMut<(), Loop>(&mut second, loop)
+        l2.serial = l2.serial + 1 let serial = l2.serial drop l2
+        while true {
+          let found = unsafe nextWatcher(loop, watch, serial)
+          if Pointer.isNull<Handle>(found) { break }
+          let handle = unsafe nn(found)
+          let h = unsafe Pointer.borrow<(), Handle>(&anchor, handle)
+          let callback = h.changed drop h
+          unsafe callback(unsafe bytesOf(handle), reported, events, 0)
+        }
+      }
+    }
+  }
+  // libuv's uv__inotify_fork: a new inotify descriptor, and every watch added to it again.
+  unsafe fn watchFork(loop: *mut Loop) -> i32 {
+    let mut anchor = () let l = unsafe Pointer.borrowMut<(), Loop>(&mut anchor, loop)
+    if l.notify < 0 { return 0 }
+    let _closed = unsafe close(l.notify)
+    let fd = unsafe inotify_init1(O_NONBLOCK | O_CLOEXEC)
+    if fd < 0 { l.notify = -1 return -(unsafe errno()) }
+    l.notify = fd
+    let registered = unsafe queueSet(l.backend, fd, TAG_INOTIFY, 0, UV_READABLE)
+    if registered != 0 { return registered }
+    let oldSlots = l.watchSlots let capacity = l.watchCapacity
+    l.watchSlots = Pointer.null<u8>() l.watchCapacity = 0 l.watchCount = 0 drop l
+    if Pointer.isNull<u8>(oldSlots) { return 0 }
+    let base = unsafe Pointer.assumeManyMut<WatchSlot>(unsafe Intrinsic.pointerReinterpret<*mut u8, *mut WatchSlot>(unsafe nn(oldSlots)))
+    let mut index: usize = 0
+    while index < capacity {
+      let value = unsafe Pointer.read<WatchSlot>(unsafe Pointer.atMut<WatchSlot>(base, index))
+      index = index + 1
+      if value.watch < 0 { continue }
+      let mut cursor = value.first
+      let path = (unsafe Pointer.borrow<(), Handle>(&anchor, unsafe nn(cursor))).path
+      let watch = unsafe inotify_add_watch(fd, unsafe nn(path), WATCH_MASK)
+      if watch == -1 { unsafe free(oldSlots) return -(unsafe errno()) }
+      while !Pointer.isNull<Handle>(cursor) {
+        let mut second = () let c = unsafe Pointer.borrowMut<(), Handle>(&mut second, unsafe nn(cursor))
+        let next = c.nextWatch c.nextWatch = Pointer.null<Handle>() c.watch = watch drop c
+        let inserted = unsafe watchInsert(loop, unsafe nn(cursor), watch)
+        if inserted != 0 { unsafe free(oldSlots) return inserted }
+        cursor = next
+      }
+    }
+    unsafe free(oldSlots)
+    return 0
+  }
+}
+
+// ---- File-system stat polls -------------------------------------------------------------------
+static if Intrinsic.targetOperatingSystem() == "darwin" {
+  extern "C" struct NativeStat {
+    dev: i32, mode: u16, nlink: u16, ino: u64, uid: u32, gid: u32, rdev: i32,
+    atime: TimeSpec, mtime: TimeSpec, ctime: TimeSpec, birthtime: TimeSpec,
+    size: i64, blocks: i64, blksize: i32, flags: u32, gen: u32, spare: i32, reserved: [i64; 2]
+  }
+  @foreign(noCapture: .("path", "buffer"))
+  unsafe extern "C" fn stat(path: *const u8, buffer: *mut NativeStat) -> i32
+  fn time(value: TimeSpec) -> UvTimespec { return UvTimespec { tv_sec: i64.toIsize(value.seconds), tv_nsec: i64.toIsize(value.nanoseconds) } }
+  unsafe fn statPath(path: *const u8, out: &mut UvStat) -> i32 {
+    let zero = TimeSpec { seconds: 0, nanoseconds: 0 }
+    let mut s = NativeStat { dev: 0, mode: 0, nlink: 0, ino: 0, uid: 0, gid: 0, rdev: 0, atime: zero, mtime: zero, ctime: zero, birthtime: zero, size: 0, blocks: 0, blksize: 0, flags: 0, gen: 0, spare: 0, reserved: [0; 2] }
+    if unsafe stat(path, Pointer.fromMutRef<NativeStat>(&mut s)) != 0 { return -(unsafe errno()) }
+    out.st_dev = i64.toU64(i32.toI64(s.dev)) out.st_mode = u16.toU64(s.mode) out.st_nlink = u16.toU64(s.nlink) out.st_uid = u32.toU64(s.uid) out.st_gid = u32.toU64(s.gid)
+    out.st_rdev = i64.toU64(i32.toI64(s.rdev)) out.st_ino = s.ino out.st_size = i64.toU64(s.size) out.st_blksize = i64.toU64(i32.toI64(s.blksize)) out.st_blocks = i64.toU64(s.blocks)
+    out.st_flags = u32.toU64(s.flags) out.st_gen = u32.toU64(s.gen)
+    out.st_atim = time(s.atime) out.st_mtim = time(s.mtime) out.st_ctim = time(s.ctime) out.st_birthtim = time(s.birthtime)
+    return 0
+  }
+} else {
+  extern "C" struct StatxTime { seconds: i64, nanoseconds: u32, reserved: i32 }
+  impl Copy for StatxTime {}
+  extern "C" struct Statx {
+    mask: u32, blksize: u32, attributes: u64, nlink: u32, uid: u32, gid: u32, mode: u16, pad: u16, ino: u64, size: u64, blocks: u64, attributesMask: u64,
+    atime: StatxTime, btime: StatxTime, ctime: StatxTime, mtime: StatxTime,
+    rdevMajor: u32, rdevMinor: u32, devMajor: u32, devMinor: u32, spare: [u64; 14]
+  }
+  @foreign(noCapture: .("path", "buffer"))
+  unsafe extern "C" fn statx(directory: i32, path: *const u8, flags: i32, mask: u32, buffer: *mut Statx) -> i32
+  fn time(value: StatxTime) -> UvTimespec { return UvTimespec { tv_sec: i64.toIsize(value.seconds), tv_nsec: u32.toIsize(value.nanoseconds) } }
+  fn zeroStatxTime() -> StatxTime { return StatxTime { seconds: 0, nanoseconds: 0, reserved: 0 } }
+  // glibc's makedev.
+  fn device(major: u32, minor: u32) -> u64 {
+    let high = u32.toU64(major) let low = u32.toU64(minor)
+    return u64.shiftLeft(high & 4294963200, 32) | u64.shiftLeft(high & 4095, 8) | u64.shiftLeft(low & 4294967040, 12) | (low & 255)
+  }
+  // statx with STATX_BASIC_STATS | STATX_BTIME, mapped as libuv maps it.
+  unsafe fn statPath(path: *const u8, out: &mut UvStat) -> i32 {
+    let mut s = Statx { mask: 0, blksize: 0, attributes: 0, nlink: 0, uid: 0, gid: 0, mode: 0, pad: 0, ino: 0, size: 0, blocks: 0, attributesMask: 0, atime: zeroStatxTime(), btime: zeroStatxTime(), ctime: zeroStatxTime(), mtime: zeroStatxTime(), rdevMajor: 0, rdevMinor: 0, devMajor: 0, devMinor: 0, spare: [0; 14] }
+    if unsafe statx(-100, path, 0, 4095, Pointer.fromMutRef<Statx>(&mut s)) != 0 { return -(unsafe errno()) }
+    out.st_dev = device(s.devMajor, s.devMinor) out.st_mode = u16.toU64(s.mode) out.st_nlink = u32.toU64(s.nlink) out.st_uid = u32.toU64(s.uid) out.st_gid = u32.toU64(s.gid)
+    out.st_rdev = device(s.rdevMajor, s.rdevMinor) out.st_ino = s.ino out.st_size = s.size out.st_blksize = u32.toU64(s.blksize) out.st_blocks = s.blocks
+    out.st_flags = 0 out.st_gen = 0
+    out.st_atim = time(s.atime) out.st_mtim = time(s.mtime) out.st_ctim = time(s.ctime) out.st_birthtim = time(s.btime)
+    return 0
+  }
+}
+fn sameTime(a: &UvTimespec, b: &UvTimespec) -> bool { return a.tv_sec == b.tv_sec && a.tv_nsec == b.tv_nsec }
+// libuv's statbuf_eq: what makes fs.watchFile report a change.
+fn sameStat(a: &UvStat, b: &UvStat) -> bool {
+  return sameTime(&a.st_ctim, &b.st_ctim) && sameTime(&a.st_mtim, &b.st_mtim) && sameTime(&a.st_birthtim, &b.st_birthtim)
+    && a.st_size == b.st_size && a.st_mode == b.st_mode && a.st_uid == b.st_uid && a.st_gid == b.st_gid
+    && a.st_ino == b.st_ino && a.st_dev == b.st_dev && a.st_flags == b.st_flags && a.st_gen == b.st_gen
+}
+unsafe fn unlinkFrom(list: *mut ?*mut Handle, handle: *mut Handle, timers: bool) -> () {
+  let mut anchor = () let h = unsafe Pointer.borrowMut<(), Handle>(&mut anchor, handle)
+  let first = unsafe Pointer.read<?*mut Handle>(list)
+  if same(first, handle) { unsafe Pointer.write<?*mut Handle>(list, h.nextTimer) }
+  else {
+    let mut cursor = first
+    while !Pointer.isNull<Handle>(cursor) {
+      let mut third = () let c = unsafe Pointer.borrowMut<(), Handle>(&mut third, unsafe nn(cursor))
+      if same(c.nextTimer, handle) { c.nextTimer = h.nextTimer break }
+      cursor = c.nextTimer
+    }
+  }
+  h.nextTimer = Pointer.null<Handle>()
+}
+// ---- Timers -----------------------------------------------------------------------------------
+// libuv's timers: a started timer waits in `timers`; when it is due, uv__run_timers stops it and
+// moves it to the ready list, and then, for each ready timer in order, restarts a repeating one and
+// calls its callback. A timer stopped or restarted while it is ready leaves the ready list.
+pub unsafe fn uv_timer_init(loopMemory: *mut u8, memory: *mut u8) -> i32 {
+  let _handle = unsafe initialize(unsafe loopOf(loopMemory), memory, UV_TIMER)
+  return 0
+}
+/// Calls `callback(handle)` after `timeout` milliseconds, and then every `repeat` if that is not 0.
+/// UV_EINVAL for a closing handle or a null callback.
+pub unsafe fn timerStart(memory: *mut u8, callback: ?extern "C" fn(*mut u8) -> (), timeout: u64, repeat: u64) -> i32 {
+  let handle = unsafe handleOf(memory)
+  let mut anchor = () let h = unsafe Pointer.borrowMut<(), Handle>(&mut anchor, handle)
+  if (h.flags & (CLOSING | CLOSED)) != 0 || Intrinsic.pointerIsNull<?extern "C" fn(*mut u8) -> ()>(callback) { return -22 }
+  drop h
+  let _stopped = unsafe uv_timer_stop(memory)
+  let h2 = unsafe Pointer.borrowMut<(), Handle>(&mut anchor, handle)
+  let mut second = () let l = unsafe Pointer.borrowMut<(), Loop>(&mut second, h2.loop)
+  let mut due = u64.wrappingAdd(l.time, timeout)
+  if due < timeout { due = 18446744073709551615 }
+  h2.fired = unsafe Intrinsic.pointerRequalify<?extern "C" fn(*mut u8) -> (), extern "C" fn(*mut u8) -> ()>(callback)
+  h2.repeat = repeat h2.due = due h2.order = l.timerCount h2.flags = h2.flags | HAS_CALLBACK
+  l.timerCount = l.timerCount + 1
+  h2.nextTimer = l.timers l.timers = handle
+  drop h2 drop l
+  unsafe start(handle)
+  return 0
+}
+pub unsafe fn uv_timer_start(memory: *mut u8, callback: AsyncCallback, timeout: u64, repeat: u64) -> i32 { return unsafe timerStart(memory, callback, timeout, repeat) }
+pub unsafe fn uv_timer_stop(memory: *mut u8) -> i32 {
+  let handle = unsafe handleOf(memory)
+  let mut anchor = () let h = unsafe Pointer.borrowMut<(), Handle>(&mut anchor, handle)
+  if h.kind != UV_TIMER { return 0 }
+  let loop = h.loop let active = (h.flags & ACTIVE) != 0 let ready = (h.flags & READY) != 0
+  h.flags = h.flags & (READY ^ 4294967295) drop h
+  let mut second = () let l = unsafe Pointer.borrowMut<(), Loop>(&mut second, loop)
+  if active { unsafe unlinkFrom(Pointer.fromMutRef<?*mut Handle>(&mut l.timers), handle, true) drop l unsafe stop(handle) }
+  else { if ready { unsafe unlinkFrom(Pointer.fromMutRef<?*mut Handle>(&mut l.ready), handle, true) } }
+  return 0
+}
+/// libuv's uv_timer_again: a repeating timer starts again with its repeat interval.
+pub unsafe fn uv_timer_again(memory: *mut u8) -> i32 {
+  let anchor = () let h = unsafe Pointer.borrow<(), Handle>(&anchor, unsafe handleOf(memory))
+  if (h.flags & HAS_CALLBACK) == 0 { return -22 }
+  let repeat = h.repeat let callback = h.fired drop h
+  if repeat != 0 { let _stopped = unsafe uv_timer_stop(memory) return unsafe timerStart(memory, callback, repeat, repeat) }
+  return 0
+}
+pub unsafe fn uv_timer_set_repeat(memory: *mut u8, repeat: u64) -> () {
+  let mut anchor = () let h = unsafe Pointer.borrowMut<(), Handle>(&mut anchor, unsafe handleOf(memory))
+  h.repeat = repeat
+}
+pub unsafe fn uv_timer_get_repeat(memory: *const u8) -> u64 {
+  let anchor = () let h = unsafe Pointer.borrow<(), Handle>(&anchor, unsafe handleOfConst(memory))
+  return h.repeat
+}
+pub unsafe fn uv_timer_get_due_in(memory: *const u8) -> u64 {
+  let anchor = () let h = unsafe Pointer.borrow<(), Handle>(&anchor, unsafe handleOfConst(memory))
+  let l = unsafe Pointer.borrow<(), Loop>(&anchor, h.loop)
+  if l.time >= h.due { return 0 }
+  return h.due - l.time
+}
+unsafe fn runTimers(loop: *mut Loop) -> () {
+  let mut anchor = () let l = unsafe Pointer.borrowMut<(), Loop>(&mut anchor, loop)
+  if Pointer.isNull<Handle>(l.timers) { return }
+  let now = l.time drop l
+  // Stop the due timers, the earliest first and then in start order, onto the ready list.
+  let mut tail: ?*mut Handle = Pointer.null<Handle>()
+  while true {
+    let l2 = unsafe Pointer.borrow<(), Loop>(&anchor, loop)
+    let mut cursor = l2.timers let mut due: ?*mut Handle = Pointer.null<Handle>() drop l2
+    let mut bestDue: u64 = 0 let mut bestOrder: u64 = 0
+    while !Pointer.isNull<Handle>(cursor) {
+      let c = unsafe Pointer.borrow<(), Handle>(&anchor, unsafe nn(cursor))
+      if c.due <= now && (Pointer.isNull<Handle>(due) || c.due < bestDue || (c.due == bestDue && c.order < bestOrder)) { due = cursor bestDue = c.due bestOrder = c.order }
+      cursor = c.nextTimer
+    }
+    if Pointer.isNull<Handle>(due) { break }
+    let pointer = unsafe nn(due)
+    let _stopped = unsafe uv_timer_stop(unsafe bytesOf(pointer))
+    let mut second = () let d = unsafe Pointer.borrowMut<(), Handle>(&mut second, pointer)
+    d.flags = d.flags | READY d.nextTimer = Pointer.null<Handle>() drop d
+    if Pointer.isNull<Handle>(tail) { let l3 = unsafe Pointer.borrowMut<(), Loop>(&mut anchor, loop) l3.ready = due }
+    else { let t = unsafe Pointer.borrowMut<(), Handle>(&mut second, unsafe nn(tail)) t.nextTimer = due }
+    tail = due
+  }
+  while true {
+    let l4 = unsafe Pointer.borrowMut<(), Loop>(&mut anchor, loop)
+    let head = l4.ready
+    if Pointer.isNull<Handle>(head) { return }
+    let pointer = unsafe nn(head)
+    let mut third = () let h = unsafe Pointer.borrowMut<(), Handle>(&mut third, pointer)
+    l4.ready = h.nextTimer h.nextTimer = Pointer.null<Handle>() h.flags = h.flags & (READY ^ 4294967295)
+    let callback = h.fired drop h drop l4
+    let _again = unsafe uv_timer_again(unsafe bytesOf(pointer))
+    unsafe callback(unsafe bytesOf(pointer))
+  }
+}
+
+// ---- File-system stat polls -------------------------------------------------------------------
+// libuv's fs-poll.c: each start makes a context with an internal, unreferenced timer and a stat
+// request on the thread pool. The stat's completion compares with the last result, calls back, and
+// starts the timer for the rest of the interval. A stopped handle's context lives until its stat
+// completes; a closed handle closes after its last context is gone.
+// `work` is first, so that a unit's address is its context's.
+struct PollContext {
+  work: Work, parent: *mut Handle, loop: *mut Loop, callback: FsPollCallback, interval: u64, started: u64, busy: i32, result: i32,
+  previous: ?*mut PollContext, timer: *mut Handle, stat: UvStat, current: UvStat, path: *mut u8
+}
+unsafe fn contextOf(pointer: *mut u8) -> *mut PollContext { return unsafe Intrinsic.pointerReinterpret<*mut u8, *mut PollContext>(pointer) }
+unsafe fn contextOfWork(unit: *mut Work) -> *mut PollContext { return unsafe Intrinsic.pointerReinterpret<*mut Work, *mut PollContext>(unit) }
+pub unsafe fn uv_fs_poll_init(loopMemory: *mut u8, memory: *mut u8) -> i32 {
+  let _handle = unsafe initialize(unsafe loopOf(loopMemory), memory, UV_FS_POLL)
+  return 0
+}
+export "C" fn silkUvPollStat(unit: *mut Work) -> () {
+  let context = unsafe contextOfWork(unit)
+  let mut anchor = () let c = unsafe Pointer.borrowMut<(), PollContext>(&mut anchor, context)
+  let mut current = zeroStat()
+  c.result = unsafe statPath(c.path, &mut current)
+  c.current = current
+}
+unsafe fn pollSubmit(context: *mut PollContext) -> () {
+  let mut anchor = () let c = unsafe Pointer.borrowMut<(), PollContext>(&mut anchor, context)
+  let loop = unsafe Intrinsic.pointerReinterpret<*mut Loop, *mut u8>(c.loop)
+  let unit = Pointer.fromMutRef<Work>(&mut c.work)
+  drop c
+  unsafe requestStarted(loop)
+  unsafe workSubmit(loop, unit, WORK_FAST_IO, silkUvPollStat, silkUvPollDone)
+}
+export "C" fn silkUvPollTimer(timer: *mut u8) -> () {
+  let context = unsafe contextOf(unsafe nn(unsafe uv_handle_get_data(timer)))
+  let mut anchor = () let c = unsafe Pointer.borrowMut<(), PollContext>(&mut anchor, context)
+  let second = () let l = unsafe Pointer.borrow<(), Loop>(&second, c.loop)
+  c.started = l.time drop c drop l
+  unsafe pollSubmit(context)
+}
+export "C" fn silkUvPollTimerClosed(timer: *mut u8) -> () {
+  let context = unsafe contextOf(unsafe nn(unsafe uv_handle_get_data(timer)))
+  let mut anchor = () let c = unsafe Pointer.borrowMut<(), PollContext>(&mut anchor, context)
+  let parent = c.parent let previous = c.previous drop c
+  let mut second = () let h = unsafe Pointer.borrowMut<(), Handle>(&mut second, parent)
+  if Pointer.address<u8>(h.context) == Pointer.address<PollContext>(context) {
+    h.context = unsafe Intrinsic.pointerReinterpret<?*mut PollContext, ?*mut u8>(previous)
+    let closing = (h.flags & CLOSING) != 0 && Pointer.isNull<u8>(h.context) drop h
+    if closing { unsafe makeClosePending(parent) }
+  } else {
+    let mut cursor = unsafe contextOf(unsafe nn(h.context)) drop h
+    while true {
+      let mut third = () let it = unsafe Pointer.borrowMut<(), PollContext>(&mut third, cursor)
+      if Pointer.address<PollContext>(it.previous) == Pointer.address<PollContext>(context) { it.previous = previous break }
+      cursor = unsafe nn(it.previous)
+    }
+  }
+  let c2 = unsafe Pointer.borrow<(), PollContext>(&anchor, context) let path = c2.path drop c2
+  unsafe free(path) unsafe free(timer) unsafe free(unsafe Intrinsic.pointerReinterpret<*mut PollContext, *mut u8>(context))
+}
+export "C" fn silkUvPollDone(unit: *mut Work, status: i32) -> () {
+  let context = unsafe contextOfWork(unit)
+  let mut anchor = () let c = unsafe Pointer.borrowMut<(), PollContext>(&mut anchor, context)
+  let parent = c.parent let timer = c.timer
+  unsafe requestFinished(unsafe Intrinsic.pointerReinterpret<*mut Loop, *mut u8>(c.loop))
+  let second = () let h = unsafe Pointer.borrow<(), Handle>(&second, parent)
+  let live = (h.flags & ACTIVE) != 0 && (h.flags & CLOSING) == 0 && Pointer.address<u8>(h.context) == Pointer.address<PollContext>(context)
+  drop h
+  if live {
+    let callback = c.callback let previous = c.stat let current = c.current let zero = zeroStat()
+    let result = if status != 0 { status } else { c.result }
+    let busy = c.busy
+    if result != 0 {
+      c.busy = result drop c
+      if busy != result { unsafe callback(unsafe bytesOf(parent), result, Pointer.fromRef<UvStat>(&previous), Pointer.fromRef<UvStat>(&zero)) }
+    } else {
+      c.stat = current c.busy = 1 drop c
+      if busy != 0 && (busy < 0 || !sameStat(&previous, &current)) { unsafe callback(unsafe bytesOf(parent), 0, Pointer.fromRef<UvStat>(&previous), Pointer.fromRef<UvStat>(&current)) }
+    }
+  } else { drop c }
+  let h2 = unsafe Pointer.borrow<(), Handle>(&second, parent)
+  let stillLive = (h2.flags & ACTIVE) != 0 && (h2.flags & CLOSING) == 0 && Pointer.address<u8>(h2.context) == Pointer.address<PollContext>(context)
+  drop h2
+  if !stillLive { unsafe uv_close(unsafe bytesOf(timer), silkUvPollTimerClosed) return }
+  // Next stat after the rest of the interval, less the time the stat took.
+  let c3 = unsafe Pointer.borrowMut<(), PollContext>(&mut anchor, context)
+  let l = unsafe Pointer.borrow<(), Loop>(&second, c3.loop)
+  let interval = c3.interval - (l.time - c3.started) % c3.interval
+  drop c3 drop l
+  if unsafe timerStart(unsafe bytesOf(timer), silkUvPollTimer, interval, 0) != 0 { unsafe abort() }
+}
+/// Stats `path` every `interval` milliseconds on the thread pool and calls `callback(handle, status,
+/// previous, current)` when the result changes, as libuv's uv_fs_poll: the first result is only
+/// remembered, and a failure is reported once until the status changes.
+pub unsafe fn uv_fs_poll_start(memory: *mut u8, callback: FsPollCallback, path: *const u8, interval: u32) -> i32 {
+  let handle = unsafe handleOf(memory)
+  let mut anchor = () let h = unsafe Pointer.borrowMut<(), Handle>(&mut anchor, handle)
+  if (h.flags & ACTIVE) != 0 { return 0 }
+  let loop = h.loop drop h
+  let copy = unsafe copyText(path)
+  let memoryContext = unsafe calloc(1, Layout.of<PollContext>().bytes)
+  let timerMemory = unsafe calloc(1, Layout.of<Handle>().bytes)
+  if Pointer.isNull<u8>(copy) || Pointer.isNull<u8>(memoryContext) || Pointer.isNull<u8>(timerMemory) { unsafe free(copy) unsafe free(memoryContext) unsafe free(timerMemory) return -12 }
+  let context = unsafe contextOf(unsafe nn(memoryContext))
+  let second = () let l = unsafe Pointer.borrow<(), Loop>(&second, loop) let now = l.time drop l
+  let timer = unsafe initialize(loop, unsafe nn(timerMemory), UV_TIMER)
+  unsafe markInternal(unsafe nn(timerMemory))
+  unsafe uv_handle_set_data(unsafe nn(timerMemory), memoryContext)
+  let h2 = unsafe Pointer.borrowMut<(), Handle>(&mut anchor, handle)
+  let empty = Work { work: Intrinsic.pointerNullFunction<?extern "C" fn(*mut Work) -> ()>(), done: Intrinsic.pointerNullFunction<?extern "C" fn(*mut Work, i32) -> ()>(), loop: Pointer.null<u8>(), next: Pointer.null<Work>(), previous: Pointer.null<Work>() }
+  unsafe Pointer.put<PollContext>(context, PollContext {
+    work: empty, parent: handle, loop: loop, callback: callback, interval: if interval == 0 { 1 } else { u32.toU64(interval) }, started: now, busy: 0, result: 0,
+    previous: unsafe Intrinsic.pointerReinterpret<?*mut u8, ?*mut PollContext>(h2.context), timer: timer, stat: zeroStat(), current: zeroStat(), path: unsafe nn(copy)
+  })
+  h2.context = memoryContext h2.statChanged = callback drop h2
+  unsafe pollSubmit(context)
+  unsafe start(handle)
+  return 0
+}
+pub unsafe fn uv_fs_poll_stop(memory: *mut u8) -> i32 {
+  let handle = unsafe handleOf(memory)
+  let mut anchor = () let h = unsafe Pointer.borrowMut<(), Handle>(&mut anchor, handle)
+  if (h.flags & ACTIVE) == 0 || h.kind != UV_FS_POLL { return 0 }
+  let context = unsafe contextOf(unsafe nn(h.context)) drop h
+  let c = unsafe Pointer.borrow<(), PollContext>(&anchor, context)
+  let timer = c.timer drop c
+  // With the timer running no stat is in flight: close it now. Otherwise the stat's completion does.
+  if unsafe uv_is_active(unsafe bytesOf(timer)) != 0 { unsafe uv_close(unsafe bytesOf(timer), silkUvPollTimerClosed) }
+  unsafe stop(handle)
+  return 0
+}
+/// The path an active stat poll watches, or null.
+pub unsafe fn fsPollPath(memory: *const u8) -> ?*const u8 {
+  let anchor = () let h = unsafe Pointer.borrow<(), Handle>(&anchor, unsafe handleOfConst(memory))
+  if (h.flags & ACTIVE) == 0 || Pointer.isNull<u8>(h.context) { return Pointer.null<u8>() }
+  let c = unsafe Pointer.borrow<(), PollContext>(&anchor, unsafe contextOf(unsafe nn(h.context)))
+  return unsafe Intrinsic.pointerRequalify<*mut u8, ?*const u8>(c.path)
+}
+
+// ---- Thread pool ------------------------------------------------------------------------------
+// libuv's thread pool (threadpool.c): one per process, started by the first submission, with
+// UV_THREADPOOL_SIZE threads (4 by default, 1 to 1024) of 8 MB stacks named "libuv-worker". Slow
+// I/O work runs on at most half of them. A worker that finishes a unit appends it to its loop's
+// list and wakes the loop, whose next wake runs `done` on the loop's thread.
+pub const WORK_CPU: i32 = 0
+pub const WORK_FAST_IO: i32 = 1
+pub const WORK_SLOW_IO: i32 = 2
+struct Pool {
+  lock: *mut u8, condition: *mut u8, idle: u32, slowRunning: u32, threads: u32, reserved: u32,
+  // The queue of waiting work, with sentinels: `slowMarker` stands in the queue for the slow I/O
+  // work kept in `slow`; `exit` ends a worker.
+  queue: Work, slow: Work, slowMarker: Work, exit: Work
+}
+export "C" fn silkUvCancelled(work: *mut Work) -> () { unsafe abort() }
+// UV_ECANCELED, with which a cancelled unit finishes.
+static if Intrinsic.targetOperatingSystem() == "darwin" { const WORK_CANCELED: i32 = -89 } else { const WORK_CANCELED: i32 = -125 }
+@threadCallbacks("prepare", "parent", "child")
+unsafe extern "C" fn pthread_atfork(prepare: ?extern "C" fn() -> (), parent: ?extern "C" fn() -> (), child: ?extern "C" fn() -> ()) -> i32
+// The word that holds the pool, shared by `pool` and the fork handler.
+unsafe fn poolWord() -> *mut u64 { return Intrinsic.processWord() }
+// libuv's reset_once, registered with pthread_atfork: a forked child has none of the pool's
+// threads, so its next submission starts a new pool.
+export "C" fn silkUvPoolForked() -> () { unsafe Atomic.store<u64>(unsafe poolWord(), 0, MemoryOrder.Release) }
+unsafe fn workAt(pointer: *mut Work) -> *mut u8 { return unsafe Intrinsic.pointerReinterpret<*mut Work, *mut u8>(pointer) }
+fn sameWork(a: ?*mut Work, b: *mut Work) -> bool { return Pointer.address<Work>(a) == Pointer.address<Work>(b) }
+// A circular list whose head is a sentinel node pointing at itself when empty (libuv's uv__queue).
+unsafe fn queueInit(node: *mut Work) -> () {
+  let mut anchor = () let n = unsafe Pointer.borrowMut<(), Work>(&mut anchor, node)
+  n.next = node n.previous = node
+}
+unsafe fn queueEmpty(head: *mut Work) -> bool {
+  let anchor = () let n = unsafe Pointer.borrow<(), Work>(&anchor, head)
+  return sameWork(n.next, head)
+}
+unsafe fn queueHead(head: *mut Work) -> *mut Work {
+  let anchor = () let n = unsafe Pointer.borrow<(), Work>(&anchor, head)
+  return unsafe nn(n.next)
+}
+unsafe fn queueInsertTail(head: *mut Work, node: *mut Work) -> () {
+  let mut anchor = () let h = unsafe Pointer.borrowMut<(), Work>(&mut anchor, head)
+  let last = unsafe nn(h.previous)
+  let mut second = () let n = unsafe Pointer.borrowMut<(), Work>(&mut second, node)
+  n.next = head n.previous = last
+  let mut third = () let l = unsafe Pointer.borrowMut<(), Work>(&mut third, last)
+  l.next = node
+  h.previous = node
+}
+unsafe fn queueRemove(node: *mut Work) -> () {
+  let mut anchor = () let n = unsafe Pointer.borrowMut<(), Work>(&mut anchor, node)
+  let before = unsafe nn(n.previous) let after = unsafe nn(n.next)
+  let mut second = () let b = unsafe Pointer.borrowMut<(), Work>(&mut second, before) b.next = after drop b
+  let a = unsafe Pointer.borrowMut<(), Work>(&mut second, after) a.previous = before
+}
+// The pool, made by the first caller that needs it; it is never freed.
+unsafe fn pool() -> *mut Pool {
+  let word = unsafe poolWord()
+  let current = unsafe Atomic.load<u64>(word, MemoryOrder.Acquire)
+  if current != 0 { return unsafe Intrinsic.pointerReinterpret<*mut u8, *mut Pool>(unsafe nn(unsafe addressPointer(current))) }
+  let memory = unsafe calloc(1, Layout.of<Pool>().bytes)
+  let lock = unsafe calloc(1, LOCK_BYTES) let condition = unsafe calloc(1, LOCK_BYTES)
+  if Pointer.isNull<u8>(memory) || Pointer.isNull<u8>(lock) || Pointer.isNull<u8>(condition) { unsafe abort() }
+  if unsafe pthread_mutex_init(unsafe nn(lock), Pointer.null<u8>()) != 0 || unsafe pthread_cond_init(unsafe nn(condition), Pointer.null<u8>()) != 0 { unsafe abort() }
+  let made = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut Pool>(unsafe nn(memory))
+  let empty = Work { work: Intrinsic.pointerNullFunction<?extern "C" fn(*mut Work) -> ()>(), done: Intrinsic.pointerNullFunction<?extern "C" fn(*mut Work, i32) -> ()>(), loop: Pointer.null<u8>(), next: Pointer.null<Work>(), previous: Pointer.null<Work>() }
+  unsafe Pointer.put<Pool>(made, Pool { lock: unsafe nn(lock), condition: unsafe nn(condition), idle: 0, slowRunning: 0, threads: 0, reserved: 0, queue: empty, slow: empty, slowMarker: empty, exit: empty })
+  let mut anchor = () let p = unsafe Pointer.borrowMut<(), Pool>(&mut anchor, made)
+  unsafe queueInit(Pointer.fromMutRef<Work>(&mut p.queue)) unsafe queueInit(Pointer.fromMutRef<Work>(&mut p.slow)) unsafe queueInit(Pointer.fromMutRef<Work>(&mut p.slowMarker))
+  let mut count: u32 = 4
+  let name = b"UV_THREADPOOL_SIZE\0"
+  let value = unsafe getenv(Pointer.fromRef<u8>(&name[0]))
+  if !Pointer.isNull<u8>(value) { count = i32.toU32(unsafe atoi(unsafe Intrinsic.pointerRequalify<?*const u8, *const u8>(value))) }
+  if count == 0 { count = 1 }
+  if count > 1024 { count = 1024 }
+  p.threads = count drop p
+  let raced = unsafe Atomic.compareExchange<u64>(word, 0, usize.toU64(Pointer.address<u8>(memory)), MemoryOrder.AcquireRelease, MemoryOrder.Acquire)
+  match move raced {
+    CompareExchange<u64>.Exchanged => {
+      let none = Intrinsic.pointerNullFunction<?extern "C" fn() -> ()>()
+      if unsafe pthread_atfork(none, none, silkUvPoolForked) != 0 { unsafe abort() }
+    }
+    CompareExchange<u64>.Observed { value: winner } => {
+      // Another thread made the pool first; this one was never started.
+      let _a = unsafe pthread_mutex_destroy(unsafe nn(lock)) unsafe free(lock) unsafe free(condition) unsafe free(memory)
+      return unsafe Intrinsic.pointerReinterpret<*mut u8, *mut Pool>(unsafe nn(unsafe addressPointer(winner)))
+    }
+  }
+  let mut attributes: [u8; 128] = [0; 128]
+  let attributesAt = Pointer.fromMutRef<u8>(&mut attributes[0])
+  if unsafe pthread_attr_init(attributesAt) != 0 { unsafe abort() }
+  let _stack = unsafe pthread_attr_setstacksize(attributesAt, 8388608)
+  let mut index: u32 = 0
+  while index < count {
+    let mut thread: usize = 0
+    if unsafe pthread_create(Pointer.fromMutRef<usize>(&mut thread), attributesAt, silkUvWorker, memory) != 0 { unsafe abort() }
+    let _detached = unsafe pthread_detach(thread)
+    index = index + 1
+  }
+  let _destroyed = unsafe pthread_attr_destroy(attributesAt)
+  return made
+}
+fn slowThreshold(threads: u32) -> u32 { return (threads + 1) / 2 }
+export "C" fn silkUvWorker(argument: ?*mut u8) -> ?*mut u8 {
+  let name = b"libuv-worker\0"
+  unsafe setThreadName(Pointer.fromRef<u8>(&name[0]))
+  let pointer = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut Pool>(unsafe nn(argument))
+  let mut anchor = () let p = unsafe Pointer.borrowMut<(), Pool>(&mut anchor, pointer)
+  let lock = p.lock let condition = p.condition
+  let queue = Pointer.fromMutRef<Work>(&mut p.queue) let slow = Pointer.fromMutRef<Work>(&mut p.slow)
+  let marker = Pointer.fromMutRef<Work>(&mut p.slowMarker) let exit = Pointer.fromMutRef<Work>(&mut p.exit)
+  drop p
+  let _locked = unsafe pthread_mutex_lock(lock)
+  while true {
+    // Wait while there is no work, or only slow I/O work and enough of it already runs.
+    while true {
+      let look = () let markerNext = (unsafe Pointer.borrow<(), Work>(&look, marker)).next
+      let onlySlow = !unsafe queueEmpty(queue) && sameWork(unsafe queueHead(queue), marker) && sameWork(markerNext, queue)
+      let p2 = unsafe Pointer.borrowMut<(), Pool>(&mut anchor, pointer)
+      if !unsafe queueEmpty(queue) && !(onlySlow && p2.slowRunning >= slowThreshold(p2.threads)) { break }
+      p2.idle = p2.idle + 1 drop p2
+      let _waited = unsafe pthread_cond_wait(condition, lock)
+      let p3 = unsafe Pointer.borrowMut<(), Pool>(&mut anchor, pointer) p3.idle = p3.idle - 1
+    }
+    let mut item = unsafe queueHead(queue)
+    if sameWork(item, exit) {
+      let _signalled = unsafe pthread_cond_signal(condition) let _unlocked = unsafe pthread_mutex_unlock(lock)
+      return Pointer.null<u8>()
+    }
+    unsafe queueRemove(item) unsafe queueInit(item)
+    let mut isSlow = false
+    if sameWork(item, marker) {
+      let p4 = unsafe Pointer.borrowMut<(), Pool>(&mut anchor, pointer)
+      if p4.slowRunning >= slowThreshold(p4.threads) { drop p4 unsafe queueInsertTail(queue, item) continue }
+      drop p4
+      // A marker with no slow work left: that work was cancelled.
+      if unsafe queueEmpty(slow) { continue }
+      isSlow = true
+      let p5 = unsafe Pointer.borrowMut<(), Pool>(&mut anchor, pointer) p5.slowRunning = p5.slowRunning + 1 let idle = p5.idle drop p5
+      item = unsafe queueHead(slow)
+      unsafe queueRemove(item) unsafe queueInit(item)
+      if !unsafe queueEmpty(slow) {
+        unsafe queueInsertTail(queue, marker)
+        if idle > 0 { let _signalled = unsafe pthread_cond_signal(condition) }
+      }
+    }
+    let _unlocked = unsafe pthread_mutex_unlock(lock)
+    let w = unsafe Pointer.borrow<(), Work>(&anchor, item)
+    let body = w.work let target = w.loop drop w
+    if !Intrinsic.pointerIsNull<?extern "C" fn(*mut Work) -> ()>(body) {
+      let present = unsafe Intrinsic.pointerRequalify<?extern "C" fn(*mut Work) -> (), extern "C" fn(*mut Work) -> ()>(body)
+      unsafe present(item)
+    }
+    unsafe workFinished(unsafe loopOf(unsafe nn(target)), item)
+    let _relocked = unsafe pthread_mutex_lock(lock)
+    if isSlow { let p6 = unsafe Pointer.borrowMut<(), Pool>(&mut anchor, pointer) p6.slowRunning = p6.slowRunning - 1 }
+  }
+  return Pointer.null<u8>()
+}
+// On a worker: `work` is done; it goes on its loop's list, and the loop wakes.
+unsafe fn workFinished(loop: *mut Loop, item: *mut Work) -> () {
+  let mut anchor = () let l = unsafe Pointer.borrowMut<(), Loop>(&mut anchor, loop)
+  let lock = unsafe nn(l.workLock) let wake = l.wakeWrite
+  let _locked = unsafe pthread_mutex_lock(lock)
+  let mut second = () let w = unsafe Pointer.borrowMut<(), Work>(&mut second, item)
+  // libuv clears `work` here so that uv_cancel knows the unit ran; a cancelled one keeps its marker.
+  if !unsafe isCancelled(w.work) { w.work = Intrinsic.pointerNullFunction<?extern "C" fn(*mut Work) -> ()>() }
+  w.next = Pointer.null<Work>() w.previous = l.workLast drop w
+  if Intrinsic.pointerIsNull<?*mut Work>(l.workLast) { l.workFirst = item } else { let mut third = () let last = unsafe Pointer.borrowMut<(), Work>(&mut third, unsafe nn(l.workLast)) last.next = item }
+  l.workLast = item
+  let wakeNeeded = unsafe Atomic.swap<u32>(Pointer.fromMutRef<u32>(&mut l.workPending), 1, MemoryOrder.SequentiallyConsistent) == 0
+  drop l
+  let _unlocked = unsafe pthread_mutex_unlock(lock)
+  if wakeNeeded {
+    let one: [u8; 1] = [1]
+    while true { if unsafe write(wake, Pointer.fromRef<u8>(&one[0]), 1) >= 0 || unsafe errno() != EINTR { break } }
+  }
+}
+unsafe fn isCancelled(body: ?extern "C" fn(*mut Work) -> ()) -> bool {
+  let cancelled: extern "C" fn(*mut Work) -> () = silkUvCancelled
+  return unsafe bits<?extern "C" fn(*mut Work) -> ()>(body) == unsafe bits<extern "C" fn(*mut Work) -> ()>(cancelled)
+}
+unsafe fn bits<F: Copy>(f: F) -> usize { return unsafe Pointer.read<usize>(unsafe Intrinsic.pointerReinterpret<*const F, *const usize>(Pointer.fromRef<F>(&f))) }
+// libuv's uv__work_done: the units that finished, in order, each with 0 or UV_ECANCELED.
+unsafe fn workDone(loop: *mut Loop) -> () {
+  let mut anchor = () let l = unsafe Pointer.borrowMut<(), Loop>(&mut anchor, loop)
+  if unsafe Atomic.swap<u32>(Pointer.fromMutRef<u32>(&mut l.workPending), 0, MemoryOrder.SequentiallyConsistent) == 0 { return }
+  let lock = unsafe nn(l.workLock)
+  drop l
+  let _locked = unsafe pthread_mutex_lock(lock)
+  let l2 = unsafe Pointer.borrowMut<(), Loop>(&mut anchor, loop)
+  let mut item = l2.workFirst
+  l2.workFirst = Pointer.null<Work>() l2.workLast = Pointer.null<Work>() drop l2
+  let _unlocked = unsafe pthread_mutex_unlock(lock)
+  let mut count: u64 = 0
+  while !Intrinsic.pointerIsNull<?*mut Work>(item) {
+    let pointer = unsafe nn(item)
+    let mut second = () let w = unsafe Pointer.borrowMut<(), Work>(&mut second, pointer)
+    let next = w.next let done = w.done let status = if unsafe isCancelled(w.work) { WORK_CANCELED } else { 0 }
+    w.next = Pointer.null<Work>() w.previous = Pointer.null<Work>() drop w
+    if !Intrinsic.pointerIsNull<?extern "C" fn(*mut Work, i32) -> ()>(done) {
+      let present = unsafe Intrinsic.pointerRequalify<?extern "C" fn(*mut Work, i32) -> (), extern "C" fn(*mut Work, i32) -> ()>(done)
+      unsafe present(pointer, status)
+    }
+    count = count + 1
+    item = next
+  }
+  if count > 1 {
+    let l3 = unsafe Pointer.borrowMut<(), Loop>(&mut anchor, loop)
+    l3.events = l3.events + (count - 1)
+    if l3.waitTimeout == 0 { l3.eventsWaiting = l3.eventsWaiting + (count - 1) }
+  }
+}
+/// Runs `work(unit)` on the pool and then `done(unit, status)` on the loop's thread during a later
+/// `uv_run`. `kind` is WORK_CPU, WORK_FAST_IO or WORK_SLOW_IO. The caller counts the request
+/// (`requestStarted`) if it should hold the loop.
+pub unsafe fn workSubmit(memory: *mut u8, unit: *mut Work, kind: i32, work: extern "C" fn(*mut Work) -> (), done: extern "C" fn(*mut Work, i32) -> ()) -> () {
+  let pointer = unsafe pool()
+  let mut anchor = () let w = unsafe Pointer.borrowMut<(), Work>(&mut anchor, unit)
+  w.loop = memory w.work = work w.done = done drop w
+  let mut second = () let p = unsafe Pointer.borrowMut<(), Pool>(&mut second, pointer)
+  let lock = p.lock let condition = p.condition
+  let queue = Pointer.fromMutRef<Work>(&mut p.queue) let slow = Pointer.fromMutRef<Work>(&mut p.slow) let marker = Pointer.fromMutRef<Work>(&mut p.slowMarker)
+  drop p
+  let _locked = unsafe pthread_mutex_lock(lock)
+  let mut node = unit
+  let mut post = true
+  if kind == WORK_SLOW_IO {
+    unsafe queueInsertTail(slow, unit)
+    // The marker already waits in the queue: the worker that takes it schedules this unit too.
+    if !unsafe queueEmpty(marker) { post = false }
+    node = marker
+  }
+  if post {
+    unsafe queueInsertTail(queue, node)
+    let p2 = unsafe Pointer.borrow<(), Pool>(&anchor, pointer)
+    if p2.idle > 0 { let _signalled = unsafe pthread_cond_signal(condition) }
+  }
+  let _unlocked = unsafe pthread_mutex_unlock(lock)
+}
+/// libuv's uv__work_cancel: a unit still waiting leaves the queue and finishes with UV_ECANCELED
+/// (-125, Darwin -89) at the loop's next wake; one that started or finished answers UV_EBUSY (-16).
+pub unsafe fn workCancel(memory: *mut u8, unit: *mut Work) -> i32 {
+  let pointer = unsafe pool()
+  let anchor = () let p = unsafe Pointer.borrow<(), Pool>(&anchor, pointer)
+  let lock = p.lock drop p
+  let loop = unsafe loopOf(memory)
+  let l = unsafe Pointer.borrow<(), Loop>(&anchor, loop)
+  let loopLock = unsafe nn(l.workLock) drop l
+  let _locked = unsafe pthread_mutex_lock(lock)
+  let _loopLocked = unsafe pthread_mutex_lock(loopLock)
+  let mut second = () let w = unsafe Pointer.borrowMut<(), Work>(&mut second, unit)
+  // Waiting means linked into a pool queue (a running unit was unlinked) and not finished.
+  let waiting = !Intrinsic.pointerIsNull<?*mut Work>(w.next) && !sameWork(w.next, unit) && !Intrinsic.pointerIsNull<?extern "C" fn(*mut Work) -> ()>(w.work) && !unsafe isCancelled(w.work)
+  drop w
+  if waiting { unsafe queueRemove(unit) }
+  let _loopUnlocked = unsafe pthread_mutex_unlock(loopLock)
+  let _unlocked = unsafe pthread_mutex_unlock(lock)
+  if !waiting { return -16 }
+  let w2 = unsafe Pointer.borrowMut<(), Work>(&mut second, unit)
+  w2.work = silkUvCancelled drop w2
+  unsafe workFinished(loop, unit)
+  return 0
+}
+
+// ---- Idle, prepare and check ------------------------------------------------------------------
+unsafe fn phaseList(loop: *mut Loop, kind: i32) -> *mut ?*mut Handle {
+  let mut anchor = () let l = unsafe Pointer.borrowMut<(), Loop>(&mut anchor, loop)
+  if kind == UV_IDLE { return Pointer.fromMutRef<?*mut Handle>(&mut l.idles) }
+  if kind == UV_PREPARE { return Pointer.fromMutRef<?*mut Handle>(&mut l.prepares) }
+  return Pointer.fromMutRef<?*mut Handle>(&mut l.checks)
+}
+unsafe fn phaseInit(loopMemory: *mut u8, memory: *mut u8, kind: i32) -> i32 {
+  let _handle = unsafe initialize(unsafe loopOf(loopMemory), memory, kind)
+  return 0
+}
+pub unsafe fn uv_idle_init(loop: *mut u8, memory: *mut u8) -> i32 { return unsafe phaseInit(loop, memory, UV_IDLE) }
+pub unsafe fn uv_prepare_init(loop: *mut u8, memory: *mut u8) -> i32 { return unsafe phaseInit(loop, memory, UV_PREPARE) }
+pub unsafe fn uv_check_init(loop: *mut u8, memory: *mut u8) -> i32 { return unsafe phaseInit(loop, memory, UV_CHECK) }
+/// Starts an idle, prepare or check handle: `callback(handle)` runs once per iteration in its
+/// phase. libuv inserts at the head, so the newest started runs first. UV_EINVAL without callback.
+pub unsafe fn phaseStart(memory: *mut u8, callback: ?extern "C" fn(*mut u8) -> ()) -> i32 {
+  let handle = unsafe handleOf(memory)
+  let mut anchor = () let h = unsafe Pointer.borrowMut<(), Handle>(&mut anchor, handle)
+  if (h.flags & ACTIVE) != 0 { return 0 }
+  if Intrinsic.pointerIsNull<?extern "C" fn(*mut u8) -> ()>(callback) { return -22 }
+  let list = unsafe phaseList(h.loop, h.kind)
+  h.fired = unsafe Intrinsic.pointerRequalify<?extern "C" fn(*mut u8) -> (), extern "C" fn(*mut u8) -> ()>(callback)
+  h.nextPhase = unsafe Pointer.read<?*mut Handle>(list)
+  unsafe Pointer.write<?*mut Handle>(list, handle)
+  drop h
+  unsafe start(handle)
+  return 0
+}
+unsafe fn phaseStop(handle: *mut Handle) -> () {
+  let mut anchor = () let h = unsafe Pointer.borrowMut<(), Handle>(&mut anchor, handle)
+  if (h.flags & ACTIVE) == 0 { return }
+  let list = unsafe phaseList(h.loop, h.kind)
+  let first = unsafe Pointer.read<?*mut Handle>(list)
+  if same(first, handle) { unsafe Pointer.write<?*mut Handle>(list, h.nextPhase) }
+  else {
+    let mut cursor = first
+    while !Pointer.isNull<Handle>(cursor) {
+      let mut second = () let c = unsafe Pointer.borrowMut<(), Handle>(&mut second, unsafe nn(cursor))
+      if same(c.nextPhase, handle) { c.nextPhase = h.nextPhase break }
+      cursor = c.nextPhase
+    }
+  }
+  h.nextPhase = Pointer.null<Handle>() drop h
+  unsafe stop(handle)
+}
+pub unsafe fn phaseStopMemory(memory: *mut u8) -> i32 { unsafe phaseStop(unsafe handleOf(memory)) return 0 }
+// Runs a phase's handles, each once, as libuv's uv__run_idle (a handle started by a callback waits
+// for the next iteration; one stopped by a callback does not run).
+unsafe fn runPhase(loop: *mut Loop, kind: i32) -> () {
+  let list = unsafe phaseList(loop, kind)
+  if Pointer.isNull<Handle>(unsafe Pointer.read<?*mut Handle>(list)) { return }
+  let mut anchor = () let l = unsafe Pointer.borrowMut<(), Loop>(&mut anchor, loop)
+  l.serial = l.serial + 1 let serial = l.serial drop l
+  // Mark the handles that were started when the phase began.
+  let mut cursor = unsafe Pointer.read<?*mut Handle>(list)
+  while !Pointer.isNull<Handle>(cursor) { let mut second = () let c = unsafe Pointer.borrowMut<(), Handle>(&mut second, unsafe nn(cursor)) c.serial = serial cursor = c.nextPhase }
+  while true {
+    let mut found: ?*mut Handle = Pointer.null<Handle>()
+    let mut walk = unsafe Pointer.read<?*mut Handle>(list)
+    while !Pointer.isNull<Handle>(walk) {
+      let mut third = () let c = unsafe Pointer.borrowMut<(), Handle>(&mut third, unsafe nn(walk))
+      if c.serial == serial { c.serial = 0 found = walk break }
+      walk = c.nextPhase
+    }
+    if Pointer.isNull<Handle>(found) { return }
+    let fourth = () let h = unsafe Pointer.borrow<(), Handle>(&fourth, unsafe nn(found))
+    let callback = h.fired drop h
+    unsafe callback(unsafe bytesOf(unsafe nn(found)))
+  }
+}
+
+// ---- Descriptor handles for other modules -----------------------------------------------------
+/// The `events` bit that a descriptor handle's callback gets with an error or hangup condition.
+pub const IO_ERROR: i32 = 256
+/// The `events` bit that comes with IO_ERROR when the condition is a hangup (epoll's EPOLLHUP;
+/// kqueue reports none).
+pub const IO_HANGUP: i32 = 1024
+/// Initializes a descriptor handle of libuv kind `kind` (UV_TCP 12, UV_NAMED_PIPE 7, UV_TTY 14,
+/// UV_UDP 15) with no descriptor yet.
+pub unsafe fn ioInit(loopMemory: *mut u8, memory: *mut u8, kind: i32) -> () {
+  let handle = unsafe initialize(unsafe loopOf(loopMemory), memory, kind)
+  let mut anchor = () let h = unsafe Pointer.borrowMut<(), Handle>(&mut anchor, handle)
+  h.flags = h.flags | IO
+}
+/// Sets the descriptor of a descriptor handle (-1 for none). Its watch must be off.
+pub unsafe fn ioSetDescriptor(memory: *mut u8, fd: i32) -> () {
+  let mut anchor = () let h = unsafe Pointer.borrowMut<(), Handle>(&mut anchor, unsafe handleOf(memory))
+  // Another descriptor: a select thread watching the old one stops.
+  if fd != h.fd && !Pointer.isNull<u8>(h.context) && (h.flags & IO) != 0 { drop h unsafe selectRelease(unsafe handleOf(memory)) }
+  let h2 = unsafe Pointer.borrowMut<(), Handle>(&mut anchor, unsafe handleOf(memory))
+  h2.fd = fd
+}
+pub unsafe fn ioDescriptor(memory: *const u8) -> i32 {
+  let anchor = () let h = unsafe Pointer.borrow<(), Handle>(&anchor, unsafe handleOfConst(memory))
+  return h.fd
+}
+/// Watches the descriptor for `events` (UV_READABLE 1, UV_WRITABLE 2, UV_DISCONNECT 4,
+/// UV_PRIORITIZED 8; 0 stops watching) and calls `callback(handle, 0, ready)`, where `ready` may
+/// carry IO_ERROR. It does not make the handle active.
+pub unsafe fn ioWatch(memory: *mut u8, events: i32, callback: PollCallback) -> i32 {
+  let handle = unsafe handleOf(memory)
+  let mut anchor = () let h = unsafe Pointer.borrowMut<(), Handle>(&mut anchor, handle)
+  let wanted = events & (UV_READABLE | UV_WRITABLE | UV_DISCONNECT | UV_PRIORITIZED)
+  if wanted == h.registered { h.polled = callback return 0 }
+  if h.fd < 0 { if wanted == 0 { return 0 } return -9 }
+  // The runtime's descriptor watchers register at once, as before the libuv facade: only uv_poll
+  // handles take libuv's deferred change list (queueSetLoop).
+  if (h.flags & IO) != 0 && !Pointer.isNull<u8>(h.context) {
+    let state = unsafe nn(h.context) h.registered = wanted h.polled = callback drop h
+    unsafe selectWatch(state, wanted)
+    return 0
+  }
+  let loop = h.loop let fd = h.fd let previous = h.registered drop h
+  let anchorLoop = () let l = unsafe Pointer.borrow<(), Loop>(&anchorLoop, loop) let queue = l.backend drop l
+  let status = unsafe queueSet(queue, fd, usize.toU64(Pointer.address<Handle>(handle)), previous, wanted)
+  if status != 0 { return status }
+  let h2 = unsafe Pointer.borrowMut<(), Handle>(&mut anchor, handle)
+  h2.registered = wanted h2.polled = callback
+  return 0
+}
+// ---- macOS: descriptors kqueue refuses ---------------------------------------------------------
+// libuv's uv__stream_try_select: kqueue refuses some descriptors with EINVAL (/dev/tty, /dev/null).
+// A descriptor handle given one is watched by a select() thread of its own instead: the thread
+// waits for the events the handle is watched for, hands what is ready to the loop through an
+// internal async handle, and waits until the loop has called the handle back before it selects
+// again. A select handle keeps its SelectState in `context` (a stat poll's field).
+static if Intrinsic.targetOperatingSystem() == "darwin" {
+  unsafe extern "C" fn selectUnlimited(count: i32, readable: ?*mut u8, writable: ?*mut u8, failed: ?*mut u8, timeout: ?*mut u8) -> i32 as "select$DARWIN_EXTSN"
+  unsafe extern "C" fn pthread_join(thread: usize, result: ?*mut ?*mut u8) -> i32
+  struct SelectState {
+    handle: *mut Handle, async: *mut u8, fd: i32, interruptRead: i32, interruptWrite: i32, ackRead: i32, ackWrite: i32,
+    thread: usize, wanted: u32, events: u32, stop: u32, sets: *mut u8, setBytes: usize
+  }
+  const EINVAL_ERROR: i32 = 22
+  unsafe fn selectOf(pointer: *mut u8) -> *mut SelectState { return unsafe Intrinsic.pointerReinterpret<*mut u8, *mut SelectState>(pointer) }
+  unsafe fn byteAt(base: *mut u8, index: usize) -> *mut u8 { return unsafe Pointer.atMut<u8>(unsafe Pointer.assumeManyMut<u8>(base), index) }
+  unsafe fn setBit(set: *mut u8, fd: i32) -> () {
+    let at = unsafe byteAt(set, i32.toUsize(fd / 8))
+    unsafe Pointer.write<u8>(at, unsafe Pointer.read<u8>(at) | u8.shiftLeft(1, i32.wrappingToU8(fd % 8)))
+  }
+  unsafe fn hasBit(set: *mut u8, fd: i32) -> bool {
+    return (unsafe Pointer.read<u8>(unsafe byteAt(set, i32.toUsize(fd / 8))) & u8.shiftLeft(1, i32.wrappingToU8(fd % 8))) != 0
+  }
+  unsafe fn poke(fd: i32) -> () {
+    let one: [u8; 1] = [1]
+    while true { let written = unsafe write(fd, Pointer.fromRef<u8>(&one[0]), 1) if written >= 0 || unsafe errno() != EINTR { return } }
+  }
+  /// Whether kqueue refuses `fd`, asked of a queue of its own as libuv does (EV_ADD of a read
+  /// filter, refused with EINVAL): 1 refused, 0 accepted, or a negative errno.
+  unsafe fn kqueueRefuses(fd: i32) -> i32 {
+    let probe = unsafe kqueue()
+    if probe < 0 { return -(unsafe errno()) }
+    let changes = [kernelEvent(i32.toUsize(fd), FILTER_READ, EV_ADD | 4, 0, 0)]
+    let mut answer: [KernelEvent; 1] = [kernelEvent(0, 0, 0, 0, 0)]
+    let tiny = TimeSpec { seconds: 0, nanoseconds: 1 }
+    let mut count: i32 = -1
+    while true {
+      count = unsafe kevent(probe, Pointer.fromSlice<KernelEvent>(&changes), 1, Pointer.fromMutSlice<KernelEvent>(&mut answer), 1, Pointer.fromRef<TimeSpec>(&tiny))
+      if count != -1 || unsafe errno() != EINTR { break }
+    }
+    let code = unsafe errno()
+    let _closed = unsafe close(probe)
+    if count == -1 { return -code }
+    if count == 0 || (answer[0].flags & EV_ERROR) == 0 || answer[0].data != i32.toIsize(EINVAL_ERROR) { return 0 }
+    return 1
+  }
+  export "C" fn silkUvSelectThread(argument: ?*mut u8) -> ?*mut u8 {
+    let name = b"libuv-select\0"
+    unsafe setThreadName(Pointer.fromRef<u8>(&name[0]))
+    let state = unsafe selectOf(unsafe nn(argument))
+    let mut anchor = ()
+    let s = unsafe Pointer.borrowMut<(), SelectState>(&mut anchor, state)
+    let fd = s.fd let interrupt = s.interruptRead let ack = s.ackRead let async = s.async let readSet = s.sets let bytes = s.setBytes
+    drop s
+    let writeSet = unsafe byteAt(readSet, bytes)
+    let top = if fd > interrupt { fd } else { interrupt }
+    let mut buffer: [u8; 1024] = [0; 1024]
+    while true {
+      let s1 = unsafe Pointer.borrowMut<(), SelectState>(&mut anchor, state)
+      if unsafe Atomic.load<u32>(Pointer.fromMutRef<u32>(&mut s1.stop), MemoryOrder.SequentiallyConsistent) != 0 { break }
+      let wanted = u32.toI32(unsafe Atomic.load<u32>(Pointer.fromMutRef<u32>(&mut s1.wanted), MemoryOrder.SequentiallyConsistent))
+      drop s1
+      let mut index: usize = 0
+      while index < bytes * 2 { unsafe Pointer.write<u8>(unsafe byteAt(readSet, index), 0) index = index + 1 }
+      if (wanted & (UV_READABLE | UV_DISCONNECT)) != 0 { unsafe setBit(readSet, fd) }
+      if (wanted & UV_WRITABLE) != 0 { unsafe setBit(writeSet, fd) }
+      unsafe setBit(readSet, interrupt)
+      let ready = unsafe selectUnlimited(top + 1, readSet, writeSet, Pointer.null<u8>(), Pointer.null<u8>())
+      if ready == -1 { if unsafe errno() == EINTR { continue } unsafe abort() }
+      if ready == 0 { continue }
+      if unsafe hasBit(readSet, interrupt) {
+        while true {
+          let count = unsafe read(interrupt, Pointer.fromMutRef<u8>(&mut buffer[0]), 1024)
+          if count == 1024 { continue }
+          if count >= 0 { break }
+          if unsafe errno() != EINTR { break }
+        }
+      }
+      let mut events: i32 = 0
+      if unsafe hasBit(readSet, fd) { events = events | UV_READABLE }
+      if unsafe hasBit(writeSet, fd) { events = events | UV_WRITABLE }
+      if events != 0 {
+        let s2 = unsafe Pointer.borrowMut<(), SelectState>(&mut anchor, state)
+        unsafe Atomic.store<u32>(Pointer.fromMutRef<u32>(&mut s2.events), i32.toU32(events), MemoryOrder.SequentiallyConsistent)
+        drop s2
+        let _sent = unsafe uv_async_send(async)
+        // The loop answers once it has called the handle back (or once the handle closes).
+        while true {
+          let count = unsafe read(ack, Pointer.fromMutRef<u8>(&mut buffer[0]), 1)
+          if count >= 0 || unsafe errno() != EINTR { break }
+        }
+      }
+    }
+    return Pointer.null<u8>()
+  }
+  // The internal async handle's callback, on the loop's thread (libuv's uv__stream_osx_select_cb).
+  export "C" fn silkUvSelectReady(memory: *mut u8) -> () {
+    let mut anchor = ()
+    let a = unsafe Pointer.borrow<(), Handle>(&anchor, unsafe handleOf(memory))
+    let state = unsafe selectOf(unsafe nn(a.data)) drop a
+    let s = unsafe Pointer.borrowMut<(), SelectState>(&mut anchor, state)
+    let events = u32.toI32(unsafe Atomic.swap<u32>(Pointer.fromMutRef<u32>(&mut s.events), 0, MemoryOrder.SequentiallyConsistent))
+    let handle = s.handle let ack = s.ackWrite drop s
+    let h = unsafe Pointer.borrow<(), Handle>(&anchor, handle)
+    let loop = h.loop let closing = (h.flags & (CLOSING | CLOSED)) != 0 drop h
+    if closing { return }
+    if events != 0 { let _called = unsafe pollReady(loop, handle, events) }
+    let h2 = unsafe Pointer.borrow<(), Handle>(&anchor, handle)
+    let closed = (h2.flags & (CLOSING | CLOSED)) != 0 drop h2
+    // A handle closed by its callback has stopped the thread already.
+    if !closed { unsafe poke(ack) }
+  }
+  export "C" fn silkUvSelectFreed(memory: *mut u8) -> () {
+    let anchor = ()
+    let a = unsafe Pointer.borrow<(), Handle>(&anchor, unsafe handleOf(memory))
+    let state = a.data drop a
+    unsafe free(state)
+    unsafe free(memory)
+  }
+  /// libuv's uv__stream_try_select for a descriptor handle whose descriptor is set: when kqueue
+  /// refuses it, a select() thread watches it from now on. 0, or a negative errno.
+  pub unsafe fn ioSelectIfRefused(memory: *mut u8) -> i32 {
+    let handle = unsafe handleOf(memory)
+    let mut anchor = ()
+    let h = unsafe Pointer.borrow<(), Handle>(&anchor, handle)
+    let fd = h.fd let loop = h.loop let already = !Pointer.isNull<u8>(h.context) drop h
+    if fd < 0 || already { return 0 }
+    let refused = unsafe kqueueRefuses(fd)
+    if refused <= 0 { return refused }
+    let mut interrupt: [i32; 2] = [-1, -1]
+    let made = unsafe makePipe(&mut interrupt, true)
+    if made != 0 { return made }
+    let mut ack: [i32; 2] = [-1, -1]
+    let made2 = unsafe makePipe(&mut ack, false)
+    if made2 != 0 { let _a = unsafe close(interrupt[0]) let _b = unsafe close(interrupt[1]) return made2 }
+    let top = if fd > interrupt[0] { fd } else { interrupt[0] }
+    // fd_set words of 32 bits, as libuv sizes them.
+    let setBytes = (i32.toUsize(top) + 32) / 32 * 4
+    let memoryAll = unsafe calloc(1, Layout.of<SelectState>().bytes + setBytes * 2)
+    let asyncMemory = unsafe calloc(1, Layout.of<Handle>().bytes)
+    if Pointer.isNull<u8>(memoryAll) || Pointer.isNull<u8>(asyncMemory) {
+      unsafe free(memoryAll) unsafe free(asyncMemory)
+      let _a = unsafe close(interrupt[0]) let _b = unsafe close(interrupt[1]) let _c = unsafe close(ack[0]) let _d = unsafe close(ack[1])
+      return -12
+    }
+    let stateBytes = unsafe nn(memoryAll)
+    let state = unsafe selectOf(stateBytes)
+    let async = unsafe nn(asyncMemory)
+    unsafe Pointer.put<SelectState>(state, SelectState {
+      handle: handle, async: async, fd: fd, interruptRead: interrupt[0], interruptWrite: interrupt[1], ackRead: ack[0], ackWrite: ack[1],
+      thread: 0, wanted: 0, events: 0, stop: 0, sets: unsafe byteAt(stateBytes, Layout.of<SelectState>().bytes), setBytes: setBytes
+    })
+    let _init = unsafe uv_async_init(unsafe Intrinsic.pointerReinterpret<*mut Loop, *mut u8>(loop), async, silkUvSelectReady)
+    let mut second = () let ah = unsafe Pointer.borrowMut<(), Handle>(&mut second, unsafe handleOf(async))
+    ah.data = stateBytes drop ah
+    unsafe markInternal(async)
+    let mut thread: usize = 0
+    if unsafe pthread_create(Pointer.fromMutRef<usize>(&mut thread), Pointer.null<u8>(), silkUvSelectThread, stateBytes) != 0 {
+      let code = unsafe errno()
+      let _a = unsafe close(interrupt[0]) let _b = unsafe close(interrupt[1]) let _c = unsafe close(ack[0]) let _d = unsafe close(ack[1])
+      unsafe uv_close(async, silkUvSelectFreed)
+      return -code
+    }
+    let s = unsafe Pointer.borrowMut<(), SelectState>(&mut anchor, state) s.thread = thread drop s
+    let h2 = unsafe Pointer.borrowMut<(), Handle>(&mut anchor, handle) h2.context = stateBytes drop h2
+    return 0
+  }
+  // A select handle's watch: the thread's mask, then a wake so that it selects for it.
+  unsafe fn selectWatch(state: *mut u8, wanted: i32) -> () {
+    let mut anchor = () let s = unsafe Pointer.borrowMut<(), SelectState>(&mut anchor, unsafe selectOf(state))
+    unsafe Atomic.store<u32>(Pointer.fromMutRef<u32>(&mut s.wanted), i32.toU32(wanted), MemoryOrder.SequentiallyConsistent)
+    let interrupt = s.interruptWrite drop s
+    unsafe poke(interrupt)
+  }
+  // Stops a select handle's thread and gives back what it held (libuv's uv__stream_close part).
+  unsafe fn selectRelease(handle: *mut Handle) -> () {
+    let mut anchor = ()
+    let h = unsafe Pointer.borrowMut<(), Handle>(&mut anchor, handle)
+    if Pointer.isNull<u8>(h.context) { return }
+    let stateBytes = unsafe nn(h.context) h.context = Pointer.null<u8>() drop h
+    let s = unsafe Pointer.borrowMut<(), SelectState>(&mut anchor, unsafe selectOf(stateBytes))
+    unsafe Atomic.store<u32>(Pointer.fromMutRef<u32>(&mut s.stop), 1, MemoryOrder.SequentiallyConsistent)
+    let interruptRead = s.interruptRead let interruptWrite = s.interruptWrite let ackRead = s.ackRead let ackWrite = s.ackWrite
+    let thread = s.thread let async = s.async drop s
+    unsafe poke(interruptWrite)
+    unsafe poke(ackWrite)
+    let _joined = unsafe pthread_join(thread, Pointer.null<?*mut u8>())
+    let _a = unsafe close(interruptRead) let _b = unsafe close(interruptWrite) let _c = unsafe close(ackRead) let _d = unsafe close(ackWrite)
+    unsafe uv_close(async, silkUvSelectFreed)
+  }
+} else {
+  /// libuv's uv__stream_try_select is macOS's: elsewhere every descriptor goes to the queue.
+  pub unsafe fn ioSelectIfRefused(memory: *mut u8) -> i32 { return 0 }
+  unsafe fn selectWatch(state: *mut u8, wanted: i32) -> () {}
+  unsafe fn selectRelease(handle: *mut Handle) -> () {}
+}
+/// The events a descriptor handle is watched for.
+pub unsafe fn ioWatched(memory: *const u8) -> i32 {
+  let anchor = () let h = unsafe Pointer.borrow<(), Handle>(&anchor, unsafe handleOfConst(memory))
+  return h.registered
+}
+/// Whether a poll or descriptor handle of the loop watches `fd` (libuv's uv__fd_exists).
+pub unsafe fn ioDescriptorWatched(loopMemory: *const u8, fd: i32) -> bool {
+  let anchor = () let l = unsafe Pointer.borrow<(), Loop>(&anchor, unsafe Intrinsic.pointerReinterpret<*const u8, *const Loop>(loopMemory))
+  let mut handle = l.first drop l
+  while !Pointer.isNull<Handle>(handle) {
+    let h = unsafe Pointer.borrow<(), Handle>(&anchor, unsafe nn(handle))
+    if (h.kind == UV_POLL || (h.flags & IO) != 0) && h.fd == fd && h.registered != 0 && (h.flags & (CLOSING | CLOSED)) == 0 { return true }
+    handle = h.next
+  }
+  return false
+}
+/// libuv's uv__handle_start and uv__handle_stop for a module that manages its handle's activity.
+pub unsafe fn ioActivate(memory: *mut u8) -> () { unsafe start(unsafe handleOf(memory)) }
+pub unsafe fn ioDeactivate(memory: *mut u8) -> () { unsafe stop(unsafe handleOf(memory)) }
+
+// ---- Handles for other modules ----------------------------------------------------------------
+/// Marks a handle as the loop's own: uv_walk does not report it and uv_loop_close does not wait for
+/// it. It is also unreferenced, as libuv's internal handles are.
+pub unsafe fn markInternal(memory: *mut u8) -> () {
+  unsafe uv_unref(memory)
+  let mut anchor = () let h = unsafe Pointer.borrowMut<(), Handle>(&mut anchor, unsafe handleOf(memory))
+  h.flags = h.flags | INTERNAL
+}
+/// Marks a handle as standing for an addon's libuv record `outer`, which becomes its data word.
+pub unsafe fn markAddon(memory: *mut u8, outer: *mut u8) -> () {
+  let mut anchor = () let h = unsafe Pointer.borrowMut<(), Handle>(&mut anchor, unsafe handleOf(memory))
+  h.flags = h.flags | ADDON h.data = outer
+}
+pub unsafe fn isAddon(memory: *const u8) -> bool {
+  let anchor = () let h = unsafe Pointer.borrow<(), Handle>(&anchor, unsafe handleOfConst(memory))
+  return (h.flags & ADDON) != 0
+}
+/// The loop a handle belongs to.
+pub unsafe fn handleLoop(memory: *const u8) -> *mut u8 {
+  let anchor = () let h = unsafe Pointer.borrow<(), Handle>(&anchor, unsafe handleOfConst(memory))
+  return unsafe Intrinsic.pointerReinterpret<*mut Loop, *mut u8>(h.loop)
+}
+/// Whether a handle was closed and its close callback ran.
+pub unsafe fn isClosed(memory: *const u8) -> bool {
+  let anchor = () let h = unsafe Pointer.borrow<(), Handle>(&anchor, unsafe handleOfConst(memory))
+  return (h.flags & CLOSED) != 0
+}
+/// The handles of a loop in uv_walk's order, including internal ones, for uv_print_all_handles:
+/// `callback(handle, argument)` gets the loop's own record, whatever it stands for.
+pub unsafe fn walkAll(memory: *mut u8, callback: WalkCallback, argument: *mut u8) -> () {
+  let anchor = () let l = unsafe Pointer.borrow<(), Loop>(&anchor, unsafe loopOf(memory))
+  let mut handle = l.first drop l
+  while !Pointer.isNull<Handle>(handle) {
+    let h = unsafe Pointer.borrow<(), Handle>(&anchor, unsafe nn(handle))
+    let next = h.next drop h
+    unsafe callback(unsafe bytesOf(unsafe nn(handle)), argument)
+    handle = next
+  }
+}
+/// Whether a handle is the loop's own (libuv's UV_HANDLE_INTERNAL).
+pub unsafe fn isInternal(memory: *const u8) -> bool {
+  let anchor = () let h = unsafe Pointer.borrow<(), Handle>(&anchor, unsafe handleOfConst(memory))
+  return (h.flags & INTERNAL) != 0
+}
+
+// ---- Run --------------------------------------------------------------------------------------
+// libuv's uv__io_poll: wait at most `timeout` milliseconds (-1 forever), dispatch the events, poll
+// again without waiting while a full batch came back, and run signal watchers last. With idle-time
+// metrics on, a first wait that does not block counts the events that were already waiting.
+unsafe fn ioPoll(loop: *mut Loop, initial: i64) -> () {
+  let mut anchor = () let l = unsafe Pointer.borrowMut<(), Loop>(&mut anchor, loop)
+  let queue = l.backend let base = l.time let metricsOn = l.idleMetrics let blockProfile = l.blockProfile
+  drop l
+  let mut count: i32 = 48
+  let mut realTimeout = initial
+  let mut timeout = initial
+  let mut reset = false let mut userTimeout: i64 = 0
+  if metricsOn { reset = true userTimeout = timeout timeout = 0 }
+  let mut ready: [Ready; 64] = [Ready { tag: 0, events: 0 }; 64]
+  while true {
+    if timeout != 0 { unsafe metricsEnter(loop) }
+    let l1 = unsafe Pointer.borrowMut<(), Loop>(&mut anchor, loop) l1.waitTimeout = i64.toI32(timeout) drop l1
+    let received = unsafe queueWait(loop, queue, &mut ready, timeout, blockProfile)
+    unsafe updateTime(loop)
+    let mut cycle = false
+    if received <= 0 {
+      if reset { timeout = userTimeout reset = false }
+      else { if received == 0 { return } }
+    } else {
+      let mut events: u64 = 0
+      let mut signals = false
+      let mut index: usize = 0
+      while index < i32.toUsize(received) {
+        let item = ready[index]
+        index = index + 1
+        if item.tag == TAG_SIGNAL { signals = true events = events + 1 continue }
+        if unsafe dispatch(loop, item) { events = events + 1 }
+      }
+      let l2 = unsafe Pointer.borrowMut<(), Loop>(&mut anchor, loop)
+      l2.events = l2.events + events
+      if reset { timeout = userTimeout reset = false l2.eventsWaiting = l2.eventsWaiting + events }
+      drop l2
+      if signals { unsafe metricsLeave(loop) unsafe signalReady(loop) return }
+      if events != 0 {
+        count = count - 1
+        if received == 64 && count != 0 { timeout = 0 cycle = true }
+        else { return }
+      }
+    }
+    if !cycle {
+      if timeout == 0 { return }
+      if timeout != -1 {
+        let l3 = unsafe Pointer.borrow<(), Loop>(&anchor, loop)
+        realTimeout = realTimeout - u64.toI64(l3.time - base) drop l3
+        if realTimeout <= 0 { return }
+        timeout = realTimeout
+      }
+    }
+  }
+}
+// One event: true when it reached a callback (libuv counts those).
+unsafe fn dispatch(loop: *mut Loop, item: Ready) -> bool {
+  if item.tag == TAG_WAKE { unsafe metricsLeave(loop) unsafe asyncReady(loop) return true }
+  if item.tag == TAG_INOTIFY { unsafe metricsLeave(loop) unsafe notifyReady(loop) return true }
+  let target = unsafe addressPointer(item.tag)
+  if Pointer.isNull<u8>(target) { return false }
+  let handle = unsafe handleOf(unsafe nn(target))
+  let second = () let h = unsafe Pointer.borrow<(), Handle>(&second, handle)
+  let kind = h.kind drop h
+  let io = (unsafe Pointer.borrow<(), Handle>(&second, handle)).flags & IO != 0
+  if kind == UV_POLL || io { return unsafe pollReady(loop, handle, item.events) }
+  static if Intrinsic.targetOperatingSystem() == "darwin" { if kind == UV_FS_EVENT { unsafe metricsLeave(loop) unsafe vnodeReady(handle, u32.shiftRight(i32.toU32(item.events), 16)) return true } }
+  return false
+}
+/// Runs the loop as libuv 1.51's uv_run: `UV_RUN_DEFAULT` (0) until nothing keeps it alive or
+/// `uv_stop`, `UV_RUN_ONCE` (1) for one iteration that may wait, `UV_RUN_NOWAIT` (2) for one that
+/// does not. Each iteration runs pending callbacks, idle and prepare handles, waits, runs pending
+/// callbacks again, check handles, close callbacks, and due timers. Returns whether the loop is
+/// still alive.
+pub unsafe fn uv_run(memory: *mut u8, mode: i32) -> i32 {
+  let loop = unsafe loopOf(memory)
+  let mut anchor = ()
+  let mut running = unsafe alive(loop)
+  if !running { unsafe updateTime(loop) }
+  let l0 = unsafe Pointer.borrow<(), Loop>(&anchor, loop) let stopped0 = l0.stopped drop l0
+  if mode == UV_RUN_DEFAULT && running && !stopped0 { unsafe updateTime(loop) unsafe runTimers(loop) }
+  while running {
+    let l = unsafe Pointer.borrow<(), Loop>(&anchor, loop)
+    if l.stopped { break }
+    let canSleep = Intrinsic.pointerIsNull<?*mut Pending>(l.pendingFirst) && Pointer.isNull<Handle>(l.idles)
+    drop l
+    unsafe runPending(loop)
+    unsafe runPhase(loop, UV_IDLE)
+    unsafe runPhase(loop, UV_PREPARE)
+    let mut timeout: i64 = 0
+    if (mode == UV_RUN_ONCE && canSleep) || mode == UV_RUN_DEFAULT { timeout = i32.toI64(unsafe backendTimeout(loop)) }
+    let mut second = () let l2 = unsafe Pointer.borrowMut<(), Loop>(&mut second, loop) l2.loopCount = l2.loopCount + 1 drop l2
+    unsafe ioPoll(loop, timeout)
+    let mut rounds: i32 = 0
+    while rounds < 8 && unsafe hasPending(loop) { unsafe runPending(loop) rounds = rounds + 1 }
+    unsafe metricsLeave(loop)
+    unsafe runPhase(loop, UV_CHECK)
+    unsafe runClosing(loop)
+    unsafe updateTime(loop)
+    unsafe runTimers(loop)
+    running = unsafe alive(loop)
+    if mode == UV_RUN_ONCE || mode == UV_RUN_NOWAIT { break }
+  }
+  let mut third = () let l3 = unsafe Pointer.borrowMut<(), Loop>(&mut third, loop)
+  l3.stopped = false
+  if running { return 1 }
+  return 0
+}
+
+// Generated by tools/keep_exports.py; do not edit below.
+/// Takes each C export as a value, so that Silk emits it (see tools/keep_exports.py).
+pub fn keepExports() -> () {
+  let _silkUvNoClose: extern "C" fn(*mut u8) -> () = silkUvNoClose
+  let _silkUvNoSignal: extern "C" fn(*mut u8, i32) -> () = silkUvNoSignal
+  let _silkUvNoPoll: extern "C" fn(*mut u8, i32, i32) -> () = silkUvNoPoll
+  let _silkUvNoExit: extern "C" fn(*mut u8, i64, i32) -> () = silkUvNoExit
+  let _silkUvNoEvent: extern "C" fn(*mut u8, ?*const u8, i32, i32) -> () = silkUvNoEvent
+  let _silkUvNoStat: extern "C" fn(*mut u8, i32, *const UvStat, *const UvStat) -> () = silkUvNoStat
+  let _silkUvSignalHandler: extern "C" fn(i32) -> () = silkUvSignalHandler
+  let _silkUvChildSignal: extern "C" fn(*mut u8, i32) -> () = silkUvChildSignal
+  let _silkUvPollStat: extern "C" fn(*mut Work) -> () = silkUvPollStat
+  let _silkUvPollTimer: extern "C" fn(*mut u8) -> () = silkUvPollTimer
+  let _silkUvPollTimerClosed: extern "C" fn(*mut u8) -> () = silkUvPollTimerClosed
+  let _silkUvPollDone: extern "C" fn(*mut Work, i32) -> () = silkUvPollDone
+  let _silkUvCancelled: extern "C" fn(*mut Work) -> () = silkUvCancelled
+  let _silkUvPoolForked: extern "C" fn() -> () = silkUvPoolForked
+  let _silkUvWorker: extern "C" fn(?*mut u8) -> ?*mut u8 = silkUvWorker
+}

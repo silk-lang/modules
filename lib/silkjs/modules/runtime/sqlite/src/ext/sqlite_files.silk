@@ -1,0 +1,356 @@
+//! A SQLite VFS over the runtime's `Files` capability, for a program whose file system is not the
+//! host's (`Files.direct` is false: `MemoryFiles`, `RootedFiles`, an embedder's own). Without it
+//! SQLite would open the host's paths through its own unix VFS, outside the program's files.
+//!
+//! Each runtime registers one VFS, named after its state, the first time it opens a database file,
+//! and unregisters it when it closes. Locks are the runtime's own: SQLite's file locks only guard
+//! against other processes, and a file system the program owns has none.
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.mem.pointer { Pointer }
+import silk.mem.layout { Layout }
+import silk.core.effect { Effect }
+import silk.core.result { Result }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.num.u8
+import silk.num.i32
+import silk.num.i64
+import silk.num.u64
+import silk.num.usize
+import silk.num.f64
+import silk.platform.native.file { OPEN_READ_ONLY, OPEN_READ_WRITE, OPEN_CREATE, OPEN_EXCLUSIVE }
+import silkjs.js_engine { Engine }
+import silkjsruntime.ext.fs_ops as ops
+import silkjsruntime.ext.fs_ops { Call, Outcome }
+import silkjsruntime.libs.core.capabilities { Composition }
+import silkjsruntime.libs.core.host as host
+
+unsafe extern "C" fn calloc(count: usize, size: usize) -> ?*mut u8
+unsafe extern "C" fn free(pointer: ?*mut u8) -> ()
+unsafe extern "C" fn time(out: ?*mut i64) -> i64
+unsafe extern "C" fn usleep(microseconds: u32) -> i32
+unsafe extern "C" fn sqlite3_vfs_register(vfs: ?*mut u8, makeDefault: i32) -> i32
+unsafe extern "C" fn sqlite3_vfs_unregister(vfs: ?*mut u8) -> i32
+
+const OK: i32 = 0
+const IOERR_READ: i32 = 266
+const IOERR_SHORT_READ: i32 = 522
+const IOERR_WRITE: i32 = 778
+const IOERR_FSYNC: i32 = 1034
+const IOERR_TRUNCATE: i32 = 1546
+const IOERR_FSTAT: i32 = 1802
+const IOERR_DELETE: i32 = 2570
+const IOERR_DELETE_NOENT: i32 = 5898
+const IOERR_CLOSE: i32 = 4106
+const CANTOPEN: i32 = 14
+const NOTFOUND: i32 = 12
+const NOMEM: i32 = 7
+
+// sqlite3_io_methods, version 1.
+extern "C" struct IoMethods {
+  version: i32,
+  close: extern "C" fn(?*mut u8) -> i32,
+  read: extern "C" fn(?*mut u8, ?*mut u8, i32, i64) -> i32,
+  write: extern "C" fn(?*mut u8, ?*mut u8, i32, i64) -> i32,
+  truncate: extern "C" fn(?*mut u8, i64) -> i32,
+  sync: extern "C" fn(?*mut u8, i32) -> i32,
+  fileSize: extern "C" fn(?*mut u8, *mut i64) -> i32,
+  lock: extern "C" fn(?*mut u8, i32) -> i32,
+  unlock: extern "C" fn(?*mut u8, i32) -> i32,
+  checkReservedLock: extern "C" fn(?*mut u8, *mut i32) -> i32,
+  fileControl: extern "C" fn(?*mut u8, i32, ?*mut u8) -> i32,
+  sectorSize: extern "C" fn(?*mut u8) -> i32,
+  deviceCharacteristics: extern "C" fn(?*mut u8) -> i32,
+}
+// sqlite3_vfs, version 1.
+extern "C" struct Vfs {
+  version: i32, fileSize: i32, maxPathname: i32,
+  next: ?*mut u8, name: ?*const u8, appData: ?*mut u8,
+  open: extern "C" fn(?*mut u8, ?*const u8, ?*mut u8, i32, ?*mut i32) -> i32,
+  delete: extern "C" fn(?*mut u8, ?*const u8, i32) -> i32,
+  access: extern "C" fn(?*mut u8, ?*const u8, i32, *mut i32) -> i32,
+  fullPathname: extern "C" fn(?*mut u8, ?*const u8, i32, ?*mut u8) -> i32,
+  dlOpen: extern "C" fn(?*mut u8, ?*const u8) -> ?*mut u8,
+  dlError: extern "C" fn(?*mut u8, i32, ?*mut u8) -> (),
+  dlSym: extern "C" fn(?*mut u8, ?*mut u8, ?*const u8) -> ?*mut u8,
+  dlClose: extern "C" fn(?*mut u8, ?*mut u8) -> (),
+  randomness: extern "C" fn(?*mut u8, i32, ?*mut u8) -> i32,
+  sleep: extern "C" fn(?*mut u8, i32) -> i32,
+  currentTime: extern "C" fn(?*mut u8, *mut f64) -> i32,
+  getLastError: extern "C" fn(?*mut u8, i32, ?*mut u8) -> i32,
+}
+// The sqlite3_file of this VFS: SQLite allocates `Vfs.fileSize` bytes and xOpen fills them.
+extern "C" struct OpenFile { methods: ?*const IoMethods, fd: i32, holder: ?*mut u8, deleting: ?*mut u8 }
+
+// What a runtime registers: the VFS, its I/O methods, its name and the capabilities whose files
+// it uses (a copy: only `files` is used, and it shares its state with the runtime's).
+struct Holder<C> { vfs: Vfs, io: IoMethods, name: [u8; 32], random: u64, capabilities: C }
+
+fn nil() -> ?*mut u8 { return Pointer.null<u8>() }
+unsafe fn nn<T>(p: ?*mut T) -> *mut T { return unsafe Intrinsic.pointerRequalify<?*mut T, *mut T>(p) }
+unsafe fn holderOf<C: Composition>(vfs: ?*mut u8) -> *mut Holder<C> {
+  let anchor = () let v = unsafe Pointer.borrow<(), Vfs>(&anchor, unsafe Intrinsic.pointerReinterpret<*mut u8, *mut Vfs>(unsafe nn(vfs)))
+  return unsafe Intrinsic.pointerReinterpret<*mut u8, *mut Holder<C>>(unsafe nn(v.appData))
+}
+unsafe fn fileOf(file: ?*mut u8) -> *mut OpenFile { return unsafe Intrinsic.pointerReinterpret<*mut u8, *mut OpenFile>(unsafe nn(file)) }
+// A C string's bytes.
+unsafe fn text<'a>(anchor: &'a (), p: ?*const u8) -> &'a [u8] {
+  if Pointer.isNull<u8>(p) { return b"" }
+  let start = unsafe Intrinsic.pointerRequalify<?*const u8, *const u8>(p)
+  let mut n: usize = 0
+  while unsafe Pointer.read<u8>(unsafe Pointer.at<u8>(unsafe Pointer.assumeMany<u8>(start), n)) != 0 { n = n + 1 }
+  return unsafe Pointer.borrowMany<(), u8>(anchor, unsafe Pointer.assumeMany<u8>(start), n)
+}
+effect fn pathCall(op: i32, path: &[u8]) -> Call ! OutOfMemoryError ? &mut Allocator {
+  let mut call = ops.call(op)
+  run call.path.appendBytes(path)
+  return move call
+}
+// Runs `call` on the holder's files: the outcome's code, a negative errno on failure.
+unsafe fn execute<C: Composition>(holder: *mut Holder<C>, call: &Call, out: &mut Outcome) -> i32 {
+  let anchor = () let h = unsafe Pointer.borrow<(), Holder<C>>(&anchor, holder)
+  unsafe h.capabilities.filesExecute(&call, &mut out)
+  return out.code
+}
+unsafe fn onPath<C: Composition>(holder: *mut Holder<C>, op: i32, path: &[u8], out: &mut Outcome) -> i32 {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return match run Effect.result(pathCall(op, path)) |> Effect.provideMut<Allocator>(&mut allocator) {
+    Result<Call, OutOfMemoryError>.Success { value } => unsafe execute<C>(holder, &value, &mut out)
+    Result<Call, OutOfMemoryError>.Failure { .. } => -12
+  }
+}
+
+export "C" fn silkFilesVfsOpen<C: Composition>(vfs: ?*mut u8, name: ?*const u8, file: ?*mut u8, flags: i32, outFlags: ?*mut i32) -> i32 {
+  let holder = unsafe holderOf<C>(vfs)
+  let target = unsafe fileOf(file)
+  // Until it opens, the file has no methods: SQLite then does not close it.
+  unsafe Pointer.put<OpenFile>(target, OpenFile { methods: Pointer.null<IoMethods>(), fd: -1, holder: nil(), deleting: nil() })
+  let mut path = List<u8>.make()
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let anchor = ()
+  let named = unsafe text(&anchor, name)
+  let built = if named.length != 0 { run Effect.result(path.appendBytes(named)) |> Effect.provideMut<Allocator>(&mut allocator) } else {
+    // A temporary file SQLite names none for: one of the runtime's own, deleted when closed.
+    let mut b = () let h = unsafe Pointer.borrowMut<(), Holder<C>>(&mut b, holder) h.random = h.random + 1 let serial = h.random drop h
+    let mut digits: [u8; 20] = [0; 20] let mut count: usize = 0 let mut value = serial
+    while true { digits[count] = u8.wrappingAdd(48, u64.wrappingToU8(value % 10)) count = count + 1 value = value / 10 if value == 0 { break } }
+    let mut name: [u8; 48] = [0; 48] let prefix = b"/.silkjs-sqlite-" let mut at: usize = 0
+    while at < prefix.length { name[at] = prefix[at] at = at + 1 }
+    while count > 0 { count = count - 1 name[at] = digits[count] at = at + 1 }
+    run Effect.result(path.appendBytes(Slice.view<u8>(&name, 0, at))) |> Effect.provideMut<Allocator>(&mut allocator)
+  }
+  if let Result<(), OutOfMemoryError>.Failure { .. } = move built { return NOMEM }
+  let mut mode = OPEN_READ_ONLY
+  if i32.bitAnd(flags, 2) != 0 { mode = OPEN_READ_WRITE }
+  if i32.bitAnd(flags, 4) != 0 { mode = i32.bitOr(mode, OPEN_CREATE) }
+  if i32.bitAnd(flags, 16) != 0 { mode = i32.bitOr(mode, OPEN_EXCLUSIVE) }
+  let mut out = ops.outcome()
+  let code = match run Effect.result(pathCall(ops.OPEN, path.asSlice())) |> Effect.provideMut<Allocator>(&mut allocator) {
+    Result<Call, OutOfMemoryError>.Success { value } => {
+      let mut call = move value call.a = i32.toI64(mode) call.b = 0o644
+      unsafe execute<C>(holder, &call, &mut out)
+    }
+    Result<Call, OutOfMemoryError>.Failure { .. } => -12
+  }
+  if code < 0 { return CANTOPEN }
+  let mut deleting = nil()
+  if i32.bitAnd(flags, 8) != 0 || named.length == 0 {
+    // DELETEONCLOSE: the path, as a C string, for xClose.
+    deleting = unsafe calloc(path.length() + 1, 1)
+    if !Pointer.isNull<u8>(deleting) {
+      let bytes = path.asSlice() let mut at: usize = 0
+      while at < bytes.length { unsafe Pointer.put<u8>(unsafe Pointer.atMut<u8>(unsafe Pointer.assumeManyMut<u8>(unsafe nn(deleting)), at), bytes[at]) at = at + 1 }
+    }
+  }
+  let mut b = () let h = unsafe Pointer.borrowMut<(), Holder<C>>(&mut b, holder) let methods = Pointer.fromRef<IoMethods>(&h.io) drop h
+  unsafe Pointer.put<OpenFile>(target, OpenFile { methods: methods, fd: i64.toI32(out.count), holder: unsafe Intrinsic.pointerReinterpret<*mut Holder<C>, *mut u8>(holder), deleting: deleting })
+  if !Pointer.isNull<i32>(outFlags) { unsafe Pointer.put<i32>(unsafe nn(outFlags), flags) }
+  return OK
+}
+export "C" fn silkFilesVfsDelete<C: Composition>(vfs: ?*mut u8, name: ?*const u8, syncDirectory: i32) -> i32 {
+  let anchor = () let mut out = ops.outcome()
+  let code = unsafe onPath<C>(unsafe holderOf<C>(vfs), ops.UNLINK, unsafe text(&anchor, name), &mut out)
+  if code == -2 { return IOERR_DELETE_NOENT }
+  if code < 0 { return IOERR_DELETE }
+  return OK
+}
+export "C" fn silkFilesVfsAccess<C: Composition>(vfs: ?*mut u8, name: ?*const u8, flags: i32, result: *mut i32) -> i32 {
+  let anchor = () let mut out = ops.outcome()
+  let code = unsafe onPath<C>(unsafe holderOf<C>(vfs), ops.STAT, unsafe text(&anchor, name), &mut out)
+  // SQLITE_ACCESS_EXISTS (0), READWRITE (1), READ (2): a file the program has is readable and
+  // writable; SQLite still opens it read-only when asked to.
+  unsafe Pointer.put<i32>(result, if code == 0 { 1 } else { 0 })
+  return OK
+}
+export "C" fn silkFilesVfsFullPathname(vfs: ?*mut u8, name: ?*const u8, size: i32, out: ?*mut u8) -> i32 {
+  // The program's file system resolves a path itself (MemoryFiles from /, RootedFiles under
+  // its root): the name is the full name.
+  let anchor = () let bytes = unsafe text(&anchor, name)
+  if i32.toUsize(size) < bytes.length + 1 { return CANTOPEN }
+  let mut at: usize = 0
+  while at < bytes.length { unsafe Pointer.put<u8>(unsafe Pointer.atMut<u8>(unsafe Pointer.assumeManyMut<u8>(unsafe nn(out)), at), bytes[at]) at = at + 1 }
+  unsafe Pointer.put<u8>(unsafe Pointer.atMut<u8>(unsafe Pointer.assumeManyMut<u8>(unsafe nn(out)), at), 0)
+  return OK
+}
+// Extensions are loaded from the host's files, which this VFS does not reach.
+export "C" fn silkFilesVfsDlOpen(vfs: ?*mut u8, name: ?*const u8) -> ?*mut u8 { return nil() }
+export "C" fn silkFilesVfsDlError(vfs: ?*mut u8, size: i32, out: ?*mut u8) -> () {
+  let message = b"extensions are not loaded from this file system"
+  if Pointer.isNull<u8>(out) || size < 1 { return () }
+  let mut at: usize = 0
+  while at < message.length && at + 1 < i32.toUsize(size) { unsafe Pointer.put<u8>(unsafe Pointer.atMut<u8>(unsafe Pointer.assumeManyMut<u8>(unsafe nn(out)), at), message[at]) at = at + 1 }
+  unsafe Pointer.put<u8>(unsafe Pointer.atMut<u8>(unsafe Pointer.assumeManyMut<u8>(unsafe nn(out)), at), 0)
+}
+export "C" fn silkFilesVfsDlSym(vfs: ?*mut u8, handle: ?*mut u8, name: ?*const u8) -> ?*mut u8 { return nil() }
+export "C" fn silkFilesVfsDlClose(vfs: ?*mut u8, handle: ?*mut u8) -> () {}
+export "C" fn silkFilesVfsRandomness<C: Composition>(vfs: ?*mut u8, size: i32, out: ?*mut u8) -> i32 {
+  // For temporary names: no secret depends on it.
+  let holder = unsafe holderOf<C>(vfs)
+  let mut b = () let h = unsafe Pointer.borrowMut<(), Holder<C>>(&mut b, holder)
+  let mut state = u64.bitXor(h.random, u64.wrappingMultiply(i64.toU64(unsafe time(Pointer.null<i64>())), 6364136223846793005))
+  let mut at: usize = 0
+  while at < i32.toUsize(size) {
+    state = u64.bitXor(state, u64.shiftLeft(state, 13)) state = u64.bitXor(state, u64.shiftRight(state, 7)) state = u64.bitXor(state, u64.shiftLeft(state, 17))
+    unsafe Pointer.put<u8>(unsafe Pointer.atMut<u8>(unsafe Pointer.assumeManyMut<u8>(unsafe nn(out)), at), u64.wrappingToU8(state))
+    at = at + 1
+  }
+  h.random = state
+  return size
+}
+export "C" fn silkFilesVfsSleep(vfs: ?*mut u8, microseconds: i32) -> i32 {
+  if microseconds > 0 { let _slept = unsafe usleep(i32.wrappingToU32(microseconds)) }
+  return microseconds
+}
+export "C" fn silkFilesVfsCurrentTime(vfs: ?*mut u8, out: *mut f64) -> i32 {
+  // A Julian day number.
+  unsafe Pointer.put<f64>(out, i64.toF64(unsafe time(Pointer.null<i64>())) / 86400.0 + 2440587.5)
+  return OK
+}
+export "C" fn silkFilesVfsGetLastError(vfs: ?*mut u8, size: i32, out: ?*mut u8) -> i32 { return 0 }
+
+unsafe fn fileCall<C: Composition>(file: ?*mut u8, op: i32, out: &mut Outcome) -> Call {
+  let anchor = () let f = unsafe Pointer.borrow<(), OpenFile>(&anchor, unsafe fileOf(file))
+  let mut call = ops.call(op) call.fd = f.fd
+  return move call
+}
+unsafe fn holderOfFile<C: Composition>(file: ?*mut u8) -> *mut Holder<C> {
+  let anchor = () let f = unsafe Pointer.borrow<(), OpenFile>(&anchor, unsafe fileOf(file))
+  return unsafe Intrinsic.pointerReinterpret<*mut u8, *mut Holder<C>>(unsafe nn(f.holder))
+}
+export "C" fn silkFilesFileClose<C: Composition>(file: ?*mut u8) -> i32 {
+  let holder = unsafe holderOfFile<C>(file)
+  let mut out = ops.outcome()
+  let call = unsafe fileCall<C>(file, ops.CLOSE, &mut out)
+  let code = unsafe execute<C>(holder, &call, &mut out)
+  let mut a = () let f = unsafe Pointer.borrowMut<(), OpenFile>(&mut a, unsafe fileOf(file)) let deleting = f.deleting f.deleting = nil() f.methods = Pointer.null<IoMethods>() drop f
+  if !Pointer.isNull<u8>(deleting) {
+    let anchor = () let mut removed = ops.outcome()
+    let _code = unsafe onPath<C>(holder, ops.UNLINK, unsafe text(&anchor, unsafe Intrinsic.pointerRequalify<?*mut u8, ?*const u8>(deleting)), &mut removed)
+    unsafe free(deleting)
+  }
+  if code < 0 { return IOERR_CLOSE }
+  return OK
+}
+export "C" fn silkFilesFileRead<C: Composition>(file: ?*mut u8, buffer: ?*mut u8, amount: i32, offset: i64) -> i32 {
+  let holder = unsafe holderOfFile<C>(file)
+  let total = i32.toUsize(amount) let mut done: usize = 0
+  while done < total {
+    let mut out = ops.outcome()
+    let mut call = unsafe fileCall<C>(file, ops.READ, &mut out)
+    call.buffer = unsafe Intrinsic.pointerRequalify<*mut u8, ?*mut u8>(unsafe Pointer.atMut<u8>(unsafe Pointer.assumeManyMut<u8>(unsafe nn(buffer)), done))
+    call.length = total - done call.position = offset + usize.toI64(done)
+    let code = unsafe execute<C>(holder, &call, &mut out)
+    if code < 0 { return IOERR_READ }
+    if out.count == 0 { break }
+    done = done + i64.toUsize(out.count)
+  }
+  if done < total {
+    // SQLite wants the rest zeroed on a short read.
+    while done < total { unsafe Pointer.put<u8>(unsafe Pointer.atMut<u8>(unsafe Pointer.assumeManyMut<u8>(unsafe nn(buffer)), done), 0) done = done + 1 }
+    return IOERR_SHORT_READ
+  }
+  return OK
+}
+export "C" fn silkFilesFileWrite<C: Composition>(file: ?*mut u8, buffer: ?*mut u8, amount: i32, offset: i64) -> i32 {
+  let holder = unsafe holderOfFile<C>(file)
+  let total = i32.toUsize(amount) let mut done: usize = 0
+  while done < total {
+    let mut out = ops.outcome()
+    let mut call = unsafe fileCall<C>(file, ops.WRITE, &mut out)
+    call.buffer = unsafe Intrinsic.pointerRequalify<*mut u8, ?*mut u8>(unsafe Pointer.atMut<u8>(unsafe Pointer.assumeManyMut<u8>(unsafe nn(buffer)), done))
+    call.length = total - done call.position = offset + usize.toI64(done)
+    let code = unsafe execute<C>(holder, &call, &mut out)
+    if code < 0 || out.count <= 0 { return IOERR_WRITE }
+    done = done + i64.toUsize(out.count)
+  }
+  return OK
+}
+export "C" fn silkFilesFileTruncate<C: Composition>(file: ?*mut u8, size: i64) -> i32 {
+  let mut out = ops.outcome()
+  let mut call = unsafe fileCall<C>(file, ops.FTRUNCATE, &mut out) call.a = size
+  if unsafe execute<C>(unsafe holderOfFile<C>(file), &call, &mut out) < 0 { return IOERR_TRUNCATE }
+  return OK
+}
+export "C" fn silkFilesFileSync<C: Composition>(file: ?*mut u8, flags: i32) -> i32 {
+  let mut out = ops.outcome()
+  let call = unsafe fileCall<C>(file, ops.FSYNC, &mut out)
+  if unsafe execute<C>(unsafe holderOfFile<C>(file), &call, &mut out) < 0 { return IOERR_FSYNC }
+  return OK
+}
+export "C" fn silkFilesFileSize<C: Composition>(file: ?*mut u8, size: *mut i64) -> i32 {
+  let mut out = ops.outcome()
+  let call = unsafe fileCall<C>(file, ops.FSTAT, &mut out)
+  if unsafe execute<C>(unsafe holderOfFile<C>(file), &call, &mut out) < 0 { return IOERR_FSTAT }
+  unsafe Pointer.put<i64>(size, u64.wrappingToI64(out.status.size))
+  return OK
+}
+export "C" fn silkFilesFileLock(file: ?*mut u8, level: i32) -> i32 { return OK }
+export "C" fn silkFilesFileUnlock(file: ?*mut u8, level: i32) -> i32 { return OK }
+export "C" fn silkFilesFileCheckReservedLock(file: ?*mut u8, result: *mut i32) -> i32 { unsafe Pointer.put<i32>(result, 0) return OK }
+export "C" fn silkFilesFileControl(file: ?*mut u8, operation: i32, argument: ?*mut u8) -> i32 { return NOTFOUND }
+export "C" fn silkFilesFileSectorSize(file: ?*mut u8) -> i32 { return 4096 }
+export "C" fn silkFilesFileDeviceCharacteristics(file: ?*mut u8) -> i32 { return 0 }
+
+/// The name to open a database file with: this runtime's VFS over its `Files`, registered the
+/// first time, or none (SQLite's own) when the program's file system is the host's.
+pub unsafe fn vfsName<'m, C: Composition>(engine: &Engine<'m, host.Services<C>>, slot: *mut ?*mut u8) -> ?[*]const u8 {
+  let holder = unsafe Pointer.read<?*mut u8>(slot)
+  static if Composition.filesDirect() { return unsafe Pointer.bytes<u8>(Pointer.null<u8>()) }
+  if Pointer.isNull<u8>(holder) {
+    let memory = unsafe calloc(1, Layout.of<Holder<C>>().bytes)
+    if Pointer.isNull<u8>(memory) { return unsafe Pointer.bytes<u8>(Pointer.null<u8>()) }
+    let typed = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut Holder<C>>(unsafe nn(memory))
+    let mut name: [u8; 32] = [0; 32] let prefix = b"silkjs-files-"
+    let mut at: usize = 0 while at < prefix.length { name[at] = prefix[at] at = at + 1 }
+    let mut address = Pointer.address<u8>(unsafe nn(memory))
+    while address != 0 && at < 31 { name[at] = u8.wrappingAdd(97, usize.wrappingToU8(address % 16)) address = address / 16 at = at + 1 }
+    unsafe Pointer.put<Holder<C>>(typed, Holder<C> {
+      vfs: Vfs { version: 1, fileSize: usize.toI32(Layout.of<OpenFile>().bytes), maxPathname: 1024, next: nil(), name: Pointer.null<u8>(), appData: memory,
+        open: silkFilesVfsOpen<C>, delete: silkFilesVfsDelete<C>, access: silkFilesVfsAccess<C>, fullPathname: silkFilesVfsFullPathname,
+        dlOpen: silkFilesVfsDlOpen, dlError: silkFilesVfsDlError, dlSym: silkFilesVfsDlSym, dlClose: silkFilesVfsDlClose,
+        randomness: silkFilesVfsRandomness<C>, sleep: silkFilesVfsSleep, currentTime: silkFilesVfsCurrentTime, getLastError: silkFilesVfsGetLastError },
+      io: IoMethods { version: 1, close: silkFilesFileClose<C>, read: silkFilesFileRead<C>, write: silkFilesFileWrite<C>, truncate: silkFilesFileTruncate<C>,
+        sync: silkFilesFileSync<C>, fileSize: silkFilesFileSize<C>, lock: silkFilesFileLock, unlock: silkFilesFileUnlock,
+        checkReservedLock: silkFilesFileCheckReservedLock, fileControl: silkFilesFileControl, sectorSize: silkFilesFileSectorSize,
+        deviceCharacteristics: silkFilesFileDeviceCharacteristics },
+      name: name, random: 0, capabilities: engine.services.capabilities.forWorker(),
+    })
+    let mut a = () let h = unsafe Pointer.borrowMut<(), Holder<C>>(&mut a, typed)
+    h.vfs.name = Pointer.fromRef<u8>(&h.name[0])
+    let vfs = unsafe Intrinsic.pointerReinterpret<*mut Vfs, *mut u8>(Pointer.fromMutRef<Vfs>(&mut h.vfs)) drop h
+    if unsafe sqlite3_vfs_register(vfs, 0) != 0 { let owned = unsafe Pointer.take<Holder<C>>(typed) drop owned unsafe free(memory) return unsafe Pointer.bytes<u8>(Pointer.null<u8>()) }
+    unsafe Pointer.put<?*mut u8>(slot, memory)
+  }
+  let anchor = () let h = unsafe Pointer.borrow<(), Holder<C>>(&anchor, unsafe Intrinsic.pointerReinterpret<*mut u8, *mut Holder<C>>(unsafe nn(unsafe Pointer.read<?*mut u8>(slot))))
+  return Pointer.fromSlice<u8>(&h.name)
+}
+/// Unregisters and frees the runtime's VFS, after its databases closed.
+pub unsafe fn release<C: Composition>(holder: ?*mut u8) -> () {
+  if Pointer.isNull<u8>(holder) { return () }
+  let typed = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut Holder<C>>(unsafe nn(holder))
+  let mut a = () let h = unsafe Pointer.borrowMut<(), Holder<C>>(&mut a, typed)
+  let vfs = unsafe Intrinsic.pointerReinterpret<*mut Vfs, *mut u8>(Pointer.fromMutRef<Vfs>(&mut h.vfs)) drop h
+  let _unregistered = unsafe sqlite3_vfs_unregister(vfs)
+  let owned = unsafe Pointer.take<Holder<C>>(typed) drop owned
+  unsafe free(holder)
+}

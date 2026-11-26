@@ -1,0 +1,543 @@
+//! A census of one runtime's heap, for hosts that compare what the engine holds with what the
+//! program warrants (Silk UI's `SILK_UI_BENCH_CENSUS`): cells by kind with the bytes their
+//! pooled class adds over what they need, objects and the slots they hold against the slots
+//! they use, how many objects share each shape, arrays, functions and their source text,
+//! atoms, the allocator's arenas, and the work counters of RuntimeState.census.
+//! It walks the live heap as qjs_stats does and changes nothing.
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.mem.layout { Layout }
+import silk.core.option { Option }
+import silk.mem.pointer { Pointer }
+import silk.collections.list { List }
+import silk.collections.hash { Hash }
+import silk.collections.hash_map { HashMap }
+import silk.num.usize
+import silk.num.u32
+import silk.num.u64
+import js_heap { HeapHeader, HeapCell, HeapKind }
+import js_core_types as types
+import js_core_types { SourceText, ScopeData, RuntimeState, ObjectData, ObjectPayload, SlotBits,
+  ShapeData, ShapeProperty, FunctionBytecode, FunctionDebugInfo, ClosureVar, VarDef,
+  ByteStorage, VarRef }
+import js_value { ValueBits }
+import js_class_data as classes
+import runtime_memory { AllocationObserver }
+import js_gc as gc
+import js_buffer_storage as buffers
+import js_string_types { FlatString, RopeString, StringOwner }
+import js_core_types { PropertySlot, VarRefState, scopeSlot, ObjectPayloadFamily, NameSlot, ClassDef }
+
+/// A container: `entries` in use, room for `capacity`, `each` bytes an entry.
+pub const HELD: usize = 0
+/// A natural unit: `entries` of them.
+pub const UNIT: usize = 1
+/// Work done since the runtime was made: `entries` times.
+pub const WORK: usize = 2
+
+/// The strings the walk met in properties, elements, constants and captured variables,
+/// each counted once however many places hold it. Atoms are counted by the atom table.
+struct Strings {
+  seen: HashMap<usize, usize>,
+  waiting: List<ValueBits>,
+  flat: usize, flatBytes: usize,
+  /// Those above the pool's largest block (1,024 bytes): large allocations.
+  large: usize, largeBytes: usize,
+  /// Those of 1 MB and more.
+  huge: usize, hugeBytes: usize,
+  ropes: usize, ropeBytes: usize
+}
+impl Strings {
+  unsafe effect fn add(self: &mut Self, value: ValueBits) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.waiting.append(value)
+    while self.waiting.length() != 0 {
+      let last = self.waiting.length() - 1
+      let next = self.waiting.get(last)
+      self.waiting.truncate(last)
+      let anchor = ()
+      match next {
+        ValueBits.String { reference } => {
+          let text = unsafe HeapCell.shortPayload<FlatString, ()>(&anchor, reference)
+          if text.atom == 0 && !self.seen.contains(Pointer.address<HeapHeader>(reference)) {
+            drop run self.seen.insert(Pointer.address<HeapHeader>(reference), 1)
+            let mut bytes = unsafe HeapCell.allocationBytes(reference)
+            if !text.compact { bytes = bytes + text.latin1.capacity() + text.utf16.capacity() * 2 }
+            self.flat = self.flat + 1 self.flatBytes = self.flatBytes + bytes
+            if bytes > 1024 { self.large = self.large + 1 self.largeBytes = self.largeBytes + bytes }
+            if bytes >= 1048576 { self.huge = self.huge + 1 self.hugeBytes = self.hugeBytes + bytes }
+          }
+        }
+        ValueBits.Rope { reference } => {
+          if !self.seen.contains(Pointer.address<HeapHeader>(reference)) {
+            drop run self.seen.insert(Pointer.address<HeapHeader>(reference), 1)
+            let rope = unsafe HeapCell.shortPayload<RopeString, ()>(&anchor, reference)
+            self.ropes = self.ropes + 1 self.ropeBytes = self.ropeBytes + unsafe HeapCell.allocationBytes(reference)
+            run self.waiting.append(rope.left) run self.waiting.append(rope.right)
+          }
+        }
+        _ => ()
+      }
+    }
+  }
+}
+
+/// Rows of the census: four values a row (kind, entries, capacity, bytes each).
+pub struct Rows {
+  pub names: List<string<'static>>,
+  pub values: List<usize>,
+}
+
+impl Rows {
+  pub fn make() -> Rows { return Rows { names: List<string<'static>>.make(), values: List<usize>.make() } }
+
+  effect fn add(self: &mut Self, name: string<'static>, kind: usize, entries: usize, capacity: usize, each: usize) -> ()
+    ! OutOfMemoryError ? &mut Allocator {
+    run self.names.append(name)
+    run self.values.append(kind)
+    run self.values.append(entries)
+    run self.values.append(capacity)
+    run self.values.append(each)
+  }
+  pub effect fn held(self: &mut Self, name: string<'static>, entries: usize, capacity: usize, each: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.add(name, HELD, entries, capacity, each)
+  }
+  /// Bytes: `used` of `reserved`.
+  pub effect fn bytes(self: &mut Self, name: string<'static>, used: usize, reserved: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.add(name, HELD, used, reserved, 1)
+  }
+  pub effect fn unit(self: &mut Self, name: string<'static>, count: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.add(name, UNIT, count, 0, 0)
+  }
+  pub effect fn work(self: &mut Self, name: string<'static>, count: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.add(name, WORK, count, 0, 0)
+  }
+}
+
+fn nativeBytes(bytes: &ByteStorage) -> usize {
+  return match &bytes.* { ByteStorage.Owned { bytes: owned } => owned.capacity() ByteStorage.Borrowed { .. } => 0 }
+}
+
+fn kindIndex(kind: HeapKind) -> usize {
+  return match kind {
+    HeapKind.Object => 0
+    HeapKind.FunctionBytecode => 1
+    HeapKind.Shape => 2
+    HeapKind.VarRef => 3
+    HeapKind.AsyncFunction => 4
+    HeapKind.Context => 5
+    HeapKind.Module => 6
+    HeapKind.String => 7
+    HeapKind.Rope => 8
+    HeapKind.BigInt => 9
+    HeapKind.Auxiliary => 10
+    HeapKind.Scope => 11
+  }
+}
+
+/// Adds the rows of runtime `rt`, whose allocator `memory` observes.
+pub unsafe effect fn collect(rt: *mut HeapHeader, memory: &AllocationObserver, out: &mut Rows) -> ()
+  ! OutOfMemoryError ? &mut Allocator {
+  let anchor = ()
+  let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, rt)
+  let value = Layout.of<ValueBits>().bytes
+  let slot = Layout.of<SlotBits>().bytes
+  let header = Layout.of<HeapHeader>().bytes
+  // Cells by kind: how many, and the bytes of their blocks.
+  let mut kindCount: [usize; 12] = [0; 12]
+  let mut kindBytes: [usize; 12] = [0; 12]
+  // Objects.
+  let mut objects: usize = 0
+  let mut plain: usize = 0
+  let mut arrays: usize = 0
+  let mut closures: usize = 0
+  let mut natives: usize = 0
+  let mut otherObjects: usize = 0
+  let mut objectCellBytes: usize = 0
+  let mut plainCellBytes: usize = 0
+  let mut arrayCellBytes: usize = 0
+  let mut closureCellBytes: usize = 0
+  let mut slotsUsed: usize = 0
+  let mut slotsHeld: usize = 0
+  let mut slotsNamed: usize = 0
+  let mut objectsWithSlots: usize = 0
+  let mut objectsNoSlots: usize = 0
+  let mut elements: usize = 0
+  let mut elementRoom: usize = 0
+  let mut emptyArrays: usize = 0
+  let mut closureRefs: usize = 0
+  let mut closureRefRoom: usize = 0
+  // How many objects use each shape.
+  let mut users = HashMap<usize, usize>.make(Hash.seed(0x63656e737573))
+  // Slots used and held by the objects of each shape, and the properties the shape names.
+  let mut shapeUsed = HashMap<usize, usize>.make(Hash.seed(0x63656e737574))
+  let mut shapeHeld = HashMap<usize, usize>.make(Hash.seed(0x63656e737575))
+  let mut shapeNamed = HashMap<usize, usize>.make(Hash.seed(0x63656e737576))
+  // Shapes.
+  let mut shapes: usize = 0
+  let mut shapeBytes: usize = 0
+  let mut shapeRecords: usize = 0
+  let mut shapeRecordRoom: usize = 0
+  let mut shapeHashBytes: usize = 0
+  // Functions.
+  let mut functions: usize = 0
+  let mut pending: usize = 0
+  let mut functionCellBytes: usize = 0
+  let mut bytecode: usize = 0
+  let mut constants: usize = 0
+  let mut variableBytes: usize = 0
+  let mut sourceOwned: usize = 0
+  let mut sourceShared: usize = 0
+  let mut sourceLent: usize = 0
+  let mut lineBytes: usize = 0
+  let mut withDebug: usize = 0
+  let mut scopes: usize = 0
+  let mut scopeSlots: usize = 0
+  let mut varRefs: usize = 0
+  let mut strings = Strings { seen: HashMap<usize, usize>.make(Hash.seed(0x63656e737577)), waiting: List<ValueBits>.make(),
+    flat: 0, flatBytes: 0, large: 0, largeBytes: 0, huge: 0, hugeBytes: 0, ropes: 0, ropeBytes: 0 }
+  // What lies above the pool's largest block, by owner: the large allocations it explains.
+  let mut bigCells: usize = 0 let mut bigCellBytes: usize = 0
+  let mut bigSlots: usize = 0 let mut bigSlotBytes: usize = 0
+  let mut bigElements: usize = 0 let mut bigElementBytes: usize = 0
+  let mut bigFunctionLists: usize = 0 let mut bigFunctionListBytes: usize = 0
+  let mut buffersHeld: usize = 0 let mut bufferBytes: usize = 0
+  let mut opaqueCells: usize = 0 let mut opaqueBytes: usize = 0
+  let mut walk = unsafe gc.walkCells(rt)
+  while true {
+    let cursor = unsafe gc.nextCell(&mut walk)
+    if Pointer.isNull<HeapHeader>(cursor) { break }
+    let cell = unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(cursor)
+    let head = unsafe Pointer.borrow<(), HeapHeader>(&anchor, cell)
+    let kind = head.kind
+    drop head
+    let cellBytes = unsafe HeapCell.allocationBytes(cell)
+    if cellBytes > 1024 { bigCells = bigCells + 1 bigCellBytes = bigCellBytes + cellBytes }
+    let at = kindIndex(kind)
+    kindCount[at] = kindCount[at] + 1
+    kindBytes[at] = kindBytes[at] + cellBytes
+    match kind {
+      HeapKind.Object => {
+        let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, cell)
+        objects = objects + 1
+        objectCellBytes = objectCellBytes + cellBytes
+        let shape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, data.shape)
+        slotsUsed = slotsUsed + data.slotCount()
+        slotsHeld = slotsHeld + data.slotCapacity()
+        slotsNamed = slotsNamed + shape.properties.length()
+        if data.slotCapacity() != 0 { objectsWithSlots = objectsWithSlots + 1 } else { objectsNoSlots = objectsNoSlots + 1 }
+        let slotBytes = data.slotCapacity() * Layout.of<SlotBits>().bytes
+        if slotBytes > 1024 { bigSlots = bigSlots + 1 bigSlotBytes = bigSlotBytes + slotBytes }
+        let key = Pointer.address<HeapHeader>(data.shape)
+        let seen = match users.get(key) { Option<usize>.Some { value: count } => count Option<usize>.None => 0 }
+        drop run users.insert(key, seen + 1)
+        let usedBefore = match shapeUsed.get(key) { Option<usize>.Some { value: count } => count Option<usize>.None => 0 }
+        drop run shapeUsed.insert(key, usedBefore + data.slotCount())
+        let heldBefore = match shapeHeld.get(key) { Option<usize>.Some { value: count } => count Option<usize>.None => 0 }
+        drop run shapeHeld.insert(key, heldBefore + data.slotCapacity())
+        drop run shapeNamed.insert(key, shape.properties.length())
+        let mut slotAt: usize = 0
+        while slotAt < data.slotCount() {
+          if slotAt < shape.properties.length() && shape.properties.get(slotAt).atom != 0 {
+            match data.slot(slotAt).view(shape.properties.get(slotAt).flags) { PropertySlot.Value { value: held } => { run unsafe strings.add(held) } _ => () }
+          }
+          slotAt = slotAt + 1
+        }
+        match &data.payload {
+          ObjectPayload.FastArray { array } => {
+            arrays = arrays + 1
+            arrayCellBytes = arrayCellBytes + cellBytes
+            elements = elements + array.values().length()
+            elementRoom = elementRoom + array.values().capacity()
+            if array.values().length() == 0 { emptyArrays = emptyArrays + 1 }
+            let elementBytes = array.values().capacity() * Layout.of<ValueBits>().bytes
+            if elementBytes > 1024 { bigElements = bigElements + 1 bigElementBytes = bigElementBytes + elementBytes }
+            let mut elementAt: usize = 0
+            while elementAt < array.values().length() { run unsafe strings.add(array.values().get(elementAt)) elementAt = elementAt + 1 }
+          }
+          ObjectPayload.BytecodeFunction { function } => {
+            closures = closures + 1
+            closureCellBytes = closureCellBytes + cellBytes
+            closureRefs = closureRefs + function.varRefs.length()
+            closureRefRoom = closureRefRoom + function.varRefs.capacity()
+          }
+          ObjectPayload.NativeFunction { .. } => { natives = natives + 1 }
+          ObjectPayload.Empty => {
+            if data.classId() == classes.JS_CLASS_OBJECT {
+              plain = plain + 1
+              plainCellBytes = plainCellBytes + cellBytes
+            } else { otherObjects = otherObjects + 1 }
+          }
+          ObjectPayload.Opaque { family, reference } => {
+            otherObjects = otherObjects + 1
+            if !Pointer.isNull<HeapHeader>(reference) {
+              let opaque = unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(reference)
+              opaqueCells = opaqueCells + 1 opaqueBytes = opaqueBytes + unsafe HeapCell.allocationBytes(opaque)
+              if family == ObjectPayloadFamily.ArrayBuffer || family == ObjectPayloadFamily.SharedArrayBuffer {
+                let buffer = unsafe buffers.snapshot(cell)
+                if !Pointer.isNull<u8>(buffer.data) && !buffer.external { buffersHeld = buffersHeld + 1 bufferBytes = bufferBytes + u64.toUsize(buffer.byteLength) }
+              }
+            }
+          }
+          _ => { otherObjects = otherObjects + 1 }
+        }
+      }
+      HeapKind.Shape => {
+        let shape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, cell)
+        shapes = shapes + 1
+        shapeBytes = shapeBytes + cellBytes
+        shapeRecords = shapeRecords + shape.properties.length()
+        shapeRecordRoom = shapeRecordRoom + shape.properties.capacity()
+        shapeHashBytes = shapeHashBytes + shape.hashIndices.capacity() * 4
+      }
+      HeapKind.FunctionBytecode => {
+        let code = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, cell)
+        functions = functions + 1
+        functionCellBytes = functionCellBytes + cellBytes
+        if code.pending.isSome() { pending = pending + 1 }
+        bytecode = bytecode + nativeBytes(&code.code)
+        constants = constants + code.constants.capacity()
+        let codeBytes = nativeBytes(&code.code)
+        let constantBytes = code.constants.capacity() * Layout.of<ValueBits>().bytes
+        let varBytes = code.varDefs.capacity() * Layout.of<VarDef>().bytes
+        let closureBytes = code.closureVars.capacity() * Layout.of<ClosureVar>().bytes
+        if codeBytes > 1024 { bigFunctionLists = bigFunctionLists + 1 bigFunctionListBytes = bigFunctionListBytes + codeBytes }
+        if constantBytes > 1024 { bigFunctionLists = bigFunctionLists + 1 bigFunctionListBytes = bigFunctionListBytes + constantBytes }
+        if varBytes > 1024 { bigFunctionLists = bigFunctionLists + 1 bigFunctionListBytes = bigFunctionListBytes + varBytes }
+        if closureBytes > 1024 { bigFunctionLists = bigFunctionLists + 1 bigFunctionListBytes = bigFunctionListBytes + closureBytes }
+        let mut constantAt: usize = 0
+        while constantAt < code.constants.length() { run unsafe strings.add(code.constants.get(constantAt)) constantAt = constantAt + 1 }
+        variableBytes = variableBytes + code.varDefs.capacity() * Layout.of<VarDef>().bytes + code.closureVars.capacity() * Layout.of<ClosureVar>().bytes
+        match &code.debug {
+          Option<FunctionDebugInfo>.Some { value: debug } => {
+            withDebug = withDebug + 1
+            match &debug.source {
+              Option<SourceText>.Some { value: source } => {
+                match &source {
+                  SourceText.Owned { bytes } => { sourceOwned = sourceOwned + bytes.capacity() }
+                  SourceText.Shared { length, .. } => { sourceShared = sourceShared + length }
+                  SourceText.Lent { length, .. } => { sourceLent = sourceLent + length }
+                }
+              }
+              _ => ()
+            }
+            if debug.lines.isSome() {
+              let tables = debug.lines.get()
+              lineBytes = lineBytes + nativeBytes(&tables.pcToLine)
+            }
+          }
+          _ => ()
+        }
+      }
+      HeapKind.Scope => {
+        let scope = unsafe HeapCell.payload<ScopeData, ()>(&anchor, cell)
+        scopes = scopes + 1
+        scopeSlots = scopeSlots + u32.toUsize(scope.count)
+        let mut scopeAt: usize = 0
+        while scopeAt < u32.toUsize(scope.count) { run unsafe strings.add(unsafe Pointer.read<ValueBits>(unsafe scopeSlot(cell, scopeAt))) scopeAt = scopeAt + 1 }
+      }
+      HeapKind.VarRef => {
+        varRefs = varRefs + 1
+        let captured = unsafe HeapCell.payload<VarRef, ()>(&anchor, cell)
+        match captured.state { VarRefState.Detached { value: held } => { run unsafe strings.add(held) } _ => () }
+      }
+      _ => ()
+    }
+  }
+  // Shapes by how many objects use them.
+  let mut usedShapes: usize = 0
+  let mut loneShapes: usize = 0
+  let mut mostUsers: usize = 0
+  let mut bucket: usize = 0
+  while bucket < users.bucketCount() {
+    if users.occupiedAt(bucket) {
+      let count = users.valueAt(bucket)
+      usedShapes = usedShapes + 1
+      if count == 1 { loneShapes = loneShapes + 1 }
+      if count > mostUsers { mostUsers = count }
+    }
+    bucket = bucket + 1
+  }
+  // The six shapes with the most objects: how many objects, the properties the shape names, and
+  // the slots those objects use against the slots they hold (tells fibers, props objects and
+  // wrappers apart by their property counts, and shows where the slot slack is).
+  let topObjects: [string<'static>; 6] = ["js.shapes.top-1.objects", "js.shapes.top-2.objects", "js.shapes.top-3.objects", "js.shapes.top-4.objects", "js.shapes.top-5.objects", "js.shapes.top-6.objects"]
+  let topNamed: [string<'static>; 6] = ["js.shapes.top-1.properties", "js.shapes.top-2.properties", "js.shapes.top-3.properties", "js.shapes.top-4.properties", "js.shapes.top-5.properties", "js.shapes.top-6.properties"]
+  let topSlots: [string<'static>; 6] = ["js.shapes.top-1.slots", "js.shapes.top-2.slots", "js.shapes.top-3.slots", "js.shapes.top-4.slots", "js.shapes.top-5.slots", "js.shapes.top-6.slots"]
+  let mut chosen: [usize; 6] = [0; 6]
+  let mut rank: usize = 0
+  while rank < 6 {
+    let mut bestKey: usize = 0
+    let mut bestCount: usize = 0
+    let mut at: usize = 0
+    while at < users.bucketCount() {
+      if users.occupiedAt(at) {
+        let key = users.keyAt(at)
+        let count = users.valueAt(at)
+        let mut taken = false
+        let mut earlier: usize = 0
+        while earlier < rank {
+          if chosen[earlier] == key { taken = true }
+          earlier = earlier + 1
+        }
+        if !taken && count > bestCount {
+          bestCount = count
+          bestKey = key
+        }
+      }
+      at = at + 1
+    }
+    chosen[rank] = bestKey
+    let used = match shapeUsed.get(bestKey) { Option<usize>.Some { value: count } => count Option<usize>.None => 0 }
+    let held = match shapeHeld.get(bestKey) { Option<usize>.Some { value: count } => count Option<usize>.None => 0 }
+    let named = match shapeNamed.get(bestKey) { Option<usize>.Some { value: count } => count Option<usize>.None => 0 }
+    run out.unit(topObjects[rank], bestCount)
+    run out.unit(topNamed[rank], named)
+    run out.held(topSlots[rank], used, held, slot)
+    rank = rank + 1
+  }
+  let ledger = memory.stats()
+  let pool = memory.poolCensus()
+  run out.bytes("js.heap.live(allocator ledger)", ledger.usedBytes, pool.carvedBytes + pool.largeBytes)
+  run out.unit("js.heap.live-blocks", ledger.allocationCount)
+  run out.bytes("js.heap.peak", ledger.peakBytes, ledger.peakBytes)
+  run out.held("js.arenas.groups(2 MB reserved each)", pool.groups, pool.groups, 2097152)
+  run out.held("js.arenas.in-use(16 KB each)", pool.arenas, pool.groups * 128, 16384)
+  run out.bytes("js.arenas.carved(touched)", pool.carvedBytes - pool.idleBytes, pool.carvedBytes)
+  run out.bytes("js.arenas.idle-blocks", pool.idleBytes, pool.idleBytes)
+  run out.unit("js.arenas.idle-block-count", pool.idleBlocks)
+  run out.held("js.large-allocations", pool.largeCount, pool.largeCount + pool.largeIdle, 0)
+  run out.bytes("js.large-allocations.bytes", pool.largeBytes, pool.largeBytes)
+  run out.work("js.allocations", pool.allocations)
+  run out.work("js.allocated-bytes", pool.allocatedBytes)
+  // Pooled blocks by size: live blocks of 16 to 64 bytes, 80 to 128, 144 to 256, and more.
+  let mut small: usize = 0
+  let mut medium: usize = 0
+  let mut large: usize = 0
+  let mut huge: usize = 0
+  let mut class: usize = 0
+  while class < 64 {
+    let live = if pool.carved[class] > pool.idle[class] { pool.carved[class] - pool.idle[class] } else { 0 }
+    let bytes = live * (class + 1) * 16
+    if class < 4 { small = small + bytes } else if class < 8 { medium = medium + bytes } else if class < 16 { large = large + bytes } else { huge = huge + bytes }
+    class = class + 1
+  }
+  run out.bytes("js.pool.live.blocks-16-to-64", small, small)
+  run out.bytes("js.pool.live.blocks-80-to-128", medium, medium)
+  run out.bytes("js.pool.live.blocks-144-to-256", large, large)
+  run out.bytes("js.pool.live.blocks-272-to-1024", huge, huge)
+  // Cells.
+  run out.held("js.cells.object", kindCount[0], kindCount[0], if kindCount[0] != 0 { kindBytes[0] / kindCount[0] } else { 0 })
+  run out.bytes("js.cells.object.bytes", objects * (header + Layout.of<ObjectData>().bytes), kindBytes[0])
+  run out.held("js.cells.function-bytecode", kindCount[1], kindCount[1], if kindCount[1] != 0 { kindBytes[1] / kindCount[1] } else { 0 })
+  run out.bytes("js.cells.function-bytecode.bytes", functions * (header + Layout.of<FunctionBytecode>().bytes), kindBytes[1])
+  run out.held("js.cells.shape", kindCount[2], kindCount[2], if kindCount[2] != 0 { kindBytes[2] / kindCount[2] } else { 0 })
+  run out.held("js.cells.var-ref", kindCount[3], kindCount[3], if kindCount[3] != 0 { kindBytes[3] / kindCount[3] } else { 0 })
+  run out.bytes("js.cells.var-ref.bytes", varRefs * (header + Layout.of<VarRef>().bytes), kindBytes[3])
+  run out.held("js.cells.scope", kindCount[11], kindCount[11], if kindCount[11] != 0 { kindBytes[11] / kindCount[11] } else { 0 })
+  run out.bytes("js.cells.scope.bytes", scopes * (header + Layout.of<ScopeData>().bytes) + scopeSlots * value, kindBytes[11])
+  run out.held("js.cells.other(async, context, module)", kindCount[4] + kindCount[5] + kindCount[6], kindCount[4] + kindCount[5] + kindCount[6], 0)
+  run out.bytes("js.cells.other.bytes", kindBytes[4] + kindBytes[5] + kindBytes[6], kindBytes[4] + kindBytes[5] + kindBytes[6])
+  // Objects.
+  run out.unit("js.objects", objects)
+  run out.held("js.objects.plain", plain, plain, if plain != 0 { plainCellBytes / plain } else { 0 })
+  run out.held("js.objects.array", arrays, arrays, if arrays != 0 { arrayCellBytes / arrays } else { 0 })
+  run out.held("js.objects.closure", closures, closures, if closures != 0 { closureCellBytes / closures } else { 0 })
+  run out.unit("js.objects.native-function", natives)
+  run out.unit("js.objects.other", otherObjects)
+  run out.unit("js.objects.with-slot-storage", objectsWithSlots)
+  run out.unit("js.objects.without-slots", objectsNoSlots)
+  run out.held("js.objects.property-slots", slotsUsed, slotsHeld, slot)
+  run out.unit("js.objects.properties-named-by-shape", slotsNamed)
+  run out.held("js.arrays.elements", elements, elementRoom, value)
+  run out.unit("js.arrays.empty", emptyArrays)
+  run out.held("js.closures.captured-refs", closureRefs, closureRefRoom, 8)
+  run out.unit("js.scopes.slots", scopeSlots)
+  // Shapes.
+  run out.unit("js.shapes", shapes)
+  run out.unit("js.shapes.used-by-objects", usedShapes)
+  run out.unit("js.shapes.used-by-one-object", loneShapes)
+  run out.unit("js.shapes.most-objects-on-one", mostUsers)
+  run out.held("js.shapes.records", shapeRecords, shapeRecordRoom, Layout.of<ShapeProperty>().bytes)
+  run out.bytes("js.shapes.cells", shapes * (header + Layout.of<ShapeData>().bytes) + shapeRecords * Layout.of<ShapeProperty>().bytes, shapeBytes)
+  run out.bytes("js.shapes.hash-indices", shapeHashBytes, shapeHashBytes)
+  run out.held("js.shapes.table", state.shapeHashCount, state.shapeHash.capacity(), 8)
+  run out.unit("js.shapes.parked", state.parkedShapeCount)
+  // Functions.
+  run out.unit("js.functions", functions)
+  run out.unit("js.functions.never-compiled(pending stub)", pending)
+  run out.unit("js.functions.with-debug-info", withDebug)
+  run out.bytes("js.functions.bytecode", bytecode, bytecode)
+  run out.held("js.functions.constants", constants, constants, value)
+  run out.bytes("js.functions.variable-tables", variableBytes, variableBytes)
+  run out.bytes("js.functions.source-text.owned", sourceOwned, sourceOwned)
+  run out.unit("js.functions.source-text.shared-spans-bytes", sourceShared)
+  run out.unit("js.functions.source-text.lent-spans-bytes", sourceLent)
+  // Strings held by properties, elements, constants and captured variables (atoms apart).
+  run out.held("js.strings", strings.flat, strings.flat, if strings.flat != 0 { strings.flatBytes / strings.flat } else { 0 })
+  run out.bytes("js.strings.bytes", strings.flatBytes, strings.flatBytes)
+  run out.held("js.strings.over-1-kb", strings.large, strings.large, if strings.large != 0 { strings.largeBytes / strings.large } else { 0 })
+  run out.bytes("js.strings.over-1-kb.bytes", strings.largeBytes, strings.largeBytes)
+  run out.held("js.strings.over-1-mb", strings.huge, strings.huge, if strings.huge != 0 { strings.hugeBytes / strings.huge } else { 0 })
+  run out.bytes("js.strings.over-1-mb.bytes", strings.hugeBytes, strings.hugeBytes)
+  run out.held("js.strings.ropes", strings.ropes, strings.ropes, if strings.ropes != 0 { strings.ropeBytes / strings.ropes } else { 0 })
+  run out.bytes("js.functions.line-tables", lineBytes, lineBytes)
+  // Atoms.
+  let atoms = state.atoms.storageUsage()
+  run out.held("js.atoms", state.atoms.count(), state.atoms.hashCapacity(), 0)
+  run out.bytes("js.atoms.bytes", atoms.bytes, atoms.bytes)
+  // Text read in place from the bytes it was loaded from (a bytecode image), not held.
+  let lentAtoms = state.atoms.lentUsage()
+  run out.unit("js.atoms.lent", lentAtoms.allocationCount)
+  run out.unit("js.atoms.lent-text-bytes", lentAtoms.bytes)
+  run out.held("js.runtime-state(caches and spare tables)", 1, 1, Layout.of<RuntimeState>().bytes)
+  run out.held("js.deferred-sources", state.deferredSources.length(), state.deferredSources.capacity(), 0)
+  run out.held("js.deferred-atoms", state.deferredAtoms.length(), state.deferredAtoms.capacity(), 4)
+  // The large allocations by size, then the ones the walk can name: cells, object slots,
+  // array elements, function lists, strings and atoms over 1 KB; ArrayBuffer bytes; the
+  // opaque cells (Map, Set, Promise and the rest) behind objects.
+  let sizeNames: [string<'static>; 6] = ["js.large.up-to-4-kb", "js.large.up-to-16-kb", "js.large.up-to-64-kb", "js.large.up-to-256-kb", "js.large.up-to-1-mb", "js.large.over-1-mb"]
+  let mut size: usize = 0
+  while size < 6 { run out.held(sizeNames[size], pool.largeSizes[size], pool.largeSizes[size], if pool.largeSizes[size] != 0 { pool.largeSizeBytes[size] / pool.largeSizes[size] } else { 0 }) size = size + 1 }
+  let largestNames: [string<'static>; 16] = ["js.large.largest-01", "js.large.largest-02", "js.large.largest-03", "js.large.largest-04",
+    "js.large.largest-05", "js.large.largest-06", "js.large.largest-07", "js.large.largest-08", "js.large.largest-09", "js.large.largest-10",
+    "js.large.largest-11", "js.large.largest-12", "js.large.largest-13", "js.large.largest-14", "js.large.largest-15", "js.large.largest-16"]
+  size = 0
+  while size < 16 { run out.bytes(largestNames[size], pool.largest[size], pool.largest[size]) size = size + 1 }
+  // The runtime's own tables, by the bytes they reserve: which of the largest blocks they are.
+  run out.bytes("js.runtime.shape-hash", state.shapeHash.capacity() * Layout.of<?*mut HeapHeader>().bytes, state.shapeHash.capacity() * Layout.of<?*mut HeapHeader>().bytes)
+  run out.bytes("js.runtime.deferred-atoms", state.deferredAtoms.capacity() * 4, state.deferredAtoms.capacity() * 4)
+  run out.bytes("js.runtime.deferred-texts", state.deferredTexts.capacity() * Layout.of<ValueBits>().bytes, state.deferredTexts.capacity() * Layout.of<ValueBits>().bytes)
+  run out.bytes("js.runtime.lexer-names", state.lexerNames.capacity() * Layout.of<NameSlot>().bytes + state.lexerNameAtoms.capacity() * Layout.of<StringOwner>().bytes,
+    state.lexerNames.capacity() * Layout.of<NameSlot>().bytes + state.lexerNameAtoms.capacity() * Layout.of<StringOwner>().bytes)
+  let preparse = (state.preparseBinderStamps.capacity() + state.preparseBinderValues.capacity() + state.preparseMarkStamps.capacity() + state.preparseMarkValues.capacity()) * 4
+  run out.bytes("js.runtime.preparse-tables", preparse, preparse)
+  run out.bytes("js.runtime.stack-scratch", state.stackScratch.entries.capacity() * 8, state.stackScratch.entries.capacity() * 8)
+  run out.bytes("js.runtime.regexp-programs", state.regexpPrograms.capacity() * Layout.of<ValueBits>().bytes, state.regexpPrograms.capacity() * Layout.of<ValueBits>().bytes)
+  run out.bytes("js.runtime.kept-objects", state.keptObjects.capacity() * Layout.of<ValueBits>().bytes, state.keptObjects.capacity() * Layout.of<ValueBits>().bytes)
+  run out.bytes("js.runtime.classes", state.classes.capacity() * Layout.of<ClassDef>().bytes, state.classes.capacity() * Layout.of<ClassDef>().bytes)
+  let bigAtoms = state.atoms.largeUsage(1024)
+  run out.held("js.large.atoms", bigAtoms.allocationCount, bigAtoms.allocationCount, if bigAtoms.allocationCount != 0 { bigAtoms.bytes / bigAtoms.allocationCount } else { 0 })
+  run out.bytes("js.large.atoms.bytes", bigAtoms.bytes, bigAtoms.bytes)
+  run out.held("js.large.cells", bigCells, bigCells, if bigCells != 0 { bigCellBytes / bigCells } else { 0 })
+  run out.bytes("js.large.cells.bytes", bigCellBytes, bigCellBytes)
+  run out.held("js.large.object-slots", bigSlots, bigSlots, if bigSlots != 0 { bigSlotBytes / bigSlots } else { 0 })
+  run out.bytes("js.large.object-slots.bytes", bigSlotBytes, bigSlotBytes)
+  run out.held("js.large.array-elements", bigElements, bigElements, if bigElements != 0 { bigElementBytes / bigElements } else { 0 })
+  run out.bytes("js.large.array-elements.bytes", bigElementBytes, bigElementBytes)
+  run out.held("js.large.function-lists", bigFunctionLists, bigFunctionLists, if bigFunctionLists != 0 { bigFunctionListBytes / bigFunctionLists } else { 0 })
+  run out.bytes("js.large.function-lists.bytes", bigFunctionListBytes, bigFunctionListBytes)
+  run out.held("js.array-buffers", buffersHeld, buffersHeld, if buffersHeld != 0 { bufferBytes / buffersHeld } else { 0 })
+  run out.bytes("js.array-buffers.bytes", bufferBytes, bufferBytes)
+  run out.held("js.opaque-cells", opaqueCells, opaqueCells, if opaqueCells != 0 { opaqueBytes / opaqueCells } else { 0 })
+  run out.bytes("js.opaque-cells.bytes", opaqueBytes, opaqueBytes)
+  // Work.
+  run out.work("js.gc.full", state.census[types.CENSUS_GC_FULL])
+  run out.work("js.gc.young", state.census[types.CENSUS_GC_YOUNG])
+  run out.work("js.gc.cells-traced", state.census[types.CENSUS_GC_TRACED])
+  run out.work("js.calls(from bytecode)", state.census[types.CENSUS_CALLS])
+  run out.work("js.get-field.site-cache-asked", state.census[types.CENSUS_FIELD_GETS])
+  run out.work("js.get-field.inline-key-missed", state.census[types.CENSUS_FIELD_REFILLS])
+  run out.work("js.property-adds", state.census[types.CENSUS_PROPERTY_ADDS])
+  run out.work("js.property-adds.not-in-transition-memo", state.census[types.CENSUS_PROPERTY_ADDS_UNMEMOIZED])
+  run out.work("js.shapes.allocated", state.census[types.CENSUS_SHAPES_ALLOCATED])
+  run out.work("js.objects.allocated", state.census[types.CENSUS_OBJECTS_ALLOCATED])
+}

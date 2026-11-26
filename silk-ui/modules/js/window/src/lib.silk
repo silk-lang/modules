@@ -1,0 +1,1087 @@
+//! A ui-js application as a client of the window host.
+//!
+//! [`JsApp`] holds the JavaScript host and the allocator its memory is counted on.
+//! [`JsClient`] is the `WindowClient` that runs it: the entry module at start, event records
+//! between the tree's `begin` and `finish`, timers and animation frames on the host's clock,
+//! and console lines on standard error. An uncaught exception is printed as the browser
+//! console prints it, and the window keeps running.
+//!
+//! What a production build does not need stays out of this package: reloading on a new
+//! build and the development server are [`JsTools`] that the package `ui-js-window-dev`
+//! provides. A production host runs [`NoTools`], so none of that code is in its program.
+//!
+//! ```silk
+//! let domain = run WaiterDomain.make()
+//! let mut allocator = run RuntimeAllocator.make(Allocator.systemAllocatorProvider())
+//! let memory = run allocator.observe()
+//! let mut app = run JsApp.open(&memory, move allocator, domain.handle())
+//! run app.define(b"@silkui/core", library)
+//! run app.entry(b"app.js", source)
+//! let mut client = JsClient.make(NoTools {})
+//! let status = run runWindow(&mut app, &fonts, List<Mutation>.make(), options, Inspector.off(), &mut client)
+//! run app.close()
+//! ```
+import ui_js_calls.gpu { GpuReply }
+import ui_js.lib { JsHost, JsError, ShellRequest, ClipboardRequest, ClipboardData, EncodedItem, encodeItem, imageLoadable, imageBuild, engineBuild }
+import opener { Openers }
+import shell { serveShell, deliverShell, ShellAnswer }
+import natives { NativeJobs, Finished }
+import ui_tree.style_assets { StyleAssets }
+import ui_tree_window.style_watch { SheetWatch }
+import ui_tree.legacy { FrameInput }
+import ui_tree.census { Census }
+import ui_tree.legacy { UiTree, TreeError }
+import ui_tree_window.host { WindowClient, environmentVariable }
+import ui_tree_window.loader { Loader }
+import ui_tree_window.platform_thread { HostPlatform, Nudge }
+import ui_tree.cssom_view { getBoundingClientRect }
+import webview.types { Placement }
+import webview.wire { WireEvent, OP_OPEN, OP_CLOSE }
+import silk.geometry.rect { Rect }
+import silk.num.f32
+import silk.num.u8
+import silk.num.u32
+import ui_tree_window.console { StderrWriter }
+import ui_tree_window.canvas_frames { CanvasPresenter }
+import ui_tree_window.canvas_bitmaps { presentCanvasBitmaps }
+import ui_js_gpu.service { GpuService }
+import ui_tree.legacy { Batch }
+import silkjs.js_atomics_native { Domain }
+import silkjs.runtime_memory { RuntimeAllocator, AllocationObserver }
+import window.types { WindowError, WindowId, WindowOptions, TitleBar }
+import window.event { Event, MouseButton }
+import window.platform { Platform }
+import window.clipboard { ClipboardEntry }
+import silk.collections.list { List }
+import silk.collections.bytes { Bytes }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.io.writer { Writer }
+import silk.mem.allocator { Allocator, OutOfMemoryError, SystemAllocator }
+import silk.text.string { String }
+import silk.num.f64
+import silk.num.f32
+
+/// A module given to [`JsApp.define`], kept to define it again after a reload.
+struct Defined {
+  name: List<u8>,
+  source: List<u8>,
+  /// The module compiled when the program was built ([`JsApp.defineImaged`]), or empty.
+  image: &'static [u8],
+}
+
+/// A JavaScript application and what it runs on.
+pub struct JsApp<'m> {
+  host: JsHost<'m>,
+  /// JavaScript memory is counted here, apart from the tree's and the window's.
+  allocator: RuntimeAllocator<SystemAllocator>,
+  memory: &'m AllocationObserver,
+  domain: Domain,
+  modules: List<Defined>,
+  name: List<u8>,
+  source: List<u8>,
+  /// The entry compiled when the program was built ([`JsApp.entryImage`]), or empty.
+  image: &'static [u8],
+  /// The system programs started for `window.open`.
+  openers: Openers,
+  /// `SILK_UI_TRACE_JS`: say what the entry starts from.
+  traced: bool,
+  /// The bytes JavaScript used after the last [`JsApp.release`].
+  settled: usize,
+  /// Runs JavaScript's WebGPU calls on the application's own GPU device, once the window
+  /// gave the handle canvases present through ([`JsApp.canvases`]).
+  gpu: Option<GpuService>,
+  /// Where the bitmaps of 2D canvases are shown from, the same handle the GPU canvases use.
+  presenter: Option<CanvasPresenter>,
+  /// The page zoom JavaScript last heard of, to tell it when a zoom key changes it.
+  zoom: f32,
+  /// The web views JavaScript opened, each shown at its node.
+  webViews: List<HostedView>,
+  /// A layout moved a web view: the next turn places it.
+  placesPending: bool,
+  /// Ends the window's wait, for a layout that moved a web view.
+  nudge: Option<Nudge>,
+  /// JavaScript's `quit(code)`: the window closes and the program exits with the code.
+  quitCode: Option<i32>,
+}
+
+/// A web view and the node it shows at.
+struct HostedView {
+  view: u32,
+  node: u32,
+  /// JavaScript's `shown`: a hidden view keeps its page.
+  shown: bool,
+  /// Where it was last placed, and where the last layout puts it.
+  placed: Placement,
+  wanted: Placement,
+}
+
+/// `__ui.shell` op 44, show or hide a web view: view, 0 or 1. Served here, not by the views.
+const OP_SHOW: u32 = 44
+
+/// `__ui.shell` op 45, quit: the exit code.
+const OP_QUIT: u32 = 45
+
+/// `__ui.shellEvent` kind of a web view event: `a` the view, `x` its code, `text` its fields.
+const WEB_VIEW_EVENT: u32 = 20
+
+fn samePlacement(a: &Placement, b: &Placement) -> bool {
+  return a.visible == b.visible && a.bounds.xMin == b.bounds.xMin && a.bounds.yMin == b.bounds.yMin
+    && a.bounds.xMax == b.bounds.xMax
+    && a.bounds.yMax == b.bounds.yMax
+    && a.clip.xMin == b.clip.xMin
+    && a.clip.yMin == b.clip.yMin
+    && a.clip.xMax == b.clip.xMax
+    && a.clip.yMax == b.clip.yMax
+}
+
+fn fieldNumber(text: string, at: usize) -> u32 {
+  let bytes = String.utf8Bytes(text)
+  let mut field: usize = 0
+  let mut value: u32 = 0
+  let mut i: usize = 0
+  while i < bytes.length {
+    if bytes[i] == 31 {
+      if field == at {
+        return value
+      }
+      field = field + 1
+      value = 0
+    } else if field == at && bytes[i] >= 48 && bytes[i] <= 57 {
+      value = value * 10 + u8.toU32(bytes[i] - 48)
+    }
+    i = i + 1
+  }
+  return if field == at {
+    value
+  } else {
+    0
+  }
+}
+
+/// How many rounds of WebGPU commands one turn serves: the promise jobs of one round's
+/// answers may write commands again, and the rest waits for the next turn.
+const GPU_ROUNDS: usize = 16
+
+/// A quiet moment collects garbage when JavaScript's memory moved this much since the last
+/// one: a launch, a screen built or taken down. Smaller changes are the engine's own business.
+const RELEASE_MOVED_BYTES: usize = 4194304
+/// The most idle memory a quiet moment leaves with the engine for what comes next.
+const RELEASE_RESERVE_BYTES: usize = 8388608
+
+effect fn deliverShellInto(host: &mut JsHost<'_>, tree: &UiTree<'_>, event: &Event, was: &mut bool) -> () ! OutOfMemoryError | JsError ? &mut Allocator {
+  was.* = run deliverShell(&mut host, tree, event)
+}
+
+/// Writes `text` to standard error.
+pub fn write(text: string) -> () {
+  let mut out = StderrWriter.make()
+  drop run Writer.writeString(text) |> Effect.provideMut<Writer>(&mut out) |> Effect.result
+}
+
+/// Prints an uncaught exception as a browser console does.
+fn uncaught(error: JsError) -> () {
+  let message = String.view(&error.message)
+  write("Uncaught ")
+  write(message)
+  write("\n")
+  // The usual cause of a missing global here is a web or Node API: say what a realm has.
+  if String.startsWith(message, "ReferenceError: ") && String.endsWith(message, " is not defined") {
+    write("  A ui-js realm has ECMAScript, timers, console and @silkui/core. It has no other web or Node API\n")
+    write("  (fetch, URL, Intl, document, process and the like). @silkui/vite lists the ones a build uses.\n")
+  }
+}
+
+/// The host's answer to a `navigator.clipboard` call: for a text read, the clipboard's text;
+/// for an item read, its representations.
+pub struct ClipboardAnswer {
+  pub call: u32,
+  pub text: Option<String>,
+  pub item: Option<EncodedItem>,
+}
+
+/// How many rounds of clipboard calls one turn of the window's loop serves: the promise jobs
+/// of one round may call again, and the rest waits for the next turn.
+pub const CLIPBOARD_ROUNDS: usize = 8
+
+/// Does JavaScript's clipboard calls `requests` on the system clipboard, oldest first.
+pub effect fn serveClipboard(requests: List<ClipboardRequest>, platform: &mut HostPlatform) -> List<ClipboardAnswer> ! OutOfMemoryError ? &mut Allocator {
+  let mut rest = move requests
+  let mut answers = List<ClipboardAnswer>.make()
+  while rest.length() > 0 {
+    match rest.remove(0) {
+      ClipboardRequest.Read { call } => {
+        let text = run platform.readClipboard()
+        run answers.append(ClipboardAnswer { call: call, text: move text, item: Option<EncodedItem>.None })
+      }
+      ClipboardRequest.Write { call, text } => {
+        run platform.writeClipboard(String.view(&text))
+        run answers.append(ClipboardAnswer { call: call, text: Option<String>.none(), item: Option<EncodedItem>.None })
+      }
+      ClipboardRequest.ReadItem { call } => {
+        let types = run platform.clipboardTypes()
+        let mut entries = List<ClipboardData>.make()
+        let mut t: usize = 0
+        while t < types.length() {
+          let mime = types.asSlice()[t].view()
+          match move run platform.readClipboardType(mime) {
+            Option<Bytes>.Some { value } => run entries.append(ClipboardData { mime: run String.copy(mime), data: move value })
+            _ => {}
+          }
+          t = t + 1
+        }
+        let item = run encodeItem(entries.asSlice())
+        run answers.append(ClipboardAnswer { call: call, text: Option<String>.none(), item: Option<EncodedItem>.some(move item) })
+      }
+      ClipboardRequest.WriteItem { call, entries } => {
+        let mut native = List<ClipboardEntry>.make()
+        let mut e = move entries
+        while e.length() > 0 {
+          let ClipboardData { mime, data } = e.remove(0)
+          run native.append(ClipboardEntry { mime: move mime, data: move data })
+        }
+        run platform.writeClipboardItem(native.asSlice())
+        run answers.append(ClipboardAnswer { call: call, text: Option<String>.none(), item: Option<EncodedItem>.None })
+      }
+    }
+  }
+  return move answers
+}
+
+impl<'m> JsApp<'m> {
+  /// A realm for one application. `allocator` is the one `memory` observes.
+  pub effect fn open(memory: &'m AllocationObserver, allocator: RuntimeAllocator<SystemAllocator>, domain: Domain) -> JsApp<'m>
+    ! OutOfMemoryError | JsError
+    ? &mut Allocator {
+    let mut own = move allocator
+    // Small blocks the engine frees are kept for its next allocations instead of going
+    // back to the system allocator, as the silkjs command line does.
+    own.enablePooling()
+    let host = run JsHost.open(memory, domain) |> Effect.provideMut<Allocator>(&mut own)
+    let traced = (run environmentVariable("SILK_UI_TRACE_JS")).isSome()
+    return JsApp {
+      traced: traced,
+      host: move host,
+      allocator: move own,
+      memory: memory,
+      domain: domain,
+      modules: List<Defined>.make(),
+      name: List<u8>.make(),
+      source: List<u8>.make(),
+      image: b"",
+      openers: Openers.make(),
+      settled: 0,
+      gpu: Option<GpuService>.None,
+      presenter: Option<CanvasPresenter>.None,
+      webViews: List<HostedView>.make(),
+      placesPending: false,
+      nudge: Option<Nudge>.None,
+      quitCode: Option<i32>.None,
+      zoom: 1.0,
+    }
+  }
+
+  /// Hands back what JavaScript no longer uses, for a window gone quiet
+  /// (`WindowClient.quiet`): a full collection when its memory moved by
+  /// [`RELEASE_MOVED_BYTES`] since the last one or `shed` says a large subtree went (its
+  /// nodes' cycles are garbage only a collection finds), then the pooled arenas left wholly
+  /// idle go back to the system, keeping an eighth of what is in use for what
+  /// comes next, [`RELEASE_RESERVE_BYTES`] at most.
+  /// Otherwise it costs a few loads.
+  pub effect fn release(self: &mut Self, shed: bool) -> () ? &mut Allocator {
+    let used = self.memory.usedBytes()
+    let moved = if used > self.settled { used - self.settled } else { self.settled - used }
+    let collected = shed || moved >= RELEASE_MOVED_BYTES
+    if collected {
+      run self.host.collect() |> Effect.provideMut<Allocator>(&mut self.allocator)
+    }
+    let live = self.memory.usedBytes()
+    let released = self.host.releaseIdle(if live / 8 < RELEASE_RESERVE_BYTES { live / 8 } else { RELEASE_RESERVE_BYTES })
+    self.settled = live
+    if self.traced && (collected || released != 0) {
+      StderrWriter.print("silkui: quiet, javascript used {} then {} bytes, {} released\n", &(used, live, released))
+    }
+  }
+
+  /// Makes `source` importable as `name` (see `JsHost.define`).
+  pub effect fn define(self: &mut Self, name: &[u8], source: &[u8]) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.defineImaged(name, source, b"")
+  }
+
+  /// [`JsApp.define`] with the module's bytecode image, written when the program was built
+  /// and embedded in it (see `JsHost.defineImaged`); an empty image is none.
+  pub effect fn defineImaged(self: &mut Self, name: &[u8], source: &[u8], image: &'static [u8]) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.host.defineImaged(name, source, image) |> Effect.provideMut<Allocator>(&mut self.allocator)
+    let mut nameCopy = List<u8>.make()
+    run nameCopy.appendSlice(name)
+    let mut sourceCopy = List<u8>.make()
+    run sourceCopy.appendSlice(source)
+    run self.modules.append(Defined { name: move nameCopy, source: move sourceCopy, image: image })
+  }
+
+  /// The ES module the window runs when it starts.
+  pub effect fn entry(self: &mut Self, name: &[u8], source: &[u8]) -> () ! OutOfMemoryError ? &mut Allocator {
+    self.name.clear()
+    run self.name.appendSlice(name)
+    self.source.clear()
+    run self.source.appendSlice(source)
+  }
+
+  /// The entry's bytecode image: what the app's build compiled its source into
+  /// (`JsHost.writeImage`, through `silkui_window.image`), embedded in the program. The
+  /// window then starts the entry from it with nothing parsed, when the engine build that
+  /// wrote it is the one linked here; otherwise it says so and runs the source given to
+  /// [`JsApp.entry`], which a host always gives as well.
+  pub fn entryImage(self: &mut Self, image: &'static [u8]) -> () {
+    self.image = image
+  }
+
+  /// Replaces the entry's source, keeping its name; [`JsApp.startEntry`] runs it. The new
+  /// source has no image: a reload runs what it was given.
+  pub fn replaceEntry(self: &mut Self, source: List<u8>) -> () {
+    self.source = move source
+    self.image = b""
+  }
+
+  /// Releases the raw JavaScript source buffers kept for development reloads, once a
+  /// production build has started its entry module.
+  pub fn releaseSources(self: &mut Self) -> () {
+    self.source.clearAndFree()
+    let items = self.modules.asMutSlice()
+    let mut i: usize = 0
+    while i < items.length {
+      items[i].source.clearAndFree()
+      items[i].name.clearAndFree()
+      i = i + 1
+    }
+    self.modules.clearAndFree()
+  }
+
+  /// The JavaScript host, for tools that talk to it directly.
+  /// What the app's JavaScript side holds, for the bench census: the engine's rows, and the
+  /// source texts the app keeps beside the engine's own.
+  pub effect fn census(self: &mut Self, out: &mut Census) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.host.census(&mut out)
+    let mut bytes: usize = self.source.capacity()
+    let mut at: usize = 0
+    while at < self.modules.length() {
+      bytes = bytes + self.modules.asSlice()[at].source.capacity()
+      at = at + 1
+    }
+    run out.bytes("js.app.source-texts(entry and modules kept by the app)", bytes, bytes)
+  }
+
+  pub fn javascript(self: &mut Self) -> &mut JsHost<'m> {
+    return &mut self.host
+  }
+
+  /// Frees the realm.
+  pub effect fn close(self: &mut Self) -> () ? &mut Allocator {
+    run self.host.close() |> Effect.provideMut<Allocator>(&mut self.allocator)
+  }
+
+  /// Runs the entry module and applies what it built.
+  pub effect fn startEntry(self: &mut Self, tree: &mut UiTree<'_>) -> () ! TreeError | OutOfMemoryError ? &mut Allocator {
+    self.host.attach(&mut tree)
+    self.sayEntry()
+    let started = run Effect.result(self.host.moduleFrom(self.image, self.source.asSlice(), self.name.asSlice())) |> Effect.provideMut<Allocator>(&mut self.allocator)
+    let ran = match move started {
+      Result<bool, OutOfMemoryError | JsError>.Success { .. } => Result<(), OutOfMemoryError | JsError>.Success { value: () }
+      Result<bool, OutOfMemoryError | JsError>.Failure { error } => Result<(), OutOfMemoryError | JsError>.Failure { error: move error }
+    }
+    run self.settle(move ran)
+    run self.host.flushRaw(&mut tree)
+  }
+
+  /// Says what the entry starts from. An image this engine build cannot load is never
+  /// silent: the program was built with a stale one, and pays for parsing at every launch.
+  /// `SILK_UI_TRACE_JS` says it for the image and for plain source too.
+  fn sayEntry(self: &Self) -> () {
+    if self.image.length != 0 && !imageLoadable(self.image) {
+      StderrWriter.print(
+        "silkui: the bytecode image of the app's JavaScript was written by another engine build ({} here, {} in the image): running from source. Build the app again.\n",
+        &(engineBuild(), imageBuild(self.image)),
+      )
+      return ()
+    }
+    if !self.traced { return () }
+    if self.image.length != 0 {
+      StderrWriter.print("silkui: JavaScript starts from its bytecode image ({} bytes, engine build {})\n", &(self.image.length, engineBuild()))
+    } else {
+      StderrWriter.print("silkui: JavaScript starts from source ({} bytes): the program has no bytecode image\n", &.(self.source.length()))
+    }
+  }
+
+  /// Runs `source` as a script named `name`, prints what it wrote and threw, and applies
+  /// what it built.
+  pub effect fn script(self: &mut Self, tree: &mut UiTree<'_>, source: &[u8], name: &[u8]) -> () ! TreeError | OutOfMemoryError ? &mut Allocator {
+    self.host.attach(&mut tree)
+    let ran = run Effect.result(self.host.evaluate(source, name)) |> Effect.provideMut<Allocator>(&mut self.allocator)
+    run self.settle(move ran)
+    run self.host.flushRaw(&mut tree)
+  }
+
+  /// Hands `line`, a message from a development server, to JavaScript (`__ui.devMessage`),
+  /// prints what it wrote and threw, and applies what it built.
+  pub effect fn message(self: &mut Self, tree: &mut UiTree<'_>, line: string) -> () ! TreeError | OutOfMemoryError ? &mut Allocator {
+    self.host.attach(&mut tree)
+    let handed = run Effect.result(self.host.devMessage(line)) |> Effect.provideMut<Allocator>(&mut self.allocator)
+    run self.settle(move handed)
+    run self.host.flushRaw(&mut tree)
+  }
+
+  /// Destroys the application's nodes and replaces the realm, with the modules given to
+  /// [`JsApp.define`] defined again. Says whether there is a new realm; the window keeps
+  /// the old one when there is not.
+  pub effect fn fresh(self: &mut Self, tree: &mut UiTree<'_>) -> bool ! TreeError | OutOfMemoryError ? &mut Allocator {
+    self.host.attach(&mut tree)
+    let compiler = self.host.stylesheetCompiler()
+    let unloaded = run Effect.result(self.host.unload()) |> Effect.provideMut<Allocator>(&mut self.allocator)
+    run self.settle(move unloaded)
+    run self.host.flushRaw(&mut tree)
+    // The new realm reads the same clock: timers it sets before the next tick are due
+    // from now, not from the time the host started.
+    let clock = self.host.clock()
+    run self.host.close() |> Effect.provideMut<Allocator>(&mut self.allocator)
+    let opened = run Effect.result(JsHost.open(self.memory, self.domain)) |> Effect.provideMut<Allocator>(&mut self.allocator)
+    match move opened {
+      Result<JsHost<'m>, OutOfMemoryError | JsError>.Success { value } => {
+        self.host = move value
+        self.host.advance(clock)
+        self.host.attach(&mut tree)
+        if let Option<GpuService>.Some { value: runner } = &mut self.gpu {
+          runner.reset()
+          self.host.enableGpu()
+        }
+      }
+      Result<JsHost<'m>, OutOfMemoryError | JsError>.Failure { error } => match move error {
+        OutOfMemoryError allocation => { fail move allocation }
+        JsError { message } => {
+          uncaught(JsError { message: move message })
+          return false
+        }
+      }
+    }
+    self.host.setStylesheetCompiler(compiler)
+    let items = self.modules.asSlice()
+    let mut i: usize = 0
+    while i < items.length {
+      run self.host.defineImaged(items[i].name.asSlice(), items[i].source.asSlice(), items[i].image) |> Effect.provideMut<Allocator>(&mut self.allocator)
+      i = i + 1
+    }
+    return true
+  }
+
+  /// Prints what JavaScript wrote to the console, and `outcome`'s exception when it failed.
+  pub effect fn settle(self: &mut Self, outcome: Result<(), OutOfMemoryError | JsError>) -> () ! OutOfMemoryError {
+    let logs = self.host.takeLogs()
+    let lines = logs.asSlice()
+    let mut i: usize = 0
+    while i < lines.length {
+      write(String.view(&lines[i].text))
+      write("\n")
+      i = i + 1
+    }
+    let opened = self.host.takeOpened()
+    let addresses = opened.asSlice()
+    i = 0
+    while i < addresses.length {
+      let address = String.utf8Bytes(String.view(&addresses[i]))
+      let started = run self.openers.open(address) |> Effect.provideMut<Allocator>(&mut self.allocator)
+      if !started {
+        write("Could not open ")
+        write(String.view(&addresses[i]))
+        write("\n")
+      }
+      i = i + 1
+    }
+    match move outcome {
+      Result<(), OutOfMemoryError | JsError>.Success { .. } => ()
+      Result<(), OutOfMemoryError | JsError>.Failure { error } => match move error {
+        OutOfMemoryError allocation => { fail move allocation }
+        JsError { message } => { uncaught(JsError { message: move message }) }
+      }
+    }
+  }
+
+  /// Answers JavaScript's clipboard calls through `platform`, and the calls their promise
+  /// jobs made, then applies what it built. Says whether there were calls.
+  effect fn clipboard(self: &mut Self, tree: &mut UiTree<'_>, platform: &mut HostPlatform) -> bool ! TreeError | OutOfMemoryError ? &mut Allocator {
+    self.host.attach(&mut tree)
+    let mut round: usize = 0
+    while round < CLIPBOARD_ROUNDS {
+      let requests = self.host.takeClipboard()
+      if requests.length() == 0 { break }
+      let mut answers = run serveClipboard(move requests, &mut platform)
+      while answers.length() > 0 {
+        let ClipboardAnswer { call, text, item } = answers.remove(0)
+        let answered = run Effect.result(self.host.answerClipboard(call, move text, move item)) |> Effect.provideMut<Allocator>(&mut self.allocator)
+        run self.settle(move answered)
+      }
+      round = round + 1
+    }
+    if round == 0 { return false }
+    run self.host.flushRaw(&mut tree)
+    return true
+  }
+
+  /// Runs web view call `op` with `text`'s fields: opening and closing keep the view's node here,
+  /// showing is served here, the rest goes to the platform's views.
+  effect fn webView(
+    self: &mut Self,
+    op: u32,
+    text: string,
+    platform: &mut HostPlatform,
+    window: WindowId,
+  ) -> f64
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let view = fieldNumber(text, 0)
+    if op == OP_QUIT {
+      self.quitCode = Option<i32>.some(u32.toI32(view))
+      return 0.0
+    }
+    if op == OP_SHOW {
+      let shown = fieldNumber(text, 1) != 0
+      let list = self.webViews.asMutSlice()
+      let mut i: usize = 0
+      while i < list.length {
+        if list[i].view == view {
+          list[i].shown = shown
+          list[i].wanted.visible = shown
+            && list[i].wanted.bounds.xMax > list[i].wanted.bounds.xMin
+            && list[i].wanted.bounds.yMax > list[i].wanted.bounds.yMin
+          self.placesPending = true
+        }
+        i = i + 1
+      }
+      return 0.0
+    }
+    let value = run platform.webView(op, window, text)
+    if op == OP_OPEN && value != 0.0 {
+      let hidden = Placement.hidden()
+      run self.webViews.append(
+        HostedView {
+          view: view,
+          node: fieldNumber(text, 1),
+          shown: true,
+          placed: hidden,
+          wanted: hidden,
+        },
+      )
+      self.placesPending = true
+    }
+    if op == OP_CLOSE {
+      let mut i: usize = 0
+      while i < self.webViews.length() {
+        if self.webViews.asSlice()[i].view == view {
+          drop self.webViews.remove(i)
+        } else {
+          i = i + 1
+        }
+      }
+    }
+    return value
+  }
+
+  /// Where the last layout puts each web view: its node's border box, in the window.
+  effect fn measureWebViews(self: &mut Self, tree: &UiTree<'_>, scale: f32) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if self.webViews.length() == 0 {
+      return ()
+    }
+    let window = Rect<f32>.new(0.0, 0.0, tree.input.width, tree.input.height)
+    let list = self.webViews.asMutSlice()
+    let mut moved = false
+    let mut i: usize = 0
+    while i < list.length {
+      let rect = run getBoundingClientRect(tree, list[i].node)
+      let x = f64.toF32(rect.x)
+      let y = f64.toF32(rect.y)
+      let bounds = Rect<f32>.new(x, y, x + f64.toF32(rect.width), y + f64.toF32(rect.height))
+      let wanted = Placement {
+        bounds: bounds,
+        clip: window,
+        visible: list[i].shown && rect.width > 0.0 && rect.height > 0.0,
+        scale: scale,
+      }
+      if !samePlacement(&wanted, &list[i].wanted) {
+        list[i].wanted = wanted
+        moved = true
+      }
+      i = i + 1
+    }
+    if moved {
+      self.placesPending = true
+      if let Option<Nudge>.Some { value } = &self.nudge {
+        value.nudge()
+      }
+    }
+  }
+
+  /// Places the web views a layout moved and hands what the views reported to JavaScript, then
+  /// applies what it built. Says whether there were events.
+  effect fn webViewTurn(self: &mut Self, tree: &mut UiTree<'_>, platform: &mut HostPlatform) -> bool
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    if self.placesPending {
+      self.placesPending = false
+      let list = self.webViews.asMutSlice()
+      let mut i: usize = 0
+      while i < list.length {
+        if !samePlacement(&list[i].placed, &list[i].wanted) {
+          list[i].placed = list[i].wanted
+          run platform.placeWebView(list[i].view, list[i].wanted)
+        }
+        i = i + 1
+      }
+    }
+    let mut events = List<WireEvent>.make()
+    run platform.takeWebViewEvents(&mut events)
+    if events.length() == 0 {
+      return false
+    }
+    self.host.attach(&mut tree)
+    while events.length() != 0 {
+      let event = events.remove(0)
+      let told = run Effect.result(
+        self.host.shellEvent(
+          WEB_VIEW_EVENT,
+          u32.toF64(event.view),
+          u32.toF64(event.code),
+          0.0,
+          String.view(&event.text),
+        ),
+      )
+        |> Effect.provideMut<Allocator>(&mut self.allocator)
+      run self.settle(move told)
+    }
+    run self.host.flushRaw(&mut tree)
+    return true
+  }
+
+  /// The exit code JavaScript's `quit` asked for, 0 when it did not.
+  pub fn exitCode(self: &Self) -> i32 {
+    return match self.quitCode {
+      Option<i32>.Some { value } => value
+      Option<i32>.None => 0
+    }
+  }
+
+  /// Gives JavaScript `navigator.gpu`: its canvases present their frames through `presenter`.
+  pub fn canvases(self: &mut Self, presenter: CanvasPresenter) -> () {
+    self.presenter = Option<CanvasPresenter>.some(presenter.clone())
+    self.gpu = Option<GpuService>.some(GpuService.make(move presenter))
+    self.host.enableGpu()
+  }
+
+  /// Runs the WebGPU commands JavaScript wrote on the application's GPU device, presents the
+  /// canvases they drew, and settles the promises they answer. Says whether that changed the
+  /// tree or left commands for the next turn.
+  effect fn graphics(self: &mut Self, tree: &mut UiTree<'_>) -> bool ! TreeError | OutOfMemoryError ? &mut Allocator {
+    let mut changed = run self.show2d(&mut tree)
+    let mut round: usize = 0
+    while round < GPU_ROUNDS {
+      let commands = self.host.takeGpuCommands()
+      if commands.length() == 0 { return changed }
+      let mut batch = Batch.make()
+      let mut replies = List<GpuReply>.make()
+      if let Option<GpuService>.Some { value: runner } = &mut self.gpu {
+        run runner.serve(commands.asSlice(), &mut batch)
+        replies = runner.takeReplies()
+      }
+      if self.traced {
+        StderrWriter.print("silkui: gpu, {} command bytes, {} answers\n", &(commands.length(), replies.length()))
+      }
+      if batch.length() != 0 {
+        run tree.apply(run batch.take())
+        changed = true
+      }
+      self.host.attach(&mut tree)
+      let answered = run Effect.result(self.host.answerGpu(move replies)) |> Effect.provideMut<Allocator>(&mut self.allocator)
+      run self.settle(move answered)
+      run self.host.flushRaw(&mut tree)
+      round = round + 1
+    }
+    return true
+  }
+
+  /// Shows the bitmaps Canvas 2D drew into since the last call, each as a frame of its canvas
+  /// node's surface, and closes the surfaces of canvases that are gone. Says whether that
+  /// changed the tree.
+  effect fn show2d(self: &mut Self, tree: &mut UiTree<'_>) -> bool ! TreeError | OutOfMemoryError ? &mut Allocator {
+    return match &self.presenter {
+      Option<CanvasPresenter>.Some { value } => run presentCanvas2d(&value, &mut tree)
+      Option<CanvasPresenter>.None => false
+    }
+  }
+
+  /// Starts JavaScript's `fn.async(...)` calls of exported Silk functions on threads, and
+  /// settles the ones that ended, then applies what their promise jobs built. Says whether a
+  /// call ended.
+  effect fn natives(self: &mut Self, jobs: &mut NativeJobs, tree: &mut UiTree<'_>) -> bool ! TreeError | OutOfMemoryError ? &mut Allocator {
+    self.host.attach(&mut tree)
+    let started = self.host.takeStartedNatives()
+    if started.length() != 0 { run jobs.start(move started, self.host.natives()) }
+    let mut done = run jobs.finished()
+    if done.length() == 0 { return false }
+    while done.length() > 0 {
+      let Finished { token, reply } = done.remove(0)
+      let answered = run Effect.result(self.host.answerNative(token, move reply)) |> Effect.provideMut<Allocator>(&mut self.allocator)
+      run self.settle(move answered)
+    }
+    run self.host.flushRaw(&mut tree)
+    return true
+  }
+
+  /// Serves JavaScript's desktop calls (notifications, the tray, global shortcuts, menus,
+  /// dialogs, `window`'s state) through `platform`, and the calls their promise jobs made,
+  /// then applies what it built. Tells JavaScript when the page zoom changed. Says whether
+  /// there were calls.
+  effect fn shell(self: &mut Self, tree: &mut UiTree<'_>, platform: &mut HostPlatform, window: WindowId) -> bool ! TreeError | OutOfMemoryError ? &mut Allocator {
+    self.host.attach(&mut tree)
+    let zoomed = tree.pageZoom() != self.zoom
+    if zoomed {
+      self.zoom = tree.pageZoom()
+      let told = run Effect.result(self.host.shellEvent(11, f32.toF64(self.zoom), 0.0, 0.0, "")) |> Effect.provideMut<Allocator>(&mut self.allocator)
+      run self.settle(move told)
+    }
+    let mut round: usize = 0
+    while round < CLIPBOARD_ROUNDS {
+      let all = self.host.takeShell()
+      if all.length() == 0 { break }
+      let mut requests = List<ShellRequest>.make()
+      let mut early = List<ShellAnswer>.make()
+      let mut taken = move all
+      while taken.length() != 0 {
+        let request = taken.remove(0)
+        if request.op >= OP_OPEN {
+          let value = run self.webView(request.op, String.view(&request.text), &mut platform, window)
+          run early.append(ShellAnswer { call: request.call, value: value })
+        } else {
+          run requests.append(move request)
+        }
+      }
+      let mut answers = run serveShell(move requests, &mut platform, &mut tree, window)
+      while early.length() > 0 { run answers.append(early.remove(0)) }
+      while answers.length() > 0 {
+        let ShellAnswer { call, value } = answers.remove(0)
+        let answered = run Effect.result(self.host.answerShell(call, value)) |> Effect.provideMut<Allocator>(&mut self.allocator)
+        run self.settle(move answered)
+      }
+      round = round + 1
+    }
+    if round == 0 && !zoomed { return false }
+    run self.host.flushRaw(&mut tree)
+    return true
+  }
+
+  /// Hands a desktop event (a file drag, a global shortcut, the tray, a notification click)
+  /// to JavaScript and applies what it built. Says whether `event` was one.
+  effect fn desktop(self: &mut Self, tree: &mut UiTree<'_>, event: &Event) -> bool ! TreeError | OutOfMemoryError ? &mut Allocator {
+    self.host.attach(&mut tree)
+    let mut was = false
+    let ran = run Effect.result(deliverShellInto(&mut self.host, &tree.*, event, &mut was)) |> Effect.provideMut<Allocator>(&mut self.allocator)
+    run self.settle(move ran)
+    if was { run self.host.flushRaw(&mut tree) }
+    return was
+  }
+
+  /// Delivers the tree's queued records and reports the listener exceptions. Says whether a
+  /// listener prevented a default.
+  /// Runs the observers after a layout, and applies what their callbacks changed.
+  effect fn observe(self: &mut Self, tree: &mut UiTree<'_>) -> () ! TreeError | OutOfMemoryError ? &mut Allocator {
+    if !self.host.observing() { return () }
+    let ran = run Effect.result(self.host.observe(&mut tree)) |> Effect.provideMut<Allocator>(&mut self.allocator)
+    run self.settle(move ran)
+    run self.host.flushRaw(&mut tree)
+  }
+
+  effect fn handle(self: &mut Self, tree: &mut UiTree<'_>) -> bool ! TreeError | OutOfMemoryError ? &mut Allocator {
+    self.host.attach(&mut tree)
+    let delivered = run Effect.result(self.host.deliverRaw(&mut tree)) |> Effect.provideMut<Allocator>(&mut self.allocator)
+    let mut prevented = false
+    let outcome = match move delivered {
+      Result<bool, OutOfMemoryError | JsError>.Success { value } => {
+        prevented = value
+        run Effect.result(self.host.report()) |> Effect.provideMut<Allocator>(&mut self.allocator)
+      }
+      Result<bool, OutOfMemoryError | JsError>.Failure { error } => Result<(), OutOfMemoryError | JsError>.Failure { error: move error }
+    }
+    run self.settle(move outcome)
+    run self.host.flushRaw(&mut tree)
+    return prevented
+  }
+}
+
+/// What a window adds to an application beyond running it: reloading it when a new build
+/// arrives, taking it from a development server. A production build has none ([`NoTools`]);
+/// `ui-js-window-dev` has the development ones.
+pub interface JsTools {
+  /// Whether the window runs the entry given to [`JsApp.entry`] when it starts. A tool that
+  /// brings the application itself (a development server) says no.
+  fn startsEntry(self: &Self) -> bool { return true }
+  /// The window is open. `platform` wakes the window's loop.
+  effect fn opened<'m>(self: &mut Self, app: &mut JsApp<'m>, platform: &HostPlatform) -> () ! OutOfMemoryError ? &mut Allocator {}
+  /// Called on every turn of the window's loop. Says whether it changed the tree.
+  effect fn poll<'m>(self: &mut Self, app: &mut JsApp<'m>, tree: &mut UiTree<'_>, time: f64) -> bool ! TreeError | OutOfMemoryError ? &mut Allocator { return false }
+  /// How soon the loop should turn again for [`JsTools.poll`], in seconds, or none.
+  fn wakeAfter(self: &Self) -> Option<f64> { return Option<f64>.None }
+  /// Whether the window serves the inspector. When it does not, the window host's
+  /// inspector code is left out of the program.
+  fn servesInspector(self: &Self) -> bool { return false }
+  /// Whether the application waits on something outside the process (a development server's
+  /// modules): see `WindowClient.awaitsOutside`.
+  fn awaitsOutside(self: &Self) -> bool { return false }
+  /// Whether raw entry and module source buffers are kept after startup for reloads.
+  fn keepsSources(self: &Self) -> bool { return false }
+}
+
+/// No tools: the application runs as it was built. What a production build uses.
+pub struct NoTools {}
+
+impl JsTools for NoTools {}
+
+/// The window client of a [`JsApp`], with the tools `T`.
+pub struct JsClient<T> {
+  /// Compiled application stylesheets, installed before each root first paints.
+  pub stylesheets: StyleAssets,
+  pub stylesheetUpdates: SheetWatch,
+  pub tools: T,
+  /// How the window's title bar is drawn. `TitleBar.Transparent` puts the application under
+  /// the bar on macOS, with the window controls over it; other systems keep their bar.
+  pub titleBar: TitleBar,
+  /// With a transparent title bar, the height of the bar the application draws at its top:
+  /// the window controls are centred in it, and a press in it moves the window (a double
+  /// click zooms or minimizes it, as the user's settings say). The application gets no
+  /// pointer events there.
+  pub titleBarHeight: f64,
+  /// With a transparent title bar, the window controls' gaps from the window's left and top
+  /// edges; 0 centres them in the bar (see `WindowOptions.controlsLeft`).
+  pub controlsLeft: f64,
+  pub controlsTop: f64,
+  /// A press in the bar asked for a window drag; `update` starts it.
+  windowDrag: bool,
+  /// Loads the image, icon and `url()` addresses the application names: `data:`, files and
+  /// `http(s):`.
+  pub loader: Loader,
+  /// The `fn.async(...)` calls of exported Silk functions running on threads.
+  jobs: NativeJobs,
+}
+
+impl<T: JsTools> JsClient<T> {
+  pub fn make(tools: T) -> JsClient<T> {
+    return JsClient<T> { tools: move tools, titleBar: TitleBar.Standard, titleBarHeight: 0.0, controlsLeft: 0.0, controlsTop: 0.0, windowDrag: false, stylesheets: StyleAssets.make(), stylesheetUpdates: SheetWatch.make(), loader: Loader.make(), jobs: NativeJobs.make() }
+  }
+}
+
+impl<T: JsTools> JsClient<T> {
+  /// Starts the loads the last batch asked for; what ended is told to the application's
+  /// `load` and `error` listeners at once.
+  effect fn load<'m>(self: &mut Self, state: &mut JsApp<'m>, tree: &mut UiTree<'_>) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    if run self.loader.serve(&mut tree) { drop run state.handle(&mut tree) }
+    drop run state.graphics(&mut tree)
+  }
+}
+
+impl<'m, T: JsTools> WindowClient<JsApp<'m>, never, never> for JsClient<T> {
+  fn needsFrame(self: &Self, state: &JsApp<'m>, tree: &UiTree<'_>) -> bool {
+    // A callback requested by input or a timer must wake an idle window before it
+    // changes the tree. wantsFrames keeps callbacks going once frames are running.
+    return state.host.wantsFrame() || state.host.observersPending() || tree.needsFrame()
+  }
+
+  effect fn layout(self: &mut Self, state: &mut JsApp<'m>, tree: &mut UiTree<'_>, input: FrameInput) -> ()
+    ! TreeError | OutOfMemoryError ? &mut Allocator {
+    let media = tree.mediaState(input)
+    if state.host.mediaChanges(&media) {
+      let told = run Effect.result(state.host.setMedia(media)) |> Effect.provideMut<Allocator>(&mut state.allocator)
+      run state.settle(move told)
+      run state.host.flushRaw(&mut tree)
+    }
+    let root = tree.current
+    drop run self.stylesheets.serve(&mut tree.*, root)
+    run tree.frame(input)
+    if tree.virtualLists.length() != 0 {
+      let result = run Effect.result(state.host.virtualRequests(&tree)) |> Effect.provideMut<Allocator>(&mut state.allocator)
+      run state.settle(move result)
+      run state.host.flushRaw(&mut tree)
+      if tree.needsFrame() { run tree.frame(input) }
+    }
+    run state.observe(&mut tree)
+    run self.load(&mut state, &mut tree)
+    run state.measureWebViews(&tree.*, input.scale)
+  }
+
+  effect fn layoutRoot(self: &mut Self, state: &mut JsApp<'m>, tree: &mut UiTree<'_>, root: u32, input: FrameInput) -> ()
+    ! TreeError | OutOfMemoryError ? &mut Allocator {
+    if (run tree.useRoot(root)) || tree.current == root {
+      run WindowClient<JsApp<'m>, never, never>.layout(&mut self.*, &mut state.*, &mut tree.*, input)
+    }
+  }
+
+  fn configure(self: &Self, state: &JsApp<'m>, options: &mut WindowOptions<'_>) -> () {
+    options.titleBar = self.titleBar
+    options.titleBarHeight = self.titleBarHeight
+    options.controlsLeft = self.controlsLeft
+    options.controlsTop = self.controlsTop
+  }
+
+  effect fn event(self: &mut Self, state: &mut JsApp<'m>, tree: &mut UiTree<'_>, event: &Event) -> bool
+    ! WindowError | TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    if run state.desktop(&mut tree, event) {
+      run self.load(&mut state, &mut tree)
+      return true
+    }
+    // Only macOS draws the application under the bar; elsewhere the system's bar is there.
+    static if Intrinsic.targetOperatingSystem() == "darwin" {
+      if let Event.MouseDown { button, position, .. } = &event.* {
+        if self.titleBar == TitleBar.Transparent && button == MouseButton.Left && tree.dragsWindow(f64.toF32(position.x), f64.toF32(position.y)) {
+          self.windowDrag = true
+          return true
+        }
+      }
+    }
+    return false
+  }
+
+  effect fn update(self: &mut Self, state: &mut JsApp<'m>, tree: &mut UiTree<'_>, platform: &mut HostPlatform, window: WindowId) -> bool
+    ! WindowError | TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    if self.windowDrag {
+      self.windowDrag = false
+      Platform.startWindowDrag(&mut platform.*, window)
+    }
+    let clipboard = run state.clipboard(&mut tree, &mut platform.*)
+    let shell = run state.shell(&mut tree, &mut platform.*, window)
+    let views = run state.webViewTurn(&mut tree, &mut platform.*)
+    let natives = run state.natives(&mut self.jobs, &mut tree)
+    let graphics = run state.graphics(&mut tree)
+    return clipboard || shell || views || natives || graphics
+  }
+
+  effect fn canvases(self: &mut Self, state: &mut JsApp<'m>, presenter: CanvasPresenter) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    state.canvases(move presenter)
+  }
+
+  effect fn start(self: &mut Self, state: &mut JsApp<'m>, tree: &mut UiTree<'_>) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    run self.stylesheets.preload(&mut tree.*)
+    if self.tools.startsEntry() {
+      run state.startEntry(&mut tree)
+      if !self.tools.keepsSources() { state.releaseSources() }
+    }
+    run self.load(&mut state, &mut tree)
+  }
+
+  effect fn opened(self: &mut Self, state: &mut JsApp<'m>, platform: &mut HostPlatform, window: WindowId) -> ()
+    ! WindowError | OutOfMemoryError
+    ? &mut Allocator {
+    state.nudge = Option<Nudge>.some(platform.nudge())
+    run self.tools.opened(&mut state, &platform.*)
+  }
+
+  effect fn poll(self: &mut Self, state: &mut JsApp<'m>, tree: &mut UiTree<'_>, time: f64) -> bool
+    ! WindowError | TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    let styled = run self.stylesheetUpdates.poll(&mut self.stylesheets, &mut tree, time)
+    let polled = run self.tools.poll(&mut state, &mut tree, time)
+    run self.loader.watch(time)
+    let loaded = run self.loader.serve(&mut tree)
+    if loaded { drop run state.handle(&mut tree) }
+    let natives = run state.natives(&mut self.jobs, &mut tree)
+    let graphics = run state.graphics(&mut tree)
+    return styled || polled || loaded || natives || graphics
+  }
+
+  fn wakeAfter(self: &Self, state: &JsApp<'m>) -> Option<f64> {
+    let wanted = self.loader.watchAfter(self.stylesheetUpdates.wakeAfter(self.tools.wakeAfter()))
+    if !self.loader.pending() && !self.jobs.pending() { return wanted }
+    // Collect running loads and Silk calls about once a frame.
+    return match wanted {
+      Option<f64>.Some { value } => Option<f64>.some(f64.min(value, 0.016))
+      Option<f64>.None => Option<f64>.some(0.016)
+    }
+  }
+
+  fn servesInspector(self: &Self) -> bool {
+    return self.tools.servesInspector()
+  }
+
+  fn awaitsOutside(self: &Self, state: &JsApp<'m>) -> bool {
+    return self.tools.awaitsOutside()
+  }
+
+  effect fn pump(self: &mut Self, state: &mut JsApp<'m>, tree: &mut UiTree<'_>) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    drop run state.handle(&mut tree)
+    run self.load(&mut state, &mut tree)
+  }
+
+  effect fn census(self: &mut Self, state: &mut JsApp<'m>, out: &mut Census) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run state.census(&mut out)
+  }
+
+  effect fn decide(self: &mut Self, state: &mut JsApp<'m>, tree: &mut UiTree<'_>) -> bool
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    let prevented = run state.handle(&mut tree)
+    run self.load(&mut state, &mut tree)
+    return prevented
+  }
+
+  fn advance(self: &mut Self, state: &mut JsApp<'m>, time: f64) -> () {
+    state.host.advance(time)
+  }
+
+  effect fn tick(self: &mut Self, state: &mut JsApp<'m>, tree: &mut UiTree<'_>, time: f64, animation: bool) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    state.host.attach(&mut tree)
+    let ran = run Effect.result(state.host.tick(time, animation)) |> Effect.provideMut<Allocator>(&mut state.allocator)
+    run state.settle(move ran)
+    run state.host.flushRaw(&mut tree)
+    run self.load(&mut state, &mut tree)
+  }
+
+  fn nextDeadline(self: &Self, state: &JsApp<'m>) -> Option<f64> {
+    return state.host.nextDeadline()
+  }
+
+  fn quitting(self: &Self, state: &JsApp<'m>) -> bool {
+    return state.quitCode.isSome()
+  }
+
+  fn wantsFrames(self: &Self, state: &JsApp<'m>) -> bool {
+    return state.host.wantsFrame()
+  }
+
+  effect fn presented(self: &mut Self, state: &mut JsApp<'m>, intervals: &[f64], dropped: u64) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run state.host.presented(intervals, dropped) |> Effect.provideMut<Allocator>(&mut state.allocator)
+  }
+
+  effect fn quiet(self: &mut Self, state: &mut JsApp<'m>, tree: &mut UiTree<'_>, shed: bool) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run state.release(shed)
+  }
+}
+
+/// Shows the 2D canvases of `tree` drawn into since the last call through `presenter` (see
+/// `ui_tree_window.canvas_bitmaps`). Says whether it changed the tree.
+pub effect fn presentCanvas2d(presenter: &CanvasPresenter, tree: &mut UiTree<'_>) -> bool ! TreeError | OutOfMemoryError ? &mut Allocator {
+  return run presentCanvasBitmaps(presenter, &mut tree)
+}

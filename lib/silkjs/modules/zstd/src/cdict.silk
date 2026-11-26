@@ -1,0 +1,675 @@
+//! Dictionaries of the compressor: a port of the dictionary half of
+//! `lib/compress/zstd_compress.c` of Zstandard 1.5.7.
+//!
+//! `ZSTD_CCtx_loadDictionary` keeps a copy of the dictionary in the context (`localDictBuffer`).
+//! The first frame after the load builds a `ZSTD_CDict` from it with the parameters requested at
+//! that moment (`ZSTD_initLocalDict`, `ZSTD_createCDict_advanced2` with `ZSTD_cpm_createCDict`),
+//! and every frame then starts from it (`ZSTD_compressBegin_internal`):
+//! - attached (`ZSTD_resetCCtx_byAttachingCDict`): the match state of the CDict becomes the
+//!   `dictMatchState` of the context, and the block compressors search its tables in place;
+//! - copied (`ZSTD_resetCCtx_byCopyingCDict`): its tables are copied into the context, and the
+//!   dictionary becomes the external segment of the window;
+//! - reloaded (`ZSTD_dictForceLoad` only, since a local CDict has no compression level): the
+//!   dictionary is inserted again with the parameters of the frame.
+//!
+//! A CDict is one allocation: its match state ([`MatchState`]), its [`CDictInfo`], its block
+//! state (`cstate.CBS_*`), an entropy workspace and its tables.
+//!
+//! Not ported: `ZSTD_c_enableDedicatedDictSearch` (the CDict is built without it), the overflow
+//! correction of `ZSTD_loadDictionaryContent` (needed only for dictionaries near 3.5 GB),
+//! `ZSTD_dct_rawContent` / `ZSTD_dct_fullDict` (only `ZSTD_dct_auto` is reachable from the API of
+//! the port) and `ZSTD_CCtx_refPrefix`.
+import mem
+import errors
+import cparams
+import cparams { Params, CParams }
+import cstate
+import cstate { MatchState, OptState }
+import cctx
+import cctx { CCtx }
+import entropy
+import fse_compress as fse
+import huf_compress as huf
+import zfast
+import zdfast
+import zlazy
+import zopt
+import zldm
+import silk.mem.pointer { Pointer }
+import silk.mem.layout { Layout }
+import silk.num.u8
+import silk.num.u16
+import silk.num.i32
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+
+/// `ZSTD_MAGIC_DICTIONARY`.
+pub const MAGIC_DICTIONARY: u32 = 0xEC30A437
+/// `ZSTD_SHORT_CACHE_TAG_BITS`.
+pub const SHORT_CACHE_TAG_BITS: u32 = 8
+const SHORT_CACHE_TAG_MASK: u32 = 255
+
+// ---- `ZSTD_dictAttachPref_e`. ----
+pub const DICT_DEFAULT_ATTACH: u32 = 0
+pub const DICT_FORCE_ATTACH: u32 = 1
+pub const DICT_FORCE_COPY: u32 = 2
+pub const DICT_FORCE_LOAD: u32 = 3
+
+/// `ZSTD_USE_CDICT_PARAMS_SRCSIZE_CUTOFF`.
+const USE_CDICT_PARAMS_SRCSIZE_CUTOFF: u64 = 131072
+/// `ZSTD_USE_CDICT_PARAMS_DICTSIZE_MULTIPLIER`.
+const USE_CDICT_PARAMS_DICTSIZE_MULTIPLIER: u64 = 6
+
+/// `attachDictSizeCutoffs`.
+const ATTACH_DICT_SIZE_CUTOFFS: [u64; 10] = [8192, 8192, 16384, 32768, 32768, 32768, 32768, 32768, 8192, 8192]
+
+/// `HUF_WORKSPACE_SIZE`.
+const WKSP_SIZE: usize = 8704
+/// Where the entropy loader keeps a normalized distribution (`short[53]`), after the workspace
+/// that `FSE_buildCTable_wksp` uses (which needs at most 1140 bytes here).
+const WKSP_NORM_AT: usize = 8192
+const WKSP_BUILD_SIZE: usize = 8192
+
+/// The part of a `ZSTD_CDict` that is not its match state.
+pub struct CDictInfo {
+  /// `cBlockState`: a block state (`cstate.CBS_*`).
+  pub cBlockState: [*]mut u8,
+  pub entropyWorkspace: [*]mut u8,
+  pub dictContent: [*]const u8,
+  /// The size of the whole dictionary, its header included (as the reference).
+  pub dictContentSize: usize,
+  pub dictID: u32,
+  pub useRowMatchFinder: u32,
+  /// `ZSTD_NO_CLEVEL` (0) for a CDict made by `ZSTD_createCDict_advanced2`.
+  pub compressionLevel: i32,
+}
+
+fn align64(n: usize) -> usize { return cstate.wsAlign(n, 64) }
+
+fn msBytes() -> usize { return align64(Layout.of<MatchState>().bytes) }
+fn infoBytes() -> usize { return align64(Layout.of<CDictInfo>().bytes) }
+
+/// The match state of the CDict at `p`, as the pointer that a `dictMatchState` holds.
+@inlineAlways
+pub unsafe fn msPtr(p: [*]mut u8) -> *mut MatchState {
+  return unsafe Pointer.atMut<MatchState>(unsafe Intrinsic.pointerReinterpret<[*]mut u8, [*]mut MatchState>(p), 0)
+}
+
+/// Borrows the match state of the CDict at `p`.
+pub unsafe fn msOf<'a>(anchor: &'a mut (), p: [*]mut u8) -> &'a mut MatchState {
+  return unsafe Pointer.borrowMut<(), MatchState>(&mut anchor, unsafe msPtr(p))
+}
+
+/// Borrows the [`CDictInfo`] of the CDict at `p`.
+pub unsafe fn infoOf<'a>(anchor: &'a mut (), p: [*]mut u8) -> &'a mut CDictInfo {
+  let q = unsafe mem.add(p, msBytes())
+  return unsafe Pointer.borrowMut<(), CDictInfo>(&mut anchor, unsafe Pointer.atMut<CDictInfo>(unsafe Intrinsic.pointerReinterpret<[*]mut u8, [*]mut CDictInfo>(q), 0))
+}
+
+// A match state with no table, as `ZSTD_reset_matchState` leaves it before the reservations.
+fn emptyMatchState(placeholder: [*]mut u8, cp: &CParams) -> MatchState {
+  return MatchState {
+    window: cstate.windowInit(),
+    loadedDictEnd: 0,
+    nextToUpdate: 0,
+    hashLog3: 0,
+    rowHashLog: 0,
+    tagTable: mem.nullp(),
+    hashCache: [0; 8],
+    hashSalt: 0,
+    hashSaltEntropy: 0,
+    hashTable: placeholder,
+    hashTable3: placeholder,
+    chainTable: placeholder,
+    forceNonContiguous: false,
+    dedicatedDictSearch: false,
+    opt: OptState {
+      litFreq: mem.nullp(), litLengthFreq: mem.nullp(), matchLengthFreq: mem.nullp(), offCodeFreq: mem.nullp(),
+      matchTable: mem.nullp(), priceTable: mem.nullp(),
+      litSum: 0, litLengthSum: 0, matchLengthSum: 0, offCodeSum: 0,
+      litSumBasePrice: 0, litLengthSumBasePrice: 0, matchLengthSumBasePrice: 0, offCodeSumBasePrice: 0,
+      priceType: 0, symbolCosts: mem.nullp(), literalCompressionMode: 0,
+    },
+    dictMatchState: Pointer.null<MatchState>(),
+    cParams: cp.*,
+    ldmSeqStore: mem.nullp(),
+    prefetchCDictTables: false,
+    lazySkipping: false,
+  }
+}
+
+// ---- Entropy tables (`ZSTD_loadCEntropy`). ----
+
+/// `HUF_readCTable`: reads the description of a Huffman table at `src[0..srcSize]` into `ctable`.
+/// `maxSymbolValue` holds the largest accepted symbol and receives the largest symbol of the
+/// table. Returns the size of the description, or an error.
+pub unsafe fn hufReadCTable(ctable: [*]mut u8, maxSymbolValue: &mut u32, src: [*]const u8, srcSize: usize, hasZeroWeights: &mut bool) -> usize {
+  let mut huffWeight: [u8; 256] = [0; 256]
+  let mut rankVal: [u32; 16] = [0; 16]
+  let mut tableLog: u32 = 0
+  let mut nbSymbols: u32 = 0
+  let readSize = unsafe entropy.readStats(&mut huffWeight, &mut rankVal, &mut nbSymbols, &mut tableLog, src, 0, srcSize)
+  if errors.isError(readSize) { return readSize }
+  hasZeroWeights.* = rankVal[0] > 0
+  if tableLog > huf.TABLELOG_MAX { return errors.err(errors.E_TABLELOG_TOOLARGE) }
+  if nbSymbols > maxSymbolValue.* + 1 { return errors.err(errors.E_MAXSYMBOLVALUE_TOOSMALL) }
+  maxSymbolValue.* = nbSymbols - 1
+  // `HUF_writeCTableHeader`.
+  unsafe mem.w64(ctable, 0, u32.toU64(tableLog & 255) | u64.shiftLeft(u32.toU64(maxSymbolValue.* & 255), 8))
+  // Prepare the base value of each rank.
+  let mut nextRankStart: u32 = 0
+  let mut n: u32 = 1
+  while n <= tableLog {
+    let curr = nextRankStart
+    nextRankStart = mem.a32(nextRankStart, mem.shl32(rankVal[mem.z(n)], n - 1))
+    rankVal[mem.z(n)] = curr
+    n = n + 1
+  }
+  // Fill nbBits.
+  let mut s: u32 = 0
+  while s < nbSymbols {
+    let w = u8.toU32(huffWeight[mem.z(s)])
+    let nbBits: u32 = if w != 0 { (tableLog + 1 - w) & 255 } else { 0 }
+    unsafe mem.w64(ctable, mem.z(s + 1) * 8, u32.toU64(nbBits))
+    s = s + 1
+  }
+  // Fill the values.
+  let mut nbPerRank: [u16; 14] = [0; 14]
+  let mut valPerRank: [u16; 14] = [0; 14]
+  s = 0
+  while s < nbSymbols {
+    let nb = u64.wrappingToU32(unsafe mem.r64(unsafe mem.ro(ctable), mem.z(s + 1) * 8) & 255)
+    nbPerRank[mem.z(nb)] = u16.wrappingAdd(nbPerRank[mem.z(nb)], 1)
+    s = s + 1
+  }
+  valPerRank[mem.z(tableLog + 1)] = 0
+  let mut min: u16 = 0
+  n = tableLog
+  while n > 0 {
+    valPerRank[mem.z(n)] = min
+    min = u16.wrappingAdd(min, nbPerRank[mem.z(n)])
+    min = u16.shiftRight(min, 1)
+    n = n - 1
+  }
+  s = 0
+  while s < nbSymbols {
+    let at = mem.z(s + 1) * 8
+    let e = unsafe mem.r64(unsafe mem.ro(ctable), at)
+    let nb = u64.wrappingToU32(e & 255)
+    let value = valPerRank[mem.z(nb)]
+    valPerRank[mem.z(nb)] = u16.wrappingAdd(value, 1)
+    if nb > 0 { unsafe mem.w64(ctable, at, e | mem.shl64(u16.toU64(value), 64 - nb)) }
+    s = s + 1
+  }
+  return readSize
+}
+
+// `ZSTD_dictNCountRepeat`.
+fn dictNCountRepeat(norm: &[i32; 256], dictMaxSymbolValue: u32, maxSymbolValue: u32) -> u32 {
+  if dictMaxSymbolValue < maxSymbolValue { return cstate.FSE_REPEAT_CHECK }
+  let mut s: u32 = 0
+  while s <= maxSymbolValue {
+    if norm[mem.z(s)] == 0 { return cstate.FSE_REPEAT_CHECK }
+    s = s + 1
+  }
+  return cstate.FSE_REPEAT_VALID
+}
+
+// Reads a distribution and builds the FSE table `ctable` of it. `buildMax` is the largest
+// symbol of the table (the largest symbol read if `u32` max). Returns the size read, or an error.
+unsafe fn loadFseTable(ctable: [*]mut u8, norm: &mut [i32; 256], maxValue: &mut u32, maxLog: u32, buildMax: u32, src: [*]const u8, at: usize, size: usize, wksp: [*]mut u8) -> usize {
+  let mut log: u32 = 0
+  let headerSize = unsafe entropy.readNCount(&mut norm, &mut maxValue, &mut log, src, at, size)
+  if errors.isError(headerSize) { return errors.err(errors.E_DICTIONARY_CORRUPTED) }
+  if log > maxLog { return errors.err(errors.E_DICTIONARY_CORRUPTED) }
+  let bmax = if buildMax == 0xFFFFFFFF { maxValue.* } else { buildMax }
+  let nrm = unsafe mem.add(wksp, WKSP_NORM_AT)
+  let mut s: u32 = 0
+  while s <= bmax {
+    unsafe mem.w16(nrm, mem.z(s) * 2, i32.wrappingToU16(norm[mem.z(s)]))
+    s = s + 1
+  }
+  let e = unsafe fse.buildCTable(ctable, unsafe mem.ro(nrm), bmax, log, wksp, WKSP_BUILD_SIZE)
+  if errors.isError(e) { return errors.err(errors.E_DICTIONARY_CORRUPTED) }
+  return headerSize
+}
+
+/// `ZSTD_loadCEntropy`: loads the entropy tables and the repeat offsets of the dictionary
+/// `dict[0..dictSize]` into the block state `bs`. Returns the size of its header, or an error.
+pub unsafe fn loadCEntropy(bs: [*]mut u8, workspace: [*]mut u8, dict: [*]const u8, dictSize: usize) -> usize {
+  let mut offcodeNCount: [i32; 256] = [0; 256]
+  let mut offcodeMaxValue: u32 = cstate.MAX_OFF
+  let mut pos: usize = 8
+  unsafe mem.w32(bs, cstate.CBS_HUF_REPEAT, huf.REPEAT_CHECK)
+  // The Huffman table.
+  let mut maxSymbolValue: u32 = 255
+  let mut hasZeroWeights = true
+  let hufHeaderSize = unsafe hufReadCTable(unsafe mem.add(bs, cstate.CBS_HUF_CTABLE), &mut maxSymbolValue, unsafe mem.addc(dict, pos), dictSize - pos, &mut hasZeroWeights)
+  // The table is valid only if it has no zero weight.
+  if !hasZeroWeights && maxSymbolValue == 255 { unsafe mem.w32(bs, cstate.CBS_HUF_REPEAT, huf.REPEAT_VALID) }
+  if errors.isError(hufHeaderSize) { return errors.err(errors.E_DICTIONARY_CORRUPTED) }
+  pos = pos + hufHeaderSize
+  // The offset codes: all the symbols are filled, to avoid garbage at the end of the table.
+  let ofSize = unsafe loadFseTable(unsafe mem.add(bs, cstate.CBS_OF_CTABLE), &mut offcodeNCount, &mut offcodeMaxValue, cstate.OFF_FSE_LOG, cstate.MAX_OFF, dict, pos, dictSize - pos, workspace)
+  if errors.isError(ofSize) { return ofSize }
+  pos = pos + ofSize
+  // The match lengths.
+  let mut mlNCount: [i32; 256] = [0; 256]
+  let mut mlMaxValue: u32 = cstate.MAX_ML
+  let mlSize = unsafe loadFseTable(unsafe mem.add(bs, cstate.CBS_ML_CTABLE), &mut mlNCount, &mut mlMaxValue, cstate.ML_FSE_LOG, 0xFFFFFFFF, dict, pos, dictSize - pos, workspace)
+  if errors.isError(mlSize) { return mlSize }
+  unsafe mem.w32(bs, cstate.CBS_ML_REPEAT, dictNCountRepeat(&mlNCount, mlMaxValue, cstate.MAX_ML))
+  pos = pos + mlSize
+  // The literal lengths.
+  let mut llNCount: [i32; 256] = [0; 256]
+  let mut llMaxValue: u32 = cstate.MAX_LL
+  let llSize = unsafe loadFseTable(unsafe mem.add(bs, cstate.CBS_LL_CTABLE), &mut llNCount, &mut llMaxValue, cstate.LL_FSE_LOG, 0xFFFFFFFF, dict, pos, dictSize - pos, workspace)
+  if errors.isError(llSize) { return llSize }
+  unsafe mem.w32(bs, cstate.CBS_LL_REPEAT, dictNCountRepeat(&llNCount, llMaxValue, cstate.MAX_LL))
+  pos = pos + llSize
+  // The repeat offsets.
+  if pos + 12 > dictSize { return errors.err(errors.E_DICTIONARY_CORRUPTED) }
+  let rep0 = unsafe mem.r32(dict, pos)
+  let rep1 = unsafe mem.r32(dict, pos + 4)
+  let rep2 = unsafe mem.r32(dict, pos + 8)
+  unsafe mem.w32(bs, cstate.CBS_REP, rep0)
+  unsafe mem.w32(bs, cstate.CBS_REP + 4, rep1)
+  unsafe mem.w32(bs, cstate.CBS_REP + 8, rep2)
+  pos = pos + 12
+  let dictContentSize = dictSize - pos
+  let mut offcodeMax: u32 = cstate.MAX_OFF
+  if usize.toU64(dictContentSize) <= 0xFFFFFFFF - 131072 {
+    // The largest offset that must be supported.
+    let maxOffset = mem.a32(mem.t32(dictContentSize), 131072)
+    offcodeMax = mem.highbit32(maxOffset)
+  }
+  // Every offset up to dictContentSize + 128 KB must be representable for a valid table.
+  let ofLimit = if offcodeMax < cstate.MAX_OFF { offcodeMax } else { cstate.MAX_OFF }
+  unsafe mem.w32(bs, cstate.CBS_OF_REPEAT, dictNCountRepeat(&offcodeNCount, offcodeMaxValue, ofLimit))
+  // Every repeat offset must be in the content, and not 0.
+  let reps: [u32; 3] = [rep0, rep1, rep2]
+  let mut u: usize = 0
+  while u < 3 {
+    if reps[u] == 0 { return errors.err(errors.E_DICTIONARY_CORRUPTED) }
+    if mem.z(reps[u]) > dictContentSize { return errors.err(errors.E_DICTIONARY_CORRUPTED) }
+    u = u + 1
+  }
+  return pos
+}
+
+// ---- Content (`ZSTD_loadDictionaryContent`). ----
+
+/// `ZSTD_CDictIndicesAreTagged`.
+pub fn indicesAreTagged(cp: &CParams) -> bool { return cp.strategy == cparams.FAST || cp.strategy == cparams.DFAST }
+
+// `ZSTD_writeTaggedIndex`.
+@inlineAlways
+unsafe fn writeTaggedIndex(table: [*]mut u8, hashAndTag: usize, index: u32) -> () {
+  let hash = usize.shiftRight(hashAndTag, 8)
+  let tag = mem.t32(hashAndTag) & SHORT_CACHE_TAG_MASK
+  unsafe cstate.tset(table, hash, mem.shl32(index, SHORT_CACHE_TAG_BITS) | tag)
+}
+
+// `ZSTD_fillHashTableForCDict`.
+unsafe fn fillHashTableForCDict(ms: &mut MatchState, end: usize, dtlm: u32) -> () {
+  let hashTable = ms.hashTable
+  let hBits = ms.cParams.hashLog + SHORT_CACHE_TAG_BITS
+  let mls = ms.cParams.minMatch
+  let base = ms.window.base
+  let mut ip = mem.z(ms.nextToUpdate)
+  let iend = mem.us(end, cstate.HASH_READ_SIZE)
+  while mem.ua(ip, 3) < mem.ua(iend, 2) {
+    let curr = mem.t32(ip)
+    unsafe writeTaggedIndex(hashTable, unsafe cstate.hashPtr(base, ip, hBits, mls), curr)
+    if dtlm != zfast.DTLM_FAST {
+      let mut p: u32 = 1
+      while p < 3 {
+        let hashAndTag = unsafe cstate.hashPtr(base, mem.ua(ip, mem.z(p)), hBits, mls)
+        if unsafe cstate.tget(hashTable, usize.shiftRight(hashAndTag, 8)) == 0 { unsafe writeTaggedIndex(hashTable, hashAndTag, mem.a32(curr, p)) }
+        p = p + 1
+      }
+    }
+    ip = mem.ua(ip, 3)
+  }
+}
+
+// `ZSTD_fillDoubleHashTableForCDict`.
+unsafe fn fillDoubleHashTableForCDict(ms: &mut MatchState, end: usize, dtlm: u32) -> () {
+  let hashLarge = ms.hashTable
+  let hBitsL = ms.cParams.hashLog + SHORT_CACHE_TAG_BITS
+  let mls = ms.cParams.minMatch
+  let hashSmall = ms.chainTable
+  let hBitsS = ms.cParams.chainLog + SHORT_CACHE_TAG_BITS
+  let base = ms.window.base
+  let mut ip = mem.z(ms.nextToUpdate)
+  let iend = mem.us(end, cstate.HASH_READ_SIZE)
+  while mem.ua(ip, 2) <= iend {
+    let curr = mem.t32(ip)
+    let mut i: u32 = 0
+    while i < 3 {
+      let smHashAndTag = unsafe cstate.hashPtr(base, mem.ua(ip, mem.z(i)), hBitsS, mls)
+      let lgHashAndTag = unsafe cstate.hashPtr(base, mem.ua(ip, mem.z(i)), hBitsL, 8)
+      if i == 0 { unsafe writeTaggedIndex(hashSmall, smHashAndTag, mem.a32(curr, i)) }
+      if i == 0 || unsafe cstate.tget(hashLarge, usize.shiftRight(lgHashAndTag, 8)) == 0 { unsafe writeTaggedIndex(hashLarge, lgHashAndTag, mem.a32(curr, i)) }
+      if dtlm == zfast.DTLM_FAST { break }
+      i = i + 1
+    }
+    ip = mem.ua(ip, 3)
+  }
+}
+
+/// `ZSTD_loadDictionaryContent` without the long distance matcher (the caller loads it): adds
+/// `src[0..srcSize]` to the window of `ms` and inserts it into its tables. `forCDict` is
+/// `ZSTD_tfp_forCDict`; `dtlm` is `zfast.DTLM_*`.
+pub unsafe fn loadDictionaryContent(ms: &mut MatchState, params: &Params, src0: [*]const u8, srcSize0: usize, dtlm: u32, forCDict: bool) -> usize {
+  let mut src = src0
+  let mut srcSize = srcSize0
+  let iendP = unsafe mem.addc(src0, srcSize0)
+  // Ensure that large dictionaries cannot make the indices overflow.
+  let mut maxDictSize: usize = mem.z(cstate.CURRENT_MAX - cstate.WINDOW_START_INDEX)
+  if indicesAreTagged(&params.cParams) && forCDict {
+    // The short cache keeps a tag in the low bits of each entry: the indices must fit the rest.
+    let shortCacheMaxDictSize: usize = mem.z(mem.shl32(1, 32 - SHORT_CACHE_TAG_BITS) - cstate.WINDOW_START_INDEX)
+    if shortCacheMaxDictSize < maxDictSize { maxDictSize = shortCacheMaxDictSize }
+  }
+  // If the dictionary is too large, only load its suffix.
+  if srcSize > maxDictSize {
+    src = unsafe mem.subc(iendP, maxDictSize)
+    srcSize = maxDictSize
+  }
+  let _w = cstate.windowUpdate(&mut ms.window, src, srcSize, false)
+  // If the dictionary is larger than the tables can reasonably index, only insert its suffix.
+  let cp = params.cParams
+  let a = cp.hashLog + 3
+  let b = cp.chainLog + 1
+  let mut lg = if a > b { a } else { b }
+  if lg > 31 { lg = 31 }
+  let maxTableDictSize = mem.z(mem.shl32(1, lg))
+  if srcSize > maxTableDictSize {
+    src = unsafe mem.subc(iendP, maxTableDictSize)
+    srcSize = maxTableDictSize
+  }
+  let base = ms.window.base
+  let ipIdx = mem.us(mem.addr(src), mem.addr(base))
+  let iendIdx = mem.us(mem.addr(iendP), mem.addr(base))
+  ms.nextToUpdate = mem.t32(ipIdx)
+  ms.loadedDictEnd = if params.forceWindow != 0 { 0 } else { mem.t32(iendIdx) }
+  ms.forceNonContiguous = params.deterministicRefPrefix != 0
+  if srcSize <= cstate.HASH_READ_SIZE { return 0 }
+  let strategy = cp.strategy
+  if strategy == cparams.FAST {
+    if forCDict { unsafe fillHashTableForCDict(&mut ms, iendIdx, dtlm) } else { unsafe zfast.fillHashTable(&mut ms, iendP, dtlm) }
+  } else if strategy == cparams.DFAST {
+    if forCDict { unsafe fillDoubleHashTableForCDict(&mut ms, iendIdx, dtlm) } else { unsafe zdfast.fillDoubleHashTable(&mut ms, iendP, dtlm) }
+  } else if strategy <= cparams.LAZY2 {
+    // (`dedicatedDictSearch` is not ported: it is never on here.)
+    if params.useRowMatchFinder == cparams.PS_ENABLE {
+      unsafe mem.fillBytes(unsafe mem.nn(ms.tagTable), 0, mem.shlz(1, cp.hashLog))
+      unsafe zlazy.rowUpdate(&mut ms, unsafe mem.subc(iendP, cstate.HASH_READ_SIZE))
+    } else {
+      let _f = unsafe zlazy.insertAndFindFirstIndexOf(&mut ms, unsafe mem.subc(iendP, cstate.HASH_READ_SIZE))
+    }
+  } else {
+    // btlazy2 and above: the dictionary is fully sorted into the tree.
+    unsafe zopt.updateTree(&mut ms, mem.us(iendIdx, cstate.HASH_READ_SIZE), iendIdx)
+  }
+  ms.nextToUpdate = mem.t32(iendIdx)
+  return 0
+}
+
+/// `ZSTD_compress_insertDictionary` with `ZSTD_dct_auto`, without the long distance matcher:
+/// returns the dictionary ID, or an error. `contentAt` receives where the content starts: 0 for a
+/// raw content dictionary, `dictSize` if nothing was loaded.
+unsafe fn insertDictionary(bs: [*]mut u8, ms: &mut MatchState, params: &Params, dict: [*]const u8, dictSize: usize, dtlm: u32, forCDict: bool, workspace: [*]mut u8, contentAt: &mut usize) -> usize {
+  contentAt.* = dictSize
+  if dictSize < 8 { return 0 }
+  unsafe cstate.resetCompressedBlockState(bs)
+  if unsafe mem.r32(dict, 0) != MAGIC_DICTIONARY {
+    // A raw content dictionary.
+    contentAt.* = 0
+    return unsafe loadDictionaryContent(&mut ms, &params, dict, dictSize, dtlm, forCDict)
+  }
+  // `ZSTD_loadZstdDictionary`.
+  let dictID: usize = if params.noDictIDFlag != 0 { 0 } else { mem.z(unsafe mem.r32(dict, 4)) }
+  let eSize = unsafe loadCEntropy(bs, workspace, dict, dictSize)
+  if errors.isError(eSize) { return eSize }
+  contentAt.* = eSize
+  let e = unsafe loadDictionaryContent(&mut ms, &params, unsafe mem.addc(dict, eSize), dictSize - eSize, dtlm, forCDict)
+  if errors.isError(e) { return e }
+  return dictID
+}
+
+// ---- The CDict (`ZSTD_createCDict_advanced2`, `ZSTD_initCDict_internal`). ----
+
+/// Builds the CDict of `dict[0..dictSize]` (which it references, and which must outlive it) with
+/// the parameters `requested`. Returns it, or null if the dictionary is corrupted.
+pub unsafe fn create(dict: [*]const u8, dictSize: usize, requested: &Params) -> ?[*]mut u8 {
+  let mut p = requested.*
+  let cp = cparams.getCParamsFromCCtxParams(&p, cparams.CONTENTSIZE_UNKNOWN, dictSize, cparams.CPM_CREATE_CDICT)
+  // (`ZSTD_dedicatedDictSearch_isSupported` only matters with `enableDedicatedDictSearch`.)
+  p.cParams = cp
+  p.useRowMatchFinder = cparams.resolveRowMatchFinderMode(p.useRowMatchFinder, &cp)
+  let rowUsed = cparams.rowMatchFinderUsed(cp.strategy, p.useRowMatchFinder)
+  let chainSize: usize = if cparams.allocateChainTable(cp.strategy, p.useRowMatchFinder, false) { mem.shlz(1, cp.chainLog) } else { 0 }
+  let hSize = mem.shlz(1, cp.hashLog)
+  let tagSize: usize = if rowUsed { hSize } else { 0 }
+  let atCbs = msBytes() + infoBytes()
+  let atWksp = atCbs + cstate.CBS_SIZE
+  let atHash = atWksp + align64(WKSP_SIZE + 128)
+  let atChain = atHash + align64(hSize * 4)
+  let atTag = atChain + align64(chainSize * 4)
+  let total = atTag + align64(tagSize) + 64
+  let raw = unsafe mem.calloc(1, total)
+  if Pointer.isNullMany<u8>(raw) { return raw }
+  let base = unsafe mem.nn(raw)
+  let hashTable = unsafe mem.add(base, atHash)
+  let mut ms0 = emptyMatchState(hashTable, &cp)
+  ms0.hashTable = hashTable
+  ms0.chainTable = unsafe mem.add(base, atChain)
+  ms0.hashTable3 = unsafe mem.add(base, atChain)
+  // `ZSTD_invalidateMatchState`.
+  cstate.windowClear(&mut ms0.window)
+  ms0.nextToUpdate = ms0.window.dictLimit
+  if rowUsed {
+    ms0.tagTable = unsafe mem.add(base, atTag)
+    ms0.hashSalt = 0
+    let mut rowLog = cp.searchLog
+    if rowLog > 6 { rowLog = 6 }
+    if rowLog < 4 { rowLog = 4 }
+    ms0.rowHashLog = cp.hashLog - rowLog
+  }
+  unsafe Pointer.put<MatchState>(unsafe msPtr(base), move ms0)
+  let cbs = unsafe mem.add(base, atCbs)
+  let wksp = unsafe mem.add(base, atWksp)
+  let infoSlot = unsafe Pointer.atMut<CDictInfo>(unsafe Intrinsic.pointerReinterpret<[*]mut u8, [*]mut CDictInfo>(unsafe mem.add(base, msBytes())), 0)
+  unsafe Pointer.put<CDictInfo>(infoSlot, CDictInfo {
+    cBlockState: cbs, entropyWorkspace: wksp, dictContent: dict, dictContentSize: dictSize,
+    dictID: 0, useRowMatchFinder: p.useRowMatchFinder, compressionLevel: 0,
+  })
+  unsafe cstate.resetCompressedBlockState(cbs)
+  // Load the dictionary (skipped below 8 bytes).
+  p.compressionLevel = cparams.CLEVEL_DEFAULT
+  p.contentSizeFlag = 1
+  let mut anchor = ()
+  let ms = unsafe msOf(&mut anchor, base)
+  let mut contentAt: usize = 0
+  let dictID = unsafe insertDictionary(cbs, &mut ms, &p, dict, dictSize, zfast.DTLM_FULL, true, wksp, &mut contentAt)
+  if errors.isError(dictID) {
+    unsafe mem.free(raw)
+    return mem.nullp()
+  }
+  let mut anchor2 = ()
+  let info = unsafe infoOf(&mut anchor2, base)
+  info.dictID = mem.t32(dictID)
+  return raw
+}
+
+/// `ZSTD_initLocalDict`: builds the CDict of the dictionary of the context, if there is one and
+/// it is not built yet, with the parameters requested now.
+pub unsafe fn initLocalDict(c: &mut CCtx) -> usize {
+  if Pointer.isNullMany<u8>(c.localDictBuffer) { return 0 }
+  if !Pointer.isNullMany<u8>(c.localCDict) { return 0 }
+  let requested = c.requestedParams
+  let made = unsafe create(unsafe mem.ro(unsafe mem.nn(c.localDictBuffer)), c.localDictSize, &requested)
+  // The reference reports any failure of `ZSTD_createCDict_advanced2` as an allocation error.
+  if Pointer.isNullMany<u8>(made) { return errors.err(errors.E_MEMORY_ALLOCATION) }
+  c.localCDict = made
+  return 0
+}
+
+// `ZSTD_shouldAttachDict`.
+fn shouldAttachDict(cdictStrategy: u32, p: &Params, pledgedSrcSize: u64) -> bool {
+  let cutoff = ATTACH_DICT_SIZE_CUTOFFS[mem.z(cdictStrategy)]
+  return (pledgedSrcSize <= cutoff || pledgedSrcSize == cparams.CONTENTSIZE_UNKNOWN || p.attachDictPref == DICT_FORCE_ATTACH)
+    && p.attachDictPref != DICT_FORCE_COPY && p.forceWindow == 0
+}
+
+/// The compression parameters of a frame of `pledgedSrcSize` bytes (`ZSTD_getCParamMode` and
+/// `ZSTD_getCParamsFromCCtxParams` of `ZSTD_CCtx_init_compressStream2`). `prefixDictSize` is
+/// the size of a prefix, when the context has one instead of a dictionary.
+pub unsafe fn frameCParams(c: &CCtx, params: &Params, pledgedSrcSize: u64, prefixDictSize: usize) -> CParams {
+  if Pointer.isNullMany<u8>(c.localCDict) || prefixDictSize != 0 {
+    return cparams.getCParamsFromCCtxParams(&params, pledgedSrcSize, prefixDictSize, cparams.CPM_NO_ATTACH_DICT)
+  }
+  let cd = unsafe mem.nn(c.localCDict)
+  let mut a1 = ()
+  let dms = unsafe msOf(&mut a1, cd)
+  let mut a2 = ()
+  let info = unsafe infoOf(&mut a2, cd)
+  let mode = if shouldAttachDict(dms.cParams.strategy, &params, pledgedSrcSize) { cparams.CPM_ATTACH_DICT } else { cparams.CPM_NO_ATTACH_DICT }
+  return cparams.getCParamsFromCCtxParams(&params, pledgedSrcSize, info.dictContentSize, mode)
+}
+
+// `ZSTD_copyCDictTableIntoCCtx`.
+unsafe fn copyTable(dst: [*]mut u8, src: [*]mut u8, tableSize: usize, tagged: bool) -> () {
+  if tagged {
+    let mut i: usize = 0
+    while i < tableSize {
+      unsafe cstate.tset(dst, i, mem.shr32(unsafe cstate.tget(src, i), SHORT_CACHE_TAG_BITS))
+      i = i + 1
+    }
+  } else {
+    unsafe mem.copyBytes(dst, unsafe mem.ro(src), tableSize * 4)
+  }
+}
+
+// `ZSTD_resetCCtx_byAttachingCDict`.
+unsafe fn resetByAttaching(c: &mut CCtx, cd: [*]mut u8, params0: &Params, pledgedSrcSize: u64) -> usize {
+  let mut anchor1 = ()
+  let dms = unsafe msOf(&mut anchor1, cd)
+  let mut anchor2 = ()
+  let info = unsafe infoOf(&mut anchor2, cd)
+  let mut params = params0.*
+  let windowLog = params.cParams.windowLog
+  // Resize the tables of the context for the input only: the dictionary has its own.
+  params.cParams = cparams.adjustCParams(dms.cParams, pledgedSrcSize, info.dictContentSize, cparams.CPM_ATTACH_DICT, params.useRowMatchFinder)
+  params.cParams.windowLog = windowLog
+  params.useRowMatchFinder = info.useRowMatchFinder
+  let e = unsafe cctx.resetInternal(&mut c, &params, pledgedSrcSize, 0, true, true)
+  if errors.isError(e) { return e }
+  let cdictEnd = mem.t32(mem.us(mem.addr(dms.window.nextSrc), mem.addr(dms.window.base)))
+  let cdictLen = mem.s32(cdictEnd, dms.window.dictLimit)
+  if cdictLen != 0 {
+    c.matchState.dictMatchState = unsafe msPtr(cd)
+    // Dictionary matches must never have negative indices once translated to the context.
+    if c.matchState.window.dictLimit < cdictEnd {
+      c.matchState.window.nextSrc = unsafe mem.addc(c.matchState.window.base, mem.z(cdictEnd))
+      cstate.windowClear(&mut c.matchState.window)
+    }
+    // `loadedDictEnd` is in the indices of the context.
+    c.matchState.loadedDictEnd = c.matchState.window.dictLimit
+  }
+  c.dictID = info.dictID
+  c.dictContentSize = info.dictContentSize
+  unsafe mem.copyBytes(c.prevCBlock, unsafe mem.ro(info.cBlockState), cstate.CBS_SIZE)
+  return 0
+}
+
+// `ZSTD_resetCCtx_byCopyingCDict`.
+unsafe fn resetByCopying(c: &mut CCtx, cd: [*]mut u8, params0: &Params, pledgedSrcSize: u64) -> usize {
+  let mut anchor1 = ()
+  let dms = unsafe msOf(&mut anchor1, cd)
+  let mut anchor2 = ()
+  let info = unsafe infoOf(&mut anchor2, cd)
+  let cdcp = dms.cParams
+  let mut params = params0.*
+  let windowLog = params.cParams.windowLog
+  // Copy only the parameters of the tables.
+  params.cParams = cdcp
+  params.cParams.windowLog = windowLog
+  params.useRowMatchFinder = info.useRowMatchFinder
+  let e = unsafe cctx.resetInternal(&mut c, &params, pledgedSrcSize, 0, false, true)
+  if errors.isError(e) { return e }
+  cstate.wsMarkTablesDirty(&mut c.workspace)
+  let tagged = indicesAreTagged(&cdcp)
+  let chainSize: usize = if cparams.allocateChainTable(cdcp.strategy, info.useRowMatchFinder, false) { mem.shlz(1, cdcp.chainLog) } else { 0 }
+  let hSize = mem.shlz(1, cdcp.hashLog)
+  unsafe copyTable(c.matchState.hashTable, dms.hashTable, hSize, tagged)
+  // The chain table is copied only if the context uses one.
+  if cparams.allocateChainTable(c.appliedParams.cParams.strategy, c.appliedParams.useRowMatchFinder, false) {
+    unsafe copyTable(c.matchState.chainTable, dms.chainTable, chainSize, tagged)
+  }
+  if cparams.rowMatchFinderUsed(cdcp.strategy, info.useRowMatchFinder) {
+    unsafe mem.copyBytes(unsafe mem.nn(c.matchState.tagTable), unsafe mem.ro(unsafe mem.nn(dms.tagTable)), hSize)
+    c.matchState.hashSalt = dms.hashSalt
+  }
+  // Zero `hashTable3`: the CDict never fills it.
+  let h3log = c.matchState.hashLog3
+  if h3log != 0 { unsafe mem.fillBytes(c.matchState.hashTable3, 0, mem.shlz(1, h3log) * 4) }
+  cstate.wsMarkTablesClean(&mut c.workspace)
+  // Copy the offsets of the dictionary.
+  c.matchState.window = dms.window
+  c.matchState.nextToUpdate = dms.nextToUpdate
+  c.matchState.loadedDictEnd = dms.loadedDictEnd
+  c.dictID = info.dictID
+  c.dictContentSize = info.dictContentSize
+  unsafe mem.copyBytes(c.prevCBlock, unsafe mem.ro(info.cBlockState), cstate.CBS_SIZE)
+  return 0
+}
+
+/// `ZSTD_compressBegin_internal` with the CDict of the context, or without a dictionary:
+/// prepares the context for a frame with `params` (fully resolved) and the dictionary.
+pub unsafe fn compressBegin(c: &mut CCtx, params: &Params, pledgedSrcSize: u64) -> usize {
+  if Pointer.isNullMany<u8>(c.localCDict) {
+    return unsafe cctx.resetInternal(&mut c, &params, pledgedSrcSize, 0, true, true)
+  }
+  let cd = unsafe mem.nn(c.localCDict)
+  let mut anchor1 = ()
+  let dms = unsafe msOf(&mut anchor1, cd)
+  let mut anchor2 = ()
+  let info = unsafe infoOf(&mut anchor2, cd)
+  let dictContentSize = info.dictContentSize
+  let size64 = usize.toU64(dictContentSize)
+  if dictContentSize > 0
+    && (pledgedSrcSize < USE_CDICT_PARAMS_SRCSIZE_CUTOFF || pledgedSrcSize < u64.wrappingMultiply(size64, USE_CDICT_PARAMS_DICTSIZE_MULTIPLIER)
+      || pledgedSrcSize == cparams.CONTENTSIZE_UNKNOWN || info.compressionLevel == 0)
+    && params.attachDictPref != DICT_FORCE_LOAD {
+    // `ZSTD_resetCCtx_usingCDict`.
+    if shouldAttachDict(dms.cParams.strategy, &params, pledgedSrcSize) { return unsafe resetByAttaching(&mut c, cd, &params, pledgedSrcSize) }
+    return unsafe resetByCopying(&mut c, cd, &params, pledgedSrcSize)
+  }
+  // Reload the dictionary with the parameters of the frame.
+  let e = unsafe cctx.resetInternal(&mut c, &params, pledgedSrcSize, dictContentSize, true, true)
+  if errors.isError(e) { return e }
+  let applied = c.appliedParams
+  let dict = info.dictContent
+  let mut contentAt: usize = 0
+  let dictID = unsafe insertDictionary(c.prevCBlock, &mut c.matchState, &applied, dict, dictContentSize, zfast.DTLM_FAST, false, c.tmpWorkspace, &mut contentAt)
+  if errors.isError(dictID) { return dictID }
+  if contentAt == 0 && applied.ldmParams.enableLdm == cparams.PS_ENABLE {
+    // Load the entire content into the long distance matcher: only for a raw content dictionary
+    // (`ZSTD_loadZstdDictionary` passes no `ldmState`).
+    let content = unsafe mem.addc(dict, contentAt)
+    let contentSize = dictContentSize - contentAt
+    let _w = cstate.windowUpdate(&mut c.ldmState.window, content, contentSize, false)
+    let iendIdx = mem.us(mem.ua(mem.addr(content), contentSize), mem.addr(c.ldmState.window.base))
+    c.ldmState.loadedDictEnd = if applied.forceWindow != 0 { 0 } else { mem.t32(iendIdx) }
+    let ldmParams = applied.ldmParams
+    let startIdx = mem.us(mem.addr(content), mem.addr(c.ldmState.window.base))
+    unsafe zldm.fillHashTable(&mut c.ldmState, startIdx, iendIdx, &ldmParams)
+  }
+  c.dictID = mem.t32(dictID)
+  c.dictContentSize = dictContentSize
+  return 0
+}

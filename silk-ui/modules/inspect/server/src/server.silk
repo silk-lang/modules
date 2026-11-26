@@ -1,0 +1,1236 @@
+//! The inspector server: the protocol over a local socket, polled from the app's frame loop.
+//!
+//! Off unless the build is a debug build (`optimization = "none"`) and `SILK_UI_INSPECT` is
+//! set. The variable names where to listen:
+//!
+//! - `1` (or empty): the Unix socket `silk-ui-inspect.sock` in the working directory (TCP port
+//!   7357 on Windows, which has no Unix sockets here)
+//! - `tcp:<port>`: TCP on 127.0.0.1 (`tcp:0` lets the system choose; the port is printed)
+//! - anything else: the path of a Unix socket
+//!
+//! The server never blocks the frame loop. A thread accepts connections, and each connection
+//! gets a pump (see `channel.bridge`) that queues its lines for the UI thread and writes what
+//! the UI thread sends; `poll` serves the lines that are already there, one per call, through
+//! a [`Session`]. Give the inspector a [`Wake`] (`wakeWith`) and an arriving line wakes the
+//! app's loop; without one, the loop wakes every 20 ms to look (`pollInterval`).
+//!
+//! A connection whose first line is `hello` with `"protocol": 3` stays open; any other gets one
+//! reply and is closed, as in protocol 2.
+//!
+//! A client in the same process, such as devtools drawn in the app's own tree, needs no socket:
+//! [`Inspector.openLocal`] gives it the other end of a [`MemoryChannel`] session, served on the
+//! spot by [`Inspector.serveLocal`]. The inspector is on while such a session is open, socket or
+//! not, and that client's roots can be left out of everything it serves ([`Inspector.hide`]).
+//!
+//! A framework extends the inspector with [`Inspector.extend`] and serves its extension from the
+//! app's loop with [`Inspector.serveExtension`] (see `extension.silk`).
+import protocol { Protocol }
+import devtools
+import timeline { Interaction, Startup }
+import channel { Channel, MemoryChannel, MemoryPair, Wake, NoWake }
+import session { Session }
+import extension { Extension, ExtensionHandler, Outgoing }
+import ui_tree.input { Input }
+import ui_tree.engine { UiTree }
+import ui_scene.scene { Scene }
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.concurrency.sync { Arc, Mutex }
+import silk.concurrency.thread { Transferable }
+import silk.concurrency.thread_native { JoinHandle, NativeThread, SpawnError }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.ownership { Drop }
+import silk.core.result { Result }
+import silk.io.writer { Writer }
+
+static if Intrinsic.targetArchitecture() != "wasm32" {
+  import silk.io.writer_native { StderrWriter }
+  import channel { bridge }
+}
+
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.net.address { Endpoint, IpAddress, Ipv4Address, Port }
+import silk.net.socket_native {
+  BoundAddress,
+  ConnectOptions,
+  Connection,
+  ListenOptions,
+  NativeSocketError,
+  accept,
+  connectUnixOwned,
+  listen,
+  listenUnix
+}
+
+static if Intrinsic.targetArchitecture() == "wasm32" {
+  // The browser has no sockets, and dropping std's socket types does not compile there, so the
+  // inspector holds these stand-ins and is always off.
+  struct Listener {}
+
+  impl Listener {
+    effect fn close(self: &mut Self) -> () ! NativeSocketError {}
+  }
+
+  struct Accepted {}
+} else {
+  import silk.net.socket_native { Accepted, Listener }
+}
+
+import silk.num.u16
+import silk.num.u64
+import silk.num.usize
+import silk.system.filesystem { FileError }
+import silk.system.host_input { HostInput, HostInputError }
+import silk.system.monotonic_clock { MonotonicClock }
+import silk.system.monotonic_clock_native { OsMonotonicClock }
+import silk.time.mark { Mark }
+import silk.text.format { Format, ParseError }
+import silk.text.string { String, InvalidUtf8 }
+import silk.mem.pointer { Pointer }
+import ui_tree.inspect { writeInt }
+
+/// The environment variable that turns the inspector on.
+pub const VARIABLE: string = "SILK_UI_INSPECT"
+
+/// The Unix socket `1` stands for.
+pub const DEFAULT_PATH: string = "silk-ui-inspect.sock"
+
+/// The TCP port `1` stands for where Unix sockets are not available.
+pub const DEFAULT_PORT: u16 = 7357
+
+/// The longest request line the server reads.
+pub const MAX_REQUEST: usize = 1048576
+
+/// How long the accept thread waits for a client before it looks whether to stop, in
+/// nanoseconds.
+const ACCEPT_PAUSE: u64 = 200000000
+
+/// How many highlight requests one poll serves before the app gets its frame.
+const FOLD_LIMIT: usize = 256
+
+/// Where the inspector listens.
+pub union Address {
+  Unix { pub path: String },
+  Tcp { pub port: u16 },
+}
+
+/// Reads an address in the syntax of `SILK_UI_INSPECT` (see the module docs). None when a
+/// `tcp:` port is not a number.
+pub effect fn parseAddress(value: string) -> Option<Address>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if value == "" || value == "1" {
+    static if Intrinsic.targetOperatingSystem() == "windows" {
+      return Option<Address>.Some { value: Address.Tcp { port: DEFAULT_PORT } }
+    } else {
+      return Option<Address>.Some { value: Address.Unix { path: run String.copy(DEFAULT_PATH) } }
+    }
+  }
+  if String.startsWith(value, "tcp:") {
+    let digits = String.slice(value, 4, String.byteLength(value) - 4)
+    return match move Format.u16Value(digits) {
+      Result<u16, ParseError>.Success { value: port } => Option<Address>.Some {
+        value: Address.Tcp { port: port },
+      }
+      Result<u16, ParseError>.Failure { error: _ } => Option<Address>.None
+    }
+  }
+  return Option<Address>.Some { value: Address.Unix { path: run String.copy(value) } }
+}
+
+/// `address` with a relative Unix socket path made absolute against `cwd` (the kernel only
+/// binds absolute paths here).
+pub effect fn resolved(address: Address, cwd: &[u8]) -> Address
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  return match move address {
+    Address.Unix { path } => {
+      if String.startsWith(String.view(&path), "/") || cwd.length == 0 {
+        return Address.Unix { path: move path }
+      }
+      let mut full = run String.copy(unsafe String.fromUtf8Unchecked(cwd))
+      if !String.endsWith(String.view(&full), "/") {
+        run full.append("/")
+      }
+      run full.append(String.view(&path))
+      return Address.Unix { path: move full }
+    }
+    Address.Tcp { port } => Address.Tcp { port: port }
+  }
+}
+
+/// Appends `unix:<path>` or `tcp:127.0.0.1:<port>`.
+pub effect fn describeAddress(address: &Address, out: &mut String) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  match &address.* {
+    Address.Unix { path } => {
+      run out.append("unix:")
+      run out.append(String.view(&path))
+    }
+    Address.Tcp { port } => {
+      run out.append("tcp:127.0.0.1:")
+      run writeInt(&mut out, u16.toU64(port))
+    }
+  }
+}
+
+/// How the app opts in.
+pub struct InspectorOptions {
+  /// Also start in optimized builds (the environment variable is still needed). For CI jobs
+  /// that test the inspector against a release build; apps should leave it off.
+  pub releaseBuilds: bool,
+  /// Print the address (or why the server did not start) to stderr.
+  pub announce: bool,
+}
+
+impl InspectorOptions {
+  pub fn make() -> InspectorOptions {
+    return InspectorOptions { releaseBuilds: false, announce: true }
+  }
+}
+
+/// Whether the build has the development tools (`devtools.enabled`).
+pub fn debugBuild() -> bool {
+  return devtools.enabled
+}
+
+/// The inspector an app owns next to its tree. When it is off (the default), every method
+/// returns at once.
+pub struct Inspector {
+  /// The socket, until the accept thread takes it.
+  listener: Option<Listener>,
+  address: Option<Address>,
+  protocol: Protocol,
+  /// A command dispatched input: no request runs until the app drew the next frame.
+  awaitingFrame: bool,
+  /// The host dispatches queued input itself with `beginNext` and `finishNext`.
+  hostDispatch: bool,
+  /// What the accept thread shares with this one, once it runs.
+  hub: Option<Arc<Mutex<Hub>>>,
+  acceptor: Option<JoinHandle<()>>,
+  /// The sessions being served.
+  sessions: List<Served>,
+  /// Whether an arriving line wakes the host's loop (see `wakeWith`).
+  woken: bool,
+  /// The session the next poll looks at first, so one busy client does not starve the others.
+  turn: usize,
+  /// Requests served, for tests and logs.
+  pub served: u64,
+  /// The key the next session gets.
+  nextKey: u64,
+}
+
+/// A session, with this thread's end of its channel.
+struct Served {
+  session: Session,
+  channel: MemoryChannel,
+  /// The client is in this process (`openLocal`).
+  local: bool,
+}
+
+/// What the accept thread and the UI thread share.
+struct Hub {
+  /// This thread's ends of the sessions accepted since the UI thread last looked.
+  arrived: List<MemoryChannel>,
+  /// The inspector is closing: accept no more.
+  stop: bool,
+}
+
+// The channel ends are allocated with the system allocator and moved only under the lock.
+impl Transferable for Hub {}
+
+effect fn say(text: string) -> () {
+  // The browser has no standard error, and the inspector never starts there.
+  static if Intrinsic.targetArchitecture() != "wasm32" {
+    let mut writer = StderrWriter.make()
+    drop run Effect.result(Writer.writeString(text) |> Effect.provideMut<Writer>(&mut writer))
+  }
+}
+
+effect fn makeHub() -> Arc<Mutex<Hub>>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let hub = Hub { arrived: List<MemoryChannel>.make(), stop: false }
+  return run Arc<Mutex<Hub>>.make(run Mutex<Hub>.make(move hub))
+}
+
+impl Inspector {
+  /// An inspector that is off.
+  pub fn off() -> Inspector {
+    return Inspector {
+      listener: Option<Listener>.None,
+      address: Option<Address>.None,
+      protocol: Protocol.make(),
+      awaitingFrame: false,
+      hostDispatch: false,
+      hub: Option<Arc<Mutex<Hub>>>.None,
+      acceptor: Option<JoinHandle<()>>.None,
+      sessions: List<Served>.make(),
+      woken: false,
+      turn: 0,
+      served: 0,
+      nextKey: 1,
+    }
+  }
+
+  /// A new session's key.
+  fn key(self: &mut Self) -> u64 {
+    let key = self.nextKey
+    self.nextKey = self.nextKey + 1
+    return key
+  }
+
+  /// Registers extension `info` (see `extension.silk`). Call it once, before the loop starts;
+  /// it works on an inspector that is off, so a session opened later finds it.
+  pub effect fn extend(self: &mut Self, info: Extension) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.protocol.extend(move info)
+  }
+
+  /// Serves extension `id` with `handler`, from the app's loop on every turn while the inspector
+  /// is on: answers the requests that wait for it, sends the replies to the sessions that asked,
+  /// and pushes what its topics and views have to say. Nothing happens while the inspector is
+  /// off.
+  pub effect fn serveExtension<X: ExtensionHandler>(
+    self: &mut Self,
+    id: string,
+    handler: &mut X,
+  ) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if !self.enabled() {
+      return ()
+    }
+    run self.protocol.serveExtension(id, &mut handler)
+    let mut j: usize = 0
+    while j < self.sessions.length() {
+      let served = &mut self.sessions.asMutSlice()[j]
+      run served.session.deliver(&mut self.protocol)
+        |> Effect.provideMut<Channel>(&mut served.channel)
+      j = j + 1
+    }
+    run self.publishNews()
+    self.release()
+  }
+
+  /// Starts the inspector when the build and `SILK_UI_INSPECT` allow it, and returns one that
+  /// is off otherwise (also when the socket cannot be opened; `announce` says why).
+  pub effect fn start(options: InspectorOptions) -> Inspector
+    ! HostInputError | OutOfMemoryError
+    ? &mut HostInput | &mut Allocator {
+    if !debugBuild() && !options.releaseBuilds {
+      return Inspector.off()
+    }
+    let value = match run HostInput.variableNamed(VARIABLE) {
+      Option<Bytes>.Some { value } => move value
+      Option<Bytes>.None => {
+        return Inspector.off()
+      }
+    }
+    let text = match HostInput.text(value.asSlice()) {
+      Result<string, InvalidUtf8>.Success { value: t } => t
+      Result<string, InvalidUtf8>.Failure { error: _ } => "1"
+    }
+    let address = match run parseAddress(text) {
+      Option<Address>.Some { value: a } => move a
+      Option<Address>.None => {
+        if options.announce {
+          run say("ui-inspect: SILK_UI_INSPECT is not 1, tcp:<port> or a socket path\n")
+        }
+        return Inspector.off()
+      }
+    }
+    let cwd = run HostInput.workingDirectory()
+    let absolute = run resolved(move address, cwd.asSlice())
+    return run Inspector.listenAt(move absolute, options.announce)
+  }
+
+  /// Starts the inspector at `address` (a Unix socket path must be absolute, see [`resolved`])
+  /// regardless of the build and the environment, for tests.
+  pub effect fn listenAt(address: Address, announce: bool) -> Inspector
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    static if Intrinsic.targetArchitecture() == "wasm32" {
+      drop address
+      return Inspector.off()
+    } else {
+      let mut inspector = Inspector.off()
+      let opened = run Effect.result(open(&address))
+      match move opened {
+        Result<Listener, NativeSocketError | FileError | OutOfMemoryError>.Success { value } => {
+          let mut text = run String.copy("ui-inspect: listening on ")
+          match &value.boundAddress() {
+            BoundAddress.Tcp { endpoint } => {
+              let port = endpoint.port().value()
+              run text.append("tcp:127.0.0.1:")
+              run writeInt(&mut text, u16.toU64(port))
+              inspector.address = Option<Address>.Some { value: Address.Tcp { port: port } }
+            }
+            _ => {
+              run describeAddress(&address, &mut text)
+              inspector.address = Option<Address>.Some { value: move address }
+            }
+          }
+          run text.append("\n")
+          if announce {
+            run say(String.view(&text))
+          }
+          inspector.listener = Option<Listener>.Some { value: move value }
+        }
+        Result<Listener, NativeSocketError | FileError | OutOfMemoryError>.Failure { error } => {
+          drop error
+          if announce {
+            let mut text = run String.copy("ui-inspect: could not listen on ")
+            run describeAddress(&address, &mut text)
+            run text.append("\n")
+            run say(String.view(&text))
+          }
+        }
+      }
+      return move inspector
+    }
+  }
+
+  /// Whether the server is on: listening, or serving a client in this process.
+  pub fn enabled(self: &Self) -> bool {
+    return self.listener.isSome() || self.acceptor.isSome() || self.hasLocal()
+  }
+
+  /// Whether a session opened with `openLocal` is open.
+  fn hasLocal(self: &Self) -> bool {
+    let list = self.sessions.asSlice()
+    let mut i: usize = 0
+    while i < list.length {
+      if list[i].local {
+        return true
+      }
+      i = i + 1
+    }
+    return false
+  }
+
+  /// Opens a session for a client in this process and returns the client's end of its channel:
+  /// the session is open from the start (no `hello` needed), its lines are served by
+  /// `serveLocal`, and it hears the topics it subscribes to as a socket client does. It turns
+  /// the inspector on, socket or not, until the client closes its end. Works on an inspector
+  /// that is `off`.
+  pub effect fn openLocal(self: &mut Self) -> MemoryChannel
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let pair = run MemoryChannel.pair()
+    let MemoryPair { first, second } = move pair
+    let mut session = Session.open()
+    session.key = self.key()
+    run self.sessions.append(Served { session: move session, channel: move first, local: true })
+    return move second
+  }
+
+  /// Serves every line the clients in this process sent, at once, against `tree`: their
+  /// requests are answered before this returns, so such a client can wait for a reply on the
+  /// same thread. Input a request dispatches waits for the host, as from `poll`. Returns
+  /// whether a line was served.
+  pub effect fn serveLocal(self: &mut Self, tree: &mut UiTree<'_>) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut any = false
+    let mut i: usize = 0
+    while i < self.sessions.length() {
+      if self.sessions.asSlice()[i].local {
+        let served = &mut self.sessions.asMutSlice()[i]
+        while run served.session.serveNext(&mut self.protocol, &mut tree)
+          |> Effect.provideMut<Channel>(&mut served.channel) {
+          self.served = self.served + 1
+          any = true
+        }
+      }
+      i = i + 1
+    }
+    self.release()
+    return any
+  }
+
+  /// Leaves root `root` out of everything the inspector serves, or shows it again (see
+  /// `Protocol.hide`): for the roots of a client in this process that draws in the tree.
+  pub effect fn hide(self: &mut Self, root: u32, on: bool) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.protocol.hide(root, on)
+  }
+
+  /// Where it listens (TCP with the port the system chose).
+  pub fn listenAddress(self: &Self) -> &Option<Address> {
+    return &self.address
+  }
+
+  /// Starts accepting clients, and wakes the host's loop with `wake` whenever a line comes in
+  /// (the window host passes its `Nudge`), so the loop waits for events with no timeout. Call
+  /// it once, before the first `poll`; a host that never calls it is polled instead (see
+  /// [`Inspector.pollInterval`]).
+  pub effect fn wakeWith<W: 'static + Wake + Transferable>(self: &mut Self, wake: W) -> ()
+    ! OutOfMemoryError {
+    if self.acceptor.isSome() || self.listener.isNone() {
+      return ()
+    }
+    run self.begin(move wake)
+    self.woken = self.acceptor.isSome()
+  }
+
+  /// Starts the accept thread with the listener.
+  effect fn begin<W: 'static + Wake + Transferable>(self: &mut Self, wake: W) -> ()
+    ! OutOfMemoryError {
+    static if Intrinsic.targetArchitecture() == "wasm32" {
+      drop wake
+    } else {
+      let listener = match move Intrinsic.replace(self.listener, Option<Listener>.None) {
+        Option<Listener>.Some { value } => move value
+        Option<Listener>.None => {
+          drop wake
+          return ()
+        }
+      }
+      let mut heap = Allocator.systemAllocatorProvider()
+      let hub = run makeHub() |> Effect.provideMut<Allocator>(&mut heap)
+      let shared = hub.clone()
+      let started = run Effect.result(
+        NativeThread.spawn(
+          || -> () {
+            acceptLoop(move listener, move shared, move wake)
+          },
+        ),
+      )
+        |> Effect.provideMut<Allocator>(&mut heap)
+      match move started {
+        Result.Success { value } => {
+          self.acceptor = Option<JoinHandle<()>>.some(move value)
+          self.hub = Option<Arc<Mutex<Hub>>>.some(move hub)
+        }
+        Result.Failure { error } => {
+          drop error
+          run say("ui-inspect: could not start the thread that accepts clients\n")
+        }
+      }
+    }
+  }
+
+  /// How long the app's event loop should wait at most, in seconds, so that requests are
+  /// served. None when the inspector is off, or when it wakes the loop itself (`wakeWith`) and
+  /// no request waits: wait as usual. 0 while requests wait, 0.02 without a wake.
+  pub fn pollInterval(self: &Self) -> Option<f64> {
+    if self.enabled() && self.protocol.extensions.pending() {
+      // Requests wait for an extension, which the loop serves on its next turn.
+      return Option<f64>.some(0.0)
+    }
+    if self.enabled() && self.protocol.shots.busy() {
+      // Screenshots wait for a frame copy or for the worker that encodes them.
+      return Option<f64>.some(0.005)
+    }
+    if !self.enabled() || (self.listener.isNone() && self.acceptor.isNone()) {
+      // Off, or serving only clients in this process, which are served on the spot.
+      return Option<f64>.None
+    }
+    if !self.woken {
+      return Option<f64>.some(0.02)
+    }
+    if !self.awaitingFrame && self.waiting() {
+      return Option<f64>.some(0.0)
+    }
+    return Option<f64>.None
+  }
+
+  /// Whether a line waits in some session, or a new session waits to be adopted.
+  fn waiting(self: &Self) -> bool {
+    let list = self.sessions.asSlice()
+    let mut i: usize = 0
+    while i < list.length {
+      if list[i].channel.pending() {
+        return true
+      }
+      i = i + 1
+    }
+    if let Option<Arc<Mutex<Hub>>>.Some { value } = &self.hub {
+      let guard = value.get().lock()
+      return guard.get().arrived.length() != 0
+    }
+    return false
+  }
+
+  /// Serves at most one waiting request per poll, unless earlier input still waits for a
+  /// frame. Returns true when the app has work: a command dispatched input (take the tree's
+  /// event records and answer them, as for window input) or changed the highlight. Either
+  /// way, drain [`Inspector.dispatchNext`] with application handling between each input,
+  /// then compose a frame and call [`Inspector.afterFrame`].
+  pub effect fn poll(self: &mut Self, tree: &mut UiTree<'_>) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if !self.enabled() {
+      return false
+    }
+    if self.acceptor.isNone() {
+      // No wake was given: the host's loop looks every `pollInterval`.
+      run self.begin(NoWake {})
+    }
+    run self.adopt()
+    run self.deliverShots()
+    if self.awaitingFrame {
+      return false
+    }
+
+    // Hosts may drain a compound interaction immediately, or process one event per frame.
+    // In either case a subsequent request cannot overwrite unprocessed input.
+    if self.protocol.hasInput() {
+      if !self.hostDispatch {
+        drop run self.protocol.dispatchNext(&mut tree)
+      }
+      self.protocol.dispatched = true
+      self.awaitingFrame = true
+      return true
+    }
+    if tree.stats.frame == 0 {
+      self.protocol.repaint = true
+      return true
+    }
+    let mut changed = false
+
+    // One request, then yield to native input and timers even when clients continuously
+    // request screenshots. A request that only replaced the highlight costs nothing until the
+    // frame, so what waits behind it is served too: a client that hovers faster than the app
+    // draws leaves no backlog of highlights to play back, one frame each.
+    let mut folded: usize = 0
+    while true {
+      self.protocol.latestWins = false
+      if !run self.serveOne(&mut tree) {
+        break
+      }
+      self.served = self.served + 1
+      if self.protocol.dispatched || self.protocol.repaint {
+        changed = true
+      }
+      if self.protocol.dispatched {
+        if !self.hostDispatch {
+          drop run self.protocol.dispatchNext(&mut tree)
+        }
+        self.awaitingFrame = true
+        break
+      }
+      if !self.protocol.latestWins || folded == FOLD_LIMIT {
+        break
+      }
+      folded = folded + 1
+
+      // Subscribers hear of this highlight before the next request's reply.
+      run self.publish(&tree.*)
+    }
+    self.release()
+    run self.publish(&tree.*)
+    return changed
+  }
+
+  /// Sends the screenshots the worker finished to the sessions that asked.
+  effect fn deliverShots(self: &mut Self) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if !run self.protocol.takeShots() {
+      return ()
+    }
+    let mut j: usize = 0
+    while j < self.sessions.length() {
+      let served = &mut self.sessions.asMutSlice()[j]
+      run served.session.deliver(&mut self.protocol)
+        |> Effect.provideMut<Channel>(&mut served.channel)
+      j = j + 1
+    }
+    self.release()
+  }
+
+  /// Says whether the host can read the frames it draws back from the GPU. When it can,
+  /// screenshots of the window wait for the next frame it draws ([`Inspector.wantsFrameCopy`],
+  /// [`Inspector.frameCopy`]) and are encoded on a worker thread, so taking one does not stop
+  /// the app's loop the way drawing it on the CPU would.
+  pub fn liveFrames(self: &mut Self, on: bool) -> () {
+    self.protocol.liveFrames = on
+  }
+
+  /// Whether a screenshot waits for a copy of the next frame: the host asks its renderer for
+  /// one and hands it to [`Inspector.frameCopy`].
+  pub fn wantsFrameCopy(self: &Self) -> bool {
+    return self.enabled() && self.protocol.shots.wantsFrame()
+  }
+
+  /// Hands the waiting screenshots the frame the host read back: `height` rows of `stride`
+  /// bytes, BGRA when `bgra`. With `ok` false the window cannot be read back, and screenshots
+  /// are drawn on the CPU from then on.
+  pub effect fn frameCopy(
+    self: &mut Self,
+    tree: &UiTree<'_>,
+    rows: List<u8>,
+    stride: u32,
+    width: u32,
+    height: u32,
+    bgra: bool,
+    ok: bool,
+  ) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if !self.enabled() {
+      return ()
+    }
+    run self.protocol.frameCopy(tree, move rows, stride, width, height, bgra, ok)
+    run self.deliverShots()
+    if !ok {
+      // The CPU answers went straight to the replies.
+      run self.deliverReplies()
+    }
+  }
+
+  /// Sends every session the replies waiting for it.
+  effect fn deliverReplies(self: &mut Self) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut j: usize = 0
+    while j < self.sessions.length() {
+      let served = &mut self.sessions.asMutSlice()[j]
+      run served.session.deliver(&mut self.protocol)
+        |> Effect.provideMut<Channel>(&mut served.channel)
+      j = j + 1
+    }
+    self.release()
+  }
+
+  /// Takes the sessions the accept thread started since the last look.
+  effect fn adopt(self: &mut Self) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let hub = match &self.hub {
+      Option<Arc<Mutex<Hub>>>.Some { value } => value.clone()
+      Option<Arc<Mutex<Hub>>>.None => {
+        return ()
+      }
+    }
+    let mut guard = hub.get().lock()
+    let state = guard.getMut()
+    while state.arrived.length() != 0 {
+      let channel = state.arrived.remove(0)
+      let mut session = Session.make()
+      session.key = self.nextKey
+      self.nextKey = self.nextKey + 1
+      run self.sessions.append(
+        Served { session: move session, channel: move channel, local: false },
+      )
+    }
+  }
+
+  /// Serves the first line waiting in a session, starting from `turn`. False when none waits.
+  effect fn serveOne(self: &mut Self, tree: &mut UiTree<'_>) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let count = self.sessions.length()
+    let mut k: usize = 0
+    while k < count {
+      let at = (self.turn + k) % count
+      let served = &mut self.sessions.asMutSlice()[at]
+      if run served.session.serveNext(&mut self.protocol, &mut tree)
+        |> Effect.provideMut<Channel>(&mut served.channel) {
+        self.turn = at + 1
+        return true
+      }
+      k = k + 1
+    }
+    return false
+  }
+
+  /// Ends the sessions that are over: a one-shot request answered, or a client that left. Their
+  /// pumps write what is queued, then close the connection.
+  fn release(self: &mut Self) -> () {
+    let mut i: usize = 0
+    while i < self.sessions.length() {
+      let over = self.sessions.asSlice()[i].session.ended
+        || !self.sessions.asSlice()[i].channel.open()
+      if over {
+        let mut gone = self.sessions.remove(i)
+        gone.session.leave(&mut self.protocol)
+        gone.channel.close()
+      } else {
+        i = i + 1
+      }
+    }
+  }
+
+  /// Tells each session about the topics it subscribed to that changed. Costs nothing while
+  /// no session subscribed to anything.
+  effect fn publish(self: &mut Self, tree: &UiTree<'_>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.publishNews()
+    let mut wanted: u32 = 0
+    let list = self.sessions.asSlice()
+    let mut i: usize = 0
+    while i < list.length {
+      wanted = wanted | list[i].session.topics
+      i = i + 1
+    }
+    if wanted == 0 {
+      self.protocol.changes.held = 0
+      return ()
+    }
+    let topics = run self.protocol.takeChanges(tree, wanted)
+    if topics == 0 {
+      return ()
+    }
+    let mut j: usize = 0
+    while j < self.sessions.length() {
+      let served = &mut self.sessions.asMutSlice()[j]
+      run served.session.publish(&self.protocol, tree, topics)
+        |> Effect.provideMut<Channel>(&mut served.channel)
+      j = j + 1
+    }
+  }
+
+  /// Pushes what extensions have to say to the sessions that subscribed to it.
+  effect fn publishNews(self: &mut Self) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut news = List<Outgoing>.make()
+    run self.protocol.extensions.takeNews(&mut news)
+    if news.length() == 0 {
+      return ()
+    }
+    let mut j: usize = 0
+    while j < self.sessions.length() {
+      let served = &mut self.sessions.asMutSlice()[j]
+      run served.session.publishNews(&news) |> Effect.provideMut<Channel>(&mut served.channel)
+      j = j + 1
+    }
+  }
+
+  /// Dispatches the next input of a compound click, key press or text entry. Service host
+  /// requests and application messages after each true result, just as for native input.
+  pub effect fn dispatchNext(self: &mut Self, tree: &mut UiTree<'_>) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return run self.protocol.dispatchNext(&mut tree)
+  }
+
+  /// Whether a compound interaction still has input for the host to process.
+  pub fn hasInput(self: &Self) -> bool {
+    return self.protocol.hasInput()
+  }
+
+  /// Leaves queued input to the host: `poll` no longer dispatches the first input of a
+  /// command itself. The host then drains the queue with `beginNext` and `finishNext`, so
+  /// its application can prevent default actions for inspector input as for window input.
+  pub fn deferInput(self: &mut Self) -> () {
+    self.hostDispatch = true
+  }
+
+  /// Starts the next queued input: targeting and event records, no default action yet.
+  /// Returns false when no input waits. See `Protocol.beginNext`.
+  pub effect fn beginNext(self: &mut Self, tree: &mut UiTree<'_>) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return run self.protocol.beginNext(&mut tree)
+  }
+
+  /// The input `beginNext` started, until `finishNext`: what a headless recording shows.
+  pub fn begun(self: &Self) -> Option<&Input> {
+    return self.protocol.begun()
+  }
+
+  /// Applies the default action of the input `beginNext` started, unless `prevented`.
+  pub effect fn finishNext(self: &mut Self, tree: &mut UiTree<'_>, prevented: bool) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.protocol.finishNext(&mut tree, prevented)
+  }
+
+  /// Publishes the complete app scene for captures and highlighting, including custom drawing.
+  pub effect fn afterFrameScene(self: &mut Self, tree: &UiTree<'_>, scene: &Scene) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if !self.enabled() {
+      return ()
+    }
+    run self.protocol.afterFrameScene(tree, scene)
+    if self.protocol.drewWaiting { run self.deliverReplies() }
+    self.protocol.dispatched = false
+    self.protocol.repaint = false
+    self.awaitingFrame = false
+    run self.publish(tree)
+  }
+
+  /// The composed app scene with an optional inspector highlight.
+  pub fn sceneWith<'t>(self: &'t Self, scene: &'t Scene) -> &'t Scene {
+    if self.protocol.highlighting() {
+      return self.protocol.overlayScene()
+    }
+    return scene
+  }
+
+  /// Adds the event records waiting in the tree's queue to the inspector's event log (the
+  /// `events` command). Call it right before the app takes them (`UiTree.takeEvents`, or
+  /// loom's `pump`), so each record is logged once.
+  pub effect fn observe(self: &mut Self, tree: &UiTree<'_>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if !self.enabled() {
+      return ()
+    }
+    run self.protocol.observe(tree)
+  }
+
+  /// Takes the frame's atlas uploads for screenshots, rebuilds the highlight overlay, lets the
+  /// next request run and tells subscribed sessions what changed. Call after every
+  /// `UiTree.frame`, before the uploads are cleared.
+  pub effect fn afterFrame(self: &mut Self, tree: &UiTree<'_>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if !self.enabled() {
+      return ()
+    }
+    run self.protocol.afterFrame(tree)
+    self.protocol.dispatched = false
+    self.protocol.repaint = false
+    self.awaitingFrame = false
+    run self.publish(tree)
+  }
+
+  /// The scene to draw: the tree's, or the tree's with the highlight on top.
+  pub fn scene<'t>(self: &'t Self, tree: &'t UiTree<'_>) -> &'t Scene {
+    if self.protocol.highlighting() {
+      return self.protocol.overlayScene()
+    }
+    return tree.scene()
+  }
+
+  /// Whether the app should draw [`Inspector.scene`] after a highlight change or input, or
+  /// because a subscribed topic changed again in a frame that already told it.
+  pub fn wantsFrame(self: &Self) -> bool {
+    if !self.enabled() {
+      return false
+    }
+    return self.protocol.dispatched || self.protocol.repaint || self.protocol.changes.held != 0
+      || self.protocol.extensions.held
+  }
+
+  /// Says how long the frame about to be handed to `afterFrame` took, in milliseconds, for
+  /// the `frames` command.
+  pub fn timed(self: &mut Self, layout: f32, paint: f32) -> () {
+    self.protocol.timeline.timed(layout, paint)
+  }
+
+  /// Adds an interaction for the `performance` command: an input, and the frame that showed
+  /// what its handlers did.
+  pub effect fn interaction(self: &mut Self, interaction: Interaction) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if !self.enabled() {
+      return ()
+    }
+    run self.protocol.timeline.interaction(move interaction)
+  }
+
+  /// Says how long the host took to each startup step, for the `performance` command.
+  pub fn started(self: &mut Self, startup: Startup) -> () {
+    self.protocol.timeline.startup = Option<Startup>.some(startup)
+  }
+
+  /// Whether window input goes through [`Inspector.pickInput`] before the app.
+  pub fn picking(self: &Self) -> bool {
+    return self.protocol.intercepts()
+  }
+
+  /// Takes window input while the picker is on; true when the app must not see it.
+  pub effect fn pickInput(self: &mut Self, tree: &UiTree<'_>, input: &Input) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return run self.protocol.pickInput(tree, input)
+  }
+
+  /// The protocol state (highlight, flags), for apps that want to look.
+  pub fn state(self: &Self) -> &Protocol {
+    return &self.protocol
+  }
+
+  /// The sessions being served.
+  pub fn sessionCount(self: &Self) -> usize {
+    return self.sessions.length()
+  }
+
+  /// Ends every session, stops listening and removes the Unix socket file. It waits for the
+  /// pump threads, at most a fraction of a second. Dropping the inspector does the same.
+  pub effect fn close(self: &mut Self) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    self.shutdown()
+  }
+
+  fn shutdown(self: &mut Self) -> () {
+    let was = self.enabled()
+    self.protocol.shots.stop()
+    while self.sessions.length() != 0 {
+      let mut gone = self.sessions.remove(0)
+      gone.channel.close()
+    }
+    if let Option<Arc<Mutex<Hub>>>.Some { value } = &self.hub {
+      let mut guard = value.get().lock()
+      let state = guard.getMut()
+      state.stop = true
+      state.arrived.clear()
+    }
+    let acceptor = Intrinsic.replace(self.acceptor, Option<JoinHandle<()>>.None)
+    drop acceptor
+    self.hub = Option<Arc<Mutex<Hub>>>.None
+    match move Intrinsic.replace(self.listener, Option<Listener>.None) {
+      Option<Listener>.Some { value } => {
+        let mut listener = move value
+        drop run Effect.result(listener.close())
+      }
+      Option<Listener>.None => {}
+    }
+    if was {
+      match &self.address {
+        Option<Address>.Some { value: a } => {
+          match &a {
+            Address.Unix { path } => {
+              let mut heap = Allocator.systemAllocatorProvider()
+              drop run Effect.result(removeSocket(String.view(&path)))
+                |> Effect.provideMut<Allocator>(&mut heap)
+            }
+            _ => {}
+          }
+        }
+        Option<Address>.None => {}
+      }
+    }
+  }
+}
+
+impl Drop for Inspector {
+  fn drop(self: &mut Inspector) -> () {
+    self.shutdown()
+  }
+}
+
+static if Intrinsic.targetArchitecture() != "wasm32" {
+  /// Whether a pump's thread ended.
+  struct Finished {
+    done: bool,
+  }
+
+  /// A connection's pump thread, as the accept thread keeps it.
+  struct Pump {
+    handle: JoinHandle<()>,
+    finished: Arc<Mutex<Finished>>,
+  }
+
+  /// The accept thread: takes each client, gives it a pump and hands this thread's end of its
+  /// channel to the UI thread, until the inspector closes. Then it waits for the pumps (the
+  /// inspector closed their sessions first) and closes the listener.
+  fn acceptLoop<W: 'static + Wake + Transferable>(
+    listener: Listener,
+    hub: Arc<Mutex<Hub>>,
+    wake: W,
+  ) -> () {
+    let mut heap = Allocator.systemAllocatorProvider()
+    let mut clock = OsMonotonicClock.make()
+    let mut socket = move listener
+    let mut pumps = List<Pump>.make()
+    while !stopping(&hub) {
+      let next = run Effect.result(acceptSoon(&mut socket))
+        |> Effect.provideMut<MonotonicClock>(&mut clock)
+      match move next {
+        Result.Success { value } => {
+          let started = run Effect.result(startPump(value.intoConnection(), &hub, &wake))
+            |> Effect.provideMut<Allocator>(&mut heap)
+          match move started {
+            Result.Success { value: pump } => {
+              drop run Effect.result(pumps.append(move pump))
+                |> Effect.provideMut<Allocator>(&mut heap)
+              wake.wake()
+            }
+            Result.Failure { error } => {
+              drop error
+            }
+          }
+        }
+        Result.Failure { error } => {
+          let waited = match &error {
+            NativeSocketError.Timeout => true
+            _ => false
+          }
+          let closed = match &error {
+            NativeSocketError.Closed => true
+            _ => false
+          }
+          drop error
+          if closed {
+            break
+          }
+          if !waited {
+            // Out of descriptors, say: do not spin.
+            run MonotonicClock.waitFor(ACCEPT_PAUSE)
+              |> Effect.provideMut<MonotonicClock>(&mut clock)
+          }
+        }
+      }
+      reap(&mut pumps)
+    }
+    clearArrived(&hub)
+    pumps.clear()
+    drop run Effect.result(socket.close())
+  }
+
+  fn clearArrived(hub: &Arc<Mutex<Hub>>) -> () {
+    let mut guard = hub.get().lock()
+    guard.getMut().arrived.clear()
+  }
+
+  fn stopping(hub: &Arc<Mutex<Hub>>) -> bool {
+    let guard = hub.get().lock()
+    return guard.get().stop
+  }
+
+  effect fn acceptSoon(listener: &mut Listener) -> Accepted
+    ! NativeSocketError
+    ? &mut MonotonicClock {
+    let start = run MonotonicClock.now()
+    let deadline = MonotonicClock.deadlineAfter(&start, ACCEPT_PAUSE)
+    return run accept(&mut listener, Option<Mark>.some(move deadline))
+  }
+
+  /// Pairs a channel for `connection`, hands one end to the UI thread and starts the pump on
+  /// the other.
+  effect fn startPump<W: 'static + Wake + Transferable>(
+    connection: Connection,
+    hub: &Arc<Mutex<Hub>>,
+    wake: &W,
+  ) -> Pump
+    ! SpawnError | OutOfMemoryError
+    ? &mut Allocator {
+    let pair = run MemoryChannel.pair()
+    let MemoryPair { first, second } = move pair
+
+    // The end is with the UI thread before the pump can read a line, so the wake that line
+    // brings finds it.
+    run handOver(hub, move first)
+    let finished = run Arc<Mutex<Finished>>.make(run Mutex<Finished>.make(Finished { done: false }))
+    let flag = finished.clone()
+    let copy = wake.copy()
+    let handle = run NativeThread.spawn(
+      || -> () {
+        bridge(move connection, move second, move copy)
+        markDone(move flag)
+      },
+    )
+    return Pump { handle: move handle, finished: move finished }
+  }
+
+  effect fn handOver(hub: &Arc<Mutex<Hub>>, end: MemoryChannel) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut guard = hub.get().lock()
+    let state = guard.getMut()
+    if state.stop {
+      drop end
+    } else {
+      run state.arrived.append(move end)
+    }
+  }
+
+  fn markDone(flag: Arc<Mutex<Finished>>) -> () {
+    let mut guard = flag.get().lock()
+    let state = guard.getMut()
+    state.done = true
+  }
+
+  fn ended(pump: &Pump) -> bool {
+    let guard = pump.finished.get().lock()
+    return guard.get().done
+  }
+
+  /// Joins the pumps whose threads ended.
+  fn reap(pumps: &mut List<Pump>) -> () {
+    let mut i: usize = 0
+    while i < pumps.length() {
+      if ended(&pumps.asSlice()[i]) {
+        drop pumps.remove(i)
+      } else {
+        i = i + 1
+      }
+    }
+  }
+}
+
+/// Opens the listener. A Unix socket file nobody answers on (left by a crash) is removed first.
+effect fn open(address: &Address) -> Listener
+  ! NativeSocketError | FileError | OutOfMemoryError
+  ? &mut Allocator {
+  static if Intrinsic.targetArchitecture() == "wasm32" {
+    fail NativeSocketError.Closed
+  } else {
+    match &address.* {
+      Address.Tcp { port } => {
+        let local = Endpoint.make(
+          IpAddress.V4 { value: Ipv4Address.fromOctets([127, 0, 0, 1]) },
+          Port.fromU16(port),
+        )
+        return run listen(local, ListenOptions.defaults())
+      }
+      Address.Unix { path } => {
+        let bytes = path.ownedUtf8Bytes()
+        let first = run Effect.result(listenUnix(bytes, ListenOptions.defaults()))
+        match move first {
+          Result<Listener, NativeSocketError>.Success { value } => {
+            return move value
+          }
+          Result<Listener, NativeSocketError>.Failure { error } => {
+            drop error
+          }
+        }
+        let mut clock = OsMonotonicClock.make()
+        let start = run MonotonicClock.now() |> Effect.provideMut<MonotonicClock>(&mut clock)
+        let probe = run Effect.result(
+          connectUnixOwned(
+            bytes,
+            ConnectOptions.defaults(),
+            Option<Mark>.some(MonotonicClock.deadlineAfter(&start, 200000000)),
+          ),
+        )
+          |> Effect.provideMut<MonotonicClock>(&mut clock)
+        match move probe {
+          Result<Connection, NativeSocketError>.Success { value } => {
+            // Another app is inspected at this path.
+            let mut live = move value
+            drop run Effect.result(live.close())
+            fail NativeSocketError.Closed
+          }
+          Result<Connection, NativeSocketError>.Failure { error } => {
+            drop error
+          }
+        }
+        run removeSocket(String.view(&path))
+        return run listenUnix(bytes, ListenOptions.defaults())
+      }
+    }
+  }
+}
+
+static if Intrinsic.targetOperatingSystem() != "windows"
+  && Intrinsic.targetArchitecture() != "wasm32" {
+  // silk.system.filesystem refuses to remove a socket file (WrongType), so unlink it directly.
+  unsafe extern "C" fn unlink(path: ?[*]const u8) -> i32
+}
+
+/// Removes the socket file at `path` (absolute).
+effect fn removeSocket(path: string) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  static if Intrinsic.targetOperatingSystem() != "windows"
+    && Intrinsic.targetArchitecture() != "wasm32" {
+    let mut bytes = run Bytes.copy(String.utf8Bytes(path))
+    run bytes.append(b"\0")
+    drop unsafe unlink(Pointer.fromSlice(bytes.asSlice()))
+  }
+}

@@ -1,0 +1,256 @@
+//! The engine's side of the React benchmark (../README.md): one process is one cold
+//! start. It embeds the engine as an application host does, runs ../dist/bundle.js and
+//! prints `name value` lines: nanoseconds per phase, collections and their ticks, and
+//! allocator and resident bytes. ../run.py runs it repeatedly and builds the tables.
+//!
+//!   react-bench mount <bundle.js> [messages]          evaluate the bundle, mount a transcript
+//!   react-bench stream <bundle.js> [messages] [ticks] mount a list, then append to its last item
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.effect { Effect }
+import silk.core.result { Result }
+import silk.collections.list { List }
+import silk.collections.bytes { Bytes }
+import silk.collections.slice { Slice }
+import silk.mem.pointer { Pointer }
+import silk.num.usize
+import silk.num.u8
+import silk.num.i32
+import silk.num.i64
+import silk.num.u32
+import silk.num.u64
+import silk.num.isize
+import silk.system.host_input { HostInput, HostInputError }
+import silkjs.js_atomics_native { WaiterDomain, SynchronizationError }
+import silkjs.js_runtime_registry { ClassIdAllocator }
+import silkjs.js_libc_process { Process }
+import silkjs.js_libc { Session }
+import silkjs.js_libc as libc
+import silkjs.js_libc_platform as platform
+import silkjs.js_libc_platform { PlatformError }
+import silkjs.js_os_events_platform as clock
+import silkjs.js_os_platform as os
+import silkjs.js_eval_compile as compile
+import silkjs.js_eval as evaluation
+import silkjs.js_bytecode_image as image
+import silkjs.js_owned_value { Value }
+import silkjs.js_value { ValueBits }
+import silkjs.js_exceptions { JsException }
+import silkjs.js_heap { HeapHeader }
+import silkjs.js_gc as gc
+import silkjs.js_runtime as runtime
+import silkjs.runtime_memory { RuntimeAllocator }
+import silkjs.runtime_memory as memory
+import silkjs.native_stack as stack
+
+fn out(bytes: &[u8]) -> () { let _written = platform.writeAll(1, bytes) }
+fn line(name: &[u8], value: usize) -> () {
+  let mut digits: [u8; 32] = [0; 32] let mut length: usize = 0 let mut rest = value
+  while true { digits[length] = usize.toU8(rest % 10) + 48 length = length + 1 rest = rest / 10 if rest == 0 { break } }
+  let mut text: [u8; 32] = [0; 32] let mut used: usize = 0
+  while length != 0 { length = length - 1 text[used] = digits[length] used = used + 1 }
+  out(name) out(b" ") out(Slice.view(&text, 0, used)) out(b"\n")
+}
+fn now() -> usize { return i64.toUsize(clock.nowNanoseconds()) }
+fn parse(text: &[u8], fallback: usize) -> usize {
+  let mut value: usize = 0 let mut index: usize = 0
+  while index < text.length {
+    if text[index] < 48 || text[index] > 57 { return fallback }
+    value = value * 10 + u8.toUsize(text[index] - 48) index = index + 1
+  }
+  if text.length == 0 { return fallback }
+  return value
+}
+static if Intrinsic.targetOperatingSystem() == "darwin" {
+  unsafe extern "C" fn processUsage(pid: i32, flavor: i32, buffer: *mut u64) -> i32 as "proc_pid_rusage"
+  unsafe extern "C" fn processId() -> i32 as "getpid"
+}
+/// The memory this process holds, as its system counts it. Linux: resident bytes, the
+/// second field of /proc/self/statm, in pages of 4 KiB. macOS: the footprint
+/// (rusage_info_v0.ri_phys_footprint), which is what `footprint` and Activity Monitor
+/// show and what falls when pages are given back (resident size there falls only once
+/// the system takes them). 0 elsewhere.
+fn resident() -> usize {
+  static if Intrinsic.targetOperatingSystem() == "darwin" {
+    // rusage_info_v0: a 16 byte uuid, then 64-bit counters; the footprint is the eighth.
+    let mut info: [u64; 12] = [0; 12]
+    if unsafe processUsage(unsafe processId(), 0, Pointer.fromMutRef<u64>(&mut info[0])) != 0 { return 0 }
+    return u64.toUsize(info[9])
+  }
+  let path = b"/proc/self/statm\0"
+  let fd = unsafe os.open(Pointer.fromRef<u8>(&path[0]), 0)
+  if fd < 0 { return 0 }
+  let mut text: [u8; 128] = [0; 128]
+  let count = unsafe os.read(fd, Pointer.fromMutRef<u8>(&mut text[0]), 127)
+  let _closed = unsafe os.close(fd)
+  if count <= 0 { return 0 }
+  let length = isize.toUsize(count)
+  let mut index: usize = 0
+  while index < length && text[index] != 32 { index = index + 1 }
+  index = index + 1
+  let mut pages: usize = 0
+  while index < length && text[index] >= 48 && text[index] <= 57 { pages = pages * 10 + u8.toUsize(text[index] - 48) index = index + 1 }
+  return pages * 4096
+}
+/// Evaluates driver source and returns its completion value when that is an integer.
+unsafe effect fn script<'m>(session: &mut Session<'m>, source: &[u8]) -> usize ! OutOfMemoryError | JsException ? &mut Allocator {
+  let realm = session.context.realm()
+  let value = run libc.evalBuffer(&mut session.engine, realm, source, b"driver.js", compile.TYPE_GLOBAL)
+  let number = match value { ValueBits.Int { value: found } => i32.toUsize(found) _ => 0 }
+  unsafe gc.release(&mut session.engine, session.runtime, value)
+  return number
+}
+effect fn call(name: &[u8], argument: usize, tail: &[u8]) -> List<u8> ! OutOfMemoryError ? &mut Allocator {
+  let mut digits: [u8; 32] = [0; 32] let mut length: usize = 0 let mut rest = argument
+  while true { digits[length] = usize.toU8(rest % 10) + 48 length = length + 1 rest = rest / 10 if rest == 0 { break } }
+  let mut source = List<u8>.make()
+  run source.appendBytes(name)
+  while length != 0 { length = length - 1 run source.append(digits[length]) }
+  run source.appendBytes(tail)
+  return move source
+}
+/// What collections cost between two points: `prefix`_full, _young and _gc_ticks.
+unsafe fn collections(rt: *mut HeapHeader, before: runtime.GcCounts, full: &[u8], young: &[u8], ticks: &[u8]) -> runtime.GcCounts {
+  let counts = unsafe runtime.gcCounts(rt)
+  line(full, u32.toUsize(counts.full - before.full))
+  line(young, u32.toUsize(counts.young - before.young))
+  line(ticks, counts.ticks - before.ticks)
+  return counts
+}
+unsafe effect fn measure<'m>(session: &mut Session<'m>, source: &[u8], bytecode: &[u8], stream: bool, messages: usize, ticks: usize) -> () ! OutOfMemoryError | JsException ? &mut Allocator {
+  let observer = session.engine.memory
+  let realm = session.context.realm()
+  let start = now()
+  // With --bytecode nothing is parsed: the image's top level is decoded and the
+  // function bodies stay in its bytes until they are first called.
+  let compiled = if bytecode.length != 0 {
+    run unsafe image.load(&mut session.engine, realm, Pointer.fromRef<u8>(&bytecode[0]), bytecode.length)
+  } else {
+    unsafe Value.adoptBits(run libc.evalBuffer(&mut session.engine, realm, source, b"bundle.js", compile.TYPE_GLOBAL | compile.FLAG_COMPILE_ONLY))
+  }
+  let parsed = now()
+  let result = run evaluation.evaluateFunction(&mut session.engine, observer, realm, move compiled)
+  unsafe gc.release(&mut session.engine, session.runtime, result.intoBits())
+  let evaluated = now()
+  let mount = run call(b"reactBench.mount(", messages, b")")
+  let nodes = run unsafe script(&mut session, mount.asSlice())
+  let mounted = now()
+  line(b"compile_ns", parsed - start)
+  line(b"evaluate_ns", evaluated - parsed)
+  line(b"mount_ns", mounted - evaluated)
+  line(b"nodes", nodes)
+  let zero = runtime.GcCounts { full: 0, young: 0, ticks: 0 }
+  let counts = unsafe collections(session.runtime, zero, b"mount_full_collections", b"mount_young_collections", b"mount_gc_ticks")
+  line(b"mount_used_bytes", observer.usedBytes())
+  line(b"mount_peak_bytes", observer.stats().peakBytes)
+  line(b"mount_resident_bytes", resident())
+  if stream {
+    let warm = run unsafe script(&mut session, b"for (let i = 0; i < 20; i++) reactBench.tick(' warm'); 0")
+    let loop = run call(b"for (let i = 0; i < ", ticks, b"; i++) reactBench.tick(' word'); 0")
+    let before = now()
+    let _done = run unsafe script(&mut session, loop.asSlice())
+    line(b"stream_ns", now() - before + warm)
+    line(b"stream_ticks", ticks)
+    let _after = unsafe collections(session.runtime, counts, b"stream_full_collections", b"stream_young_collections", b"stream_gc_ticks")
+    line(b"stream_used_bytes", observer.usedBytes())
+  }
+  // What stays once the garbage of the mount is gone: a forced full collection.
+  run unsafe gc.collect(&mut session.engine, session.runtime, true)
+  line(b"retained_used_bytes", observer.usedBytes())
+  line(b"retained_resident_bytes", resident())
+  // What the process keeps once the tree is gone: the peak's memory should go back.
+  let _gone = run unsafe script(&mut session, b"reactBench.unmount(); 0")
+  run unsafe gc.collect(&mut session.engine, session.runtime, true)
+  // As a host does when its app goes idle; the engine also does after a full
+  // collection of its own.
+  line(b"unmounted_released_bytes", unsafe runtime.releaseIdle(observer, session.runtime, 0))
+  line(b"unmounted_used_bytes", observer.usedBytes())
+  line(b"unmounted_resident_bytes", resident())
+}
+effect fn program() -> i32 ! HostInputError | OutOfMemoryError | SynchronizationError ? &mut HostInput | &mut Allocator {
+  let arguments: List<Bytes> = run HostInput.arguments()
+  let values = arguments.asSlice()
+  // --bytecode <image>: load the bundle from an image (`silkjs-engine --write-image`).
+  let mut first: usize = 1
+  let mut bytecode = List<u8>.make()
+  if values.length > 2 && values[1].asSlice() == b"--bytecode" {
+    let read = run Effect.result(platform.readFile(values[2].asSlice()))
+    match move read {
+      Result<List<u8>, OutOfMemoryError | PlatformError>.Success { value } => { bytecode = move value }
+      Result<List<u8>, OutOfMemoryError | PlatformError>.Failure { .. } => { out(b"react-bench: cannot read the image\n") return 2 }
+    }
+    if !image.loadable(bytecode.asSlice()) { out(b"react-bench: not a bytecode image of this engine build\n") return 2 }
+    first = 3
+  }
+  if values.length < first + 2 { out(b"usage: react-bench [--bytecode <image>] mount|stream <bundle.js> [messages] [ticks] | image <bundle.js> > <image>\n") return 2 }
+  let stream = values[first].asSlice() == b"stream"
+  let writes = values[first].asSlice() == b"image"
+  let mut messages: usize = if stream { 200 } else { 1000 }
+  let mut ticks: usize = 200
+  if values.length > first + 2 { messages = parse(values[first + 2].asSlice(), messages) }
+  if values.length > first + 3 { ticks = parse(values[first + 3].asSlice(), ticks) }
+  let loaded = run Effect.result(platform.readFile(values[first + 1].asSlice()))
+  let source = match move loaded {
+    Result<List<u8>, OutOfMemoryError | PlatformError>.Success { value } => move value
+    Result<List<u8>, OutOfMemoryError | PlatformError>.Failure { .. } => { out(b"react-bench: cannot read the bundle\n") return 2 }
+  }
+  let clockStart = now() let tickStart = unsafe memory.ticks()
+  let namespace = run ClassIdAllocator.make()
+  let process = run Process.make(&namespace)
+  let domain = run WaiterDomain.make()
+  let mut allocator = run RuntimeAllocator.make(Allocator.systemAllocatorProvider())
+  allocator.enablePooling()
+  let observer = run allocator.observe()
+  let rt = run runtime.allocateRuntimeStorage(stack.currentFrameAddress()) |> Effect.provideMut<Allocator>(&mut allocator)
+  let opened = run Effect.result(unsafe Session.fromRuntime(&observer, domain.handle(), &process, false, rt)) |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut session = match move opened {
+    Result<Session, OutOfMemoryError | JsException>.Success { value } => move value
+    Result<Session, OutOfMemoryError | JsException>.Failure { .. } => { out(b"react-bench: cannot create the realm\n") return 2 }
+  }
+  if writes {
+    // `image <bundle.js>`: the bundle as a bytecode image on standard output, for --bytecode.
+    let realm = session.context.realm()
+    let built = run Effect.result(image.write(&mut session.engine, &observer, realm, source.asSlice(), b"bundle.js", compile.TYPE_GLOBAL)) |> Effect.provideMut<Allocator>(&mut allocator)
+    let mut status: i32 = 1
+    match move built {
+      Result<List<u8>, JsException>.Success { value } => {
+        if platform.writeAll(1, value.asSlice()) { status = 0 } else { out(b"react-bench: cannot write the image\n") }
+      }
+      Result<List<u8>, JsException>.Failure { .. } => {
+        run libc.dumpError(&mut session.engine, realm) |> Effect.provideMut<Allocator>(&mut allocator)
+      }
+    }
+    run unsafe session.close() |> Effect.provideMut<Allocator>(&mut allocator)
+    drop session
+    return status
+  }
+  line(b"realm_ns", now() - clockStart)
+  line(b"realm_used_bytes", observer.usedBytes())
+  let measured = run Effect.result(unsafe measure(&mut session, source.asSlice(), bytecode.asSlice(), stream, messages, ticks)) |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut status: i32 = 0
+  match move measured {
+    Result<(), OutOfMemoryError | JsException>.Success { .. } => ()
+    Result<(), OutOfMemoryError | JsException>.Failure { .. } => {
+      run libc.dumpError(&mut session.engine, session.context.realm()) |> Effect.provideMut<Allocator>(&mut allocator)
+      status = 1
+    }
+  }
+  // Ticks to nanoseconds: both clocks over the whole run.
+  line(b"run_ns", now() - clockStart)
+  line(b"run_ticks", unsafe memory.ticks() - tickStart)
+  run unsafe session.close() |> Effect.provideMut<Allocator>(&mut allocator)
+  drop session
+  line(b"closed_resident_bytes", resident())
+  drop bytecode
+  return status
+}
+pub effect fn main() -> i32 ? &mut HostInput {
+  let mut system = Allocator.systemAllocatorProvider()
+  let executed = run Effect.result(program()) |> Effect.provideMut<Allocator>(&mut system)
+  match move executed {
+    Result<i32, HostInputError | OutOfMemoryError | SynchronizationError>.Success { value } => { return value }
+    Result<i32, HostInputError | OutOfMemoryError | SynchronizationError>.Failure { .. } => {
+      out(b"react-bench: unable to initialize the engine\n")
+      return 2
+    }
+  }
+}

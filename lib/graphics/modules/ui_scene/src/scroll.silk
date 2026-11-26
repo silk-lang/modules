@@ -1,0 +1,426 @@
+//! Scroll-linked groups: primitives whose position follows a scroll offset, so a renderer can
+//! scroll them without painting again, as a browser compositor scrolls a layer.
+//!
+//! [`Scene.pushScrollGroup`] opens a group with a [`ScrollLink`]. Its primitives are painted
+//! where they sit with every scroll at 0, and drawn moved by the link's offset at the scroll
+//! positions the renderer uses: [`Scene.scrolls`] as painted, or newer ones. Each axis of the
+//! offset is `clamp(factor * scroll + base, low, high)` of the linked node's scroll. Fractional
+//! positions survive composition; individual coverage rasterizers choose their pixel sampling.
+//!
+//! - scrolled content: factor -1 ([`ScrollAxis.content`]);
+//! - a scrollbar thumb: factor `travel / range` ([`ScrollAxis.scaled`]);
+//! - a sticky box: factor 1 with the base and limits of its sticky range.
+//!
+//! Groups nest: a group's offset adds to its parent's, and its clip is cut by its parent's.
+//! [`Placements.resolve`] works out every group's offset and clip, and its methods move a
+//! primitive of a group by them.
+import silk.collections.list { List }
+import silk.core.ownership { Copy }
+import silk.geometry.matrix { Matrix3 }
+import silk.geometry.rect { Rect }
+import silk.geometry.vector { Vector2 }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f32
+import silk.num.u32
+import silk.num.usize
+import radii { Radii }
+import primitives {
+  ContentMask,
+  GlyphSprite,
+  ImageSprite,
+  LayerSprite,
+  PathSprite,
+  Quad,
+  Shadow,
+  Underline,
+}
+
+/// An offset that leaves everything unbounded.
+pub const UNBOUNDED: f32 = 1.0e30
+
+/// The group of primitives outside every scroll group.
+pub const ROOT_GROUP: u32 = 0
+
+/// One axis of a [`ScrollLink`]: the offset `clamp(factor * scroll + base, low, high)`.
+pub struct ScrollAxis {
+  pub factor: f32,
+  pub base: f32,
+  pub low: f32,
+  pub high: f32,
+}
+
+impl Copy for ScrollAxis {}
+
+impl ScrollAxis {
+  /// No movement on this axis.
+  pub fn fixed() -> ScrollAxis {
+    return ScrollAxis { factor: 0.0, base: 0.0, low: -UNBOUNDED, high: UNBOUNDED }
+  }
+
+  /// Content that moves against the scroll.
+  pub fn content() -> ScrollAxis {
+    return ScrollAxis { factor: -1.0, base: 0.0, low: -UNBOUNDED, high: UNBOUNDED }
+  }
+
+  /// Moves `factor` pixels per pixel of scroll, unbounded.
+  pub fn scaled(factor: f32) -> ScrollAxis {
+    return ScrollAxis { factor: factor, base: 0.0, low: -UNBOUNDED, high: UNBOUNDED }
+  }
+
+  /// This axis for scrolls and offsets `scale` times larger: from CSS to device pixels.
+  pub fn inDevice(self: &Self, scale: f32) -> ScrollAxis {
+    return ScrollAxis {
+      factor: self.factor,
+      base: self.base * scale,
+      low: self.low * scale,
+      high: self.high * scale,
+    }
+  }
+
+  /// The offset at `scroll`, preserving fractional device pixels.
+  pub fn at(self: &Self, scroll: f32) -> f32 {
+    let raw = self.factor * scroll + self.base
+    let bounded = f32.min(f32.max(raw, self.low), self.high)
+    return bounded
+  }
+}
+
+/// How a group follows the scroll of node `node` (an id the painter chooses, the same one its
+/// [`ScrollPosition`] carries).
+pub struct ScrollLink {
+  pub node: u32,
+  pub x: ScrollAxis,
+  pub y: ScrollAxis,
+}
+
+impl Copy for ScrollLink {}
+
+/// Where node `node` is scrolled to and how far it can go, in device pixels.
+pub struct ScrollPosition {
+  pub node: u32,
+  pub x: f32,
+  pub y: f32,
+  pub minX: f32,
+  pub maxX: f32,
+  pub minY: f32,
+  pub maxY: f32,
+}
+
+impl Copy for ScrollPosition {}
+
+impl ScrollPosition {
+  /// This position moved by (`dx`, `dy`) and kept in range.
+  pub fn movedBy(self: Self, dx: f32, dy: f32) -> ScrollPosition {
+    return ScrollPosition {
+      node: self.node,
+      x: f32.min(f32.max(self.x + dx, self.minX), f32.max(self.maxX, self.minX)),
+      y: f32.min(f32.max(self.y + dy, self.minY), f32.max(self.maxY, self.minY)),
+      minX: self.minX,
+      maxX: self.maxX,
+      minY: self.minY,
+      maxY: self.maxY,
+    }
+  }
+}
+
+/// A group as the scene records it.
+pub struct ScrollGroup {
+  /// The enclosing group, [`ROOT_GROUP`] at the top level.
+  pub parent: u32,
+  pub link: ScrollLink,
+  /// What the group's primitives are cut to, in its parent's space.
+  pub clip: Rect<f32>,
+  /// The corner radii of `clip`, zero for a plain rectangle.
+  pub clipRadii: Radii,
+  /// Where the group's primitives can draw at any scroll, in its parent's space: what the group
+  /// is ordered by against everything around it.
+  pub bounds: Rect<f32>,
+}
+
+impl Copy for ScrollGroup {}
+
+/// Where a group draws: moved by (`dx`, `dy`) and cut to `clip`, in window pixels.
+pub struct Placement {
+  pub dx: f32,
+  pub dy: f32,
+  pub clip: Rect<f32>,
+  /// `clip` with the rounded corners of the groups that cut it.
+  pub mask: ContentMask,
+}
+
+impl Copy for Placement {}
+
+fn unbounded() -> Rect<f32> {
+  return Rect<f32>.new(-UNBOUNDED, -UNBOUNDED, UNBOUNDED, UNBOUNDED)
+}
+
+fn moved(r: Rect<f32>, dx: f32, dy: f32) -> Rect<f32> {
+  return Rect<f32>.new(r.xMin + dx, r.yMin + dy, r.xMax + dx, r.yMax + dy)
+}
+
+fn cut(a: Rect<f32>, b: Rect<f32>) -> Rect<f32> {
+  return Rect<f32>.new(
+    f32.max(a.xMin, b.xMin),
+    f32.max(a.yMin, b.yMin),
+    f32.min(a.xMax, b.xMax),
+    f32.min(a.yMax, b.yMax),
+  )
+}
+
+fn movedMask(mask: ContentMask, p: Placement) -> ContentMask {
+  return mask.moved(p.dx, p.dy).intersect(p.mask)
+}
+
+/// Where each node's scroll position is in a list of them: a scene of a thousand scrollers
+/// (every clipped box is one) would otherwise read the list a thousand times.
+pub struct ScrollIndex {
+  /// For a node below [`INDEXED`], its position's index + 1, or 0 for none.
+  places: List<u32>,
+  /// The nodes that have a place, to forget them without clearing every place.
+  nodes: List<u32>,
+}
+
+/// Nodes from here up are not indexed, so `places` stays small whatever a node is called.
+const INDEXED: u32 = 4194304
+
+impl ScrollIndex {
+  pub fn make() -> ScrollIndex {
+    return ScrollIndex { places: List<u32>.make(), nodes: List<u32>.make() }
+  }
+
+  /// Whether `node`'s place can be kept: [`ScrollIndex.find`] says nothing of other nodes.
+  pub fn holds(node: u32) -> bool {
+    return node < INDEXED
+  }
+
+  /// The index of `node`'s position, or `usize.MAX` when it has none.
+  pub fn find(self: &Self, node: u32) -> usize {
+    if u32.toUsize(node) < self.places.length() {
+      let place = self.places.get(u32.toUsize(node))
+      if place != 0 {
+        return u32.toUsize(place) - 1
+      }
+    }
+    return usize.MAX
+  }
+
+  /// Keeps `index` as the place of `node`, which [`ScrollIndex.holds`].
+  pub effect fn set(self: &mut Self, node: u32, index: usize) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let at = u32.toUsize(node)
+    let held = self.places.length()
+    if at >= held {
+      run self.places.appendRepeated(0, at + 1 - held)
+    }
+    if self.places.get(at) == 0 {
+      run self.nodes.append(node)
+    }
+    self.places.set(at, usize.toU32(index) + 1)
+  }
+
+  /// Forgets every place.
+  pub fn clear(self: &mut Self) -> () {
+    let nodes = self.nodes.asSlice()
+    let places = self.places.asMutSlice()
+    let mut i: usize = 0
+    while i < nodes.length {
+      places[u32.toUsize(nodes[i])] = 0
+      i = i + 1
+    }
+    self.nodes.clear()
+  }
+}
+
+/// The offset and clip of every group of a scene at some scroll positions.
+pub struct Placements {
+  list: List<Placement>,
+  /// Where each node's position is in the positions being resolved.
+  index: ScrollIndex,
+}
+
+impl Placements {
+  pub fn make() -> Placements {
+    return Placements { list: List<Placement>.make(), index: ScrollIndex.make() }
+  }
+
+  /// Works out every group of `groups` (parents before children) at the scroll positions of
+  /// `painted`, each replaced by the one of `newer` for the same node when there is one.
+  pub effect fn resolve(
+    self: &mut Self,
+    groups: &[ScrollGroup],
+    painted: &[ScrollPosition],
+    newer: &[ScrollPosition],
+  ) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    self.list.clear()
+    run self.list.append(Placement { dx: 0.0, dy: 0.0, clip: unbounded(), mask: ContentMask.new(unbounded()) })
+    self.index.clear()
+    let mut p: usize = 0
+    while p < painted.length {
+      // The first position of a node is the one a search from the start finds.
+      if ScrollIndex.holds(painted[p].node) && self.index.find(painted[p].node) == usize.MAX {
+        run self.index.set(painted[p].node, p)
+      }
+      p = p + 1
+    }
+    let mut g: usize = 1
+    while g < groups.length {
+      let group = groups[g]
+      let parent = self.list.get(u32.toUsize(group.parent))
+      let scroll = positionOf(&self.index, painted, newer, group.link.node)
+      let dx = parent.dx + group.link.x.at(scroll.x)
+      let dy = parent.dy + group.link.y.at(scroll.y)
+      let mask = parent.mask.intersect(ContentMask.rounded(group.clip, group.clipRadii).moved(parent.dx, parent.dy))
+      run self.list.append(Placement { dx: dx, dy: dy, clip: mask.bounds, mask: mask })
+      g = g + 1
+    }
+  }
+
+  /// Whether every group draws where it was painted, unclipped: nothing to move.
+  pub fn still(self: &Self) -> bool {
+    return self.list.length() <= 1
+  }
+
+  /// How many groups are placed: group indices below this have a placement of their own.
+  pub fn count(self: &Self) -> usize {
+    return self.list.length()
+  }
+
+  /// The placement of group `group`.
+  pub fn get(self: &Self, group: u32) -> Placement {
+    if u32.toUsize(group) >= self.list.length() {
+      return Placement { dx: 0.0, dy: 0.0, clip: unbounded(), mask: ContentMask.new(unbounded()) }
+    }
+    return self.list.get(u32.toUsize(group))
+  }
+
+  pub fn quad(self: &Self, q: Quad, group: u32) -> Quad {
+    if group == ROOT_GROUP {
+      return q
+    }
+    let p = self.get(group)
+    let mut out = q
+    out.bounds = moved(q.bounds, p.dx, p.dy)
+    out.mask = movedMask(q.mask, p)
+    return out
+  }
+
+  pub fn shadow(self: &Self, s: Shadow, group: u32) -> Shadow {
+    if group == ROOT_GROUP {
+      return s
+    }
+    let p = self.get(group)
+    let mut out = s
+    out.bounds = moved(s.bounds, p.dx, p.dy)
+    out.mask = movedMask(s.mask, p)
+    return out
+  }
+
+  pub fn underline(self: &Self, u: Underline, group: u32) -> Underline {
+    if group == ROOT_GROUP {
+      return u
+    }
+    let p = self.get(group)
+    let mut out = u
+    out.bounds = moved(u.bounds, p.dx, p.dy)
+    out.mask = movedMask(u.mask, p)
+    return out
+  }
+
+  pub fn glyph(self: &Self, g: GlyphSprite, group: u32) -> GlyphSprite {
+    if group == ROOT_GROUP {
+      return g
+    }
+    let p = self.get(group)
+    let mut out = g
+    out.bounds = moved(g.bounds, p.dx, p.dy)
+    out.mask = movedMask(g.mask, p)
+    return out
+  }
+
+  pub fn image(self: &Self, s: ImageSprite, group: u32) -> ImageSprite {
+    if group == ROOT_GROUP {
+      return s
+    }
+    let p = self.get(group)
+    let mut out = s
+    out.bounds = moved(s.bounds, p.dx, p.dy)
+    out.clipBounds = moved(s.clipBounds, p.dx, p.dy)
+    out.mask = movedMask(s.mask, p)
+    return out
+  }
+
+  pub fn path(self: &Self, s: PathSprite, group: u32) -> PathSprite {
+    if group == ROOT_GROUP {
+      return s
+    }
+    let p = self.get(group)
+    let mut out = s
+
+    // Strip coverage has integer pixel origins; quantize coverage only, not the group's geometry.
+    out.x = s.x + f32.toI32(f32.round(p.dx))
+    out.y = s.y + f32.toI32(f32.round(p.dy))
+    out.paintBounds = moved(s.paintBounds, p.dx, p.dy)
+    out.mask = movedMask(s.mask, p)
+    return out
+  }
+
+  pub fn layer(self: &Self, s: LayerSprite, group: u32) -> LayerSprite {
+    if group == ROOT_GROUP {
+      return s
+    }
+    let p = self.get(group)
+    let mut out = s
+    out.bounds = cut(moved(s.bounds, p.dx, p.dy), p.clip)
+    out.effects.clip = moved(s.effects.clip, p.dx, p.dy)
+    out.clip = movedMask(s.clip, p)
+    if s.transformed() {
+      // The layer's own primitives are outside every group (see `Scene.pushTransformLayer`):
+      // only where they land moves.
+      let a = s.transform.values
+      out.transform = Matrix3<f32>.new(
+        [
+          a[0] + p.dx * a[2],
+          a[1] + p.dy * a[2],
+          a[2],
+          a[3] + p.dx * a[5],
+          a[4] + p.dy * a[5],
+          a[5],
+          a[6] + p.dx * a[8],
+          a[7] + p.dy * a[8],
+          a[8],
+        ],
+      )
+    } else {
+      out.source = out.bounds
+    }
+    return out
+  }
+}
+
+fn positionOf(index: &ScrollIndex, painted: &[ScrollPosition], newer: &[ScrollPosition], node: u32) -> Vector2<f32> {
+  let mut i: usize = 0
+  while i < newer.length {
+    if newer[i].node == node {
+      return Vector2<f32> { x: newer[i].x, y: newer[i].y }
+    }
+    i = i + 1
+  }
+  if ScrollIndex.holds(node) {
+    let at = index.find(node)
+    if at == usize.MAX {
+      return Vector2<f32> { x: 0.0, y: 0.0 }
+    }
+    return Vector2<f32> { x: painted[at].x, y: painted[at].y }
+  }
+  i = 0
+  while i < painted.length {
+    if painted[i].node == node {
+      return Vector2<f32> { x: painted[i].x, y: painted[i].y }
+    }
+    i = i + 1
+  }
+  return Vector2<f32> { x: 0.0, y: 0.0 }
+}

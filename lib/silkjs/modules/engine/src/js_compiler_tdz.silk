@@ -1,0 +1,388 @@
+//! Temporal dead zone checks the code does not need. Before the label pass
+//! (pre-label code, label ids as operands), a forward "definitely
+//! initialized" dataflow over the function's own lexical locals turns
+//! get_loc_check, put_loc_check and set_loc_check into get_loc, put_loc and
+//! set_loc wherever every path from the local's scope entry
+//! (set_loc_uninitialized) went through a store, and removes the
+//! set_loc_uninitialized of locals that then have no checked access left.
+//!
+//! Sound by construction: control flow follows the code's own branches, so
+//! code that runs in another order than it is written (for-in/of heads,
+//! switch cases) is handled like any other join. Exception handlers, finally
+//! blocks and for-await throw handlers start with nothing known. Captured
+//! locals (cells or scope slots), referenced ones, eval and debugger code are
+//! left alone.
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.collections.list { List }
+import silk.mem.pointer { Pointer }
+import silk.num.i32
+import silk.num.u8
+import silk.num.u16
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+import byte_buffer { ByteBuffer, readU16, readU32 }
+import js_compiler_types { FunctionDef }
+import js_opcode_data as op
+
+/// Tracked locals at most (words of state per label).
+const MAX_WORDS: usize = 8
+/// Dataflow rounds before giving up (each backward edge that changes a label
+/// state costs one).
+const MAX_ROUNDS: usize = 12
+
+/// Per-opcode TDZ classification bitmask (parser-view opcodes):
+///   1: plain local op, 2: checked local op, 4: label at +1, 8: label at +5,
+///   16: unknownTarget, 32: noFallthrough, 64: OP_label, 128: non-plain local invalidator.
+const TDZ_CLASS: [u8; 256] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 32, 0, 32, 0, 0, 32, 32, 0, 0, 0, 0, 0, 32, 32, 32, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 0, 0, 0, 0, 0, 0, 1, 3, 3, 3, 128, 128, 0, 0, 0, 128, 4, 4, 36, 20, 20, 32, 0, 0, 0, 8, 8, 8, 8, 8, 128, 0, 0, 0, 0, 0, 20, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 128, 128, 0, 0, 0, 0, 0, 0, 68, 0, 0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+
+/// The pass; input is fd's pre-label code, rewritten in place (same sizes; a
+/// removed set_loc_uninitialized becomes three nops, which the label pass drops).
+pub effect fn elideChecks(fd: &FunctionDef, input: &mut ByteBuffer) -> () ! OutOfMemoryError ? &mut Allocator {
+  if fd.hasEvalCall || fd.isEval || fd.debuggerMetadata.enabled { return }
+  let varCount = fd.vars.length()
+  if varCount == 0 { return }
+  let mut hasLexical = false
+  let mut vi: usize = 0
+  while vi < varCount {
+    if fd.vars.get(vi).isLexical { hasLexical = true break }
+    vi = vi + 1
+  }
+  if !hasLexical { return }
+  let bytes = input.asSlice()
+  let len = bytes.length
+  if len == 0 { return }
+  let ptr = unsafe Intrinsic.pointerRequalify<?[*]const u8, [*]const u8>(Pointer.fromSlice<u8>(bytes))
+  // Locals with a checked access get a bit; locals some other opcode names lose it.
+  let mut bitOf = List<i32>.make()
+  let mut tracked: usize = 0
+  let mut pos: usize = 0
+  while pos < len {
+    let code = unsafe Pointer.read<u8>(unsafe Pointer.at<u8>(ptr, pos))
+    if (TDZ_CLASS[u8.toUsize(code)] & 2) != 0 {
+      let index = u16.toUsize(readU16(bytes, usize.wrappingAdd(pos, 1)))
+      if index < varCount {
+        if bitOf.length() == 0 { run bitOf.reserveExact(varCount) while bitOf.length() < varCount { run bitOf.append(-1) } }
+        if bitOf.get(index) == -1 && tracked < MAX_WORDS * 64 { bitOf.set(index, usize.toI32(tracked)) tracked = tracked + 1 }
+      }
+    }
+    pos = usize.wrappingAdd(pos, u8.toUsize(op.opcodeInfo(code, false).size))
+  }
+  if tracked == 0 { return }
+  let words = (tracked + 63) / 64
+  let labelCount = fd.labels.length()
+  // Per label: its known state (all ones until a branch or fallthrough reaches
+  // it), and whether it starts with nothing known.
+  let mut states = List<u64>.make() run states.reserveExact(labelCount * words)
+  while states.length() < labelCount * words { run states.append(u64.MAX) }
+  let mut unknown = List<bool>.make() run unknown.reserveExact(labelCount)
+  while unknown.length() < labelCount { run unknown.append(false) }
+  pos = 0
+  while pos < len {
+    let code = unsafe Pointer.read<u8>(unsafe Pointer.at<u8>(ptr, pos))
+    let cls = TDZ_CLASS[u8.toUsize(code)]
+    if (cls & (128 | 16)) != 0 {
+      if (cls & 128) != 0 {
+        let idxOff: usize = if code == op.OP_make_loc_ref { 5 } else { 1 }
+        let index = u16.toUsize(readU16(bytes, usize.wrappingAdd(pos, idxOff)))
+        if index < varCount && bitOf.get(index) >= 0 { bitOf.set(index, -1) }
+      } else {
+        let label = u32.toUsize(readU32(bytes, usize.wrappingAdd(pos, 1)))
+        if label < labelCount { unknown.set(label, true) let mut w: usize = 0 while w < words { states.set(label * words + w, 0) w = w + 1 } }
+      }
+    }
+    pos = usize.wrappingAdd(pos, u8.toUsize(op.opcodeInfo(code, false).size))
+  }
+  let mut i: usize = 0
+  while i < varCount {
+    let v = fd.vars.get(i)
+    if v.isCaptured || v.isReferenced { bitOf.set(i, -1) }
+    i = i + 1
+  }
+  let mut cur = List<u64>.make() run cur.reserveExact(words)
+  while cur.length() < words { run cur.append(0) }
+  let mut round: usize = 0
+  let mut stable = false
+  if words == 1 && labelCount > 0 {
+    while !stable && round < MAX_ROUNDS {
+      stable = walk1(&bitOf, &mut states, &unknown, bytes, ptr)
+      round = round + 1
+    }
+  } else {
+    while !stable && round < MAX_ROUNDS {
+      stable = walk(&bitOf, &mut states, &unknown, &mut cur, words, bytes, ptr)
+      round = round + 1
+    }
+  }
+  if !stable { return }
+  // The last round changed nothing: the same states say which checks go.
+  let mut unchecked = List<usize>.make()
+  if words == 1 && labelCount > 0 {
+    run walkRewrite1(&bitOf, &states, bytes, ptr, &mut unchecked)
+  } else {
+    run walkRewrite(&bitOf, &states, &mut cur, words, bytes, ptr, &mut unchecked)
+  }
+  // Locals with a checked access left keep their dead zone marker.
+  let mut keep = List<bool>.make() run keep.reserveExact(varCount)
+  while keep.length() < varCount { run keep.append(false) }
+  let mut next: usize = 0
+  let mut markers = List<usize>.make()
+  pos = 0
+  while pos < len {
+    let code = unsafe Pointer.read<u8>(unsafe Pointer.at<u8>(ptr, pos))
+    if (TDZ_CLASS[u8.toUsize(code)] & 2) != 0 {
+      if next < unchecked.length() && unchecked.get(next) == pos { next = next + 1 }
+      else { keep.set(u16.toUsize(readU16(bytes, usize.wrappingAdd(pos, 1))), true) }
+    } else if code == op.OP_set_loc_uninitialized { run markers.append(pos) }
+    pos = usize.wrappingAdd(pos, u8.toUsize(op.opcodeInfo(code, false).size))
+  }
+  i = 0
+  while i < markers.length() {
+    let at = markers.get(i)
+    let index = u16.toUsize(readU16(bytes, usize.wrappingAdd(at, 1)))
+    if index < varCount && bitOf.get(index) >= 0 && !keep.get(index) { } else { markers.set(i, usize.MAX) }
+    i = i + 1
+  }
+  drop bytes
+  i = 0
+  while i < unchecked.length() {
+    let at = unchecked.get(i)
+    let code = input.get(at)
+    if code == op.OP_get_loc_check { input.set(at, op.OP_get_loc) }
+    else if code == op.OP_put_loc_check { input.set(at, op.OP_put_loc) }
+    else { input.set(at, op.OP_set_loc) }
+    i = i + 1
+  }
+  i = 0
+  while i < markers.length() {
+    let at = markers.get(i)
+    if at != usize.MAX { input.set(at, op.OP_nop) input.set(at + 1, op.OP_nop) input.set(at + 2, op.OP_nop) }
+    i = i + 1
+  }
+}
+
+fn isSet(cur: &List<u64>, bit: i32) -> bool {
+  let b = i32.toUsize(bit)
+  return u64.shiftRight(cur.get(b / 64), usize.toU64(b % 64)) & 1 != 0
+}
+fn setBit(cur: &mut List<u64>, bit: i32, on: bool) -> () {
+  let b = i32.toUsize(bit)
+  let mask = u64.shiftLeft(1, usize.toU64(b % 64))
+  let c = cur.get(b / 64)
+  if on { cur.set(b / 64, c | mask) } else { cur.set(b / 64, c & ~mask) }
+}
+
+/// Fast single-word forward round (<= 64 tracked locals, labelCount > 0).
+fn walk1(bitOf: &List<i32>, states: &mut List<u64>, unknown: &List<bool>, bytes: &[u8], ptr: [*]const u8) -> bool {
+  let bitOfLen = bitOf.length()
+  let bitOfPtr = unsafe Intrinsic.pointerRequalify<?[*]const i32, [*]const i32>(Pointer.fromSlice<i32>(bitOf.asSlice()))
+  let statesPtr = unsafe Intrinsic.pointerRequalify<?[*]mut u64, [*]mut u64>(Pointer.fromMutSlice<u64>(states.asMutSlice()))
+  let unknownPtr = unsafe Intrinsic.pointerRequalify<?[*]const bool, [*]const bool>(Pointer.fromSlice<bool>(unknown.asSlice()))
+  let len = bytes.length
+  let mut stable = true
+  let mut curWord: u64 = 0
+  let mut live = true
+  let mut pos: usize = 0
+  while pos < len {
+    let code = unsafe Pointer.read<u8>(unsafe Pointer.at<u8>(ptr, pos))
+    let size = u8.toUsize(op.opcodeInfo(code, false).size)
+    let cls = TDZ_CLASS[u8.toUsize(code)]
+    if (cls & 63) == 0 && (cls & 64) == 0 {
+      if !live { curWord = u64.MAX live = true }
+      pos = usize.wrappingAdd(pos, size)
+      continue
+    }
+    if (cls & 64) != 0 {
+      let label = u32.toUsize(readU32(bytes, usize.wrappingAdd(pos, 1)))
+      let s = unsafe Pointer.read<u64>(unsafe Pointer.at<u64>(statesPtr, label))
+      if live { curWord = curWord & s } else { curWord = s }
+      live = true
+      if !unsafe Pointer.read<bool>(unsafe Pointer.at<bool>(unknownPtr, label)) && s != curWord {
+        unsafe Pointer.write<u64>(unsafe Pointer.atMut<u64>(statesPtr, label), curWord)
+        stable = false
+      }
+    } else {
+      if !live { curWord = u64.MAX }
+      if (cls & 1) != 0 {
+        let index = u16.toUsize(readU16(bytes, usize.wrappingAdd(pos, 1)))
+        if index < bitOfLen {
+          let bit = unsafe Pointer.read<i32>(unsafe Pointer.at<i32>(bitOfPtr, index))
+          if bit >= 0 {
+            let mask = u64.shiftLeft(1, i32.toU64(bit))
+            if code != op.OP_set_loc_uninitialized { curWord = curWord | mask } else { curWord = curWord & ~mask }
+          }
+        }
+      }
+      if (cls & (4 | 8)) != 0 && (cls & 16) == 0 {
+        let offset: usize = if (cls & 4) != 0 { 1 } else { 5 }
+        let label = u32.toUsize(readU32(bytes, usize.wrappingAdd(pos, offset)))
+        if !unsafe Pointer.read<bool>(unsafe Pointer.at<bool>(unknownPtr, label)) {
+          let s = unsafe Pointer.read<u64>(unsafe Pointer.at<u64>(statesPtr, label))
+          let meet = s & curWord
+          if meet != s {
+            unsafe Pointer.write<u64>(unsafe Pointer.atMut<u64>(statesPtr, label), meet)
+            stable = false
+          }
+        }
+      }
+      live = (cls & 32) == 0
+    }
+    pos = usize.wrappingAdd(pos, size)
+  }
+  return stable
+}
+
+/// Fast single-word final round (<= 64 tracked locals, labelCount > 0).
+effect fn walkRewrite1(bitOf: &List<i32>, states: &List<u64>, bytes: &[u8], ptr: [*]const u8, unchecked: &mut List<usize>) -> ()
+  ! OutOfMemoryError ? &mut Allocator {
+  let bitOfLen = bitOf.length()
+  let bitOfPtr = unsafe Intrinsic.pointerRequalify<?[*]const i32, [*]const i32>(Pointer.fromSlice<i32>(bitOf.asSlice()))
+  let statesPtr = unsafe Intrinsic.pointerRequalify<?[*]const u64, [*]const u64>(Pointer.fromSlice<u64>(states.asSlice()))
+  let len = bytes.length
+  let mut curWord: u64 = 0
+  let mut live = true
+  let mut pos: usize = 0
+  while pos < len {
+    let code = unsafe Pointer.read<u8>(unsafe Pointer.at<u8>(ptr, pos))
+    let size = u8.toUsize(op.opcodeInfo(code, false).size)
+    let cls = TDZ_CLASS[u8.toUsize(code)]
+    if (cls & (1 | 32 | 64)) == 0 {
+      if !live { curWord = u64.MAX live = true }
+      pos = usize.wrappingAdd(pos, size)
+      continue
+    }
+    if (cls & 64) != 0 {
+      let label = u32.toUsize(readU32(bytes, usize.wrappingAdd(pos, 1)))
+      let s = unsafe Pointer.read<u64>(unsafe Pointer.at<u64>(statesPtr, label))
+      if live { curWord = curWord & s } else { curWord = s }
+      live = true
+    } else {
+      if !live { curWord = u64.MAX }
+      if (cls & 1) != 0 {
+        let index = u16.toUsize(readU16(bytes, usize.wrappingAdd(pos, 1)))
+        if index < bitOfLen {
+          let bit = unsafe Pointer.read<i32>(unsafe Pointer.at<i32>(bitOfPtr, index))
+          if bit >= 0 {
+            let mask = u64.shiftLeft(1, i32.toU64(bit))
+            if (cls & 2) != 0 && (curWord & mask) != 0 { run unchecked.append(pos) }
+            if code != op.OP_set_loc_uninitialized { curWord = curWord | mask } else { curWord = curWord & ~mask }
+          }
+        }
+      }
+      live = (cls & 32) == 0
+    }
+    pos = usize.wrappingAdd(pos, size)
+  }
+}
+
+/// One forward round over the code: true when no label state changed.
+fn walk(bitOf: &List<i32>, states: &mut List<u64>, unknown: &List<bool>, cur: &mut List<u64>, words: usize, bytes: &[u8], ptr: [*]const u8) -> bool {
+  let mut stable = true
+  let mut w: usize = 0
+  while w < words { cur.set(w, 0) w = w + 1 }
+  let mut live = true
+  let len = bytes.length
+  let mut pos: usize = 0
+  while pos < len {
+    let code = unsafe Pointer.read<u8>(unsafe Pointer.at<u8>(ptr, pos))
+    let size = u8.toUsize(op.opcodeInfo(code, false).size)
+    let cls = TDZ_CLASS[u8.toUsize(code)]
+    if (cls & 127) == 0 {
+      if !live { w = 0 while w < words { cur.set(w, u64.MAX) w = w + 1 } live = true }
+      pos = usize.wrappingAdd(pos, size)
+      continue
+    }
+    if (cls & 64) != 0 {
+      let label = u32.toUsize(readU32(bytes, usize.wrappingAdd(pos, 1)))
+      w = 0
+      while w < words {
+        let s = states.get(label * words + w)
+        let c = cur.get(w)
+        if live { cur.set(w, c & s) } else { cur.set(w, s) }
+        w = w + 1
+      }
+      live = true
+      // A fallthrough into a label is an edge too: the label's state is the meet.
+      if !unknown.get(label) {
+        w = 0
+        while w < words {
+          let s = states.get(label * words + w)
+          let c = cur.get(w)
+          if s != c { states.set(label * words + w, c) stable = false }
+          w = w + 1
+        }
+      }
+    } else {
+      if !live { w = 0 while w < words { cur.set(w, u64.MAX) w = w + 1 } }
+      if (cls & 1) != 0 {
+        let index = u16.toUsize(readU16(bytes, usize.wrappingAdd(pos, 1)))
+        if index < bitOf.length() {
+          let bit = bitOf.get(index)
+          if bit >= 0 { setBit(&mut cur, bit, code != op.OP_set_loc_uninitialized) }
+        }
+      }
+      if (cls & (4 | 8)) != 0 && (cls & 16) == 0 {
+        let offset: usize = if (cls & 4) != 0 { 1 } else { 5 }
+        let label = u32.toUsize(readU32(bytes, usize.wrappingAdd(pos, offset)))
+        if !unknown.get(label) {
+          w = 0
+          while w < words {
+            let s = states.get(label * words + w)
+            let meet = s & cur.get(w)
+            if meet != s { states.set(label * words + w, meet) stable = false }
+            w = w + 1
+          }
+        }
+      }
+      live = (cls & 32) == 0
+    }
+    pos = usize.wrappingAdd(pos, size)
+  }
+  return stable
+}
+
+/// The final round: the positions of checked accesses to locals known
+/// initialized, in code order.
+effect fn walkRewrite(bitOf: &List<i32>, states: &List<u64>, cur: &mut List<u64>, words: usize, bytes: &[u8], ptr: [*]const u8, unchecked: &mut List<usize>) -> ()
+  ! OutOfMemoryError ? &mut Allocator {
+  let mut w: usize = 0
+  while w < words { cur.set(w, 0) w = w + 1 }
+  let mut live = true
+  let len = bytes.length
+  let mut pos: usize = 0
+  while pos < len {
+    let code = unsafe Pointer.read<u8>(unsafe Pointer.at<u8>(ptr, pos))
+    let size = u8.toUsize(op.opcodeInfo(code, false).size)
+    let cls = TDZ_CLASS[u8.toUsize(code)]
+    if (cls & (1 | 32 | 64)) == 0 {
+      if !live { w = 0 while w < words { cur.set(w, u64.MAX) w = w + 1 } live = true }
+      pos = usize.wrappingAdd(pos, size)
+      continue
+    }
+    if (cls & 64) != 0 {
+      let label = u32.toUsize(readU32(bytes, usize.wrappingAdd(pos, 1)))
+      w = 0
+      while w < words {
+        let s = states.get(label * words + w)
+        let c = cur.get(w)
+        if live { cur.set(w, c & s) } else { cur.set(w, s) }
+        w = w + 1
+      }
+      live = true
+    } else {
+      if !live { w = 0 while w < words { cur.set(w, u64.MAX) w = w + 1 } }
+      if (cls & 1) != 0 {
+        let index = u16.toUsize(readU16(bytes, usize.wrappingAdd(pos, 1)))
+        if index < bitOf.length() {
+          let bit = bitOf.get(index)
+          if bit >= 0 {
+            if (cls & 2) != 0 && isSet(&cur.*, bit) { run unchecked.append(pos) }
+            setBit(&mut cur, bit, code != op.OP_set_loc_uninitialized)
+          }
+        }
+      }
+      live = (cls & 32) == 0
+    }
+    pos = usize.wrappingAdd(pos, size)
+  }
+}

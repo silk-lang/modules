@@ -1,0 +1,723 @@
+//! Long distance matching: a port of `lib/compress/zstd_ldm.c` and `zstd_ldm_geartab.h` of
+//! Zstandard 1.5.7.
+//!
+//! The long distance matcher looks for matches of `minMatchLength` bytes or more at any distance
+//! in the window. It cuts the input at the positions where a rolling "gear" hash of the last
+//! bytes has `hashRateLog` chosen bits at zero, hashes the `minMatchLength` bytes before each cut
+//! with XXH64, and keeps the positions in a table of buckets ([`cctx.LdmState`]). A block is then
+//! compressed around the matches found: the block compressor of the strategy runs on the
+//! literals between them ([`blockCompress`]), or, for `btopt` and above, the optimal parser gets
+//! them as candidates through `ms.ldmSeqStore`.
+//!
+//! A `RawSeqStore_t` is 40 bytes behind a pointer, with the layout that `zopt` documents
+//! (`zopt.RSS_*`); a `rawSeq` is 12 bytes: `u32 offset`, `u32 litLength`, `u32 matchLength`.
+//! An entry of the hash table (`ldmEntry_t`) is 8 bytes: `u32 offset`, `u32 checksum`.
+//!
+//! The parameters (`ZSTD_ldm_adjustParameters`) are in `cparams.ldmAdjustParameters`.
+import mem
+import errors
+import cparams
+import cparams { LdmParams }
+import cstate
+import cstate { MatchState, SeqStore }
+import cctx { CCtx, LdmState }
+import cdispatch
+import zfast
+import zdfast
+import zopt
+import silk.core.ownership { Copy }
+import silk.mem.pointer { Pointer }
+import silk.num.u8
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+
+/// `LDM_BATCH_SIZE`: how many cut points are found before they are looked up.
+const BATCH_SIZE: u32 = 64
+/// `kMaxChunkSize` of `ZSTD_ldm_generateSequences`.
+const MAX_CHUNK_SIZE: usize = 1048576
+
+/// `ZSTD_ldm_gearTab`.
+const GEAR_TAB: [u64; 256] = [
+  0xF5B8F72C5F77775C, 0x84935F266B7AC412, 0xB647ADA9CA730CCC, 0xB065BB4B114FB1DE,
+  0x34584E7E8C3A9FD0, 0x4E97E17C6AE26B05, 0x3A03D743BC99A604, 0xCECD042422C4044F,
+  0x76DE76C58524259E, 0x9C8528F65BADEACA, 0x86563706E2097529, 0x2902475FA375D889,
+  0xAFB32A9739A5EBE6, 0xCE2714DA3883E639, 0x021EAF821722E69E, 0x00037B628620B628,
+  0x049A8D455D88CAF5, 0x8556D711E6958140, 0x04F7AE74FC605C1F, 0x829F0C3468BD3A20,
+  0x4FFDC885C625179E, 0x8473DE048A3DAF1B, 0x51008822B05646B2, 0x69D75D12B2D1CC5F,
+  0x8C9D4A19159154BC, 0xC3CC10F4ABBD4003, 0xD06DDC1CECB97391, 0xBE48E6E7ED80302E,
+  0x3481DB31CEE03547, 0xACC3F67CDAA1D210, 0x65CB771D8C7F96CC, 0x8EB27177055723DD,
+  0xC789950D44CD94BE, 0x934FEADC3700B12B, 0x5E485F11EDBDF182, 0x1E2E2A46FD64767A,
+  0x2969CA71D82EFA7C, 0x9D46E9935EBBBA2E, 0xE056B67E05E6822B, 0x94D73F55739D03A0,
+  0xCD7010BDB69B5A03, 0x455EF9FCD79B82F4, 0x869CB54A8749C161, 0x38D1A4FA6185D225,
+  0xB475166F94BBE9BB, 0xA4143548720959F1, 0x7AED4780BA6B26BA, 0xD0CE264439E02312,
+  0x84366D746078D508, 0xA8CE973C72ED17BE, 0x21C323A29A430B01, 0x9962D617E3AF80EE,
+  0xAB0CE91D9C8CF75B, 0x530E8EE6D19A4DBC, 0x2EF68C0CF53F5D72, 0xC03A681640A85506,
+  0x496E4E9F9C310967, 0x78580472B59B14A0, 0x273824C23B388577, 0x66BF923AD45CB553,
+  0x47AE1A5A2492BA86, 0x35E304569E229659, 0x4765182A46870B6F, 0x6CBAB625E9099412,
+  0xDDAC9A2E598522C1, 0x7172086E666624F2, 0xDF5003CA503B7837, 0x88C0C1DB78563D09,
+  0x58D51865ACFC289D, 0x177671AEC65224F1, 0xFB79D8A241E967D7, 0x2BE1E101CAD9A49A,
+  0x6625682F6E29186B, 0x399553457AC06E50, 0x035DFFB4C23ABB74, 0x429DB2591F54AADE,
+  0xC52802A8037D1009, 0x6ACB27381F0B25F3, 0xF45E2551EE4F823B, 0x8B0EA2D99580C2F7,
+  0x3BED519CBCB4E1E1, 0x0FF452823DBB010A, 0x9D42ED614F3DD267, 0x5B9313C06257C57B,
+  0xA114B8008B5E1442, 0xC1FE311C11C13D4B, 0x66E8763EA34C5568, 0x8B982AF1C262F05D,
+  0xEE8876FAAA75FBB7, 0x8A62A4D0D172BB2A, 0xC13D94A3B7449A97, 0x6DBBBA9DC15D037C,
+  0xC786101F1D92E0F1, 0xD78681A907A0B79B, 0xF61AAF2962C9ABB9, 0x2CFD16FCD3CB7AD9,
+  0x868C5B6744624D21, 0x25E650899C74DDD7, 0xBA042AF4A7C37463, 0x4EB1A539465A3ECA,
+  0xBE09DBF03B05D5CA, 0x774E5A362B5472BA, 0x47A1221229D183CD, 0x504B0CA18EF5A2DF,
+  0xDFFBDFBDE2456EB9, 0x46CD2B2FBEE34634, 0xF2AEF8FE819D98C3, 0x357F5276D4599D61,
+  0x24A5483879C453E3, 0x088026889192B4B9, 0x28DA96671782DBEC, 0x4EF37C40588E9AAA,
+  0x8837B90651BC9FB3, 0xC164F741D3F0E5D6, 0xBC135A0A704B70BA, 0x069CD868F7622ADA,
+  0xBC37BA89E0B9C0AB, 0x47C14A01323552F6, 0x4F00794BACEE98BB, 0x7107DE7D637A69D5,
+  0x88AF793BB6F2255E, 0xF3C6466B8799B598, 0xC288C616AA7F3B59, 0x81CA63CF42FCA3FD,
+  0x88D85ACE36A2674B, 0x0D056BD3792389E7, 0xE55C396C4E9DD32D, 0xBEFB504571E6C0A6,
+  0x96AB32115E91E8CC, 0xBF8ACB18DE8F38D1, 0x66DAE58801672606, 0x833B6017872317FB,
+  0xB87C16F2D1C92864, 0xDB766A74E58B669C, 0x89659F85C61417BE, 0xC8DAAD856011EA0C,
+  0x76A4B565B6FE7EAE, 0xA469D085F6237312, 0xAAF0365683A3E96C, 0x4DBB746F8424F7B8,
+  0x0638755AF4E4ACC1, 0x3D7807F5BDE64486, 0x17BE6D8F5BBB7639, 0x0903F0CD44DC35DC,
+  0x67B672EAFDF1196C, 0xA676FF93ED4C82F1, 0x521D1004C5053D9D, 0x37BA9AD09CCC9202,
+  0x84E54D297AACFB51, 0x0A0B4B776A143445, 0x0820D471E20B348E, 0x1874383CB83D46DC,
+  0x97EDEEC7A1EFE11C, 0xB330E50B1BDC42AA, 0x1DD91955CE70E032, 0xA514CDB88F2939D5,
+  0x2791233FD90DB9D3, 0x7B670A4CC50F7A9B, 0x77C07D2A05C6DFA5, 0xE3778B6646D0A6FA,
+  0xB39C8EDA47B56749, 0x933ED448ADDBEF28, 0xAF846AF6AB7D0BF4, 0x0E5AF208EB666E49,
+  0x5E6622F73534CD6A, 0x297DAECA42EF5B6E, 0x862DAEF3D35539A6, 0xE68722498F8E1EA9,
+  0x981C53093DC0D572, 0xFA09B0BFBF86FBF5, 0x30B1E96166219F15, 0x70E7D466BDC4FB83,
+  0x5A66736E35F2A8E9, 0xCDDB59D2B7C1BAEF, 0xD6C7D247D26D8996, 0xEA4E39EAC8DE1BA3,
+  0x539C8BB19FA3AFF2, 0x09F90E4C5FD508D8, 0xA34E5956FBAF3385, 0x2E2F8E151D3EF375,
+  0x173691E9B83FAEC1, 0xB85A8D56BF016379, 0x8382381267408AE3, 0xB90F901BBDC0096D,
+  0x7C6AD32933BCEC65, 0x76BB5E2F2C8AD595, 0x390F851A6CF46D28, 0xC3E6064DA1C2DA72,
+  0xC52A0C101CFA5389, 0xD78EAF84A3FBC530, 0x3781B9E2288B997E, 0x73C2F6DEA83D05C4,
+  0x04228E364C5B5ED7, 0x9D7A3EDF0DA43911, 0x8EDCFEDA24686756, 0x5E7667A7B7A9B3A1,
+  0x4C4F389FA143791D, 0xB08BC1023DA7CDDC, 0x7AB4BE3AE529B1CC, 0x754E6132DBE74FF9,
+  0x71635442A839DF45, 0x2F6FB1643FBE52DE, 0x961E0A42CF7A8177, 0xF3B45D83D89EF2EA,
+  0xEE3DE4CF4A6E3E9B, 0xCD6848542C3295E7, 0xE4CEE1664C78662F, 0x9947548B474C68C4,
+  0x25D73777A5ED8B0B, 0x00C915B1D636B7FC, 0x21C2BA75D9B0D2DA, 0x5F6B5DCF608A64A1,
+  0xDCF333255FF9570C, 0x633B922418CED4EE, 0xC136DDE0B004B34A, 0x58CC83B05D4B2F5A,
+  0x5EB424DDA28E42D2, 0x62DF47369739CD98, 0xB4E0B42485E4CE17, 0x16E1F0C1F9A8D1E7,
+  0x8EC3916707560EBF, 0x62BA6E2DF2CC9DB3, 0xCBF9F4FF77D83A16, 0x78D9D7D07D2BBCC4,
+  0xEF554CE1E02C41F4, 0x8D7581127ECCF94D, 0xA9B53336CB3C8A05, 0x38C42C0BF45C4F91,
+  0x640893CDF4488863, 0x80EC34BC575EA568, 0x39F324F5B48EAA40, 0xE9D9ED1F8EFF527F,
+  0x9224FC058CC5A214, 0xBABA00B04CFE7741, 0x309A9F120FCF52AF, 0xA558F3EC65626212,
+  0x424BEC8B7ADABE2F, 0x41622513A6AEA433, 0xB88DA2D5324CA798, 0xD287733B245528A4,
+  0x9A44697E6D68AEC3, 0x7B1093BE2F49BB28, 0x50BBEC632E3D8AAD, 0x6CD90723E1EA8283,
+  0x897B9E7431B02BF3, 0x219EFDCB338A7047, 0x3B0311F0A27C0656, 0xDB17BF91C0DB96E7,
+  0x8CD4FD6B4E85A5B2, 0xFAB071054BA6409D, 0x40D6FE831FA9DFD9, 0xAF358DEBAD7D791E,
+  0xEB8D0E25A65E3E58, 0xBBCBD3DF14E08580, 0x0CF751F27ECDAB2B, 0x2B4DA14F2613D8F4,
+]
+
+// ---- A `RawSeqStore_t` and its sequences. ----
+
+unsafe fn readPointer(p: [*]const u8, at: usize) -> ?[*]mut u8 {
+  return unsafe Pointer.readUnaligned<?[*]mut u8>(unsafe Intrinsic.pointerReinterpret<*const u8, *const align(1) ?[*]mut u8>(unsafe Pointer.at<u8>(p, at)))
+}
+unsafe fn writePointer(p: [*]mut u8, at: usize, value: ?[*]mut u8) -> () {
+  unsafe Pointer.writeUnaligned<?[*]mut u8>(unsafe Intrinsic.pointerReinterpret<*mut u8, *mut align(1) ?[*]mut u8>(unsafe Pointer.atMut<u8>(p, at)), value)
+}
+
+@inlineAlways
+unsafe fn rz(p: [*]mut u8, at: usize) -> usize { return u64.toUsize(unsafe mem.r64(unsafe mem.ro(p), at)) }
+@inlineAlways
+unsafe fn wz(p: [*]mut u8, at: usize, v: usize) -> () { unsafe mem.w64(p, at, usize.toU64(v)) }
+
+/// Sets the `RawSeqStore_t` at `store` (`zopt.RSS_BYTES` bytes) to the `size` sequences at `seq`,
+/// of which none is consumed, with room for `capacity`.
+pub unsafe fn storeInit(store: [*]mut u8, seq: ?[*]mut u8, size: usize, capacity: usize) -> () {
+  unsafe writePointer(store, zopt.RSS_SEQ, seq)
+  unsafe wz(store, zopt.RSS_POS, 0)
+  unsafe wz(store, zopt.RSS_POS_IN_SEQUENCE, 0)
+  unsafe wz(store, zopt.RSS_SIZE, size)
+  unsafe wz(store, zopt.RSS_CAPACITY, capacity)
+}
+
+/// The number of sequences of the store.
+pub unsafe fn storeSize(store: [*]mut u8) -> usize { return unsafe rz(store, zopt.RSS_SIZE) }
+
+/// Whether the store has sequences that are not consumed yet (`pos < size`).
+pub unsafe fn storePending(store: [*]mut u8) -> bool { return unsafe rz(store, zopt.RSS_POS) < unsafe rz(store, zopt.RSS_SIZE) }
+
+// The sequences of a store: a pointer that is only used when the store is not empty.
+@inlineAlways
+unsafe fn storeSeq(store: [*]mut u8) -> [*]mut u8 { return unsafe mem.nn(unsafe readPointer(unsafe mem.ro(store), zopt.RSS_SEQ)) }
+
+struct RawSeq {
+  offset: u32,
+  litLength: u32,
+  matchLength: u32,
+}
+impl Copy for RawSeq {}
+
+// ---- Sizes. ----
+
+/// `ZSTD_ldm_getTableSize`, without the rounding of the workspace: the bytes of the hash table
+/// and of the bucket offsets.
+pub fn getTableSize(params: &LdmParams) -> usize {
+  if params.enableLdm != cparams.PS_ENABLE { return 0 }
+  let bucketSizeLog = if params.bucketSizeLog < params.hashLog { params.bucketSizeLog } else { params.hashLog }
+  return mem.shlz(1, params.hashLog - bucketSizeLog) + mem.shlz(1, params.hashLog) * 8
+}
+
+/// `ZSTD_ldm_getMaxNbSeq`.
+pub fn getMaxNbSeq(params: &LdmParams, maxChunkSize: usize) -> usize {
+  if params.enableLdm != cparams.PS_ENABLE { return 0 }
+  return maxChunkSize / mem.z(params.minMatchLength)
+}
+
+// ---- XXH64 of a short range, with seed 0. ----
+const XP1: u64 = 0x9E3779B185EBCA87
+const XP2: u64 = 0xC2B2AE3D27D4EB4F
+const XP3: u64 = 0x165667B19E3779F9
+const XP4: u64 = 0x85EBCA77C2B2AE63
+const XP5: u64 = 0x27D4EB2F165667C5
+
+@inlineAlways
+fn xround(acc: u64, lane: u64) -> u64 {
+  return u64.wrappingMultiply(u64.rotateLeft(u64.wrappingAdd(acc, u64.wrappingMultiply(lane, XP2)), 31), XP1)
+}
+@inlineAlways
+fn xmerge(hash: u64, lane: u64) -> u64 {
+  return u64.wrappingAdd(u64.wrappingMultiply(hash ^ xround(0, lane), XP1), XP4)
+}
+
+// `XXH64(p + at, length, 0)`.
+unsafe fn xxh64(p: [*]const u8, at: usize, length: usize) -> u64 {
+  let end = mem.ua(at, length)
+  let mut i = at
+  let mut hash: u64 = XP5
+  if length >= 32 {
+    let mut v1 = u64.wrappingAdd(XP1, XP2)
+    let mut v2 = XP2
+    let mut v3: u64 = 0
+    let mut v4 = u64.wrappingSubtract(0, XP1)
+    while mem.ua(i, 32) <= end {
+      v1 = xround(v1, unsafe mem.r64(p, i))
+      v2 = xround(v2, unsafe mem.r64(p, mem.ua(i, 8)))
+      v3 = xround(v3, unsafe mem.r64(p, mem.ua(i, 16)))
+      v4 = xround(v4, unsafe mem.r64(p, mem.ua(i, 24)))
+      i = mem.ua(i, 32)
+    }
+    hash = u64.wrappingAdd(u64.wrappingAdd(u64.rotateLeft(v1, 1), u64.rotateLeft(v2, 7)), u64.wrappingAdd(u64.rotateLeft(v3, 12), u64.rotateLeft(v4, 18)))
+    hash = xmerge(hash, v1)
+    hash = xmerge(hash, v2)
+    hash = xmerge(hash, v3)
+    hash = xmerge(hash, v4)
+  }
+  hash = u64.wrappingAdd(hash, usize.toU64(length))
+  while mem.ua(i, 8) <= end {
+    hash = hash ^ xround(0, unsafe mem.r64(p, i))
+    hash = u64.wrappingAdd(u64.wrappingMultiply(u64.rotateLeft(hash, 27), XP1), XP4)
+    i = mem.ua(i, 8)
+  }
+  if mem.ua(i, 4) <= end {
+    hash = hash ^ u64.wrappingMultiply(u32.toU64(unsafe mem.r32(p, i)), XP1)
+    hash = u64.wrappingAdd(u64.wrappingMultiply(u64.rotateLeft(hash, 23), XP2), XP3)
+    i = mem.ua(i, 4)
+  }
+  while i < end {
+    hash = hash ^ u64.wrappingMultiply(u8.toU64(unsafe mem.r8(p, i)), XP5)
+    hash = u64.wrappingMultiply(u64.rotateLeft(hash, 11), XP1)
+    i = mem.ua(i, 1)
+  }
+  hash = hash ^ u64.shiftRight(hash, 33)
+  hash = u64.wrappingMultiply(hash, XP2)
+  hash = hash ^ u64.shiftRight(hash, 29)
+  hash = u64.wrappingMultiply(hash, XP3)
+  hash = hash ^ u64.shiftRight(hash, 32)
+  return hash
+}
+
+// ---- The gear hash (`ldmRollingHashState_t`). ----
+struct Gear {
+  rolling: u64,
+  stopMask: u64,
+}
+
+// `ZSTD_ldm_gear_init`: the state that cuts on average every `1 << hashRateLog` bytes.
+fn gearInit(params: &LdmParams) -> Gear {
+  let maxBitsInMask: u32 = if params.minMatchLength < 64 { params.minMatchLength } else { 64 }
+  let hashRateLog = params.hashRateLog
+  let mut stopMask: u64 = 0
+  if hashRateLog > 0 && hashRateLog <= maxBitsInMask {
+    // The bits of highest weight that still depend on `minMatchLength` bytes only.
+    stopMask = mem.shl64(u64.wrappingSubtract(mem.shl64(1, hashRateLog), 1), maxBitsInMask - hashRateLog)
+  } else {
+    // In this degenerate case we simply honor the hash rate.
+    stopMask = u64.wrappingSubtract(mem.shl64(1, hashRateLog), 1)
+  }
+  return Gear { rolling: 0xFFFFFFFF, stopMask: stopMask }
+}
+
+// `ZSTD_ldm_gear_reset` is not ported as a function: the reference computes the hash of
+// `minMatchLength` bytes and does not store it in the state, so it changes nothing.
+
+// `ZSTD_ldm_gear_feed`: hashes `data[at..at + size]` and adds to `splits` the offsets (from
+// `at`, of the byte after the cut) of the cut points, until the data ends or `splits` holds
+// `BATCH_SIZE` of them. Returns the number of bytes hashed.
+unsafe fn gearFeed(state: &mut Gear, data: [*]const u8, at: usize, size: usize, splits: &mut [usize; 64], numSplits: &mut u32) -> usize {
+  let mut hash = state.rolling
+  let mask = state.stopMask
+  let mut n: usize = 0
+  let mut found = numSplits.*
+  while n < size {
+    hash = u64.wrappingAdd(u64.shiftLeft(hash, 1), GEAR_TAB[u8.toUsize(unsafe mem.r8(data, mem.ua(at, n)))])
+    n = mem.ua(n, 1)
+    if (hash & mask) == 0 {
+      splits[mem.z(found) & 63] = n
+      found = found + 1
+      if found == BATCH_SIZE { break }
+    }
+  }
+  state.rolling = hash
+  numSplits.* = found
+  return n
+}
+
+// ---- The hash table. ----
+
+// `ZSTD_ldm_insertEntry`: puts the entry in the bucket of `hash`, over the oldest one.
+@inlineAlways
+unsafe fn insertEntry(table: [*]mut u8, bucketOffsets: [*]mut u8, hash: usize, offset: u32, checksum: u32, bucketSizeLog: u32) -> () {
+  let slot = u8.toUsize(unsafe mem.r8(unsafe mem.ro(bucketOffsets), hash))
+  let at = usize.wrappingMultiply(mem.ua(mem.shlz(hash, bucketSizeLog), slot), 8)
+  unsafe mem.w32(table, at, offset)
+  unsafe mem.w32(table, mem.ua(at, 4), checksum)
+  unsafe mem.w8(bucketOffsets, hash, usize.wrappingToU8(mem.ua(slot, 1) & mem.us(mem.shlz(1, bucketSizeLog), 1)))
+}
+
+// `ZSTD_ldm_countBackwardsMatch`: how many bytes before `inBase[pIn]` and `mBase[pMatch]` are
+// equal, not going below `pAnchor` and `pMatchBase`.
+@inlineAlways
+unsafe fn countBackwardsMatch(inBase: [*]const u8, pIn: usize, pAnchor: usize, mBase: [*]const u8, pMatch: usize, pMatchBase: usize) -> usize {
+  let mut length: usize = 0
+  while mem.us(pIn, length) > pAnchor && mem.us(pMatch, length) > pMatchBase
+    && unsafe mem.r8(inBase, mem.us(mem.us(pIn, length), 1)) == unsafe mem.r8(mBase, mem.us(mem.us(pMatch, length), 1)) {
+    length = mem.ua(length, 1)
+  }
+  return length
+}
+
+/// `ZSTD_ldm_fillHashTable`: inserts the cut points of `base[ip..iend]` (indices of the window of
+/// `ls`) into the table, without looking for matches: the load of a dictionary.
+pub unsafe fn fillHashTable(ls: &mut LdmState, ip0: usize, iend: usize, params: &LdmParams) -> () {
+  let minMatchLength = mem.z(params.minMatchLength)
+  let bucketSizeLog = params.bucketSizeLog
+  let hBits = params.hashLog - bucketSizeLog
+  let hMask = mem.us(mem.shlz(1, hBits), 1)
+  let base = ls.window.base
+  let table = unsafe mem.nn(ls.hashTable)
+  let bucketOffsets = unsafe mem.nn(ls.bucketOffsets)
+  let istart = ip0
+  let mut ip = ip0
+  let mut splits: [usize; 64] = [0; 64]
+  let mut hashState = gearInit(&params)
+  while ip < iend {
+    let mut numSplits: u32 = 0
+    let hashed = unsafe gearFeed(&mut hashState, base, ip, mem.us(iend, ip), &mut splits, &mut numSplits)
+    let mut n: usize = 0
+    while n < mem.z(numSplits) {
+      if mem.ua(ip, splits[n]) >= mem.ua(istart, minMatchLength) {
+        let split = mem.us(mem.ua(ip, splits[n]), minMatchLength)
+        let xxhash = unsafe xxh64(base, split, minMatchLength)
+        let hash = u64.toUsize(xxhash & 0xFFFFFFFF) & hMask
+        unsafe insertEntry(table, bucketOffsets, hash, mem.t32(split), u64.wrappingToU32(u64.shiftRight(xxhash, 32)), bucketSizeLog)
+      }
+      n = n + 1
+    }
+    ip = mem.ua(ip, hashed)
+  }
+}
+
+// `ZSTD_ldm_generateSequences_internal`: finds the long distance matches of `src[0..srcSize]`,
+// which is in the window of `ls`, and adds them to `store`. Returns the number of bytes after
+// the last match, or an error if the store is full.
+unsafe fn generateSequencesInternal(ls: &mut LdmState, store: [*]mut u8, params: &LdmParams, src: [*]const u8, srcSize: usize) -> usize {
+  // LDM parameters.
+  let extDict = cstate.windowHasExtDict(&ls.window)
+  let minMatchLength = mem.z(params.minMatchLength)
+  let bucketSizeLog = params.bucketSizeLog
+  let entsPerBucket = mem.shlz(1, bucketSizeLog)
+  let hBits = params.hashLog - bucketSizeLog
+  let hMask = mem.us(mem.shlz(1, hBits), 1)
+  // Prefix and extDict parameters.
+  let dictLimit = ls.window.dictLimit
+  let lowestIndex: u32 = if extDict { ls.window.lowLimit } else { dictLimit }
+  let base = ls.window.base
+  let dictBase = ls.window.dictBase
+  let dictStart = mem.z(lowestIndex)
+  let dictEnd = mem.z(dictLimit)
+  let lowPrefix = mem.z(dictLimit)
+  let table = unsafe mem.nn(ls.hashTable)
+  let tableRead = unsafe mem.ro(table)
+  let bucketOffsets = unsafe mem.nn(ls.bucketOffsets)
+  // Input bounds, as indices of the window.
+  let istart = mem.us(mem.addr(src), mem.addr(base))
+  let iend = mem.ua(istart, srcSize)
+  // Input positions.
+  let mut anchor = istart
+  let mut ip = istart
+  // Arrays for staged processing.
+  let mut splits: [usize; 64] = [0; 64]
+  let mut candSplit: [usize; 64] = [0; 64]
+  let mut candHash: [usize; 64] = [0; 64]
+  let mut candChecksum: [u32; 64] = [0; 64]
+  if srcSize < minMatchLength { return mem.us(iend, anchor) }
+  // The rolling hash starts after the first `minMatchLength` bytes.
+  let mut hashState = gearInit(&params)
+  ip = mem.ua(ip, minMatchLength)
+  // `ip < ilimit`, where `ilimit` is `iend - HASH_READ_SIZE`.
+  while mem.ua(ip, cstate.HASH_READ_SIZE) < iend {
+    let mut numSplits: u32 = 0
+    let hashed = unsafe gearFeed(&mut hashState, base, ip, mem.us(mem.us(iend, cstate.HASH_READ_SIZE), ip), &mut splits, &mut numSplits)
+    let count = mem.z(numSplits)
+    let mut n: usize = 0
+    while n < count {
+      let split = mem.us(mem.ua(ip, splits[n]), minMatchLength)
+      let xxhash = unsafe xxh64(base, split, minMatchLength)
+      candSplit[n] = split
+      candHash[n] = u64.toUsize(xxhash & 0xFFFFFFFF) & hMask
+      candChecksum[n] = u64.wrappingToU32(u64.shiftRight(xxhash, 32))
+      n = n + 1
+    }
+    n = 0
+    while n < count {
+      let split = candSplit[n]
+      let checksum = candChecksum[n]
+      let hash = candHash[n]
+      n = n + 1
+      let newOffset = mem.t32(split)
+      // A cut point that would give a sequence overlapping the previous one is only
+      // registered in the table.
+      if split < anchor {
+        unsafe insertEntry(table, bucketOffsets, hash, newOffset, checksum, bucketSizeLog)
+        continue
+      }
+      let mut forwardMatchLength: usize = 0
+      let mut backwardMatchLength: usize = 0
+      let mut bestMatchLength: usize = 0
+      let mut bestOffset: u32 = 0
+      let mut found = false
+      let bucket = usize.wrappingMultiply(mem.shlz(hash, bucketSizeLog), 8)
+      let mut e: usize = 0
+      while e < entsPerBucket {
+        let at = mem.ua(bucket, usize.wrappingMultiply(e, 8))
+        e = e + 1
+        let curOffset = unsafe mem.r32(tableRead, at)
+        if unsafe mem.r32(tableRead, mem.ua(at, 4)) != checksum || curOffset <= lowestIndex { continue }
+        let cur = mem.z(curOffset)
+        let mut curForwardMatchLength: usize = 0
+        let mut curBackwardMatchLength: usize = 0
+        if extDict {
+          let inDict = curOffset < dictLimit
+          let curMatchBase = if inDict { dictBase } else { base }
+          let matchEnd = if inDict { dictEnd } else { iend }
+          let lowMatch = if inDict { dictStart } else { lowPrefix }
+          curForwardMatchLength = unsafe cstate.count2segments(base, split, iend, curMatchBase, cur, matchEnd, lowPrefix)
+          if curForwardMatchLength < minMatchLength { continue }
+          // `ZSTD_ldm_countBackwardsMatch_2segments`.
+          curBackwardMatchLength = unsafe countBackwardsMatch(base, split, anchor, curMatchBase, cur, lowMatch)
+          let reachedLow = mem.us(cur, curBackwardMatchLength) == lowMatch
+          let lowIsDictStart = mem.ua(mem.addr(curMatchBase), lowMatch) == mem.ua(mem.addr(dictBase), dictStart)
+          if reachedLow && !lowIsDictStart {
+            // The match goes on backwards from the end of the dictionary segment.
+            curBackwardMatchLength = mem.ua(curBackwardMatchLength, unsafe countBackwardsMatch(base, mem.us(split, curBackwardMatchLength), anchor, dictBase, dictEnd, dictStart))
+          }
+        } else {
+          curForwardMatchLength = unsafe cstate.count(base, split, base, cur, iend)
+          if curForwardMatchLength < minMatchLength { continue }
+          curBackwardMatchLength = unsafe countBackwardsMatch(base, split, anchor, base, cur, lowPrefix)
+        }
+        let curTotalMatchLength = mem.ua(curForwardMatchLength, curBackwardMatchLength)
+        if curTotalMatchLength > bestMatchLength {
+          bestMatchLength = curTotalMatchLength
+          forwardMatchLength = curForwardMatchLength
+          backwardMatchLength = curBackwardMatchLength
+          bestOffset = curOffset
+          found = true
+        }
+      }
+      // No match found: insert the entry and go to the next candidate.
+      if !found {
+        unsafe insertEntry(table, bucketOffsets, hash, newOffset, checksum, bucketSizeLog)
+        continue
+      }
+      // Match found.
+      let size = unsafe rz(store, zopt.RSS_SIZE)
+      // Out of sequence storage.
+      if size == unsafe rz(store, zopt.RSS_CAPACITY) { return errors.err(errors.E_DSTSIZE_TOOSMALL) }
+      let seq = unsafe storeSeq(store)
+      let seqAt = usize.wrappingMultiply(size, zopt.RAWSEQ_BYTES)
+      unsafe mem.w32(seq, seqAt, mem.s32(newOffset, bestOffset))
+      unsafe mem.w32(seq, mem.ua(seqAt, 4), mem.t32(mem.us(mem.us(split, backwardMatchLength), anchor)))
+      unsafe mem.w32(seq, mem.ua(seqAt, 8), mem.t32(mem.ua(forwardMatchLength, backwardMatchLength)))
+      unsafe wz(store, zopt.RSS_SIZE, mem.ua(size, 1))
+      // Insert the current entry after the lookup, so that it does not clobber the best entry.
+      unsafe insertEntry(table, bucketOffsets, hash, newOffset, checksum, bucketSizeLog)
+      anchor = mem.ua(split, forwardMatchLength)
+      // A match that ends after the data hashed so far is a repeating, overlapping pattern (all
+      // zeroes, for one). Only its first repetition goes into the table: skip the others.
+      if anchor > mem.ua(ip, hashed) {
+        // (`ZSTD_ldm_gear_reset` here changes nothing.) Continue the outer loop at `anchor`.
+        ip = mem.us(anchor, hashed)
+        break
+      }
+    }
+    ip = mem.ua(ip, hashed)
+  }
+  return mem.us(iend, anchor)
+}
+
+// `ZSTD_ldm_reduceTable`: lowers the offsets of the table by `reducerValue`.
+unsafe fn reduceTable(table: [*]mut u8, size: usize, reducerValue: u32) -> () {
+  let mut u: usize = 0
+  while u < size {
+    let at = usize.wrappingMultiply(u, 8)
+    let offset = unsafe mem.r32(unsafe mem.ro(table), at)
+    if offset < reducerValue { unsafe mem.w32(table, at, 0) } else { unsafe mem.w32(table, at, offset - reducerValue) }
+    u = u + 1
+  }
+}
+
+/// `ZSTD_ldm_generateSequences`: adds to `store` the long distance matches of
+/// `src[0..srcSize]`, which the caller already added to the window of `ls`
+/// (`cstate.windowUpdate`). Returns 0 or an error.
+///
+/// The literals after the last match are not in the store: the caller counts them with the
+/// size of what it compresses.
+pub unsafe fn generateSequences(ls: &mut LdmState, store: [*]mut u8, params: &LdmParams, src: [*]const u8, srcSize: usize) -> usize {
+  let maxDist = mem.shl32(1, params.windowLog)
+  let partial: usize = if srcSize % MAX_CHUNK_SIZE != 0 { 1 } else { 0 }
+  let nbChunks = srcSize / MAX_CHUNK_SIZE + partial
+  let mut leftoverSize: usize = 0
+  let mut chunk: usize = 0
+  // The input can be very large (with worker jobs), so it is cut into chunks to enforce the
+  // maximum distance and to correct the overflow of the indices.
+  while chunk < nbChunks && unsafe rz(store, zopt.RSS_SIZE) < unsafe rz(store, zopt.RSS_CAPACITY) {
+    let chunkOffset = chunk * MAX_CHUNK_SIZE
+    let chunkStart = unsafe mem.addc(src, chunkOffset)
+    let remaining = srcSize - chunkOffset
+    let chunkSize = if remaining < MAX_CHUNK_SIZE { remaining } else { MAX_CHUNK_SIZE }
+    let chunkEnd = unsafe mem.addc(chunkStart, chunkSize)
+    let prevSize = unsafe rz(store, zopt.RSS_SIZE)
+    // 1. Perform overflow correction if necessary.
+    if cstate.windowNeedOverflowCorrection(&ls.window, chunkEnd) {
+      let correction = cstate.windowCorrectOverflow(&mut ls.window, 0, maxDist, chunkStart)
+      unsafe reduceTable(unsafe mem.nn(ls.hashTable), mem.shlz(1, params.hashLog), correction)
+      // Invalidate dictionaries on overflow correction.
+      ls.loadedDictEnd = 0
+    }
+    // 2. Enforce the maximum offset allowed (`ZSTD_window_enforceMaxDist`). An offset must be
+    // valid at the end of its sequence, since a sequence can be split into two.
+    let chunkEndIdx = mem.t32(mem.us(mem.addr(chunkEnd), mem.addr(ls.window.base)))
+    if chunkEndIdx > mem.a32(maxDist, ls.loadedDictEnd) {
+      let newLowLimit = mem.s32(chunkEndIdx, maxDist)
+      if ls.window.lowLimit < newLowLimit { ls.window.lowLimit = newLowLimit }
+      if ls.window.dictLimit < ls.window.lowLimit { ls.window.dictLimit = ls.window.lowLimit }
+      ls.loadedDictEnd = 0
+    }
+    // 3. Generate the sequences for the chunk, and get the new leftover size.
+    let newLeftoverSize = unsafe generateSequencesInternal(&mut ls, store, &params, chunkStart, chunkSize)
+    if errors.isError(newLeftoverSize) { return newLeftoverSize }
+    // 4. Add the leftover literals of the previous chunks to the first sequence of this one, or
+    // keep them with this chunk if it has no sequence.
+    if prevSize < unsafe rz(store, zopt.RSS_SIZE) {
+      let seq = unsafe storeSeq(store)
+      let at = mem.ua(usize.wrappingMultiply(prevSize, zopt.RAWSEQ_BYTES), 4)
+      unsafe mem.w32(seq, at, mem.a32(unsafe mem.r32(unsafe mem.ro(seq), at), mem.t32(leftoverSize)))
+      leftoverSize = newLeftoverSize
+    } else {
+      leftoverSize = mem.ua(leftoverSize, chunkSize)
+    }
+    chunk = chunk + 1
+  }
+  return 0
+}
+
+/// `ZSTD_ldm_skipSequences`: skips past `srcSize` bytes of the sequences of `store`. A match that
+/// is cut to less than `minMatch` bytes becomes literals of the next sequence.
+pub unsafe fn skipSequences(store: [*]mut u8, srcSize0: usize, minMatch: u32) -> () {
+  let mut srcSize = srcSize0
+  while srcSize > 0 && unsafe storePending(store) {
+    let seq = unsafe storeSeq(store)
+    let pos = unsafe rz(store, zopt.RSS_POS)
+    let at = usize.wrappingMultiply(pos, zopt.RAWSEQ_BYTES)
+    let litLength = unsafe mem.r32(unsafe mem.ro(seq), mem.ua(at, 4))
+    let matchLength = unsafe mem.r32(unsafe mem.ro(seq), mem.ua(at, 8))
+    if srcSize <= mem.z(litLength) {
+      // Skip past `srcSize` literals.
+      unsafe mem.w32(seq, mem.ua(at, 4), mem.s32(litLength, mem.t32(srcSize)))
+      return
+    }
+    srcSize = srcSize - mem.z(litLength)
+    unsafe mem.w32(seq, mem.ua(at, 4), 0)
+    if srcSize < mem.z(matchLength) {
+      // Skip past the first `srcSize` bytes of the match.
+      let rest = mem.s32(matchLength, mem.t32(srcSize))
+      unsafe mem.w32(seq, mem.ua(at, 8), rest)
+      if rest < minMatch {
+        // The match is too short: omit it.
+        if pos + 1 < unsafe rz(store, zopt.RSS_SIZE) {
+          let next = mem.ua(at, zopt.RAWSEQ_BYTES + 4)
+          unsafe mem.w32(seq, next, mem.a32(unsafe mem.r32(unsafe mem.ro(seq), next), rest))
+        }
+        unsafe wz(store, zopt.RSS_POS, pos + 1)
+      }
+      return
+    }
+    srcSize = srcSize - mem.z(matchLength)
+    unsafe mem.w32(seq, mem.ua(at, 8), 0)
+    unsafe wz(store, zopt.RSS_POS, pos + 1)
+  }
+}
+
+// `maybeSplitSequence`: the next sequence of the store, cut to the `remaining` bytes of the
+// block. An offset of 0 means that the rest of the block is literals.
+unsafe fn maybeSplitSequence(store: [*]mut u8, remaining: u32, minMatch: u32) -> RawSeq {
+  let seq = unsafe mem.ro(unsafe storeSeq(store))
+  let pos = unsafe rz(store, zopt.RSS_POS)
+  let at = usize.wrappingMultiply(pos, zopt.RAWSEQ_BYTES)
+  let mut sequence = RawSeq { offset: unsafe mem.r32(seq, at), litLength: unsafe mem.r32(seq, mem.ua(at, 4)), matchLength: unsafe mem.r32(seq, mem.ua(at, 8)) }
+  // Likely: no partial sequence.
+  if remaining >= mem.a32(sequence.litLength, sequence.matchLength) {
+    unsafe wz(store, zopt.RSS_POS, pos + 1)
+    return sequence
+  }
+  // Cut the sequence short.
+  if remaining <= sequence.litLength {
+    sequence.offset = 0
+  } else if remaining < mem.a32(sequence.litLength, sequence.matchLength) {
+    sequence.matchLength = remaining - sequence.litLength
+    if sequence.matchLength < minMatch { sequence.offset = 0 }
+  }
+  // Skip past `remaining` bytes for the future sequences.
+  unsafe skipSequences(store, mem.z(remaining), minMatch)
+  return sequence
+}
+
+/// `ZSTD_ldm_skipRawSeqStoreBytes`: moves forward in the store by `nbBytes`, with
+/// `posInSequence` (the way of the optimal parser, which does not change the sequences).
+pub unsafe fn skipRawSeqStoreBytes(store: [*]mut u8, nbBytes: usize) -> () {
+  let mut currPos = mem.t32(mem.ua(unsafe rz(store, zopt.RSS_POS_IN_SEQUENCE), nbBytes))
+  while currPos != 0 && unsafe storePending(store) {
+    let seq = unsafe mem.ro(unsafe storeSeq(store))
+    let pos = unsafe rz(store, zopt.RSS_POS)
+    let at = usize.wrappingMultiply(pos, zopt.RAWSEQ_BYTES)
+    let total = mem.a32(unsafe mem.r32(seq, mem.ua(at, 4)), unsafe mem.r32(seq, mem.ua(at, 8)))
+    if currPos >= total {
+      currPos = currPos - total
+      unsafe wz(store, zopt.RSS_POS, pos + 1)
+    } else {
+      unsafe wz(store, zopt.RSS_POS_IN_SEQUENCE, mem.z(currPos))
+      break
+    }
+  }
+  if currPos == 0 || !unsafe storePending(store) { unsafe wz(store, zopt.RSS_POS_IN_SEQUENCE, 0) }
+}
+
+// `ZSTD_ldm_limitTableUpdate`: after a long match, the tables are only updated for the last
+// positions before `anchor`.
+fn limitTableUpdate(ms: &mut MatchState, anchor: [*]const u8) -> () {
+  let curr = mem.t32(mem.us(mem.addr(anchor), mem.addr(ms.window.base)))
+  if curr > mem.a32(ms.nextToUpdate, 1024) {
+    let gap = mem.s32(mem.s32(curr, ms.nextToUpdate), 1024)
+    ms.nextToUpdate = mem.s32(curr, if gap < 512 { gap } else { 512 })
+  }
+}
+
+// `ZSTD_ldm_fillFastTables`: fills the tables of `fast` and `dfast` up to `end`. The other
+// strategies fill theirs in their block compressors.
+unsafe fn fillFastTables(ms: &mut MatchState, end: [*]const u8) -> () {
+  // The reference compares `ip + 2` with the pointer `end - HASH_READ_SIZE`, which is below
+  // the base of the window when `end` is within 8 bytes of it: nothing to insert then. The
+  // ports of the two fill functions compute that bound as an index, which would wrap.
+  if mem.us(mem.addr(end), mem.addr(ms.window.base)) < cstate.HASH_READ_SIZE { return }
+  if ms.cParams.strategy == cparams.FAST {
+    unsafe zfast.fillHashTable(&mut ms, end, zfast.DTLM_FAST)
+  } else if ms.cParams.strategy == cparams.DFAST {
+    unsafe zdfast.fillDoubleHashTable(&mut ms, end, zfast.DTLM_FAST)
+  }
+}
+
+/// `ZSTD_ldm_blockCompress`: compresses the block `src[0..srcSize]` with the sequences of
+/// `store`, and returns the size of the last literals. Below `btopt` each long distance match
+/// is stored as it is and the block compressor runs on the literals between them; from `btopt`
+/// the optimal parser reads the store through `ms.ldmSeqStore`.
+pub unsafe fn blockCompress(store: [*]mut u8, ms: &mut MatchState, seqStore: &mut SeqStore, rep: [*]mut u8, useRowMatchFinder: u32, src: [*]const u8, srcSize: usize) -> usize {
+  let strategy = ms.cParams.strategy
+  let minMatch = ms.cParams.minMatch
+  let dictMode = cstate.dictMode(&ms)
+  // The optimal parser uses the long distance matches as candidates only.
+  if strategy >= cparams.BTOPT {
+    ms.ldmSeqStore = mem.opt(store)
+    let lastLLSize = unsafe cdispatch.compressBlock(strategy, useRowMatchFinder, dictMode, &mut ms, &mut seqStore, rep, src, srcSize)
+    unsafe skipRawSeqStoreBytes(store, srcSize)
+    return lastLLSize
+  }
+  let mut ip: usize = 0
+  // Loop through each sequence and apply the block compressor to the literals.
+  while unsafe storePending(store) && ip < srcSize {
+    // `maybeSplitSequence` updates the position of the store.
+    let sequence = unsafe maybeSplitSequence(store, mem.t32(srcSize - ip), minMatch)
+    // End signal.
+    if sequence.offset == 0 { break }
+    // Fill the tables for the block compressor.
+    let here = unsafe mem.addc(src, ip)
+    limitTableUpdate(&mut ms, here)
+    unsafe fillFastTables(&mut ms, here)
+    // Run the block compressor.
+    let newLitLength = unsafe cdispatch.compressBlock(strategy, useRowMatchFinder, dictMode, &mut ms, &mut seqStore, rep, here, mem.z(sequence.litLength))
+    ip = ip + mem.z(sequence.litLength)
+    // Update the repeat offsets.
+    unsafe mem.w32(rep, 8, unsafe mem.r32(unsafe mem.ro(rep), 4))
+    unsafe mem.w32(rep, 4, unsafe mem.r32(unsafe mem.ro(rep), 0))
+    unsafe mem.w32(rep, 0, sequence.offset)
+    // Store the sequence.
+    unsafe cstate.storeSeq(&mut seqStore, newLitLength, src, ip - newLitLength, srcSize, cstate.offsetToOffBase(sequence.offset), mem.z(sequence.matchLength))
+    ip = ip + mem.z(sequence.matchLength)
+  }
+  // Fill the tables for the block compressor, and compress the last literals.
+  let here = unsafe mem.addc(src, ip)
+  limitTableUpdate(&mut ms, here)
+  unsafe fillFastTables(&mut ms, here)
+  return unsafe cdispatch.compressBlock(strategy, useRowMatchFinder, dictMode, &mut ms, &mut seqStore, rep, here, srcSize - ip)
+}
+
+// ---- The hooks of `ZSTD_buildSeqStore` (`cctx.buildSeqStore`). ----
+
+/// Whether the block compressor of the context goes through [`compressBlock`]: the context has
+/// external sequences left (the long distance matches of a worker job), or long distance
+/// matching is on.
+pub unsafe fn isActive(c: &CCtx) -> bool {
+  return unsafe storePending(c.externSeqStore) || c.appliedParams.ldmParams.enableLdm == cparams.PS_ENABLE
+}
+
+/// The part of `ZSTD_buildSeqStore` for a block of `srcSize` bytes that is too small to be
+/// compressed: skips its bytes in the external sequences.
+pub unsafe fn skipBlock(c: &mut CCtx, srcSize: usize) -> () {
+  if c.appliedParams.cParams.strategy >= cparams.BTOPT {
+    unsafe skipRawSeqStoreBytes(c.externSeqStore, srcSize)
+  } else {
+    unsafe skipSequences(c.externSeqStore, srcSize, c.appliedParams.cParams.minMatch)
+  }
+}
+
+/// The part of `ZSTD_buildSeqStore` that selects and stores the sequences of the block
+/// `src[0..srcSize]` when [`isActive`]: with the external sequences of the context if it has
+/// some left, else with the long distance matches of the block, which it generates. Returns
+/// the size of the last literals, or an error.
+pub unsafe fn compressBlock(c: &mut CCtx, src: [*]const u8, srcSize: usize) -> usize {
+  let rep = unsafe mem.add(c.nextCBlock, cstate.CBS_REP)
+  let useRowMatchFinder = c.appliedParams.useRowMatchFinder
+  if unsafe storePending(c.externSeqStore) {
+    let store = c.externSeqStore
+    return unsafe blockCompress(store, &mut c.matchState, &mut c.seqStore, rep, useRowMatchFinder, src, srcSize)
+  }
+  let mut storeBytes: [u8; 40] = [0; 40]
+  let store = unsafe mem.nn(Pointer.fromMutSlice<u8>(&mut storeBytes))
+  unsafe storeInit(store, c.ldmSequences, 0, c.maxNbLdmSequences)
+  let ldmParams = c.appliedParams.ldmParams
+  let e = unsafe generateSequences(&mut c.ldmState, store, &ldmParams, src, srcSize)
+  if errors.isError(e) { return e }
+  let lastLLSize = unsafe blockCompress(store, &mut c.matchState, &mut c.seqStore, rep, useRowMatchFinder, src, srcSize)
+  // The store is a local: the match state does not keep a pointer to it.
+  c.matchState.ldmSeqStore = mem.nullp()
+  return lastLLSize
+}

@@ -1,0 +1,529 @@
+//! The block splitter that runs after the match finder (`ZSTD_compressBlock_splitBlock` of
+//! `lib/compress/zstd_compress.c` of Zstandard 1.5.7), with the estimation of the size of a block
+//! from its entropy statistics (`ZSTD_buildBlockEntropyStats`, `ZSTD_estimateBlockSize`).
+//!
+//! The frame driver calls [`compressBlockSplitBlock`] in place of `cctx.compressBlockInternal`
+//! when `appliedParams.postBlockSplitter` is `cparams.PS_ENABLE`. It writes whole blocks, with
+//! their headers.
+//!
+//! The reference keeps its scratch (`ZSTD_blockSplitCtx`) in the context; here it is on the
+//! stack: the partitions, the derived sequence stores and the entropy metadata.
+import mem
+import errors
+import hist
+import cstate
+import cstate { SeqStore }
+import cparams
+import cseq
+import cctx
+import cctx { CCtx }
+import huf_compress as huf
+import silk.mem.pointer { Pointer }
+import silk.num.u8
+import silk.num.u16
+import silk.num.i16
+import silk.num.u32
+import silk.num.usize
+
+/// `MIN_SEQUENCES_BLOCK_SPLITTING`.
+const MIN_SEQUENCES_BLOCK_SPLITTING: usize = 300
+/// `ZSTD_MAX_NB_BLOCK_SPLITS`.
+const MAX_NB_BLOCK_SPLITS: usize = 196
+/// `ZSTD_MAX_HUF_HEADER_SIZE`.
+const MAX_HUF_HEADER_SIZE: usize = 128
+/// `ZSTD_MAX_FSE_HEADERS_SIZE`.
+const MAX_FSE_HEADERS_SIZE: usize = 133
+/// `COMPRESS_LITERALS_SIZE_MIN`.
+const COMPRESS_LITERALS_SIZE_MIN: usize = 63
+const LIT_HUF_LOG: u32 = 11
+
+// The default distributions as arrays of `i16` in memory, for `cseq.crossEntropyCost`.
+const N_LL: usize = 0
+const N_ML: usize = 72
+const N_OF: usize = 180
+const NORMS_SIZE: usize = 240
+
+unsafe fn initNorms(norms: [*]mut u8) -> () {
+  let mut i: usize = 0
+  while i < 36 { unsafe mem.w16(norms, N_LL + i * 2, i16.wrappingToU16(cstate.LL_DEFAULT_NORM[i])) i = i + 1 }
+  i = 0
+  while i < 53 { unsafe mem.w16(norms, N_ML + i * 2, i16.wrappingToU16(cstate.ML_DEFAULT_NORM[i])) i = i + 1 }
+  i = 0
+  while i < 29 { unsafe mem.w16(norms, N_OF + i * 2, i16.wrappingToU16(cstate.OF_DEFAULT_NORM[i])) i = i + 1 }
+}
+
+/// `ZSTD_entropyCTablesMetadata_t`, without the buffers of the table descriptions, which the
+/// splitter never reads.
+pub struct EntropyMetadata {
+  /// `hufMetadata.hType`: a `cstate.SET_*`.
+  pub hType: u32,
+  pub hufDesSize: usize,
+  pub llType: u32,
+  pub ofType: u32,
+  pub mlType: u32,
+  pub fseTablesSize: usize,
+  pub lastCountSize: usize,
+}
+
+fn copyStore(s: &SeqStore) -> SeqStore {
+  return SeqStore { sequencesStart: s.sequencesStart, nbSeq: s.nbSeq, litStart: s.litStart, litSize: s.litSize, llCode: s.llCode, mlCode: s.mlCode, ofCode: s.ofCode, maxNbSeq: s.maxNbSeq, maxNbLit: s.maxNbLit, longLengthType: s.longLengthType, longLengthPos: s.longLengthPos }
+}
+
+// `ZSTD_buildBlockEntropyStats_literals`: builds the entropy of the literals into `nextBlock`
+// and stores their block type in `meta.hType`. `prevBlock` and `nextBlock` are block states.
+// Returns the size of the description of the Huffman table, or an error.
+unsafe fn buildBlockEntropyStatsLiterals(src: [*]const u8, srcSize: usize, prevBlock: [*]const u8, nextBlock: [*]mut u8, meta: &mut EntropyMetadata, hufDesBuffer: [*]mut u8, literalsCompressionIsDisabled: bool, workspace: [*]mut u8, wkspSize: usize, hufFlags: u32) -> usize {
+  let countWksp = workspace
+  let countWkspSize: usize = 1024
+  let nodeWksp = unsafe mem.add(workspace, countWkspSize)
+  let nodeWkspSize = wkspSize - countWkspSize
+  let mut maxSymbolValue: u32 = huf.SYMBOLVALUE_MAX
+  let mut huffLog: u32 = LIT_HUF_LOG
+  let prevRepeat = unsafe mem.r32(prevBlock, cstate.CBS_HUF_REPEAT)
+  let mut repeat = prevRepeat
+  // Prepare nextEntropy assuming that the existing table is reused.
+  let _c0 = unsafe mem.memcpy(nextBlock, prevBlock, cstate.CBS_HUF_SIZE)
+  if literalsCompressionIsDisabled {
+    meta.hType = cstate.SET_BASIC
+    return 0
+  }
+  // Small: don't even attempt compression (speed opt).
+  let minLitSize: usize = if prevRepeat == huf.REPEAT_VALID { 6 } else { COMPRESS_LITERALS_SIZE_MIN }
+  if srcSize <= minLitSize {
+    meta.hType = cstate.SET_BASIC
+    return 0
+  }
+  // Scan the input and build the symbol statistics.
+  let largest = unsafe hist.count(countWksp, &mut maxSymbolValue, src, srcSize, workspace, wkspSize)
+  if errors.isError(largest) { return largest }
+  if largest == srcSize {
+    // Only one literal symbol.
+    meta.hType = cstate.SET_RLE
+    return 0
+  }
+  if largest <= usize.shiftRight(srcSize, 7) + 4 {
+    // Heuristic: likely not compressible.
+    meta.hType = cstate.SET_BASIC
+    return 0
+  }
+  let count = unsafe mem.ro(countWksp)
+  // Validate the previous Huffman table.
+  if repeat == huf.REPEAT_CHECK && !unsafe huf.validateCTable(unsafe mem.addc(prevBlock, cstate.CBS_HUF_CTABLE), count, maxSymbolValue) {
+    repeat = huf.REPEAT_NONE
+  }
+  // Build the Huffman tree.
+  let nextCTable = unsafe mem.add(nextBlock, cstate.CBS_HUF_CTABLE)
+  let _m = unsafe mem.memset(nextCTable, 0, huf.CTABLE_BYTES)
+  huffLog = unsafe huf.optimalTableLog(huffLog, srcSize, maxSymbolValue, nodeWksp, nodeWkspSize, nextCTable, count, hufFlags)
+  let maxBits = unsafe huf.buildCTable(nextCTable, count, maxSymbolValue, huffLog, nodeWksp, nodeWkspSize)
+  if errors.isError(maxBits) { return maxBits }
+  huffLog = mem.t32(maxBits)
+  // Build and write the CTable.
+  let newCSize = unsafe huf.estimateCompressedSize(unsafe mem.ro(nextCTable), count, maxSymbolValue)
+  let hSize = unsafe huf.writeCTable(hufDesBuffer, MAX_HUF_HEADER_SIZE, unsafe mem.ro(nextCTable), maxSymbolValue, huffLog, nodeWksp, nodeWkspSize)
+  // Check against repeating the previous CTable.
+  if repeat != huf.REPEAT_NONE {
+    let oldCSize = unsafe huf.estimateCompressedSize(unsafe mem.addc(prevBlock, cstate.CBS_HUF_CTABLE), count, maxSymbolValue)
+    if oldCSize < srcSize && (oldCSize <= mem.ua(hSize, newCSize) || mem.ua(hSize, 12) >= srcSize) {
+      let _c1 = unsafe mem.memcpy(nextBlock, prevBlock, cstate.CBS_HUF_SIZE)
+      meta.hType = cstate.SET_REPEAT
+      return 0
+    }
+  }
+  if mem.ua(newCSize, hSize) >= srcSize {
+    let _c2 = unsafe mem.memcpy(nextBlock, prevBlock, cstate.CBS_HUF_SIZE)
+    meta.hType = cstate.SET_BASIC
+    return 0
+  }
+  meta.hType = cstate.SET_COMPRESSED
+  unsafe mem.w32(nextBlock, cstate.CBS_HUF_REPEAT, huf.REPEAT_CHECK)
+  return hSize
+}
+
+// `ZSTD_buildBlockEntropyStats_sequences`: builds the entropy of the sequences into `nextBlock`
+// and stores the encoding types in `meta`. Returns the size of the FSE tables, or an error.
+unsafe fn buildBlockEntropyStatsSequences(s: &SeqStore, prevBlock: [*]const u8, nextBlock: [*]mut u8, strategy: u32, meta: &mut EntropyMetadata, fseTablesBuffer: [*]mut u8, workspace: [*]mut u8, wkspSize: usize, consts: [*]const u8) -> usize {
+  let nbSeq = s.nbSeq
+  let countWorkspace = workspace
+  let countBytes = mem.z(cstate.MAX_SEQ + 1) * 4
+  let entropyWorkspace = unsafe mem.add(workspace, countBytes)
+  let entropyWorkspaceSize = wkspSize - countBytes
+  if nbSeq != 0 {
+    let stats = unsafe cseq.buildSequencesStatistics(&s, nbSeq, prevBlock, nextBlock, fseTablesBuffer, MAX_FSE_HEADERS_SIZE, strategy, countWorkspace, entropyWorkspace, entropyWorkspaceSize, consts)
+    if errors.isError(stats.size) { return stats.size }
+    meta.llType = stats.llType
+    meta.ofType = stats.offType
+    meta.mlType = stats.mlType
+    meta.lastCountSize = stats.lastCountSize
+    return stats.size
+  }
+  // `ZSTD_buildDummySequencesStatistics`.
+  unsafe mem.w32(nextBlock, cstate.CBS_LL_REPEAT, cstate.FSE_REPEAT_NONE)
+  unsafe mem.w32(nextBlock, cstate.CBS_OF_REPEAT, cstate.FSE_REPEAT_NONE)
+  unsafe mem.w32(nextBlock, cstate.CBS_ML_REPEAT, cstate.FSE_REPEAT_NONE)
+  meta.llType = cstate.SET_BASIC
+  meta.ofType = cstate.SET_BASIC
+  meta.mlType = cstate.SET_BASIC
+  meta.lastCountSize = 0
+  return 0
+}
+
+/// `ZSTD_buildBlockEntropyStats`: builds the entropy tables of the block of `s` into `nextBlock`
+/// (a block state, as `prevBlock`) and describes them in `meta`. `hufDesBuffer` has 128 bytes
+/// and `fseTablesBuffer` 133; `workspace` is the `tmpWorkspace` of a context. Returns 0, or an
+/// error.
+pub unsafe fn buildBlockEntropyStats(s: &SeqStore, prevBlock: [*]const u8, nextBlock: [*]mut u8, strategy: u32, literalsCompressionIsDisabled: bool, meta: &mut EntropyMetadata, hufDesBuffer: [*]mut u8, fseTablesBuffer: [*]mut u8, workspace: [*]mut u8, wkspSize: usize, consts: [*]const u8) -> usize {
+  let hufFlags: u32 = if strategy >= cparams.BTULTRA { huf.FLAG_OPTIMAL_DEPTH } else { 0 }
+  meta.hufDesSize = unsafe buildBlockEntropyStatsLiterals(unsafe mem.ro(s.litStart), s.litSize, prevBlock, nextBlock, &mut meta, hufDesBuffer, literalsCompressionIsDisabled, workspace, wkspSize, hufFlags)
+  if errors.isError(meta.hufDesSize) { return meta.hufDesSize }
+  meta.fseTablesSize = unsafe buildBlockEntropyStatsSequences(&s, prevBlock, nextBlock, strategy, &mut meta, fseTablesBuffer, workspace, wkspSize, consts)
+  if errors.isError(meta.fseTablesSize) { return meta.fseTablesSize }
+  return 0
+}
+
+// `ZSTD_estimateBlockSize_literal`: the estimated size of the literals section (header and
+// content) of a block. `hufCTable` is the table of the block.
+unsafe fn estimateBlockSizeLiteral(literals: [*]const u8, litSize: usize, hufCTable: [*]const u8, meta: &EntropyMetadata, workspace: [*]mut u8, wkspSize: usize, writeEntropy: bool) -> usize {
+  let countWksp = workspace
+  let mut maxSymbolValue: u32 = huf.SYMBOLVALUE_MAX
+  let mut literalSectionHeaderSize: usize = 3
+  if litSize >= 1024 { literalSectionHeaderSize = literalSectionHeaderSize + 1 }
+  if litSize >= 16384 { literalSectionHeaderSize = literalSectionHeaderSize + 1 }
+  let singleStream = litSize < 256
+  if meta.hType == cstate.SET_BASIC { return litSize }
+  if meta.hType == cstate.SET_RLE { return 1 }
+  // set_compressed or set_repeat.
+  let largest = unsafe hist.count(countWksp, &mut maxSymbolValue, literals, litSize, workspace, wkspSize)
+  if errors.isError(largest) { return litSize }
+  let mut cLitSizeEstimate = unsafe huf.estimateCompressedSize(hufCTable, unsafe mem.ro(countWksp), maxSymbolValue)
+  if writeEntropy { cLitSizeEstimate = mem.ua(cLitSizeEstimate, meta.hufDesSize) }
+  // A multi-stream Huffman section has a jump table of 6 bytes.
+  if !singleStream { cLitSizeEstimate = mem.ua(cLitSizeEstimate, 6) }
+  return mem.ua(cLitSizeEstimate, literalSectionHeaderSize)
+}
+
+// `ZSTD_estimateBlockSize_symbolType`: the estimated size of the FSE-compressed symbols of one
+// kind (of, ml, ll) of a block. `bitsKind` selects the additional bits of a code: 0 for the code
+// itself (offsets), 1 for `LL_bits`, 2 for `ML_bits`.
+unsafe fn estimateBlockSizeSymbolType(type_: u32, codeTable: [*]const u8, nbSeq: usize, maxCode: u32, fseCTable: [*]const u8, bitsKind: u32, defaultNorm: [*]const u8, defaultNormLog: u32, workspace: [*]mut u8, wkspSize: usize) -> usize {
+  let countWksp = workspace
+  let mut cSymbolTypeSizeEstimateInBits: usize = 0
+  let mut max = maxCode
+  // Cannot fail.
+  let _h = unsafe hist.countFast(countWksp, &mut max, codeTable, nbSeq, workspace, wkspSize)
+  if type_ == cstate.SET_BASIC {
+    // This encoding type was selected, so it must be valid.
+    cSymbolTypeSizeEstimateInBits = unsafe cseq.crossEntropyCost(defaultNorm, defaultNormLog, unsafe mem.ro(countWksp), max)
+  } else if type_ == cstate.SET_RLE {
+    cSymbolTypeSizeEstimateInBits = 0
+  } else if type_ == cstate.SET_COMPRESSED || type_ == cstate.SET_REPEAT {
+    cSymbolTypeSizeEstimateInBits = unsafe cseq.fseBitCost(fseCTable, unsafe mem.ro(countWksp), max)
+  }
+  if errors.isError(cSymbolTypeSizeEstimateInBits) { return usize.wrappingMultiply(nbSeq, 10) }
+  let mut i: usize = 0
+  while i < nbSeq {
+    let code = u8.toUsize(unsafe mem.r8(codeTable, i))
+    if bitsKind == 1 {
+      cSymbolTypeSizeEstimateInBits = mem.ua(cSymbolTypeSizeEstimateInBits, u8.toUsize(cstate.LL_BITS[code]))
+    } else if bitsKind == 2 {
+      cSymbolTypeSizeEstimateInBits = mem.ua(cSymbolTypeSizeEstimateInBits, u8.toUsize(cstate.ML_BITS[code]))
+    } else {
+      // For offsets, the offset code is also the number of additional bits.
+      cSymbolTypeSizeEstimateInBits = mem.ua(cSymbolTypeSizeEstimateInBits, code)
+    }
+    i = mem.ua(i, 1)
+  }
+  return usize.shiftRight(cSymbolTypeSizeEstimateInBits, 3)
+}
+
+// `ZSTD_estimateBlockSize_sequences`: the estimated size of the sequences section (header and
+// content) of a block. `block` is the block state that holds the FSE tables.
+unsafe fn estimateBlockSizeSequences(ofCodeTable: [*]const u8, llCodeTable: [*]const u8, mlCodeTable: [*]const u8, nbSeq: usize, block: [*]const u8, meta: &EntropyMetadata, norms: [*]const u8, workspace: [*]mut u8, wkspSize: usize, writeEntropy: bool) -> usize {
+  let mut sequencesSectionHeaderSize: usize = 2
+  if nbSeq >= 128 { sequencesSectionHeaderSize = sequencesSectionHeaderSize + 1 }
+  if nbSeq >= cstate.LONGNBSEQ { sequencesSectionHeaderSize = sequencesSectionHeaderSize + 1 }
+  let mut cSeqSizeEstimate: usize = 0
+  cSeqSizeEstimate = mem.ua(cSeqSizeEstimate, unsafe estimateBlockSizeSymbolType(meta.ofType, ofCodeTable, nbSeq, cstate.MAX_OFF, unsafe mem.addc(block, cstate.CBS_OF_CTABLE), 0, unsafe mem.addc(norms, N_OF), cstate.OF_DEFAULT_NORM_LOG, workspace, wkspSize))
+  cSeqSizeEstimate = mem.ua(cSeqSizeEstimate, unsafe estimateBlockSizeSymbolType(meta.llType, llCodeTable, nbSeq, cstate.MAX_LL, unsafe mem.addc(block, cstate.CBS_LL_CTABLE), 1, unsafe mem.addc(norms, N_LL), cstate.LL_DEFAULT_NORM_LOG, workspace, wkspSize))
+  cSeqSizeEstimate = mem.ua(cSeqSizeEstimate, unsafe estimateBlockSizeSymbolType(meta.mlType, mlCodeTable, nbSeq, cstate.MAX_ML, unsafe mem.addc(block, cstate.CBS_ML_CTABLE), 2, unsafe mem.addc(norms, N_ML), cstate.ML_DEFAULT_NORM_LOG, workspace, wkspSize))
+  if writeEntropy { cSeqSizeEstimate = mem.ua(cSeqSizeEstimate, meta.fseTablesSize) }
+  return mem.ua(cSeqSizeEstimate, sequencesSectionHeaderSize)
+}
+
+// `ZSTD_estimateBlockSize`: the estimated size of a block, from its literals, its codes and the
+// entropy tables of `block`.
+unsafe fn estimateBlockSize(literals: [*]const u8, litSize: usize, ofCodeTable: [*]const u8, llCodeTable: [*]const u8, mlCodeTable: [*]const u8, nbSeq: usize, block: [*]const u8, meta: &EntropyMetadata, norms: [*]const u8, workspace: [*]mut u8, wkspSize: usize, writeLitEntropy: bool, writeSeqEntropy: bool) -> usize {
+  let literalsSize = unsafe estimateBlockSizeLiteral(literals, litSize, unsafe mem.addc(block, cstate.CBS_HUF_CTABLE), &meta, workspace, wkspSize, writeLitEntropy)
+  let seqSize = unsafe estimateBlockSizeSequences(ofCodeTable, llCodeTable, mlCodeTable, nbSeq, block, &meta, norms, workspace, wkspSize, writeSeqEntropy)
+  return mem.ua(mem.ua(seqSize, literalsSize), cstate.BLOCK_HEADER_SIZE)
+}
+
+// `ZSTD_buildEntropyStatisticsAndEstimateSubBlockSize`: builds the entropy statistics of `s`
+// and uses them to estimate its compressed size. Returns the estimate, or an error.
+unsafe fn buildEntropyStatisticsAndEstimateSubBlockSize(s: &SeqStore, c: &mut CCtx, norms: [*]const u8) -> usize {
+  let mut meta = EntropyMetadata { hType: 0, hufDesSize: 0, llType: 0, ofType: 0, mlType: 0, fseTablesSize: 0, lastCountSize: 0 }
+  let mut hufDes: [u8; 128] = [0; 128]
+  let mut fseTables: [u8; 136] = [0; 136]
+  let hufDesBuffer = unsafe mem.nn(Pointer.fromMutSlice<u8>(&mut hufDes))
+  let fseTablesBuffer = unsafe mem.nn(Pointer.fromMutSlice<u8>(&mut fseTables))
+  let strategy = c.appliedParams.cParams.strategy
+  let disabled = cparams.literalsCompressionIsDisabled(&c.appliedParams)
+  let prevBlock = unsafe mem.ro(c.prevCBlock)
+  let nextBlock = c.nextCBlock
+  let built = unsafe buildBlockEntropyStats(&s, prevBlock, nextBlock, strategy, disabled, &mut meta, hufDesBuffer, fseTablesBuffer, c.tmpWorkspace, c.tmpWkspSize, unsafe mem.ro(c.consts))
+  if errors.isError(built) { return built }
+  return unsafe estimateBlockSize(unsafe mem.ro(s.litStart), s.litSize, unsafe mem.ro(s.ofCode), unsafe mem.ro(s.llCode), unsafe mem.ro(s.mlCode), s.nbSeq, unsafe mem.ro(nextBlock), &meta, norms, c.tmpWorkspace, c.tmpWkspSize, meta.hType == cstate.SET_COMPRESSED, true)
+}
+
+// `ZSTD_countSeqStoreLiteralsBytes` on the first `nbSeqs` sequences at `sequences`.
+unsafe fn countLiteralsBytes(sequences: [*]const u8, nbSeqs: usize, longLengthType: u32, longLengthPos: u32) -> usize {
+  let mut literalsBytes: usize = 0
+  let mut i: usize = 0
+  while i < nbSeqs {
+    literalsBytes = mem.ua(literalsBytes, u16.toUsize(unsafe mem.r16(sequences, mem.ua(usize.wrappingMultiply(i, 8), 4))))
+    if i == mem.z(longLengthPos) && longLengthType == cstate.LLT_LITERAL_LENGTH { literalsBytes = mem.ua(literalsBytes, 0x10000) }
+    i = mem.ua(i, 1)
+  }
+  return literalsBytes
+}
+
+// `ZSTD_countSeqStoreMatchBytes`.
+unsafe fn countMatchBytes(sequences: [*]const u8, nbSeqs: usize, longLengthType: u32, longLengthPos: u32) -> usize {
+  let mut matchBytes: usize = 0
+  let mut i: usize = 0
+  while i < nbSeqs {
+    matchBytes = mem.ua(matchBytes, mem.ua(u16.toUsize(unsafe mem.r16(sequences, mem.ua(usize.wrappingMultiply(i, 8), 6))), cstate.MINMATCH))
+    if i == mem.z(longLengthPos) && longLengthType == cstate.LLT_MATCH_LENGTH { matchBytes = mem.ua(matchBytes, 0x10000) }
+    i = mem.ua(i, 1)
+  }
+  return matchBytes
+}
+
+// `ZSTD_deriveSeqStoreChunk`: the store of the sequences `startIdx..endIdx` of `original`.
+unsafe fn deriveSeqStoreChunk(original: &SeqStore, startIdx: usize, endIdx: usize) -> SeqStore {
+  let mut result = copyStore(&original)
+  let origSequences = unsafe mem.ro(original.sequencesStart)
+  if startIdx > 0 {
+    result.litStart = unsafe mem.add(result.litStart, unsafe countLiteralsBytes(origSequences, startIdx, original.longLengthType, original.longLengthPos))
+  }
+  // Move longLengthPos into the correct position if necessary.
+  if original.longLengthType != cstate.LLT_NONE {
+    if mem.z(original.longLengthPos) < startIdx || mem.z(original.longLengthPos) > endIdx {
+      result.longLengthType = cstate.LLT_NONE
+    } else {
+      result.longLengthPos = mem.s32(result.longLengthPos, mem.t32(startIdx))
+    }
+  }
+  result.sequencesStart = unsafe mem.add(original.sequencesStart, usize.wrappingMultiply(startIdx, 8))
+  result.nbSeq = endIdx - startIdx
+  if endIdx == original.nbSeq {
+    // The derived chunk reaches the end of the block: it holds the last literals too.
+    result.litSize = mem.us(mem.ua(mem.addrm(original.litStart), original.litSize), mem.addrm(result.litStart))
+  } else {
+    result.litSize = unsafe countLiteralsBytes(unsafe mem.ro(result.sequencesStart), result.nbSeq, result.longLengthType, result.longLengthPos)
+  }
+  result.llCode = unsafe mem.add(result.llCode, startIdx)
+  result.mlCode = unsafe mem.add(result.mlCode, startIdx)
+  result.ofCode = unsafe mem.add(result.ofCode, startIdx)
+  return move result
+}
+
+// `ZSTD_resolveRepcodeToRawOffset`: the raw offset that the repeat code `offBase` stands for
+// with the history `rep`.
+unsafe fn resolveRepcodeToRawOffset(rep: [*]const u8, offBase: u32, ll0: u32) -> u32 {
+  let adjustedRepCode = offBase - 1 + ll0
+  if adjustedRepCode == cstate.REP_NUM {
+    // litlength == 0 and offCode == 2 implies the selection of the first repcode - 1. It may
+    // be 0, an invalid offset, which the caller compares and discards.
+    return mem.s32(unsafe mem.r32(rep, 0), 1)
+  }
+  return unsafe mem.r32(rep, mem.z(adjustedRepCode) * 4)
+}
+
+// `ZSTD_seqStore_resolveOffCodes`: reconciles the divergences in offset history that arise from
+// the emission of RLE or raw blocks, and replaces the repeat codes of the store that became
+// invalid. `dRep` is updated as on the decompression side, `cRep` in accordance with the store.
+unsafe fn seqStoreResolveOffCodes(dRep: [*]mut u8, cRep: [*]mut u8, s: &SeqStore, nbSeq: u32) -> () {
+  let longLitLenIdx: u32 = if s.longLengthType == cstate.LLT_LITERAL_LENGTH { s.longLengthPos } else { nbSeq }
+  let mut idx: u32 = 0
+  while idx < nbSeq {
+    let at = usize.wrappingMultiply(mem.z(idx), 8)
+    let litLength = unsafe mem.r16(unsafe mem.ro(s.sequencesStart), at + 4)
+    let ll0: u32 = if litLength == 0 && idx != longLitLenIdx { 1 } else { 0 }
+    let offBase = unsafe mem.r32(unsafe mem.ro(s.sequencesStart), at)
+    let mut newOffBase = offBase
+    if offBase >= 1 && offBase <= cstate.REP_NUM {
+      let dRawOffset = unsafe resolveRepcodeToRawOffset(unsafe mem.ro(dRep), offBase, ll0)
+      let cRawOffset = unsafe resolveRepcodeToRawOffset(unsafe mem.ro(cRep), offBase, ll0)
+      // Adjust the simulated decompression history on a mismatch: replace the repeat code with
+      // the offset it references, as the compression history tells.
+      if dRawOffset != cRawOffset {
+        newOffBase = cstate.offsetToOffBase(cRawOffset)
+        unsafe mem.w32(s.sequencesStart, at, newOffBase)
+      }
+    }
+    // The compression history is always updated with the values of the unmodified store; the
+    // decompression history may use the modified offset.
+    unsafe cstate.updateRep(dRep, newOffBase, ll0)
+    unsafe cstate.updateRep(cRep, offBase, ll0)
+    idx = idx + 1
+  }
+}
+
+// `ZSTD_compressSeqStore_singleBlock`: compresses the store `s`, which stands for
+// `src[0..srcSize]`, into a block with its header at `dst`. Returns the size of the block.
+unsafe fn compressSeqStoreSingleBlock(c: &mut CCtx, s: &SeqStore, dRep: [*]mut u8, cRep: [*]mut u8, dst: [*]mut u8, dstCapacity: usize, src: [*]const u8, srcSize: usize, lastBlock: u32, isPartition: bool) -> usize {
+  let rleMaxLength: usize = 25
+  let mut cSize: usize = 0
+  // In case of an RLE or raw block, the simulated decompression history must be reset.
+  let dRepOriginal0 = unsafe mem.r32(unsafe mem.ro(dRep), 0)
+  let dRepOriginal1 = unsafe mem.r32(unsafe mem.ro(dRep), 4)
+  let dRepOriginal2 = unsafe mem.r32(unsafe mem.ro(dRep), 8)
+  if isPartition { unsafe seqStoreResolveOffCodes(dRep, cRep, &s, mem.t32(s.nbSeq)) }
+  if dstCapacity < cstate.BLOCK_HEADER_SIZE { return errors.err(errors.E_DSTSIZE_TOOSMALL) }
+  let strategy = c.appliedParams.cParams.strategy
+  let disabled = cparams.literalsCompressionIsDisabled(&c.appliedParams)
+  let mut cSeqsSize = unsafe cseq.entropyCompressSeqStore(&s, unsafe mem.ro(c.prevCBlock), c.nextCBlock, strategy, disabled, unsafe mem.add(dst, cstate.BLOCK_HEADER_SIZE), dstCapacity - cstate.BLOCK_HEADER_SIZE, srcSize, c.tmpWorkspace, c.tmpWkspSize, unsafe mem.ro(c.consts))
+  if errors.isError(cSeqsSize) { return cSeqsSize }
+  // The first block of a frame is never RLE: decoders before 1.4.3 reject it.
+  if !c.isFirstBlock && cSeqsSize < rleMaxLength && unsafe cctx.isRLE(src, srcSize) { cSeqsSize = 1 }
+  if cSeqsSize == 0 {
+    cSize = unsafe cctx.noCompressBlock(dst, dstCapacity, src, srcSize, lastBlock)
+    if errors.isError(cSize) { return cSize }
+    // Reset the simulated decompression history.
+    unsafe mem.w32(dRep, 0, dRepOriginal0)
+    unsafe mem.w32(dRep, 4, dRepOriginal1)
+    unsafe mem.w32(dRep, 8, dRepOriginal2)
+  } else if cSeqsSize == 1 {
+    cSize = unsafe cctx.rleCompressBlock(dst, dstCapacity, unsafe mem.r8(src, 0), srcSize, lastBlock)
+    if errors.isError(cSize) { return cSize }
+    unsafe mem.w32(dRep, 0, dRepOriginal0)
+    unsafe mem.w32(dRep, 4, dRepOriginal1)
+    unsafe mem.w32(dRep, 8, dRepOriginal2)
+  } else {
+    cctx.confirmRepcodesAndEntropyTables(&mut c)
+    // `writeBlockHeader`.
+    unsafe mem.w24(dst, 0, mem.a32(lastBlock + 4, mem.t32(usize.shiftLeft(cSeqsSize, 3))))
+    cSize = cstate.BLOCK_HEADER_SIZE + cSeqsSize
+  }
+  if unsafe mem.r32(unsafe mem.ro(c.prevCBlock), cstate.CBS_OF_REPEAT) == cstate.FSE_REPEAT_VALID {
+    unsafe mem.w32(c.prevCBlock, cstate.CBS_OF_REPEAT, cstate.FSE_REPEAT_CHECK)
+  }
+  return cSize
+}
+
+// `ZSTD_deriveBlockSplitsHelper`: the recursive search for block splits. Estimates the cost of
+// the sequences `startIdx..endIdx` as one block and as two halves; if splitting is advantageous,
+// recurses down the two halves. `splits` is an array of `u32`; `splitIdx` is the number of
+// split locations written so far.
+unsafe fn deriveBlockSplitsHelper(splits: [*]mut u8, splitIdx: &mut usize, startIdx: usize, endIdx: usize, c: &mut CCtx, origSeqStore: &SeqStore, norms: [*]const u8) -> () {
+  let midIdx = (startIdx + endIdx) / 2
+  if endIdx - startIdx < MIN_SEQUENCES_BLOCK_SPLITTING || splitIdx.* >= MAX_NB_BLOCK_SPLITS { return }
+  let fullSeqStoreChunk = unsafe deriveSeqStoreChunk(&origSeqStore, startIdx, endIdx)
+  let firstHalfSeqStore = unsafe deriveSeqStoreChunk(&origSeqStore, startIdx, midIdx)
+  let secondHalfSeqStore = unsafe deriveSeqStoreChunk(&origSeqStore, midIdx, endIdx)
+  let estimatedOriginalSize = unsafe buildEntropyStatisticsAndEstimateSubBlockSize(&fullSeqStoreChunk, &mut c, norms)
+  let estimatedFirstHalfSize = unsafe buildEntropyStatisticsAndEstimateSubBlockSize(&firstHalfSeqStore, &mut c, norms)
+  let estimatedSecondHalfSize = unsafe buildEntropyStatisticsAndEstimateSubBlockSize(&secondHalfSeqStore, &mut c, norms)
+  if errors.isError(estimatedOriginalSize) || errors.isError(estimatedFirstHalfSize) || errors.isError(estimatedSecondHalfSize) { return }
+  if mem.ua(estimatedFirstHalfSize, estimatedSecondHalfSize) < estimatedOriginalSize {
+    unsafe deriveBlockSplitsHelper(splits, &mut splitIdx, startIdx, midIdx, &mut c, &origSeqStore, norms)
+    unsafe cstate.tset(splits, splitIdx.*, mem.t32(midIdx))
+    splitIdx.* = splitIdx.* + 1
+    unsafe deriveBlockSplitsHelper(splits, &mut splitIdx, midIdx, endIdx, &mut c, &origSeqStore, norms)
+  }
+}
+
+// `ZSTD_deriveBlockSplits`: fills `partitions` with the indices of the partitions inside the
+// block that can improve the compression ratio. Returns the number of splits (the number of
+// partitions minus 1).
+unsafe fn deriveBlockSplits(c: &mut CCtx, origSeqStore: &SeqStore, partitions: [*]mut u8, nbSeq: u32, norms: [*]const u8) -> usize {
+  let mut splitIdx: usize = 0
+  // Refuse to try and split anything with less than 4 sequences.
+  if nbSeq <= 4 { return 0 }
+  unsafe deriveBlockSplitsHelper(partitions, &mut splitIdx, 0, mem.z(nbSeq), &mut c, &origSeqStore, norms)
+  unsafe cstate.tset(partitions, splitIdx, nbSeq)
+  return splitIdx
+}
+
+// `ZSTD_compressBlock_splitBlock_internal`: attempts to split the block of `c.seqStore` into
+// several blocks to improve the compression ratio. Returns the size of all blocks, with their
+// headers.
+unsafe fn compressBlockSplitBlockInternal(c: &mut CCtx, dst: [*]mut u8, dstCapacity0: usize, src: [*]const u8, blockSize: usize, lastBlock: u32, nbSeq: u32) -> usize {
+  let mut cSize: usize = 0
+  let mut ip: usize = 0
+  let mut op: usize = 0
+  let mut dstCapacity = dstCapacity0
+  let mut srcBytesTotal: usize = 0
+  // `ZSTD_MAX_NB_BLOCK_SPLITS` split locations, and the final one.
+  let mut partitionsStore: [u8; 800] = [0; 800]
+  let partitions = unsafe mem.nn(Pointer.fromMutSlice<u8>(&mut partitionsStore))
+  let mut normsStore: [u8; 240] = [0; 240]
+  let normsMut = unsafe mem.nn(Pointer.fromMutSlice<u8>(&mut normsStore))
+  unsafe initNorms(normsMut)
+  let norms = unsafe mem.ro(normsMut)
+  let origSeqStore = copyStore(&c.seqStore)
+  let numSplits = unsafe deriveBlockSplits(&mut c, &origSeqStore, partitions, nbSeq, norms)
+
+  // If a block is split and some partitions are emitted as RLE or uncompressed, the offset
+  // history may become invalid. Two histories simulate it on the compression and on the
+  // decompression side, and tell whether a repeat code must be replaced with its raw offset:
+  // cRep is updated for each partition, whether or not it was emitted compressed; dRep only for
+  // compressed partitions, with the replacement offsets, and is the final history sent to the
+  // next block.
+  let mut repStore: [u8; 24] = [0; 24]
+  let dRep = unsafe mem.nn(Pointer.fromMutSlice<u8>(&mut repStore))
+  let cRep = unsafe mem.add(dRep, 12)
+  let _d = unsafe mem.memcpy(dRep, unsafe mem.addc(unsafe mem.ro(c.prevCBlock), cstate.CBS_REP), 12)
+  let _c = unsafe mem.memcpy(cRep, unsafe mem.addc(unsafe mem.ro(c.prevCBlock), cstate.CBS_REP), 12)
+
+  if numSplits == 0 {
+    return unsafe compressSeqStoreSingleBlock(&mut c, &origSeqStore, dRep, cRep, dst, dstCapacity, src, blockSize, lastBlock, false)
+  }
+
+  let mut currSeqStore = unsafe deriveSeqStoreChunk(&origSeqStore, 0, mem.z(unsafe cstate.tget(partitions, 0)))
+  let mut i: usize = 0
+  while i <= numSplits {
+    let lastPartition = i == numSplits
+    let mut lastBlockEntireSrc: u32 = 0
+    let seqs = unsafe mem.ro(currSeqStore.sequencesStart)
+    let mut srcBytes = mem.ua(unsafe countLiteralsBytes(seqs, currSeqStore.nbSeq, currSeqStore.longLengthType, currSeqStore.longLengthPos), unsafe countMatchBytes(seqs, currSeqStore.nbSeq, currSeqStore.longLengthType, currSeqStore.longLengthPos))
+    srcBytesTotal = mem.ua(srcBytesTotal, srcBytes)
+    let mut nextSeqStore = copyStore(&currSeqStore)
+    if lastPartition {
+      // The final partition: account for the possible last literals.
+      srcBytes = mem.ua(srcBytes, mem.us(blockSize, srcBytesTotal))
+      lastBlockEntireSrc = lastBlock
+    } else {
+      nextSeqStore = unsafe deriveSeqStoreChunk(&origSeqStore, mem.z(unsafe cstate.tget(partitions, i)), mem.z(unsafe cstate.tget(partitions, i + 1)))
+    }
+    let cSizeChunk = unsafe compressSeqStoreSingleBlock(&mut c, &currSeqStore, dRep, cRep, unsafe mem.add(dst, op), dstCapacity, unsafe mem.addc(src, ip), srcBytes, lastBlockEntireSrc, true)
+    if errors.isError(cSizeChunk) { return cSizeChunk }
+    ip = mem.ua(ip, srcBytes)
+    op = mem.ua(op, cSizeChunk)
+    dstCapacity = mem.us(dstCapacity, cSizeChunk)
+    cSize = mem.ua(cSize, cSizeChunk)
+    currSeqStore = move nextSeqStore
+    i = i + 1
+  }
+  // cRep and dRep may have diverged during the compression: the dRep history is the one of the
+  // next block.
+  let _r = unsafe mem.memcpy(unsafe mem.add(c.prevCBlock, cstate.CBS_REP), unsafe mem.ro(dRep), 12)
+  return cSize
+}
+
+/// `ZSTD_compressBlock_splitBlock`: compresses the block `src[0..srcSize]` into one or several
+/// blocks at `dst`, with their headers; `lastBlock` is 1 if it is the last block of the frame.
+/// Returns the size written.
+pub unsafe fn compressBlockSplitBlock(c: &mut CCtx, dst: [*]mut u8, dstCapacity: usize, src: [*]const u8, srcSize: usize, lastBlock: u32) -> usize {
+  let bss = unsafe cctx.buildSeqStore(&mut c, src, srcSize)
+  if errors.isError(bss) { return bss }
+  if bss == cctx.BSS_NO_COMPRESS {
+    if unsafe mem.r32(unsafe mem.ro(c.prevCBlock), cstate.CBS_OF_REPEAT) == cstate.FSE_REPEAT_VALID {
+      unsafe mem.w32(c.prevCBlock, cstate.CBS_OF_REPEAT, cstate.FSE_REPEAT_CHECK)
+    }
+    return unsafe cctx.noCompressBlock(dst, dstCapacity, src, srcSize, lastBlock)
+  }
+  let nbSeq = mem.t32(c.seqStore.nbSeq)
+  return unsafe compressBlockSplitBlockInternal(&mut c, dst, dstCapacity, src, srcSize, lastBlock, nbSeq)
+}

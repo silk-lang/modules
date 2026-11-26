@@ -1,0 +1,972 @@
+//! Headless runs: any window app runs with no display, no GPU and no window, driven by a script,
+//! when `SILK_UI_HEADLESS` names the script's file. The host (`host.runHeadless`) draws every
+//! frame on the CPU, on a clock that moves exactly one frame (1/60 s) per turn, so a run gives
+//! the same pixels every time and never waits for the display.
+//!
+//! A script line is a `ui-inspect-cli` command, in the same words (`click --name Save`,
+//! `type "hello"`, `press Enter`, `screenshot out.png`, `snapshot tree.txt`, `wait --text Saved`),
+//! run against the app in this process. A few lines are the run's own:
+//!
+//! - `wait 500ms` (or `2s`): lets that much time pass, frame by frame.
+//! - `size W H [SCALE]`: resizes the window (CSS pixels, and the device pixel ratio).
+//! - `record FILE` ... `stop`: records every frame in between as a 60 fps video, with ffmpeg
+//!   (`SILK_UI_FFMPEG`, else the usual places). A FILE ending in `/` keeps the PNG frames.
+//!   `--show-input` draws the pointer and keys over the frames (`input_overlay`); `--overview
+//!   PNG` writes twelve frames picked across the recording as one image at `stop`.
+//! - `drop FILE... [at X Y]`: drags files in from the desktop and drops them at X, Y (the
+//!   window's middle without `at`).
+//! - `shortcut ID`, `tray [middle|right]`, `tray-item ACTION`, `click-notification ID`: a
+//!   global shortcut, a click on the tray icon or its menu item, a click on a notification.
+//!
+//! A command that fails, or a `wait` that does not hold within 10 seconds of the run's time, ends
+//! the run with status 1 after saying which line it was. Otherwise the run ends with status 0
+//! after the last line. `#` starts a comment.
+//!
+//! A browser has no files or processes to run a script with: for wasm32 this module is empty.
+static if Intrinsic.targetArchitecture() != "wasm32" {
+  import ui_inspect_server.lib { Inspector, Channel, MemoryChannel }
+  import ui_inspect_server.commands { Command, parseCommand, requestLine, replyPng, splitWords, appendInt }
+  import ui_tree.inspect { encodePng }
+  import codec.image { ImageError }
+  import vector.pixmap { Pixmap }
+  import console { StderrWriter }
+  import silk.collections.bytes { Bytes }
+  import silk.collections.list { List }
+  import silk.core.effect { Effect }
+  import silk.core.option { Option }
+  import silk.core.result { Result }
+  import silk.io.writer { Writer }
+  import silk.io.writer_native { StdoutWriter }
+  import silk.json.scanner { JsonError }
+  import silk.json.value { Json, Value }
+  import silk.mem.allocator { Allocator, OutOfMemoryError }
+  import silk.num.f64
+  import silk.num.u32
+  import silk.num.u64
+  import silk.num.usize
+  import silk.system.child_process { ChildProcess, ProcessError, ProcessRequest }
+  import silk.system.child_process_native { OsChildProcess }
+  import silk.system.filesystem { FileSystem, FileError, Path }
+  import silk.system.filesystem_machine { MachineFileSystem }
+  import silk.system.host_input { HostInput, HostInputError }
+  import silk.text.format { Format, ParseError }
+  import silk.text.string { String, InvalidUtf8 }
+
+  static if Intrinsic.targetOperatingSystem() == "windows" {
+    import silk.platform.windows.host_input { WindowsHostInput }
+    import silk.platform.windows.path { WindowsPath }
+  } else {
+    import silk.platform.native.host_input { NativeHostInput }
+    import silk.system.host_input_native { OsHostInput }
+  }
+
+  /// The environment variable that asks for a headless run: the path of its script.
+  pub const VARIABLE: string = "SILK_UI_HEADLESS"
+
+  /// The script a headless run was asked for, or None for an ordinary run.
+  pub effect fn requested() -> Option<String>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let named = run variable(VARIABLE)
+    if let Option<String>.Some { value } = &named {
+      if value.ownedByteLength() == 0 {
+        return Option<String>.None
+      }
+    }
+    return move named
+  }
+
+  /// The environment variable that asks for the windowless bench: how many frames it runs (see
+  /// `host.runBench`).
+  pub const BENCH_VARIABLE: string = "SILK_UI_BENCH"
+
+  /// Whether this process runs with no window system at all: a headless script was asked for,
+  /// or the windowless bench. `platform_thread.launch` then starts no window system (on macOS
+  /// no AppKit, so no Dock icon and no request to be activated) and `host.startGpu` no GPU.
+  pub effect fn windowless() -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return (run requested()).isSome() || (run variable(BENCH_VARIABLE)).isSome()
+  }
+
+  /// The time one turn of a headless run takes, in seconds.
+  pub const FRAME: f64 = 1.0 / 60.0
+
+  /// How many frames a command may take before the run gives up on it: 10 seconds.
+  const PATIENCE: u32 = 600
+
+  /// What the host does after a turn of the script.
+  pub union Turn {
+    /// Draws the next frame and asks again.
+    Next,
+    /// Resizes the window, then goes on.
+    Resize { pub width: f64, pub height: f64, pub scale: f64 },
+    /// Sends a desktop event to the app, then goes on.
+    Desktop { pub input: Desktop },
+    /// The run is over, with this exit status.
+    Done { pub status: i32 },
+  }
+
+  /// A desktop event a script line asked for.
+  pub union Desktop {
+    /// Files dragged in and dropped at `x`, `y`; a negative `x` is the window's middle.
+    Drop { pub paths: List<String>, pub x: f64, pub y: f64 },
+    Shortcut { pub id: u32 },
+    /// `MouseEvent.button` numbering: 0 left, 1 middle, 2 right.
+    Tray { pub button: u32 },
+    TrayItem { pub action: u32 },
+    NotificationClick { pub id: u32 },
+  }
+
+  /// A request sent to the app, waiting for its reply.
+  struct Asked {
+    id: u64,
+    command: Command,
+    /// The request line, sent again while a `wait` is pending.
+    line: String,
+    /// Frames since it was first sent.
+    frames: u32,
+  }
+
+  /// A video being recorded: one file per frame, made into a video at `stop`.
+  struct Recording {
+    /// Where the video goes, as written in the script.
+    file: String,
+    /// The directory of the frames.
+    frames: Path,
+    count: u32,
+    /// Keep the frames as PNG files and make no video (the file ends in `/`). Otherwise frames
+    /// are raw RGBA, which costs nothing to write.
+    keep: bool,
+    /// The size of every frame, in device pixels: the first frame's.
+    width: u32,
+    height: u32,
+    /// Draw the pointer and keys over the frames (`--show-input`).
+    showInput: bool,
+    /// A PNG of frames picked across the recording, made at `stop` (`--overview FILE`).
+    overview: String,
+  }
+
+  /// The script of a headless run and where it is.
+  pub struct Script {
+    lines: List<String>,
+    /// The next line to run.
+    at: usize,
+    /// The line being run, for messages (counted from 1).
+    current: usize,
+    client: MemoryChannel,
+    asked: Option<Asked>,
+    /// Frames still to let pass for a `wait 500ms`.
+    sleeping: u32,
+    recording: Option<Recording>,
+    nextId: u64,
+    directory: Path,
+  }
+
+  impl Script {
+    /// Reads the script at `path` and opens its session on `inspector`. None, after saying why,
+    /// when the file cannot be read.
+    pub effect fn load(path: string, inspector: &mut Inspector) -> Option<Script>
+      ! OutOfMemoryError
+      ? &mut Allocator {
+      let directory = match move run Effect.result(workingDirectory()) {
+        Result.Success { value } => move value
+        Result.Failure { error } => {
+          drop error
+          StderrWriter.print("headless: the working directory cannot be read\n", &())
+          return Option<Script>.None
+        }
+      }
+      let read = run Effect.result(readText(&directory, path))
+      let text = match move read {
+        Result.Success { value } => move value
+        Result.Failure { error } => {
+          drop error
+          StderrWriter.print("headless: cannot read the script {}\n", &.(path))
+          return Option<Script>.None
+        }
+      }
+      let mut lines = List<String>.make()
+      let mut parts = String.split(String.view(&text), "\n")
+      while true {
+        match parts.next() {
+          Option<string>.Some { value } => {
+            run lines.append(run String.copy(value))
+          }
+          Option<string>.None => {
+            break
+          }
+        }
+      }
+      return Option<Script>.Some {
+        value: Script {
+          lines: move lines,
+          at: 0,
+          current: 0,
+          client: run inspector.openLocal(),
+          asked: Option<Asked>.None,
+          sleeping: 0,
+          recording: Option<Recording>.None,
+          nextId: 1,
+          directory: move directory,
+        },
+      }
+    }
+
+    /// Whether every frame should come to [`Script.frame`] as pixels: a video is being recorded.
+    pub fn isRecording(self: &Self) -> bool {
+      return self.recording.isSome()
+    }
+
+    /// Whether the recording draws the input over its frames (`input_overlay`).
+    pub fn showsInput(self: &Self) -> bool {
+      return match &self.recording {
+        Option<Recording>.Some { value } => value.showInput
+        Option<Recording>.None => false
+      }
+    }
+
+    /// Takes the frame the host just drew, while recording.
+    pub effect fn frame(self: &mut Self, pixels: &Pixmap) -> ()
+      ! OutOfMemoryError
+      ? &mut Allocator {
+      if let Option<Recording>.Some { value } = &mut self.recording {
+        value.count = value.count + 1
+        let mut name = String.make()
+        let mut digits = String.make()
+        run appendInt(&mut digits, u32.toU64(value.count))
+        let mut pad = String.byteLength(String.view(&digits))
+        while pad < 6 {
+          run name.append("0")
+          pad = pad + 1
+        }
+        run name.append(String.view(&digits))
+        if value.count == 1 {
+          value.width = pixels.width()
+          value.height = pixels.height()
+        }
+        run name.append(if value.keep { ".png" } else { ".rgba" })
+        let written = run Effect.result(writeFrame(&value.frames, String.view(&name), pixels, value.keep))
+        if let Result.Failure { error } = move written {
+          drop error
+          StderrWriter.print("headless: could not write a video frame\n", &())
+        }
+      }
+    }
+
+    /// Runs the script after a frame: reads the reply it waits for, or sends the next lines.
+    pub effect fn turn(self: &mut Self) -> Turn
+      ! OutOfMemoryError
+      ? &mut Allocator {
+      if self.sleeping > 0 {
+        self.sleeping = self.sleeping - 1
+        return Turn.Next
+      }
+      if self.asked.isSome() {
+        return run self.answered()
+      }
+      while self.at < self.lines.length() {
+        self.current = self.at + 1
+        let mut words = List<String>.make()
+        let line = run String.copy(String.view(&self.lines.asSlice()[self.at]))
+        self.at = self.at + 1
+        if !run splitWords(String.view(&line), &mut words) {
+          return run self.abort("a quote is not closed")
+        }
+        if words.length() == 0 {
+          continue
+        }
+        let list = words.asSlice()
+        let first = String.view(&list[0])
+        if first == "wait" && list.length == 2 && (run durationFrames(String.view(&list[1]))) > 0 {
+          self.sleeping = (run durationFrames(String.view(&list[1]))) - 1
+          return Turn.Next
+        }
+        if first == "size" {
+          return run self.resize(list)
+        }
+        if first == "record" {
+          return run self.record(list)
+        }
+        if first == "stop" {
+          return run self.stop()
+        }
+        if first == "drop" || first == "shortcut" || first == "tray" || first == "tray-item"
+          || first == "click-notification" {
+          return run self.desktop(list)
+        }
+        if first == "capture" {
+          return run self.abort("a headless run records video with record FILE ... stop instead")
+        }
+        let mut problem = String.make()
+        let parsed = run parseCommand(list, &mut problem)
+        let mut command = match move parsed {
+          Option<Command>.Some { value } => move value
+          Option<Command>.None => {
+            return run self.abort(String.view(&problem))
+          }
+        }
+        let mut request = String.make()
+        if !run requestLine(&mut command, &mut request, &mut problem) {
+          return run self.abort(String.view(&problem))
+        }
+        let id = self.nextId
+        self.nextId = self.nextId + 1
+        let numbered = run numberedLine(String.view(&request), id)
+        drop run Channel.send(String.view(&numbered)) |> Effect.provideMut<Channel>(&mut self.client)
+        self.asked = Option<Asked>.Some {
+          value: Asked { id: id, command: move command, line: move numbered, frames: 0 },
+        }
+        return Turn.Next
+      }
+      return run self.finish(0)
+    }
+
+    /// Looks for the reply to the request sent last.
+    effect fn answered(self: &mut Self) -> Turn
+      ! OutOfMemoryError
+      ? &mut Allocator {
+      let id = match &self.asked {
+        Option<Asked>.Some { value } => value.id
+        Option<Asked>.None => 0
+      }
+      while true {
+        let mut line = String.make()
+        if !run Channel.receive(&mut line) |> Effect.provideMut<Channel>(&mut self.client) {
+          break
+        }
+        let parsed = run Effect.result(Json.parse(line.ownedUtf8Bytes()))
+        let document = match move parsed {
+          Result<Value, JsonError | OutOfMemoryError>.Success { value } => move value
+          Result<Value, JsonError | OutOfMemoryError>.Failure { error } => {
+            drop error
+            continue
+          }
+        }
+
+        // Pushes of subscribed topics have no id: they are not the reply.
+        let replyId = match Json.field(&document, "id") {
+          Option<&Value>.Some { value } => Json.asU64(Option<&Value>.Some { value: value }).unwrapOr(0)
+          Option<&Value>.None => 0
+        }
+        if replyId != id {
+          continue
+        }
+        return run self.reply(&document, String.view(&line))
+      }
+      if let Option<Asked>.Some { value } = &mut self.asked {
+        value.frames = value.frames + 1
+        if value.frames > PATIENCE {
+          return run self.abort("no reply within 10 seconds")
+        }
+      }
+      return Turn.Next
+    }
+
+    effect fn reply(self: &mut Self, document: &Value, line: string) -> Turn
+      ! OutOfMemoryError
+      ? &mut Allocator {
+      let asked = match move Intrinsic.replace(self.asked, Option<Asked>.None) {
+        Option<Asked>.Some { value } => move value
+        Option<Asked>.None => {
+          return Turn.Next
+        }
+      }
+      if flag(document, "pending") {
+        // A wait that does not hold yet: ask again next frame, within its patience.
+        if asked.frames >= PATIENCE {
+          return run self.abort("the wait did not hold within 10 seconds")
+        }
+        drop run Channel.send(String.view(&asked.line)) |> Effect.provideMut<Channel>(&mut self.client)
+        self.asked = Option<Asked>.Some {
+          value: Asked {
+            id: asked.id,
+            command: move asked.command,
+            line: move asked.line,
+            frames: asked.frames + 1,
+          },
+        }
+        return Turn.Next
+      }
+      if !flag(document, "ok") {
+        return run self.abort(Json.asString(Json.field(document, "error")).unwrapOr("the command failed"))
+      }
+      let cmd = String.view(&asked.command.cmd)
+      let file = String.view(&asked.command.file)
+      if cmd == "screenshot" {
+        let png = match move run replyPng(document) {
+          Option<Bytes>.Some { value } => move value
+          Option<Bytes>.None => {
+            return run self.abort("the reply has no PNG")
+          }
+        }
+        if !run self.save(file, png.asSlice()) {
+          return run self.abort("the PNG cannot be written")
+        }
+      } else if cmd == "snapshot" || cmd == "inspect" {
+        let text = Json.asString(Json.field(document, "text")).unwrapOr("")
+        if file != "" {
+          if !run self.save(file, String.utf8Bytes(text)) {
+            return run self.abort("the text cannot be written")
+          }
+        } else {
+          run out(text)
+        }
+      } else if !quiet(cmd) {
+        run out(line)
+        run out("\n")
+      }
+      return Turn.Next
+    }
+
+    effect fn resize(self: &mut Self, words: &[String]) -> Turn
+      ! OutOfMemoryError
+      ? &mut Allocator {
+      if words.length != 3 && words.length != 4 {
+        return run self.abort("size takes WIDTH HEIGHT and an optional SCALE")
+      }
+      let width = number(String.view(&words[1]))
+      let height = number(String.view(&words[2]))
+      let scale = if words.length == 4 {
+        number(String.view(&words[3]))
+      } else {
+        1.0
+      }
+      if width < 1.0 || height < 1.0 || scale <= 0.0 {
+        return run self.abort("size takes positive numbers")
+      }
+      if self.recording.isSome() {
+        return run self.abort("a video keeps one size: resize before record or after stop")
+      }
+      return Turn.Resize { width: width, height: height, scale: scale }
+    }
+
+    effect fn desktop(self: &mut Self, words: &[String]) -> Turn
+      ! OutOfMemoryError
+      ? &mut Allocator {
+      let first = String.view(&words[0])
+      if first == "drop" {
+        let mut paths = List<String>.make()
+        let mut x: f64 = -1.0
+        let mut y: f64 = -1.0
+        let mut i: usize = 1
+        while i < words.length {
+          if String.view(&words[i]) == "at" && i + 3 == words.length {
+            x = number(String.view(&words[i + 1]))
+            y = number(String.view(&words[i + 2]))
+            break
+          }
+          run paths.append(run String.copy(String.view(&words[i])))
+          i = i + 1
+        }
+        if paths.length() == 0 {
+          return run self.abort("drop takes the files to drop, then an optional at X Y")
+        }
+        return Turn.Desktop { input: Desktop.Drop { paths: move paths, x: x, y: y } }
+      }
+      if first == "tray" {
+        let button: u32 = if words.length < 2 {
+          0
+        } else if String.view(&words[1]) == "middle" {
+          1
+        } else if String.view(&words[1]) == "right" {
+          2
+        } else {
+          return run self.abort("tray takes an optional middle or right")
+        }
+        return Turn.Desktop { input: Desktop.Tray { button: button } }
+      }
+      if words.length != 2 || number(String.view(&words[1])) < 1.0 {
+        return run self.abort("this line takes one id, from 1")
+      }
+      let id = f64.toU32(number(String.view(&words[1])))
+      return Turn.Desktop {
+        input: if first == "shortcut" {
+          Desktop.Shortcut { id: id }
+        } else if first == "tray-item" {
+          Desktop.TrayItem { action: id }
+        } else {
+          Desktop.NotificationClick { id: id }
+        },
+      }
+    }
+
+    effect fn record(self: &mut Self, words: &[String]) -> Turn
+      ! OutOfMemoryError
+      ? &mut Allocator {
+      if words.length < 2 || String.startsWith(String.view(&words[1]), "--") {
+        return run self.abort("record takes the video file to write")
+      }
+      if self.recording.isSome() {
+        return run self.abort("a video is already being recorded")
+      }
+      let mut showInput = false
+      let mut overview = String.make()
+      let mut w: usize = 2
+      while w < words.length {
+        let word = String.view(&words[w])
+        if word == "--show-input" {
+          showInput = true
+        } else if word == "--overview" && w + 1 < words.length {
+          overview = run String.copy(String.view(&words[w + 1]))
+          w = w + 1
+        } else {
+          return run self.abort("record takes FILE, then --show-input and --overview PNG")
+        }
+        w = w + 1
+      }
+      let file = String.view(&words[1])
+      let keep = String.endsWith(file, "/")
+      let mut name = run String.copy(file)
+      if !keep {
+        run name.append(".frames")
+      }
+      let made = run Effect.result(makeDirectory(&self.directory, String.view(&name)))
+      let frames = match move made {
+        Result.Success { value } => move value
+        Result.Failure { error } => {
+          drop error
+          return run self.abort("the directory for the frames cannot be made")
+        }
+      }
+      self.recording = Option<Recording>.Some {
+        value: Recording {
+          file: run String.copy(file),
+          frames: move frames,
+          count: 0,
+          keep: keep,
+          width: 0,
+          height: 0,
+          showInput: showInput,
+          overview: move overview,
+        },
+      }
+      return Turn.Next
+    }
+
+    effect fn stop(self: &mut Self) -> Turn
+      ! OutOfMemoryError
+      ? &mut Allocator {
+      if !self.recording.isSome() {
+        return run self.abort("stop ends a record, and none is running")
+      }
+      if !run self.encode() {
+        return run self.abort("the video could not be made (is ffmpeg installed? SILK_UI_FFMPEG names it)")
+      }
+      return Turn.Next
+    }
+
+    /// Makes the video of the recording, if one runs. False when ffmpeg failed.
+    effect fn encode(self: &mut Self) -> bool
+      ! OutOfMemoryError
+      ? &mut Allocator {
+      let recording = match move Intrinsic.replace(self.recording, Option<Recording>.None) {
+        Option<Recording>.Some { value } => move value
+        Option<Recording>.None => {
+          return true
+        }
+      }
+      if String.byteLength(String.view(&recording.overview)) > 0 {
+        let sheet = run Effect.result(overviewImage(&self.directory, &recording))
+        let made = match move sheet {
+          Result.Success { value } => value
+          Result.Failure { error } => {
+            drop error
+            false
+          }
+        }
+        if !made {
+          StderrWriter.print("headless: the overview could not be made\n", &())
+          return false
+        }
+      }
+      if recording.keep {
+        return true
+      }
+      let made = run Effect.result(ffmpeg(&self.directory, &recording))
+      return match move made {
+        Result.Success { value } => value
+        Result.Failure { error } => {
+          drop error
+          false
+        }
+      }
+    }
+
+    effect fn finish(self: &mut Self, status: i32) -> Turn
+      ! OutOfMemoryError
+      ? &mut Allocator {
+      if self.recording.isSome() && !(run self.encode()) && status == 0 {
+        StderrWriter.print("headless: the video could not be made (is ffmpeg installed? SILK_UI_FFMPEG names it)\n", &())
+        return Turn.Done { status: 1 }
+      }
+      self.client.close()
+      return Turn.Done { status: status }
+    }
+
+    effect fn abort(self: &mut Self, why: string) -> Turn
+      ! OutOfMemoryError
+      ? &mut Allocator {
+      StderrWriter.print("headless: line {}: {}\n", &(self.current, why))
+      return run self.finish(1)
+    }
+
+    /// Writes `data` to `file`, relative to the working directory. False when it cannot.
+    effect fn save(self: &Self, file: string, data: &[u8]) -> bool
+      ! OutOfMemoryError
+      ? &mut Allocator {
+      let written = run Effect.result(writeUnder(&self.directory, file, data))
+      return match move written {
+        Result.Success { value: _ } => true
+        Result.Failure { error } => {
+          drop error
+          false
+        }
+      }
+    }
+  }
+
+  /// Commands whose reply says nothing a script wants to see.
+  fn quiet(cmd: string) -> bool {
+    return cmd == "click" || cmd == "hover" || cmd == "scroll" || cmd == "pointer" || cmd == "press"
+      || cmd == "key"
+      || cmd == "type"
+      || cmd == "wait"
+      || cmd == "highlight"
+      || cmd == "set-style"
+      || cmd == "reset-styles"
+      || cmd == "pick-mode"
+      || cmd == "comment"
+      || cmd == "resolve"
+  }
+
+  fn flag(document: &Value, key: string) -> bool {
+    return match Json.field(document, key) {
+      Option<&Value>.Some { value } => match &value.* {
+        Value.Bool { value: b } => b
+        _ => false
+      }
+      Option<&Value>.None => false
+    }
+  }
+
+  /// A plain decimal number, or 0.
+  pub fn number(text: string) -> f64 {
+    return match Format.f64Value(text) {
+      Result<f64, ParseError>.Success { value } => value
+      Result<f64, ParseError>.Failure { error: _ } => 0.0
+    }
+  }
+
+  /// The frames `500ms` or `2s` lasts (at least one), or 0 when `text` is not a duration.
+  effect fn durationFrames(text: string) -> u32 {
+    let seconds = if String.endsWith(text, "ms") {
+      number(String.slice(text, 0, String.byteLength(text) - 2)) / 1000.0
+    } else if String.endsWith(text, "s") {
+      number(String.slice(text, 0, String.byteLength(text) - 1))
+    } else {
+      0.0
+    }
+    if seconds <= 0.0 {
+      return 0
+    }
+    return f64.toU32(f64.ceil(seconds / FRAME - 0.000001))
+  }
+
+  /// `request` with the id `id`: the CLI numbers its request 1, and a raw request may have none.
+  effect fn numberedLine(request: string, id: u64) -> String
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut line = run String.copy("{\"id\":")
+    run appendInt(&mut line, id)
+    if String.startsWith(request, "{\"id\":1,") {
+      run line.append(",")
+      run line.append(String.slice(request, 8, String.byteLength(request) - 8))
+    } else if String.startsWith(request, "{") {
+      let rest = String.slice(request, 1, String.byteLength(request) - 1)
+      if !String.startsWith(rest, "}") {
+        run line.append(",")
+      }
+      run line.append(rest)
+    } else {
+      run line.append("}")
+    }
+    return move line
+  }
+
+  effect fn out(text: string) -> () {
+    let mut writer = StdoutWriter.make()
+    drop run Effect.result(Writer.writeString(text) |> Effect.provideMut<Writer>(&mut writer))
+    drop run Effect.result(Writer.flush() |> Effect.provideMut<Writer>(&mut writer))
+  }
+
+  /// `file` under `base`, unless it is absolute.
+  effect fn under(base: &Path, file: string) -> Path
+    ! FileError | OutOfMemoryError
+    ? &mut Allocator {
+    if String.startsWith(file, "/") {
+      return run Path.fromBytes(String.utf8Bytes(file))
+    }
+    return run Path.resolveBytes(base, String.utf8Bytes(file))
+  }
+
+  effect fn readText(base: &Path, file: string) -> String
+    ! FileError | InvalidUtf8 | OutOfMemoryError
+    ? &mut Allocator {
+    let path = run under(base, file)
+    let mut files = run MachineFileSystem.make()
+    let bytes = run FileSystem.readFile(&path) |> Effect.provideMut<FileSystem>(&mut files)
+    let text = match String.fromUtf8(bytes.asSlice()) {
+      Result<string, InvalidUtf8>.Success { value } => value
+      Result<string, InvalidUtf8>.Failure { error } => {
+        fail move error
+      }
+    }
+    return run String.copy(text)
+  }
+
+  effect fn writeUnder(base: &Path, file: string, data: &[u8]) -> ()
+    ! FileError | OutOfMemoryError
+    ? &mut Allocator {
+    let path = run under(base, file)
+    let mut files = run MachineFileSystem.make()
+    run FileSystem.writeFileWithParents(&path, data) |> Effect.provideMut<FileSystem>(&mut files)
+  }
+
+  effect fn makeDirectory(base: &Path, name: string) -> Path
+    ! FileError | OutOfMemoryError
+    ? &mut Allocator {
+    let path = run under(base, name)
+    let mut files = run MachineFileSystem.make()
+    if let Result.Success { value: _ } = run Effect.result(FileSystem.stat(&path))
+      |> Effect.provideMut<FileSystem>(&mut files) {
+      run FileSystem.removeDirectoryRecursively(&path) |> Effect.provideMut<FileSystem>(&mut files)
+    }
+    run FileSystem.createDirectory(&path) |> Effect.provideMut<FileSystem>(&mut files)
+    return move path
+  }
+
+  effect fn writeFrame(directory: &Path, name: string, pixels: &Pixmap, png: bool) -> ()
+    ! FileError | ImageError | OutOfMemoryError
+    ? &mut Allocator {
+    let path = run Path.resolveBytes(directory, String.utf8Bytes(name))
+    let mut files = run MachineFileSystem.make()
+    if png {
+      let encoded = run encodePng(pixels)
+      run FileSystem.writeFile(&path, encoded.asSlice()) |> Effect.provideMut<FileSystem>(&mut files)
+    } else {
+      run FileSystem.writeFile(&path, pixels.data()) |> Effect.provideMut<FileSystem>(&mut files)
+    }
+  }
+
+  /// The first of `SILK_UI_FFMPEG` and the usual places that holds a file.
+  effect fn ffmpegPath() -> Option<Path>
+    ! FileError | OutOfMemoryError
+    ? &mut Allocator {
+    let mut files = run MachineFileSystem.make()
+    let named = run variable("SILK_UI_FFMPEG")
+    let mut candidates = List<String>.make()
+    if let Option<String>.Some { value } = move named {
+      run candidates.append(move value)
+    }
+    run candidates.append(run String.copy("/opt/homebrew/bin/ffmpeg"))
+    run candidates.append(run String.copy("/usr/local/bin/ffmpeg"))
+    run candidates.append(run String.copy("/usr/bin/ffmpeg"))
+    run candidates.append(run String.copy("C:/ffmpeg/bin/ffmpeg.exe"))
+    let list = candidates.asSlice()
+    let mut i: usize = 0
+    while i < list.length {
+      let made = run Effect.result(Path.make(String.view(&list[i])))
+      if let Result.Success { value: path } = move made {
+        let found = run Effect.result(FileSystem.stat(&path)) |> Effect.provideMut<FileSystem>(&mut files)
+        if let Result.Success { value: _ } = move found {
+          return Option<Path>.Some { value: move path }
+        }
+      }
+      i = i + 1
+    }
+    return Option<Path>.None
+  }
+
+  /// Frames the overview shows: `OVERVIEW_COLUMNS` across, at most `OVERVIEW_FRAMES`, each
+  /// `OVERVIEW_WIDTH` device pixels wide.
+  const OVERVIEW_FRAMES: u32 = 12
+
+  const OVERVIEW_COLUMNS: u32 = 4
+
+  const OVERVIEW_WIDTH: u32 = 360
+
+  /// Makes `recording.overview`: frames picked evenly from the first to the last, side by side
+  /// in rows, with ffmpeg. False when ffmpeg is missing or fails.
+  effect fn overviewImage(base: &Path, recording: &Recording) -> bool
+    ! FileError | ProcessError | OutOfMemoryError
+    ? &mut Allocator {
+    let program = match move run ffmpegPath() {
+      Option<Path>.Some { value } => move value
+      Option<Path>.None => {
+        return false
+      }
+    }
+    if recording.count == 0 {
+      return true
+    }
+    let shown = if recording.count < OVERVIEW_FRAMES { recording.count } else { OVERVIEW_FRAMES }
+    let columns = if shown < OVERVIEW_COLUMNS { shown } else { OVERVIEW_COLUMNS }
+    let rows = (shown + columns - 1) / columns
+    // ffmpeg counts frames from 0; frame k of the overview is the k/(shown-1) point.
+    let mut filter = run String.copy("select='")
+    let mut k: u32 = 0
+    while k < shown {
+      let at = if shown == 1 { 0 } else { u32.toU64(k) * u32.toU64(recording.count - 1) / u32.toU64(shown - 1) }
+      if k > 0 {
+        run filter.append("+")
+      }
+      run filter.append("eq(n,")
+      run appendInt(&mut filter, at)
+      run filter.append(")")
+      k = k + 1
+    }
+    run filter.append("',scale=")
+    run appendInt(&mut filter, u32.toU64(OVERVIEW_WIDTH))
+    run filter.append(":-2,tile=")
+    run appendInt(&mut filter, u32.toU64(columns))
+    run filter.append("x")
+    run appendInt(&mut filter, u32.toU64(rows))
+    run filter.append(":padding=12:margin=12:color=0xe5e7eb")
+    let output = run under(base, String.view(&recording.overview))
+    let mut request = run ChildProcess.request(&program)
+    run inputArguments(&mut request, recording)
+    run ChildProcess.addArgument(&mut request, "-vf")
+    run ChildProcess.addArgument(&mut request, String.view(&filter))
+    run ChildProcess.addArgument(&mut request, "-frames:v")
+    run ChildProcess.addArgument(&mut request, "1")
+    run ChildProcess.addArgument(&mut request, "-update")
+    run ChildProcess.addArgument(&mut request, "1")
+    run ChildProcess.addArgument(&mut request, pathText(&output))
+    let mut provider = OsChildProcess.make()
+    let outcome = run ChildProcess.submit(&request) |> Effect.provideMut<ChildProcess>(&mut provider)
+    return ChildProcess.exitCode(&outcome).unwrapOr(1) == 0
+  }
+
+  /// The arguments that read the recording's frames: raw RGBA files, or PNGs when kept.
+  effect fn inputArguments(request: &mut ProcessRequest, recording: &Recording) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut pattern = run String.copy(pathText(&recording.frames))
+    run pattern.append(if recording.keep { "/%06d.png" } else { "/%06d.rgba" })
+    run ChildProcess.addArgument(&mut request, "-y")
+    run ChildProcess.addArgument(&mut request, "-loglevel")
+    run ChildProcess.addArgument(&mut request, "error")
+    run ChildProcess.addArgument(&mut request, "-f")
+    run ChildProcess.addArgument(&mut request, "image2")
+    if !recording.keep {
+      let mut size = String.make()
+      run appendInt(&mut size, u32.toU64(recording.width))
+      run size.append("x")
+      run appendInt(&mut size, u32.toU64(recording.height))
+      run ChildProcess.addArgument(&mut request, "-c:v")
+      run ChildProcess.addArgument(&mut request, "rawvideo")
+      run ChildProcess.addArgument(&mut request, "-pixel_format")
+      run ChildProcess.addArgument(&mut request, "rgba")
+      run ChildProcess.addArgument(&mut request, "-video_size")
+      run ChildProcess.addArgument(&mut request, String.view(&size))
+    }
+    run ChildProcess.addArgument(&mut request, "-framerate")
+    run ChildProcess.addArgument(&mut request, "60")
+    run ChildProcess.addArgument(&mut request, "-i")
+    run ChildProcess.addArgument(&mut request, String.view(&pattern))
+  }
+
+  /// Makes `recording.file` from its frames with ffmpeg, then removes the frames. False when
+  /// ffmpeg is missing or fails; the frames then stay.
+  effect fn ffmpeg(base: &Path, recording: &Recording) -> bool
+    ! FileError | ProcessError | OutOfMemoryError
+    ? &mut Allocator {
+    let program = match move run ffmpegPath() {
+      Option<Path>.Some { value } => move value
+      Option<Path>.None => {
+        return false
+      }
+    }
+    if recording.count == 0 {
+      return true
+    }
+    let output = run under(base, String.view(&recording.file))
+    let mut request = run ChildProcess.request(&program)
+    run inputArguments(&mut request, recording)
+    if String.endsWith(String.view(&recording.file), ".mp4") || String.endsWith(String.view(&recording.file), ".mov") {
+      // Players want even sizes and 4:2:0 colour.
+      run ChildProcess.addArgument(&mut request, "-vf")
+      run ChildProcess.addArgument(&mut request, "pad=ceil(iw/2)*2:ceil(ih/2)*2")
+      run ChildProcess.addArgument(&mut request, "-pix_fmt")
+      run ChildProcess.addArgument(&mut request, "yuv420p")
+    }
+    run ChildProcess.addArgument(&mut request, pathText(&output))
+    let mut provider = OsChildProcess.make()
+    let outcome = run ChildProcess.submit(&request) |> Effect.provideMut<ChildProcess>(&mut provider)
+    if ChildProcess.exitCode(&outcome).unwrapOr(1) != 0 {
+      return false
+    }
+    let mut files = run MachineFileSystem.make()
+    run FileSystem.removeDirectoryRecursively(&recording.frames) |> Effect.provideMut<FileSystem>(&mut files)
+    return true
+  }
+
+  /// The working directory, as a path.
+  effect fn workingDirectory() -> Path
+    ! FileError | HostInputError | OutOfMemoryError
+    ? &mut Allocator {
+    static if Intrinsic.targetOperatingSystem() == "windows" {
+      let mut inputs = run WindowsHostInput.capture()
+      let bytes = run HostInput.workingDirectory() |> Effect.provideMut<HostInput>(&mut inputs)
+      return run WindowsPath.fromNativeBytes(bytes.asSlice())
+    } else {
+      let snapshot = run unsafe NativeHostInput.environmentSnapshot()
+      let mut inputs = OsHostInput.make(move snapshot)
+      let bytes = run HostInput.workingDirectory() |> Effect.provideMut<HostInput>(&mut inputs)
+      return run Path.fromBytes(bytes.asSlice())
+    }
+  }
+
+  /// This process's environment variable `name`, or None.
+  effect fn variable(name: string) -> Option<String>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    static if Intrinsic.targetOperatingSystem() == "windows" {
+      let captured = run Effect.result(WindowsHostInput.capture())
+      if let Result.Success { value } = move captured {
+        let mut inputs = move value
+        return run valueOf(name) |> Effect.provideMut<HostInput>(&mut inputs)
+      }
+      return Option<String>.None
+    } else {
+      let captured = run Effect.result(unsafe NativeHostInput.environmentSnapshot())
+      if let Result.Success { value } = move captured {
+        let mut inputs = OsHostInput.make(move value)
+        return run valueOf(name) |> Effect.provideMut<HostInput>(&mut inputs)
+      }
+      return Option<String>.None
+    }
+  }
+
+  effect fn valueOf(name: string) -> Option<String>
+    ! OutOfMemoryError
+    ? &mut Allocator | &mut HostInput {
+    let found = run Effect.result(HostInput.variableNamed(name))
+    if let Result.Success { value } = move found {
+      if let Option<Bytes>.Some { value: bytes } = move value {
+        if let Result<string, InvalidUtf8>.Success { value: text } = String.fromUtf8(bytes.asSlice()) {
+          return Option<String>.Some { value: run String.copy(text) }
+        }
+      }
+    }
+    return Option<String>.None
+  }
+
+  fn pathText(path: &Path) -> string {
+    return match String.fromUtf8(Path.rawBytes(path)) {
+      Result<string, InvalidUtf8>.Success { value } => value
+      Result<string, InvalidUtf8>.Failure { error: _ } => ""
+    }
+  }
+}

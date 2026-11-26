@@ -1,0 +1,628 @@
+# ui-tree
+
+The retained UI tree, like a small DOM: you make nodes, put them in each other, style them, feed
+input in and read events out, and ask for a frame to draw. It is laid out by
+[css-layout](https://github.com/silk-lang/lib-css/tree/main/modules/layout) with [ui-text](../text), and painted into a
+[ui_scene](https://github.com/silk-lang/lib-graphics/tree/main/modules/ui_scene) `Scene` that the CPU reference or
+[ui_renderer](https://github.com/silk-lang/lib-graphics/tree/main/modules/ui_renderer) draws. It has no closures and no callbacks: what
+crosses the boundary is plain data, so Silk code can call it directly and a JavaScript or remote
+host can drive it through the mutation protocol.
+
+## Using a tree
+
+```silk
+import ui_tree.lib { Tree, Viewport, EventKind, Event, Input }
+import ui_tree.css
+import ui_tree.css { px }
+
+let mut tree = run Tree.make(&fonts)               // borrows a font_collection FontCollection
+let sans = run tree.fontFamily("Inter, Noto Sans, sans-serif")
+let root = run tree.box(&[
+  css.fontFamily(sans.raw()),
+  css.paddingTop(px(16.0)),
+])
+let save = run tree.box(&[])
+run tree.append(save, run tree.text("Save"))
+run tree.append(root, save)
+run tree.setRoot(root)
+run tree.listen(save, &[EventKind.Click])
+
+let frame = run tree.frame(Viewport { width: 800.0, height: 600.0, scale: 2.0 }, time)
+// draw frame.scene after copying frame.uploads, then: tree.clearUploads()
+
+run tree.dispatch(Input.press(20.0, 30.0))
+run tree.dispatch(Input.release(20.0, 30.0))
+let records = run tree.events()
+// records[i].target, records[i].path, and records[i].event:
+//   Event.Click { pointer, button, count } => ...
+```
+
+- **Nodes** come back as typed handles: `tree.box(style)`, `tree.span(style)` (an inline box),
+  `tree.text(value)`, `tree.input(style)`, `tree.image(source, style)`, `tree.icon(source, style)`
+  and `tree.canvas(style)` return `BoxNode`, `TextNode`, `InputNode`, `ImageNode`, `IconNode`
+  and `CanvasNode`. The kind is in the type, so appending to a text node or setting the text of
+  a box does not compile. Every handle has an `id()`, a `NodeId`, which is what events and
+  queries name nodes by; `BoxNode.of(id)` and the others turn an id back into a handle.
+- **Structure**: `setRoot` (opens the first root, see [Roots](#roots)), `append`,
+  `insertBefore`, `remove` (detach, can be appended again) and `destroy` (free the subtree). A
+  child already in the tree moves, as in the DOM.
+- **Style** is a list of CSS declarations built with `ui_tree.css` (`css.width(px(120.0))`,
+  `css.display(Keyword.Flex)`), values as written: `setStyle` for the base look, `setStyleFor`
+  with a `StyleState` for hover, active, focus and focus-visible, and `clearStyle`. Text
+  properties inherit; the rest do not.
+- **Content and attributes**: `setText`, `setSource`, `setCanvas`, `setCanvasSurface`, `setCanvasPixels`, `setGrid`, `setAttribute`
+  (role, label, test id, tab index, cursor, disabled, focus trap, checked, selected, expanded,
+  and for inputs multiline, read-only and placeholder), with `setLabel`, `setTestId` and
+  `setRole` for the common ones.
+- **Events**: `listen(node, &[EventKind.Click, ...])` says what a node wants records for,
+  `dispatch(input)` feeds a pointer, wheel, key or text `Input` in, and `events()` takes the
+  queued `EventRecord`s. A record has the `target`, the `path` from the root to it, and an
+  `Event` union whose variants carry only what that event has. `record.hits(node)` asks whether
+  the event reaches a listener on `node` while bubbling. See [Interaction](#interaction).
+- **Focus, selection and scrolling**: `focus`, `blur`, `focused()`, `select`, `selection`,
+  `caretRect`, `scrollTo`, `scrollIntoView`, `scrollOffset`.
+- **Resources**: `fontFamily(names)`, `defineImage(bytes)`, `defineDecodedImage(image)`,
+  `defineIcon(bytes)` and `release(resource)`.
+- **Frames**: `frame(viewport, time)` returns a `Frame` with the `scene`, the atlas `uploads`,
+  the `cursor`, the `ime` area, `wakeAt` (the next caret blink) and `again` (the tree wants
+  another frame right away). `needsFrame()` tells an on-demand host whether to ask.
+- **Queries** answer with `Option` when there may be nothing: `root()`, `parent`, `children`,
+  `kind`, `path`, `hitTest`, `pick` (what an element picker selects), `bounds`, `fragments`,
+  `find`, `view` (a `NodeView`: a read-only look at one node's attributes, state, styles and
+  computed style, for inspectors and tests) and `describe` (the text snapshot goldens compare).
+- **Errors**: calls fail with a `TreeError` (`StaleNode`, `WrongKind`, `Cycle`,
+  `UnknownResource`, `BadResource`, `BadVirtualList`, `Layout`, `View`), and
+  `error.message()` says it in a sentence: `node #12 does not exist (it was destroyed, or never
+  created)`. An id is not handed out again after its node is destroyed, so an old handle fails
+  and never names a newer node.
+
+Grid track lengths resolve after the node's font size and writing mode, using the current
+viewport. State looks and overrides can replace tracks. An explicit `setGrid` survives
+unrelated style changes; a later grid declaration replaces it.
+
+## The mutation protocol
+
+A JavaScript or remote host drives the same tree with plain data. It chooses its own node, font
+family and resource numbers, sends `Mutation` values, and gets the same event records back.
+
+```silk
+let mut batch = Batch.make()
+run batch.fontFamily(1, "Inter, Noto Sans, sans-serif")
+run batch.create(1, NodeKind.Box)
+run batch.style(1, &[css.paddingTop(px(16.0))])
+run batch.root(1)
+run batch.text(1, 2, "Hello")                     // create, set text, append to 1
+run tree.apply(run batch.take())
+```
+
+- `apply` stops at the first mutation that fails with a `ProtocolError` holding its `index` and
+  the `TreeError`; the mutations before it stay applied.
+- `Mutation` (`mutation.silk`) has one variant for each thing a direct call does: `Create`,
+  `InsertBefore`, `Remove`, `Destroy`, `SetStyle`, `ClearStyle`, `SetText`, `SetAttribute`,
+  `SetSelection`, `SetListeners`, `OpenRoot`, `UpdateRoot`, `CloseRoot`, `Focus`, `Blur`,
+  `ScrollTo`, `ScrollIntoView`, `SetSource`, `SetCanvas`, `SetCanvasSurface`, `SetCanvasPixels`, `SetGrid`, the virtual list and anchor
+  mutations, and the resource definitions.
+- Direct calls and protocol ids can share one tree: `NodeId.of(7)` names the client's node 7,
+  and a node made with `tree.box` takes a number that is not in use.
+
+## Roots
+
+A tree holds several roots: top-level trees with ids the client chooses, in one node id space
+and with one glyph atlas and font set. `Mutation.OpenRoot { root, node, options }` opens one
+(`Batch.root(id)` and `tree.setRoot(node)` open the first, `FIRST_ROOT`, with default options),
+`UpdateRoot` replaces its `RootOptions` (title, requested size and position, resizable, parent
+root, kind) and `CloseRoot` detaches its node. Options are requests; the tree keeps them for the
+host. The tree never closes a root by itself.
+
+In the engine (`UiTree`) one root at a time is current: `frame`, `scene`, `hitTest`, the
+geometry queries and pointer input are about it, and the other open roots are parked with their
+own layout, scenes, focus, hover, press and viewport. `useRoot(root)` makes a root current,
+`frameRoot(root, input)` frames one in its own viewport, and `dispatchTo(root, input)` and
+`beginAt(root, input)` aim pointer input at one. Key and text input go to `keyRoot`, the first
+root until a host reports another `Focused`. `Focus` and the other mutations about one node
+apply in that node's root; `Blur` blurs the key root. `apply` leaves the current root as it
+found it. `openRoots`, `rootOpen`, `rootNode`, `rootOptions` and `rootViewport` answer for any
+root.
+
+Each root keeps what its last layout and paint left (css-layout's output, the scenes, the
+fragment hashes, and what changed since), so changing the current root costs no layout or
+paint: a frame of one root lays out and paints only what changed in it, and replays the rest
+of its own last scene. css-layout has one tree and one viewport for all roots; the current
+root's node is the viewport's child, and a root that comes back after another was laid out
+skips layout unless its own nodes or size changed. A change that reaches a waiting root from
+outside (a node moved out of it, a font family or resource redefined) marks it `touched`, and
+its next frame styles and lays out again. `needsFrameOf(root)` answers `needsFrame` for any
+root, so a host with a window per root frames only the windows that need it, and `sceneOf(root)`
+gives any root's last scene, for a host that draws two roots on one surface. With one root
+nothing changes.
+
+Each root also counts its own changes: `revisionOf(root)` moves when its nodes, their text,
+styles, focus or geometry change (a mutation counts for the root that holds its node; a new,
+detached node for none; a font family or resource for every root), and `stats` is the current
+root's last frame's. So a client that watches some roots, such as the inspector, is not woken
+by the others. `semanticRevision` still counts every change.
+
+A root can be set aside for a second client that shares the tree (`setAside(root, true)`): the
+records whose path starts at its node and its root events wait for `takeEventsOf(root)` and
+`takeRootEventsOf(root)`, and `takeEvents` and `takeRootEvents` leave them, so the client that
+owns the rest of the tree never hears of it. Devtools drawn in the app's own process are such a
+client (`ui-inspect-devtools`' `embedded`). The second client applies its batches with its root
+current, so the nodes it makes count for its root and the first client's root needs no frame
+for them.
+
+Element events need no root: the first id of their path is the root's node. What happens to a
+root itself comes as a `RootEvent` (`ui_protocol.root`): `CloseRequested`, `Resized`, `Focused`,
+`Blurred`, `ScaleChanged`, `AppearanceChanged` and `Failed`. A host reports them with
+`reportRoot(root, kind)` and the client drains them with `takeRootEvents`; a waiting event is
+replaced by a later one of the same kind for the same root, so the queue stays short when
+nobody drains it. `rootSupport` says how many roots the tree shows (any number of headless
+surfaces by default); a root past it fails with `Failed` and stays closed. The native window
+host (`ui-tree-window`) shows each open root in an OS window of its own and reports each
+window's resize, scale, focus, appearance and close requests as its root's events; in the
+browser it shows the first root only.
+
+## Moving from the old API
+
+`ui_tree.lib` is the API above. The engine underneath is `ui_tree.engine` (`UiTree`), and the
+old front door is `ui_tree.legacy`, which the packages of this repository import until each is
+ported. `tree.engine()` reaches the engine from a `Tree` for those packages. The sections below
+still describe some features in the engine's terms (`Mutation` names, `takeEvents`, `LISTEN_*`
+flags); each has the direct call listed above.
+
+## Virtual scrolling
+
+Variable-height virtualization belongs to the retained tree. `loom` uses the same
+mutation/query protocol available to a direct Silk client or a future JS binding;
+it does not maintain a separate geometry algorithm.
+
+1. Create a box with a bounded height, vertical flex layout, and scrolling enabled.
+   Configure it with `Mutation.SetVirtualList { id, count, options }`, or
+   `Batch.virtualList`. `VirtualOptions` supplies an estimated row height, overscan,
+   gap, and content revision.
+2. Read `tree.virtualIndices(id)`. Mount ordinary child boxes for these sorted indices.
+   The request includes overscan and any bound rows containing keyboard focus, its
+   active descendant, or the host-reported browse cursor. These may be different rows.
+   `virtualRange` still reports the contiguous range and keyboard pin. Destroy other rows, retaining durable
+   application state outside those nodes. The tree rejects removing, destroying, or
+   reparenting a bound row containing focus with `BadVirtualList`, even if a client
+   uses a stale range. To deliberately delete that item, transfer or clear focus
+   first. Moving the row within the same list and tearing down the list are allowed.
+3. Send `Mutation.SetVirtualItems { id, items }` (or `Batch.virtualItems`) with
+   `{ index, id }` records for **all** direct children in ascending logical order.
+   The tree owns the layout-only spacers between these nodes. These private nodes
+   never become client IDs, hit targets, or accessibility entries.
+4. Call `tree.frame`, then query the range again. Reconcile and frame again if the
+   requested range changed, before presenting. Repeat after scrolling, resizing,
+   changing content, or changing focus. `layoutNow` also updates measurements and
+   the range, but does not paint. `needsFrame` reports tree work; the host must
+   still check range requests after a completed frame.
+
+The tree measures mounted boxes, maintains a prefix-sum height index, and anchors
+the visible item while estimates change. Height lookup and updates are logarithmic;
+measurement storage is linear in logical item count. Width changes, count changes,
+changed estimates/gaps, or a changed `revision` reset measurements. Revisions retain
+the visible **index**, not the identity of an item moved in the model. A client that
+reorders content should preserve the focused node and bind it at its new index.
+
+The container must be a vertical, nonwrapping flex column with no unrelated children,
+vertical padding, or external row gap. Row wrappers must be in normal flow, in logical
+order, with no vertical margins and `flex-shrink: 0`; their contents can have natural,
+variable heights. Use `options.gap` for spacing. Estimates must be finite and positive;
+overscan and gaps must be finite and nonnegative. Zero-height rows are accounted for
+with a minimum one-pixel extent. Invalid configurations or bindings return
+`TreeError.BadVirtualList`; a rejected binding preserves the previous bindings.
+
+`ClearVirtualList` removes the controller and its private spacers while preserving
+ordinary child nodes. Destroying its container releases both. Virtual scrolling uses
+continuous layout: clear the controller before `frameFragmented`, which otherwise
+returns `TreeError.Layout`. Search, selection, tab navigation, and accessibility only
+see mounted nodes; document-wide operations still need model-level support.
+
+See [the direct-tree integration test](tests/src/virtual_lists.silk) for a complete
+client using only mutation batches and range queries, including distant jumps,
+focus retention, variable row heights, resize anchoring, and cleanup.
+
+## Anchored popups
+
+`Mutation.SetAnchor { id, target, options }` attaches a popup box to an anchor node.
+`AnchorOptions` specifies the gap, preferred height, end alignment, and whether to
+match the anchor width. The tree chooses above/below placement and viewport limits
+after continuous viewport layout, then updates them on scroll and resize without a framework render.
+The popup uses fixed viewport positioning; put it after ordinary content so it draws
+and receives hits above that content. This API does not change parentage or event
+bubbling. Menus and popovers in `loom-components` use it through `Ui.anchored`.
+Width matching includes the popup's padding and border; menus no longer add those
+on top of the trigger width.
+
+`ClearAnchor` restores the popup's client styles. An anchor that is detached or not
+laid out hides the popup until it has geometry again. Destroying the popup removes
+its relationship. The anchor must exist at configuration time; cyclic anchor
+relationships and anchors inside their own popup are rejected. Popup decoration,
+open/closed state, dismissal, and menu keyboard behavior remain client concerns.
+
+## Large canvases and canvas pixels
+
+A canvas node with at least 256 commands is drawn once into a bitmap after its commands hold
+still through a settle cooldown, and paint then emits one sprite for it (`canvas_raster`). A
+window host rasterizes those snapshots on a background worker thread and presents finished
+bitmaps before layout (`ui_tree_window.canvas_bitmaps`), discarding stale results if the canvas
+changed; a host that never does keeps painting the commands.
+`SetCanvasPixels` gives a canvas straight RGBA8 pixels, as `putImageData` does; they are shown
+the same way, with the bitmap's size as the node's natural size.
+
+## Canvas text and image requests
+
+`canvas_text.TextCache` owns raster tiles and measurements. `canvas_view.TextBindings`
+tracks instance rectangles and validates visible coverage, raster generations, and
+density. Its checks skip regions already covered during panning and validate shared
+rasters once when all text has complete bindings. `canvas_view.Refinement` supplies
+the idle deadline for improving text density after motion. These APIs do not depend
+on an application document model.
+
+Build bindings in scene order with `append`, using `usize.MAX` for a missing raster.
+Use `rebind` after refreshing an instance and `clear` before rebuilding geometry.
+Advance `TextCache.rasterFrame` for each raster/binding update epoch. Set
+`allTextBound` only when every instance has an uncropped raster in that epoch.
+A host can defer density changes during motion; missing or uncovered text must still
+refresh immediately. Wake at the refinement deadline even when input stops.
+
+`image_load.ImageLoad` is a portable request state machine. Capture the token returned
+by `begin`, test `accepts(token)` before installing pixels, then call `finish`.
+Replacement and cancellation invalidate old tokens. Native or browser hosts supply
+file/network I/O and decoding; the tree continues to accept `DefineImage` and
+`DefineDecodedImage` mutations. The native worker implementation is available through
+`ui-tree-window.images`, with compatibility exports from `loom-window.images`.
+
+## Interaction
+
+Hosts feed plain-data `Input` records (`input.silk`) to `tree.dispatch`: pointer move, down, up,
+leave and cancel, wheel, key down and key up, with positions in CSS pixels and keys named as UI
+Events name them (`key` `"Enter"`, `code` `"KeyA"`). [ui-tree-window](window) turns
+modules/platform/window events into them; tests and inspectors build them directly. The tree acts on
+input against the last frame's layout, and the changes show at the next frame
+(`tree.needsFrame()` says whether one is due).
+
+- **Hit testing** walks the fragments topmost first (later siblings and children paint on top),
+  applies overflow clipping per axis against the padding box, and skips nodes with
+  `pointer-events: none` (not inherited by native `Style`) or `visibility: hidden`. Text is never
+  a target: its element is, as in the DOM. `tree.hitTest(x, y)` and CSSOM View use the same walk.
+- **Hover and active.** The hit node and its ancestors are hovered; pressing the primary button
+  makes the pressed node and its ancestors active. Their `Hover` and `Active` looks apply, and
+  enter and leave records go to listeners (leave deepest first, enter outermost first). Hover
+  follows content that moves under a still pointer after scrolling or relayout.
+  `tree.cursor()` is the hovered path's cursor (inputs default to the text cursor).
+- **Pointer capture.** The node a primary press lands on gets the moves and the release until
+  the button comes up, so drags keep their target. The click goes to the nearest common
+  ancestor of the press and release targets, with the click count. Disabled nodes (and their
+  subtrees) get no down, up or click and no active state. `tree.setPointerCapture(node)`
+  hands the press to another node, as DOM `setPointerCapture`, and that node gets a
+  `GotPointerCapture` record. `LostPointerCapture` follows when it is released, handed on, or
+  the press ends (after the pointer up, before the click). `Input.PointerCancel` ends a press
+  without a click and queues `PointerCancel` for the node that was getting its records. All
+  three bubble. The implicit capture of a plain press reports nothing, as a mouse press in a
+  browser.
+- **Focus.** A press focuses the nearest focusable node at or above it, or blurs. Focusable
+  means a tab index other than `NOT_FOCUSABLE` (the default for everything but inputs), laid
+  out, visible and not disabled. Tab and Shift+Tab move through the tabbable nodes (tab index
+  0 or more): positive indices first, lowest first, then tree order, wrapping; inside a node
+  with the `FocusTrap` attribute they cycle within it. Focus that came from the keyboard shows
+  the `FocusVisible` look (inputs always do), and Tab scrolls the new focus into view.
+- **Keys** go to the focused node, or the root, with the key, code, modifiers and repeat.
+  Enter on a focused button, link, menu item, tab or option and Space (on key up) on a button,
+  checkbox, radio, switch, menu item, tab or option queue a click with click count 0.
+- **Scrolling.** Boxes with `overflow: auto` or `scroll` on an axis scroll with the wheel. Each
+  axis of a wheel delta goes to the nearest container that can still move that way, and the
+  rest goes outwards, so nested scroll boxes work. `hidden` allows programmatic scrolling:
+  `ScrollTo` (clamped at the next frame), `ScrollIntoView`, and the `cssom_view` scroll APIs.
+  Nearest alignment leaves an oversized target alone when it already covers the scrollport.
+  Fractional scroll offsets move scene groups, hit targets, and geometry queries together
+  without requiring relayout. `tree.scrollOffset(id)`, `info`, and `describe` report them,
+  and listeners get `Scroll` records with the new offset. Scroll containers with something
+  to scroll draw overlay thumbs that take no space and can be dragged.
+- **Records** for pointer down, up, move, click, wheel and keys are queued when the target or any
+  node on its path listens (they bubble, client side). Enter, leave, focus, blur and scroll are
+  queued only for a target that listens itself.
+
+## CSSOM View
+
+`ui_tree.cssom_view` adapts the shared `modules/style` View algorithms to this tree:
+
+- `elementFromPoint` and `elementsFromPoint` use the input hit traversal, including actual
+  clipping, sticky offsets, and pointer-event eligibility. Viewport/root fallback is applied
+  by the View API rather than changing input dispatch.
+- `getClientRects` and `getBoundingClientRect` report rendered border-box fragments in CSS
+  pixels; anonymous input/text internals are not extra element boxes.
+- `NativeGeometry` supplies box quads and coordinate conversion from actual layout.
+- Client, scroll, and offset metrics use the layout and scroll ranges already used by input.
+- Caret and range geometry use shaped glyph positions; returned DOM text offsets are UTF-16,
+  not the UTF-8 byte offsets used by the editing implementation.
+- `scroll`, `scrollTo`, `scrollBy`, and `scrollIntoView` support immediate and smooth requests.
+  The tree owns pending requests and completion/interruption state. Feed monotonically
+  increasing `FrameInput.time` and keep drawing while `needsFrame()` is true; smooth movement
+  uses a 250 ms ease-out. Wheel, pointer-down, and key-down input interrupt pending motion.
+
+Call geometry APIs after current layout has been produced. This adapter does not add a CSS
+parser-to-`Style` bridge, browser browsing contexts, or
+`content-visibility` to the renderer. Unsupported host features are not represented by
+fabricated geometry.
+
+## Text editing
+
+Input nodes edit their value themselves and tell the client with `Input` records (DOM-named
+`inputType`, the new value and selection). Everything they draw comes from css-layout's text
+fragments: the caret, the selection rectangles and the composition underline are placed from
+each fragment's `sourceStart`/`sourceEnd` and the advances of the glyph run ui-text shaped
+during layout (interpolated inside ligatures), and a click goes to the nearest grapheme
+boundary on the nearest line by the same positions. Nothing is shaped outside layout.
+
+- **Display text.** What css-layout lays out is the value with the input method's composition
+  spliced in at the caret, or the placeholder when the value is empty, plus a zero width space
+  where a line would have no text (an empty value, or a trailing line break in a multiline
+  input) so the caret has a line box. Inputs default to `white-space: pre` and
+  `overflow: hidden` on one line, `pre-wrap` and `overflow-y: auto` with `Multiline`.
+- **Input.** `Input.TextInput` types or commits, `Input.ImePreedit` shows a composition (its
+  selected clause underlined thicker; empty text cancels), `Input.Paste` answers a clipboard
+  read. [ui-tree-window](window) maps modules/platform/window's `TextInput` and `ImePreedit` to them.
+- **Keys** (Control on Windows and Linux, Command and Option with `Keymap.Mac`, the default on
+  macOS builds): arrows by grapheme, word or line end, Shift to extend; Home and End (visual
+  line in multiline inputs, before the space a soft wrap hangs); Up and Down by visual line
+  keeping the x; Backspace and Delete by grapheme, word or line; Enter in multiline inputs;
+  select all, copy, cut, paste, undo and redo. Typing replaces the selection; single-line
+  inputs turn typed or pasted line breaks into spaces. Keys pass to the input method while it
+  composes.
+- **Pointer.** A press places the caret (Shift extends), a double click selects a word, a
+  triple click the line or the whole single-line value; dragging extends by the same unit. A
+  press commits a composition. Tab into an input selects its text.
+- **Undo.** Consecutive typing, and consecutive deletions, merge into one step, up to 100
+  steps. A `SetText` with a different value puts the caret at the end and forgets the history;
+  the same value changes nothing, so a client can echo every record back (controlled inputs).
+  `ReadOnly` inputs select and copy only.
+- **Host requests.** The tree owns no clipboard: copy and cut queue
+  `HostRequest.WriteClipboard`, paste `HostRequest.ReadClipboard { target }`, drained with
+  `takeRequests`. `imeArea()` gives the caret (the composition's start while composing) for
+  the candidate window. `ui-tree-window`'s `serve` answers both through a `Platform`.
+- **Caret.** It blinks with frame time (0.5 s on, 0.5 s off, on again after each edit or move),
+  repainting only its input; `nextBlink()` says when to draw next. After layout, the focused
+  input scrolls so the caret is in view (a single-line input scrolls back to its start on
+  blur). `CaretColor`, `SelectionColor` and `PlaceholderColor` style it. `caretRect(id)` and
+  `selection(id)` report it, and `describe` writes `selection=`, `preedit=` and the input flags.
+- **Rich inputs.** `SetRichText` gives an input a document: its value, mark spans (`MarkSpan`,
+  bits over value bytes) and atoms (`Atom { kind, label, data }`), each atom one `OBJECT`
+  (U+FFFC) in the value, so offsets stay value bytes and the caret steps over an atom as one
+  unit. `DefineMark` and `DefineAtom` give a mark bit or atom kind its declarations. The input
+  lays out one inline run per stretch of equal marks and an inline-block per atom (its
+  label), under the input's own text style. Typing takes the marks before the caret (or the
+  ones `Format` set at the caret), `Format` over a range and `InsertAtom` are undo steps with
+  their own `inputType`, and `Input` records carry the marks, atoms and active marks.
+- **Selection changes.** After each input and each batch, a focused input whose selection
+  (or, in a rich input, the marks typing would get) moved since the last report queues a
+  `SelectionChange` record for `LISTEN_SELECTION_CHANGE` listeners on its path, as DOM
+  `selectionchange` at an input: caret keys, clicks, drags, `Select` and edits (after their
+  `Input` record) all report, and a key that moves nothing does not.
+
+## Frames
+
+`frame` resolves styles, lays out, and paints:
+
+- **Layout** is incremental. Style changes reach css-layout only when they change a layout
+  input, and an unchanged tree at an unchanged size skips `compute`. css-layout reads the
+  tree through its `LayoutSource` interface (`src/layout_table.silk`). It does not use a copy
+  in its own `Tree`. Each layout node is a row of links and a style index, 29 bytes. Elements
+  with equal layout styles share one style entry. A text node reads its text from its UI
+  node.
+- **Paint** walks the layout fragments, not the nodes. Boxes paint their background (solid, or
+  linear, radial and conic gradients, and `url()` images the host loads), border (solid or dashed, per side, with radii), outer and inset shadow,
+  opacity (an isolated layer) and `overflow: hidden` clip. Text is drawn from css-layout's text
+  fragments: each fragment's `shapeKey` names the glyph run ui-text shaped during layout, so
+  nothing is shaped twice. Inline boxes paint their decorations per fragment, so a highlighted
+  span split across lines gets one background per line with the outer edges only on its first
+  and last pieces. Underline, overline and line-through follow the text color or a decoration
+  color, wavy or straight. Glyphs, icons and images go through the shared atlas as sprites.
+- **Stacking** follows CSS 2 Appendix E (`src/stacking.silk`). The viewport makes the root
+  stacking context, and so do boxes with a `z-index` other than `auto` (positioned boxes and
+  flex or grid items), `opacity` below 1, a backdrop blur, `position: fixed` or `sticky`. The
+  root context paints the root element's background first. Each context paints negative
+  `z-index`, then its in-flow content, `z-index: auto` and 0 in document order, then positive `z-index`. Positioned boxes
+  paint from their context inside the clips and scroll groups of the boxes they sit in. Hit
+  testing walks the same order backwards. A snapshot of one node paints in tree order.
+- **Replay.** Each fragment gets a hash of everything that affects its subtree's paint. When a
+  subtree's hash, clip and scale match the previous frame, its operations are copied with
+  `Scene.replay` instead of being painted again. `tree.stats` (`FrameStats`) counts replayed and
+  repainted subtrees, painted fragments, glyphs, primitives and layout work.
+
+## Inspection
+
+For people and agents looking at a running UI (`inspect.silk`):
+
+- `info(tree, id)` gives a node's kind, parent, bounds, focus and hover state and paint order;
+  `fragmentsOf` its layout fragments with border, padding and content rects; `childrenOf`, and
+  `findAll(tree, value)` finds nodes by test id, label or text.
+- `describe(tree, options, &mut out)` writes a deterministic text snapshot, one line per node
+  with role, label, test id, text, focus, disabled, checked, selected, expanded, rects and
+  scroll offsets, and with `DescribeOptions.withStyles()` the styles
+  that differ from the defaults or the parent. `describeNodeById` does one subtree.
+- `CpuSnapshot` renders the whole frame, or one node's subtree cropped to its box
+  (`renderNode`), with the CPU reference; `encodePng` turns either into PNG bytes.
+  `renderScene` draws another scene over the tree's atlas, such as an inspector overlay.
+- [ui-inspect](../inspect) builds on these: queries by role, name and text, hit paths and an
+  element picker, the devtools highlight overlay, a node view, synthetic input, and session
+  record and replay.
+- **Style overrides** (`UiTree.setOverride(id, state, declarations, replace)`) let a second
+  party that shares the tree, such as the inspector trying a style, lay declarations over what
+  the client set for a node in one state. The tree merges them at style resolution (as
+  `css.set`, or instead of the client's with `replace`), so they outlast the client's
+  `SetStyle` and `ClearStyle` of the node, which change only the declarations underneath;
+  `clearOverride` shows exactly what the client set last. Overrides go with their node when it
+  is destroyed, change only the revision of the root holding the node, are never reported to
+  the client (`NodeView.style` is the client's), and cost nothing while there are none.
+  `overrideOf`, `overridden` and `styleOverrides` read them.
+
+## Tests
+
+```sh
+silk test --manifest-path modules/tree/tests/silk.toml --root src/tests.silk
+silk build --manifest-path modules/tree/tests/silk.toml
+build/x86_64-unknown-linux-gnu/dev/ui-tree-tests modules/tree/tests/goldens [--update]
+silk task browser check-tree
+silk test --manifest-path modules/tree/window/tests/silk.toml --root src/tests.silk
+silk task native demo modules/tree/demo -- check
+```
+
+- The unit tests cover replay (an unchanged frame replays the whole tree; changing one card's
+  background repaints that card and its ancestors and replays the rest, with pixels equal to a
+  fresh tree), relayout after text changes, failing mutations and id reuse, inheritance and
+  state variants, focus events with paths, and the inspection queries.
+- The override tests (`tests/src/overrides.silk`): an override survives the client restyling
+  and clearing the node, clearing it shows the client's last value, `replace` leaves the
+  client's out, a destroyed node's overrides go (and a new node with its id has none), only the
+  holding root changes and an override drawn once asks for no frame, and a hover override
+  restyles on hover.
+- The interaction tests (`tests/src/interaction.silk`) script the inbox fixture with synthetic
+  input and check the records (kinds, targets, paths, payloads), the states and looks, and
+  what repaints: hover, press, capture and click, disabled nodes, pointer-events, Tab order
+  with positive indices and focus traps, keyboard clicks, Tab scrolling the focus into view,
+  wheel scrolling with nested chaining and clamping, hover following scrolled content,
+  `ScrollTo` and `ScrollIntoView`, thumb dragging, and scrolled pixels equal to a fresh tree
+  scrolled by mutations. `window/tests` sends modules/platform/window events through the headless
+  backend and the adapter into the same fixture.
+- The editing tests (`tests/src/editing.silk`) script the editor fixture: typing and undo
+  grouping, grapheme and word movement (combining marks, a ZWJ emoji), both keymaps, the
+  clipboard requests, clicks, drags and double and triple clicks placed from the fragments,
+  multiline vertical movement and wrapped line ends, composition (drawn, committed, cancelled,
+  replacing the selection, ended by blur), controlled values, `SetSelection` clamping, blinking
+  and caret scrolling, and edited pixels equal to a fresh tree with the same value and
+  selection. `window/tests` types, composes, copies and pastes through the adapter.
+- The goldens are the trees in `fixtures/` (a card list with icons, an inline highlight
+  across lines, an image, an opacity layer, a canvas chart and a clipped box; a sign-in form
+  with a focus ring, a gradient button, a checkbox, an underlined link and a dashed note; an
+  inbox with a toolbar, a scrolling list and a nested scroll box with their thumbs; an editor
+  with a selection, a wrapping multiline input, a placeholder and a read-only input), each
+  as a PNG (tolerance 2 per channel) and a `describe` text that must match exactly.
+- `silk task browser check-tree` builds `browser/` for wasm32 and draws the trees with ui_renderer on
+  `navigator.gpu` in the installed Chromium, RGBA8 and BGRA8, against the CPU reference of the
+  same frame, with examples/graphics-demo's limits (max 96, at most 0.2% of channels over 8, mean 0.25).
+  The inbox receives a fractional `60.25px` wheel scroll before rendering, exercising retained
+  scroll placement through the input/hit-testing path.
+  On SwiftShader both trees stay under a mean of 0.07; the largest difference (75) is on the
+  edge of the form's link underline.
+- `silk task browser parity` compares behaviour with Chromium, case by case. `tools/parity`
+  builds each case with the `Tree` API, feeds it inputs and prints the page a browser should
+  build for it (a box is a `div`, the root is the `body`, styles go inline as written), the
+  inputs, and what the tree saw: the handlers that ran, in order, as `type:target>current`;
+  the border box of every node with a test id; the scroll offsets; the focused node.
+  The task replays the inputs in Chromium through the DevTools protocol and
+  `tests/chrome/parity.js` lists every difference. `--only NAME` runs one case and `--within`
+  sets the box tolerance (0.5px). It is a development aid and is not part of `check` or CI.
+  To add a case, write a function in `tools/parity/src/cases.silk` and add it to `all`.
+
+  One known difference: after a press on one box, the tree sends the release to the pressed
+  box (its implicit capture), where a mouse in Chromium sends it to the box under the pointer
+  (`release-elsewhere`).
+
+Fixtures use examples/graphics-demo's embedded Noto Sans subsets, icons and photo, so the native tests and
+the wasm build draw the same bytes.
+
+## Limits
+
+- In-flow content of a stacking context paints in tree order, without CSS's split into block
+  backgrounds, floats and inline content; positioned inline boxes paint in flow.
+- One box shadow per box, and the `overflow: hidden` clip is the padding box rectangle, not
+  rounded.
+- Styles are resolved for the whole tree whenever any style changes (cheap next to layout, but
+  not incremental).
+- Batches are not atomic.
+- The atlas never evicts.
+- Scrollbars are overlays that take no space; the arrow keys, Page Up and Page Down do not
+  scroll yet, and the root does not scroll the viewport (give it `overflow: auto`).
+- Hit testing uses rectangles: rounded corners and clip radii are not hit shapes.
+- A transformed box that is not a pure translation is resampled from its own layer, so magnified
+  content is softer than content painted at that size. Caret and range rectangles ignore
+  transforms.
+- Editing moves logically: in right-to-left text the arrows follow the text order, not the
+  screen, and a caret at a direction boundary is drawn on one side only. No password masking,
+  no drag and drop of text, no maximum length, and text outside inputs is not selectable.
+- A press during a composition commits it in the tree; platforms whose input method keeps
+  composing would need to be told (modules/platform/window has no call for that yet).
+- The end padding of a single-line input is not part of its scroll range, so a caret at the
+  end of a long value sits at the padding edge.
+- Tab is always the tree's: a client cannot cancel it (use `FocusTrap` for dialogs).
+
+## Window demo
+
+`demo/` (`silk task native demo modules/tree/demo -- --editor` for the editor fixture, the place to try an input method)
+is the inbox in a native window (modules/platform/window, ui_renderer on Dawn) and a tiny client:
+it reads the records and answers with mutations (New appends a row and scrolls it into view,
+Archive removes the focused row). `silk task native demo modules/tree/demo -- check` scripts a hover, a fractional wheel
+scroll, and a Tab, then reads the surface back and compares it with the CPU reference,
+on X11 and Wayland under Xvfb and Weston with lavapipe.
+
+
+## Compiled stylesheet input
+
+`Batch.adoptStyleSheet(root, sheet, bytes)` appends a compiled `css-style` sheet to that
+root's cascade. `replaceStyleSheet` keeps its position; `removeStyleSheet` removes its rules.
+`styleSheetOrder(root, ids)` changes their order without recompiling. Sheet ids are local to a root. Invalid compiled bytes fail with `TreeError.StyleSheet` and
+leave the previous sheet intact. Closing a root releases its sheets.
+
+The tree matches native tags, ids, classes, named attributes and interaction state. Layer
+order is shared across adopted sheets. Inline looks participate in the same ordered list;
+important declarations preserve CSS precedence. Sheet custom properties inherit, registered
+properties use their declared inheritance/defaults, and inline `var()` can read that scope. `Batch.customProperty` sets or removes a custom
+property in a look; `ClearStyle` clears that look's custom properties too. JS style objects
+forward `--name` entries, preserving their case and numeric tokens.
+The resolved list feeds both layout and paint effects. Matched sheet/rule ids remain on the
+node's resolved style.
+
+Named ARIA relation attributes resolve literal element IDs for accessibility, within their
+root and in tree order. Typed `LabelledBy`, `DescribedBy`, `Controls`, and `ActiveDescendant`
+attributes still take client node numbers. The most recent typed or named write wins; a
+numeric-looking literal ID is an element ID, not a client node number.
+
+Hosts may call `UiTree.setStyleEnvironment(root, environment, systemColors)` to supply media
+preferences, input capabilities and the system-color palette. Frame dimensions and scale
+supply viewport queries and resolution. The default environment is headless. Class and pointer-state changes invalidate affected subtrees when selector dependencies
+permit it. Ancestor/sibling selectors and scope-changing declarations conservatively
+restyle the root; roots that only use style objects retain their existing path.
+
+`StyleSheet.load(&mut tree, run StyleSource.text(bytes))` loads runtime CSS into root 0.
+`tree.loadStyleSheet(root, run StyleSource.url(url))` targets another root. Hosts serve
+these requests through `Loader` with an explicitly installed runtime compiler; compiled-only
+hosts leave it disabled. A handle's `state`, `replace`, and `remove` methods observe or
+change the load. The batch equivalent is `loadStyleSheet(root, id, source)`.
+Loads reserve their cascade position before I/O, preserve the previous sheet on failure,
+and discard stale completions after replacement, removal, or root closure.
+
+`::before` and `::after` on box elements generate private layout boxes for string content
+and `attr(name[, "fallback"])`. Empty strings generate boxes; `normal`, `none`, and invalid
+computed content do not. `content: inherit` receives the ordinary origin's computed
+`normal` value and generates no box, matching CSS 2.2 and Chromium. The boxes inherit from their origin and participate in layout,
+paint, transitions, animations, and accessible names. Selectors and public child queries
+see only application nodes. Pointer and accessibility actions target the origin; motion
+events carry `pseudoElement`. Generated overflow scrolls independently, with offsets
+baked into paint rather than exported under the origin's compositor scroll ID.
+
+Input, image, icon, and canvas nodes do not generate these boxes. Counters, quotes, images,
+alternative content, typed `attr()`, and other pseudo-elements remain unsupported. The compiler diagnoses unsupported static content and pseudo-state suffixes;
+origin states such as `.button:hover::before` work.
+
+Size container queries support named containers, `size` and `inline-size` containment,
+physical and logical dimensions, ranges, boolean conditions, and query lists. Each query
+selects the nearest eligible ancestor for all required axes; pseudo-elements can select their
+origin. `cqw`, `cqh`, `cqi`, `cqb`, `cqmin`, and `cqmax` work in styles, grid tracks, transforms,
+paint effects, and keyframes. Missing unit axes fall back to the viewport.
+
+Grid tracks and paint effects resolve `ch`, `ex`, `cap`, `lh`, and their root-relative forms
+against the selected font and computed line height. Root font changes cross ancestors with
+independent fonts; inherited effects retain their defining font bases. These measured bases
+are not yet wired into every ordinary length or transform property.
+
+Frames, immediate geometry reads, and fragmented layout settle changed query results and unit
+bases within a pass budget derived from container depth. Only dependent nodes and their inherited
+subtrees are restyled. Intermediate passes retain the original transition state and animation
+clock, including starting styles and generated boxes whose final query still matches. Idle and
+scroll-only layout does not re-evaluate container conditions. Style and scroll-state queries
+remain unsupported.
+
+The stylesheet/style-object parity suite covers every `css_coverage` row. Generated-content
+tests also exercise real pixels, public structure, accessibility, media changes, sheet
+replacement/removal, scrolling, motion cancellation, and private slot reuse.

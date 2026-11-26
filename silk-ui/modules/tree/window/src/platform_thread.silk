@@ -1,0 +1,2197 @@
+//! The platform thread and the UI thread.
+//!
+//! [`launch`] turns the calling thread (the process's main thread) into the platform thread and
+//! starts the app on a new UI thread. The platform thread only runs the OS event loop, so
+//! window moves, live resize and the input method's candidate window stay smooth however long
+//! the app takes; macOS requires this, since AppKit runs only on the main thread.
+//!
+//! The two threads share one [`Link`]. The platform thread queues each OS event there and wakes
+//! the UI thread. The UI thread talks to the platform through a [`PlatformProxy`], which
+//! implements `Platform`: calls that return nothing are queued as commands and the platform
+//! thread is woken with a `Waker`; the few that answer (opening a window or a dialog, reading
+//! the clipboard) wait for the platform thread's reply, which comes at once because the
+//! platform thread never waits for the UI thread. The window's size and scale come from the
+//! last values the platform thread saw. Accessibility goes the same way: the UI thread sends
+//! snapshots and the platform thread answers the OS from the last one.
+//!
+//! Everything crossing threads is allocated with the system allocator, whatever allocator the
+//! app's code provides.
+import silk.core.ownership { Drop }
+import accessibility { Bridge }
+import accesskit.lib { TreeUpdate, ActionRequest }
+import adapter { LINE_PIXELS }
+import render_thread { Compositor, FastScrolled }
+import window.event { ScrollDelta }
+import silk.num.f32
+import window.event { Event, Modifiers, MouseButton, Phase }
+import window.keys { KeyCode }
+import window.shell { Notification, Tray, TrayIcon }
+import window.clipboard { ClipboardEntry }
+import window.menu { MenuBar, MenuEntry, OpenDialog, SaveDialog }
+import window.native { NativePlatform, Waker }
+import window.headless { HeadlessPlatform }
+
+static if Intrinsic.targetArchitecture() != "wasm32" {
+  import headless
+}
+import window.platform { Platform }
+import window.types {
+  Appearance,
+  Cursor,
+  CursorImage,
+  cursorImageFits,
+  DialogId,
+  ImeState,
+  RawSurface,
+  TitleBar,
+  Wait,
+  WindowError,
+  WindowId,
+  WindowOptions,
+}
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.collections.bytes { Bytes }
+import silk.concurrency.sync { Arc, Mutex, Parker, Unparker }
+import silk.concurrency.thread { Transferable }
+import silk.concurrency.thread_native { NativeThread, SpawnError }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.geometry.point { Point2 }
+import silk.geometry.size { Size2 }
+import silk.geometry.vector { Vector2 }
+import console { StderrWriter }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import clock { Clock }
+import ui_tree.process_memory
+import silk.system.monotonic_clock { MonotonicClock }
+import silk.system.monotonic_clock_native { OsMonotonicClock }
+import silk.text.string { String }
+import silk.num.f64
+import ui_inspect_server.channel { Wake }
+import webview.native { NativeWebViews }
+import webview.types { Placement }
+import webview.wire { WireViews, WireEvent, OP_OPEN }
+
+/// What the UI thread asks the platform thread to do, with owned copies of its arguments.
+union Command {
+  OpenWindow {
+    title: String,
+    size: Size2<f64>,
+    minSize: Option<Size2<f64>>,
+    resizable: bool,
+    titleBar: TitleBar,
+    titleBarHeight: f64,
+    controlsLeft: f64,
+    controlsTop: f64,
+    visible: bool,
+    transparent: bool,
+  },
+  CloseWindow { window: WindowId },
+  RequestFrame { window: WindowId },
+  SetTitle { window: WindowId, title: String },
+  SetContentSize { window: WindowId, size: Size2<f64> },
+  SetMinContentSize { window: WindowId, size: Size2<f64> },
+  SetVisible { window: WindowId, visible: bool },
+  Focus { window: WindowId },
+  Minimize { window: WindowId },
+  ToggleFullScreen { window: WindowId },
+  StartWindowDrag { window: WindowId },
+  SetCursor { window: WindowId, cursor: Cursor },
+  SetCursorImage { window: WindowId, width: u32, height: u32, pixels: Bytes, hotX: u32, hotY: u32, scale: f64 },
+  SetIme { window: WindowId, ime: ImeState },
+  SetMenuBar { bar: MenuBar },
+  ShowContextMenu { window: WindowId, x: f64, y: f64, menu: MenuBar },
+  OpenFileDialog {
+    title: String,
+    directory: Option<String>,
+    files: bool,
+    directories: bool,
+    multiple: bool,
+    extensions: String,
+    parent: Option<WindowId>,
+  },
+  SaveFileDialog {
+    title: String,
+    directory: Option<String>,
+    name: String,
+    extensions: String,
+    parent: Option<WindowId>,
+  },
+  ReadClipboard,
+  WriteClipboard { text: String },
+  ClipboardTypes,
+  ReadClipboardType { mime: String },
+  WriteClipboardItem { entries: List<ClipboardEntry> },
+  SetTray {
+    pixels: List<u8>,
+    width: u32,
+    height: u32,
+    template: bool,
+    tooltip: String,
+    menu: MenuBar,
+  },
+  RemoveTray,
+  RegisterShortcut { id: u32, code: KeyCode, modifiers: Modifiers },
+  UnregisterShortcut { id: u32 },
+  Notify { title: String, body: String },
+  SetBadge { text: String },
+  SetProgress { fraction: f64 },
+  OpenUrl { url: String },
+  RevealPath { path: String },
+  StartFileDrag { window: WindowId, paths: List<String> },
+  Accessibility { window: WindowId, update: TreeUpdate },
+  /// A web view call as text (`webview.wire`): the views live on this thread.
+  WebView { op: u32, window: u32, text: String },
+  PlaceWebView { view: u32, placement: Placement },
+}
+
+/// The platform thread's answer to a command that waits for one.
+union Reply {
+  Window { window: WindowId, size: Size2<f64>, scale: f64, raw: RawSurface },
+  Dialog { dialog: DialogId },
+  Clipboard { text: Option<String> },
+  ClipboardTypes { types: List<String> },
+  ClipboardData { data: Option<Bytes> },
+  Done { ok: bool },
+  Notified { id: u32 },
+  Failed { error: WindowError },
+}
+
+/// An accessibility action and the window it is for.
+struct WindowAction {
+  window: u32,
+  request: ActionRequest,
+}
+
+/// A window's accessibility bridge, on the platform thread.
+struct WindowBridge {
+  window: u32,
+  bridge: Bridge,
+}
+
+/// The bridge of `window` in `bridges`, made and attached when it has none.
+fn bridgeOf(platform: &NativePlatform, bridges: &mut List<WindowBridge>, window: u32) -> usize {
+  let mut i: usize = 0
+  while i < bridges.length() {
+    if bridges.asSlice()[i].window == window {
+      return i
+    }
+    i = i + 1
+  }
+  let mut bridge = Bridge.make()
+  bridge.attach(WindowId { value: window }, platform.rawSurface(WindowId { value: window }))
+  let mut heap = Allocator.systemAllocatorProvider()
+  drop run Effect.result(bridges.append(WindowBridge { window: window, bridge: move bridge }))
+    |> Effect.provideMut<Allocator>(&mut heap)
+  return bridges.length() - 1
+}
+
+/// The content size and scale of a window past the first, as the platform thread last saw
+/// them.
+struct Metrics {
+  window: u32,
+  size: Size2<f64>,
+  scale: f64,
+}
+
+/// What the two threads share. Each side holds the lock only to move values in or out.
+struct Link {
+  /// OS events for the UI thread, oldest first.
+  events: List<Event>,
+  /// Commands for the platform thread, oldest first.
+  commands: List<Command>,
+  reply: Option<Reply>,
+  /// Accessibility actions the OS asked for, for the UI thread.
+  actions: List<WindowAction>,
+  /// The windows whose elements assistive technology asked for.
+  accessWanted: List<u32>,
+  /// The first window the app opened, for polling accessibility actions and for the
+  /// compositor; 0 before.
+  window: u32,
+  /// The window's content size and scale as the platform thread last saw them.
+  size: Size2<f64>,
+  scale: f64,
+  /// The same for the app's other windows.
+  others: List<Metrics>,
+  appearance: Appearance,
+  /// The app returned: the platform thread stops.
+  done: bool,
+  /// Where wheel events go first, once the UI thread's render thread runs.
+  compositor: Option<Compositor>,
+  /// Offsets the compositor set, for the UI thread, oldest first.
+  fastScrolls: List<FastScrolled>,
+  /// Events a [`Driver`] made, handled as if the OS had sent them, oldest first.
+  synthetic: List<Event>,
+  /// A [`Nudge`] asked the UI thread's wait to end.
+  nudged: bool,
+  /// Woken with the UI thread when the client waits itself (`HostPlatform.alsoWake`).
+  also: Option<AlsoWake>,
+  /// What the web views reported, for the UI thread, oldest first.
+  webViewEvents: List<WireEvent>,
+}
+
+// The raw surface handles in a reply belong to the window, which outlives both threads' use
+// of them: the platform thread closes it only when the UI thread asks.
+impl Transferable for Link {}
+
+/// The platform side of a launched app, passed to the app's entry. Put it in
+/// `RunOptions.platform` so the window host runs through the platform thread.
+pub struct Launched {
+  link: Arc<Mutex<Link>>,
+  waker: Waker,
+  /// The UI thread sleeps here; the platform thread wakes it.
+  parker: Parker,
+}
+
+impl Transferable for Launched {}
+
+impl Launched {
+  /// The appearance the platform thread last reported: Light until the window system has
+  /// started (about 90 ms after launch on macOS), then the system's.
+  pub fn appearance(self: &Self) -> Appearance {
+    return self.link.get().lock().get().appearance
+  }
+
+  /// A handle that feeds made-up input to the platform thread, for tests and benchmarks.
+  pub fn driver(self: &Self) -> Driver {
+    return Driver { link: self.link.clone(), waker: self.waker }
+  }
+}
+
+/// Ends the UI thread's wait for the next event, from any thread: the window host then asks
+/// its client for background work (`WindowClient.poll`). This is how a worker thread says it
+/// has a result.
+pub union Nudge {
+  Direct { waker: Waker },
+  Proxied { link: Arc<Mutex<Link>>, wake: Unparker },
+}
+
+impl Transferable for Nudge {}
+
+// The inspector wakes the UI thread this way when a request line comes in.
+impl Wake for Nudge {
+  fn wake(self: &Self) -> () {
+    self.nudge()
+  }
+
+  fn copy(self: &Self) -> Nudge {
+    return self.clone()
+  }
+}
+
+impl Nudge {
+  pub fn nudge(self: &Self) -> () {
+    match &self.* {
+      Nudge.Direct { waker } => waker.wake()
+      Nudge.Proxied { link, wake } => {
+        let mut guard = link.get().lock()
+        let state = guard.getMut()
+        state.nudged = true
+        drop guard
+        wake.unpark()
+        wakeAlso(&link)
+      }
+    }
+  }
+
+  pub fn clone(self: &Self) -> Nudge {
+    return match &self.* {
+      Nudge.Direct { .. } => Nudge.Direct { waker: Waker.make() }
+      Nudge.Proxied { link, wake } => Nudge.Proxied { link: link.clone(), wake: wake.clone() }
+    }
+  }
+}
+
+/// Feeds the platform thread made-up input from any thread, which it handles as OS input: a
+/// wheel goes to the compositor first. For exit tests and benchmarks, so input arrives where
+/// the OS delivers it on every backend, even with no way to make real OS input.
+pub struct Driver {
+  link: Arc<Mutex<Link>>,
+  waker: Waker,
+}
+
+impl Transferable for Driver {}
+
+impl Driver {
+  /// Whether the app's window is open and its compositor runs.
+  pub fn ready(self: &Self) -> bool {
+    let guard = self.link.get().lock()
+    let state = guard.get()
+    return state.window != 0 && Option<Compositor>.isSome(&state.compositor)
+  }
+
+  /// Frames the window's render thread presented so far, 0 before it runs.
+  pub fn presented(self: &Self) -> u64 {
+    let guard = self.link.get().lock()
+    return match &guard.get().compositor {
+      Option<Compositor>.Some { value } => value.presented()
+      Option<Compositor>.None => 0
+    }
+  }
+
+  /// Frames the UI thread painted that reached the screen so far, 0 before the compositor runs.
+  pub fn painted(self: &Self) -> u64 {
+    let guard = self.link.get().lock()
+    return match &guard.get().compositor {
+      Option<Compositor>.Some { value } => value.painted()
+      Option<Compositor>.None => 0
+    }
+  }
+
+  /// A left click at (`x`, `y`) logical points: a press and a release.
+  pub effect fn click(self: &Self, x: f64, y: f64) -> ()
+    ! OutOfMemoryError {
+    let mut guard = self.link.get().lock()
+    let state = guard.getMut()
+    let window = WindowId { value: state.window }
+    let at = Point2<f64>.new(x, y)
+    let mut heap = Allocator.systemAllocatorProvider()
+    run state.synthetic.append(
+      Event.MouseMoved { window: window, position: at, modifiers: Modifiers.none() },
+    )
+      |> Effect.provideMut<Allocator>(&mut heap)
+    run state.synthetic.append(
+      Event.MouseDown {
+        window: window,
+        button: MouseButton.Left,
+        position: at,
+        modifiers: Modifiers.none(),
+        clickCount: 1,
+      },
+    )
+      |> Effect.provideMut<Allocator>(&mut heap)
+    run state.synthetic.append(
+      Event.MouseUp {
+        window: window,
+        button: MouseButton.Left,
+        position: at,
+        modifiers: Modifiers.none(),
+      },
+    )
+      |> Effect.provideMut<Allocator>(&mut heap)
+    drop guard
+    self.waker.wake()
+  }
+
+  /// The window's content size, in logical points.
+  pub fn size(self: &Self) -> Size2<f64> {
+    return self.link.get().lock().get().size
+  }
+
+  /// A mouse wheel step of `lines` lines down (up when negative) at (`x`, `y`) logical points.
+  pub effect fn wheel(self: &Self, x: f64, y: f64, lines: f64) -> ()
+    ! OutOfMemoryError {
+    let mut guard = self.link.get().lock()
+    let state = guard.getMut()
+    let event = Event.Scroll {
+      window: WindowId { value: state.window },
+      position: Point2<f64>.new(x, y),
+      delta: ScrollDelta.Lines { delta: Vector2<f64>.new(0.0, -lines) },
+      phase: Phase.None,
+      modifiers: Modifiers.none(),
+    }
+    let mut heap = Allocator.systemAllocatorProvider()
+    run state.synthetic.append(move event) |> Effect.provideMut<Allocator>(&mut heap)
+    drop guard
+    self.waker.wake()
+  }
+
+  /// Asks the app's window to close, as its close button does.
+  pub effect fn close(self: &Self) -> ()
+    ! OutOfMemoryError {
+    let mut guard = self.link.get().lock()
+    let state = guard.getMut()
+    let event = Event.CloseRequested { window: WindowId { value: state.window } }
+    let mut heap = Allocator.systemAllocatorProvider()
+    run state.synthetic.append(move event) |> Effect.provideMut<Allocator>(&mut heap)
+    drop guard
+    self.waker.wake()
+  }
+}
+
+/// Runs `app` on a new UI thread and the OS event loop on this one, until `app` returns. Call
+/// it from `main`, before anything else touches the window system; `app` gets the
+/// [`Launched`] handle to open its window with. Returns `app`'s result, or 1 when the window
+/// system or the thread cannot start.
+///
+/// On the browser, where there are no threads, it runs `app` on this thread and the window host
+/// keeps its one-thread loop.
+pub effect fn launch<
+  F: 'static + once fn(Option<Launched>) -> i32 + Intrinsic.Detached + Transferable
+>(app: F) -> i32
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  static if Intrinsic.targetArchitecture() == "wasm32" {
+    return app(Option<Launched>.None)
+  } else {
+    // Freed pages go back to the system on macOS (`process_memory.useSpaceEfficientMalloc`).
+    // It may restart the process, so it comes before any thread or window.
+    process_memory.useSpaceEfficientMalloc()
+    // A headless run and the windowless bench open no window system (see `headless.silk`).
+    if run headless.windowless() {
+      return app(Option<Launched>.None)
+    }
+    // The UI thread starts before the window system, which takes about 100 ms on macOS: the
+    // app loads its fonts, script and GPU meanwhile. Its first command waits for the platform.
+    let mut heap = Allocator.systemAllocatorProvider()
+    let shared = run makeLink(Appearance.Light) |> Effect.provideMut<Allocator>(&mut heap)
+    let uiParker = run Parker.make() |> Effect.provideMut<Allocator>(&mut heap)
+    let wakeUi = uiParker.unparker()
+    let launched = Launched { link: shared.clone(), waker: Waker.make(), parker: move uiParker }
+    let finishedLink = shared.clone()
+    let spawned = run Effect.result(
+      NativeThread.spawn(
+        || -> i32 {
+          let entry = move app
+          let handle = move launched
+          let link = move finishedLink
+          let code = entry(Option<Launched>.some(move handle))
+          markDone(&link)
+          Waker.make().wake()
+          return code
+        },
+      ),
+    )
+      |> Effect.provideMut<Allocator>(&mut heap)
+    let thread = match move spawned {
+      Result.Success { value } => move value
+      Result.Failure { error } => match move error {
+        SpawnError failure => {
+          drop failure
+          StderrWriter.print("ui-tree: the UI thread could not start\n", &())
+          return 1
+        }
+        OutOfMemoryError failure => {
+          fail move failure
+        }
+      }
+    }
+    let started = run Effect.result(NativePlatform.start())
+    let mut platform = match move started {
+      Result.Success { value } => move value
+      Result.Failure { error } => {
+        // No window system: the app's calls fail, and it reports that itself.
+        run refuse(&shared, &wakeUi, move error)
+        return thread.join()
+      }
+    }
+    setAppearance(&shared, platform.appearance())
+    run servePlatform(&mut platform, &shared, &wakeUi) |> Effect.provideMut<Allocator>(&mut heap)
+    return thread.join()
+  }
+}
+
+effect fn makeLink(appearance: Appearance) -> Arc<Mutex<Link>>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let link = Link {
+    events: List<Event>.make(),
+    commands: List<Command>.make(),
+    reply: Option<Reply>.None,
+    actions: List<WindowAction>.make(),
+    accessWanted: List<u32>.make(),
+    window: 0,
+    size: Size2<f64>.new(0.0, 0.0),
+    scale: 1.0,
+    others: List<Metrics>.make(),
+    appearance: appearance,
+    done: false,
+    compositor: Option<Compositor>.None,
+    fastScrolls: List<FastScrolled>.make(),
+    synthetic: List<Event>.make(),
+    nudged: false,
+    also: Option<AlsoWake>.None,
+    webViewEvents: List<WireEvent>.make(),
+  }
+  return run Arc<Mutex<Link>>.make(run Mutex<Link>.make(move link))
+}
+
+fn setAppearance(link: &Arc<Mutex<Link>>, appearance: Appearance) -> () {
+  let mut guard = link.get().lock()
+  let state = guard.getMut()
+  state.appearance = appearance
+}
+
+/// Answers each call of the UI thread with `error` until it is done, when there is no window
+/// system to serve it.
+effect fn refuse(link: &Arc<Mutex<Link>>, wakeUi: &Unparker, error: WindowError) -> () {
+  let mut clock = OsMonotonicClock.make()
+  while !isDone(link) {
+    let commands = takeCommands(link)
+    if commands.length() != 0 {
+      answer(link, wakeUi, Reply.Failed { error: error })
+    }
+    drop commands
+    run Effect.sleep(1000000) |> Effect.provideMut<MonotonicClock>(&mut clock)
+  }
+}
+
+fn markDone(link: &Arc<Mutex<Link>>) -> () {
+  let mut guard = link.get().lock()
+  let state = guard.getMut()
+  state.done = true
+}
+
+fn isDone(link: &Arc<Mutex<Link>>) -> bool {
+  return link.get().lock().get().done
+}
+
+fn takeCommands(link: &Arc<Mutex<Link>>) -> List<Command> {
+  let mut guard = link.get().lock()
+  return Intrinsic.replace(guard.getMut().commands, List<Command>.make())
+}
+
+fn answer(link: &Arc<Mutex<Link>>, wakeUi: &Unparker, reply: Reply) -> () {
+  let mut guard = link.get().lock()
+  let state = guard.getMut()
+  state.reply = Option<Reply>.some(move reply)
+  drop guard
+  wakeUi.unpark()
+}
+
+/// The platform thread's loop: wait for OS events, run the UI thread's commands, hand the
+/// events over, until the app is done.
+effect fn servePlatform(
+  platform: &mut NativePlatform,
+  link: &Arc<Mutex<Link>>,
+  wakeUi: &Unparker,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut bridges = List<WindowBridge>.make()
+  let mut views = WireViews<NativeWebViews>.make(NativeWebViews.make())
+  while true {
+    let mut commands = takeCommands(link)
+    let list = commands.asMutSlice()
+    let mut i: usize = 0
+    while i < list.length {
+      let command = Intrinsic.replace(list[i], Command.ReadClipboard)
+      match move command {
+        Command.WebView { op, window, text } => {
+          let value = run views.serve(op, window, String.view(&text))
+          if op == OP_OPEN {
+            answer(link, wakeUi, Reply.Done { ok: value != 0.0 })
+          }
+        }
+        Command.PlaceWebView { view, placement } => views.place(view, placement)
+        Command other => run execute(&mut platform, link, wakeUi, &mut bridges, move other)
+      }
+      i = i + 1
+    }
+    drop commands
+    run handOverWebViewEvents(&mut views, link, wakeUi)
+    if isDone(link) {
+      break
+    }
+    run serveSynthetic(link, wakeUi)
+    let mut next = run platform.nextEvent(Wait.Forever)
+    run handOverWebViewEvents(&mut views, link, wakeUi)
+    let handled = match &next {
+      Option<Event>.Some { value } => run fastScroll(link, &value)
+      Option<Event>.None => false
+    }
+    if handled {
+      next = Option<Event>.None
+    }
+
+    // Every open window's bridge: attach new ones, collect their actions and requests.
+    let mut windows = List<u32>.make()
+    let mut seen = link.get().lock()
+    let open = seen.get()
+    if open.window != 0 {
+      run windows.append(open.window)
+    }
+    let mut o: usize = 0
+    while o < open.others.length() {
+      run windows.append(open.others.asSlice()[o].window)
+      o = o + 1
+    }
+    drop seen
+    let mut actions = List<WindowAction>.make()
+    let mut wanted = List<u32>.make()
+    let mut w: usize = 0
+    while w < windows.length() {
+      let window = windows.get(w)
+      let at = bridgeOf(&platform, &mut bridges, window)
+      let slot = &mut bridges.asMutSlice()[at]
+      let mut taken = run slot.bridge.takeRequests()
+      // AX navigation need not produce any keyboard or pointer event in the app.
+      // A frame services these actions even when the client was otherwise idle.
+      let hasActions = taken.length() != 0
+      while taken.length() != 0 {
+        let request = taken.remove(0)
+        run actions.append(WindowAction { window: window, request: move request })
+      }
+      let requested = slot.bridge.wanted()
+      if requested {
+        run wanted.append(window)
+      }
+      if requested || hasActions {
+        let mut guard = link.get().lock()
+        let state = guard.getMut()
+        let mut k: usize = 0
+        while k < state.accessWanted.length() && state.accessWanted.get(k) != window { k = k + 1 }
+        if hasActions || k == state.accessWanted.length() {
+          run state.events.append(Event.RequestFrame { window: WindowId { value: window }, targetTime: 0.0 })
+        }
+      }
+      w = w + 1
+    }
+    let mut forUi = actions.length() != 0 || handled
+    let mut guard = link.get().lock()
+    let state = guard.getMut()
+    if wanted.length() != state.accessWanted.length() {
+      forUi = true
+    }
+    state.accessWanted = move wanted
+    while actions.length() != 0 {
+      let action = actions.remove(0)
+      run state.actions.append(move action)
+    }
+    match move next {
+      Option<Event>.Some { value } => {
+        match &value {
+          Event.Resized { window: which, size, scaleFactor } => {
+            if which.value == state.window {
+              state.size = size
+              state.scale = scaleFactor
+            } else {
+              let others = state.others.asMutSlice()
+              let mut o: usize = 0
+              while o < others.length {
+                if others[o].window == which.value {
+                  others[o].size = size
+                  others[o].scale = scaleFactor
+                }
+                o = o + 1
+              }
+            }
+          }
+          Event.ScaleFactorChanged { window: which, scaleFactor } => {
+            if which.value == state.window {
+              state.scale = scaleFactor
+            } else {
+              let others = state.others.asMutSlice()
+              let mut o: usize = 0
+              while o < others.length {
+                if others[o].window == which.value {
+                  others[o].scale = scaleFactor
+                }
+                o = o + 1
+              }
+            }
+          }
+          Event.AppearanceChanged { appearance } => {
+            state.appearance = appearance
+          }
+          _ => {}
+        }
+        run state.events.append(move value)
+        forUi = true
+      }
+      Option<Event>.None => {}
+    }
+    drop guard
+    if forUi {
+      wakeUi.unpark()
+      wakeAlso(link)
+    }
+  }
+}
+
+/// Moves what the web views reported to the UI thread, and wakes it when there was something.
+effect fn handOverWebViewEvents(
+  views: &mut WireViews<NativeWebViews>,
+  link: &Arc<Mutex<Link>>,
+  wakeUi: &Unparker,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut events = List<WireEvent>.make()
+  run views.take(&mut events)
+  if events.length() == 0 {
+    return ()
+  }
+  let mut guard = link.get().lock()
+  let state = guard.getMut()
+  while events.length() != 0 {
+    run state.webViewEvents.append(events.remove(0))
+  }
+  drop guard
+  wakeUi.unpark()
+  wakeAlso(link)
+}
+
+/// Handles the events a [`Driver`] made as OS events.
+effect fn serveSynthetic(link: &Arc<Mutex<Link>>, wakeUi: &Unparker) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut guard = link.get().lock()
+  let mut events = Intrinsic.replace(guard.getMut().synthetic, List<Event>.make())
+  drop guard
+  if events.length() == 0 {
+    return
+  }
+  let list = events.asMutSlice()
+  let mut i: usize = 0
+  while i < list.length {
+    let event = Intrinsic.replace(list[i], Event.CloseRequested { window: WindowId { value: 0 } })
+    if !run fastScroll(link, &event) {
+      let mut held = link.get().lock()
+      run held.getMut().events.append(move event)
+    }
+    i = i + 1
+  }
+  wakeUi.unpark()
+  wakeAlso(link)
+}
+
+/// What else to wake with the UI thread, for a client that waits itself: `wake(token)`, from
+/// any thread.
+pub struct AlsoWake {
+  pub wake: extern "C" fn(usize) -> (),
+  pub token: usize,
+}
+
+/// Ends the wait of a client that waits itself, when it gave a waker.
+// Under the lock: the proxy's drop takes the waker away before the client's loop closes.
+fn wakeAlso(link: &Arc<Mutex<Link>>) -> () {
+  let guard = link.get().lock()
+  if let Option<AlsoWake>.Some { value } = &guard.get().also {
+    unsafe (value.wake)(value.token)
+  }
+  drop guard
+}
+
+/// Scrolls the frame on screen through the compositor when `event` is a wheel it can take on
+/// its own; the offsets go to the UI thread afterwards. Returns whether it did.
+effect fn fastScroll(link: &Arc<Mutex<Link>>, event: &Event) -> bool
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut px: f64 = 0.0
+  let mut py: f64 = 0.0
+  let mut target: u32 = 0
+  let mut amount = ScrollDelta.Points { delta: Vector2<f64>.new(0.0, 0.0) }
+  match &event.* {
+    Event.Scroll { window, position, delta, .. } => {
+      px = position.x
+      py = position.y
+      target = window.value
+      amount = delta
+    }
+    _ => {
+      return false
+    }
+  }
+  let guard = link.get().lock()
+  let state = guard.get()
+
+  // The compositor scrolls the first window's frame; the others scroll on the UI thread.
+  if target != state.window {
+    return false
+  }
+  let compositor = match &state.compositor {
+    Option<Compositor>.Some { value } => value.clone()
+    Option<Compositor>.None => {
+      return false
+    }
+  }
+  let scale = f64.toF32(state.scale)
+  drop guard
+
+  // As the tree reads a wheel (adapter.toInput), in device pixels.
+  let mut dx: f32 = 0.0
+  let mut dy: f32 = 0.0
+  match amount {
+    ScrollDelta.Lines { delta: lines } => {
+      dx = -f64.toF32(lines.x) * LINE_PIXELS
+      dy = -f64.toF32(lines.y) * LINE_PIXELS
+    }
+    ScrollDelta.Points { delta: points } => {
+      dx = -f64.toF32(points.x)
+      dy = -f64.toF32(points.y)
+    }
+  }
+  let mut moved = List<FastScrolled>.make()
+  let x = f64.toF32(px) * scale
+  let y = f64.toF32(py) * scale
+  if !run compositor.scroll(x, y, dx * scale, dy * scale, &mut moved) {
+    return false
+  }
+  let mut held = link.get().lock()
+  let values = held.getMut()
+  let list = moved.asSlice()
+  let mut i: usize = 0
+  while i < list.length {
+    run values.fastScrolls.append(list[i])
+    i = i + 1
+  }
+  return true
+}
+
+/// Runs one command on the platform thread.
+effect fn execute(
+  platform: &mut NativePlatform,
+  link: &Arc<Mutex<Link>>,
+  wakeUi: &Unparker,
+  bridges: &mut List<WindowBridge>,
+  command: Command,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  match move command {
+    Command.OpenWindow {
+      title,
+      size,
+      minSize,
+      resizable,
+      titleBar,
+      titleBarHeight,
+      controlsLeft,
+      controlsTop,
+      visible,
+      transparent,
+    } => {
+      let options = WindowOptions {
+        title: String.view(&title),
+        size: size,
+        minSize: minSize,
+        resizable: resizable,
+        titleBar: titleBar,
+        titleBarHeight: titleBarHeight,
+        controlsLeft: controlsLeft,
+        controlsTop: controlsTop,
+        visible: visible,
+        transparent: transparent,
+      }
+      let opened = run Effect.result(platform.openWindow(&options))
+      match move opened {
+        Result.Success { value } => {
+          let size = platform.contentSize(value)
+          let scale = platform.scaleFactor(value)
+          let mut guard = link.get().lock()
+          let state = guard.getMut()
+          if state.window == 0 {
+            state.window = value.value
+            state.size = size
+            state.scale = scale
+          } else {
+            run state.others.append(Metrics { window: value.value, size: size, scale: scale })
+          }
+          drop guard
+          answer(
+            link,
+            wakeUi,
+            Reply.Window {
+              window: value,
+              size: size,
+              scale: scale,
+              raw: platform.rawSurface(value),
+            },
+          )
+        }
+        Result.Failure { error } => match move error {
+          WindowError failure => answer(link, wakeUi, Reply.Failed { error: failure })
+          OutOfMemoryError failure => {
+            answer(link, wakeUi, Reply.Failed { error: WindowError.CreationFailed })
+            fail move failure
+          }
+        }
+      }
+    }
+    Command.CloseWindow { window } => {
+      let mut b: usize = 0
+      while b < bridges.length() {
+        if bridges.asSlice()[b].window == window.value {
+          drop bridges.remove(b)
+        } else {
+          b = b + 1
+        }
+      }
+      platform.closeWindow(window)
+      let mut guard = link.get().lock()
+      let state = guard.getMut()
+      if state.window == window.value {
+        state.window = 0
+      }
+      let mut o: usize = 0
+      while o < state.others.length() {
+        if state.others.asSlice()[o].window == window.value {
+          drop state.others.remove(o)
+        } else {
+          o = o + 1
+        }
+      }
+    }
+    Command.RequestFrame { window } => platform.requestFrame(window)
+    Command.SetTitle { window, title } => {
+      run platform.setTitle(window, String.view(&title))
+    }
+    Command.SetContentSize { window, size } => platform.setContentSize(window, size)
+    Command.SetMinContentSize { window, size } => platform.setMinContentSize(window, size)
+    Command.SetVisible { window, visible } => platform.setVisible(window, visible)
+    Command.Focus { window } => platform.focus(window)
+    Command.Minimize { window } => platform.minimize(window)
+    Command.ToggleFullScreen { window } => platform.toggleFullScreen(window)
+    Command.StartWindowDrag { window } => platform.startWindowDrag(window)
+    Command.SetCursor { window, cursor } => platform.setCursor(window, cursor)
+    Command.SetCursorImage { window, width, height, pixels, hotX, hotY, scale } => {
+      let image = CursorImage {
+        width: width,
+        height: height,
+        pixels: pixels.asSlice(),
+        hotX: hotX,
+        hotY: hotY,
+        scale: scale,
+      }
+      drop run platform.setCursorImage(window, &image)
+    }
+    Command.SetIme { window, ime } => platform.setIme(window, ime)
+    Command.SetMenuBar { bar } => {
+      run platform.setMenuBar(&bar)
+    }
+    Command.ShowContextMenu { window, x, y, menu } => {
+      drop run platform.showContextMenu(window, x, y, &menu)
+    }
+    Command.OpenFileDialog {
+      title,
+      directory,
+      files,
+      directories,
+      multiple,
+      extensions,
+      parent
+    } => {
+      let options = OpenDialog {
+        title: String.view(&title),
+        directory: match &directory {
+          Option<String>.Some { value } => Option<string>.some(String.view(&value))
+          Option<String>.None => Option<string>.None
+        },
+        files: files,
+        directories: directories,
+        multiple: multiple,
+        extensions: String.view(&extensions),
+        parent: parent,
+      }
+      let opened = run Effect.result(platform.openFileDialog(&options))
+      run answerDialog(link, wakeUi, move opened)
+    }
+    Command.SaveFileDialog { title, directory, name, extensions, parent } => {
+      let options = SaveDialog {
+        title: String.view(&title),
+        directory: match &directory {
+          Option<String>.Some { value } => Option<string>.some(String.view(&value))
+          Option<String>.None => Option<string>.None
+        },
+        name: String.view(&name),
+        extensions: String.view(&extensions),
+        parent: parent,
+      }
+      let opened = run Effect.result(platform.saveFileDialog(&options))
+      run answerDialog(link, wakeUi, move opened)
+    }
+    Command.ReadClipboard => {
+      let text = run platform.readClipboard()
+      answer(link, wakeUi, Reply.Clipboard { text: move text })
+    }
+    Command.WriteClipboard { text } => {
+      run platform.writeClipboard(String.view(&text))
+    }
+    Command.ClipboardTypes => {
+      let types = run platform.clipboardTypes()
+      answer(link, wakeUi, Reply.ClipboardTypes { types: move types })
+    }
+    Command.ReadClipboardType { mime } => {
+      let data = run platform.readClipboardType(String.view(&mime))
+      answer(link, wakeUi, Reply.ClipboardData { data: move data })
+    }
+    Command.WriteClipboardItem { entries } => {
+      run platform.writeClipboardItem(entries.asSlice())
+    }
+    Command.SetTray { pixels, width, height, template, tooltip, menu } => {
+      let tray = Tray {
+        icon: TrayIcon {
+          width: width,
+          height: height,
+          pixels: pixels.asSlice(),
+          template: template,
+        },
+        tooltip: String.view(&tooltip),
+        menu: &menu,
+      }
+      let shown = run platform.setTray(&tray)
+      answer(link, wakeUi, Reply.Done { ok: shown })
+    }
+    Command.RemoveTray => platform.removeTray()
+    Command.RegisterShortcut { id, code, modifiers } => {
+      let held = run platform.registerShortcut(id, code, modifiers)
+      answer(link, wakeUi, Reply.Done { ok: held })
+    }
+    Command.UnregisterShortcut { id } => platform.unregisterShortcut(id)
+    Command.Notify { title, body } => {
+      let notification = Notification {
+        title: String.view(&title),
+        body: String.view(&body),
+      }
+      let id = run platform.notify(&notification)
+      answer(link, wakeUi, Reply.Notified { id: id })
+    }
+    Command.SetBadge { text } => {
+      let shown = run platform.setBadge(String.view(&text))
+      answer(link, wakeUi, Reply.Done { ok: shown })
+    }
+    Command.SetProgress { fraction } => {
+      let shown = run platform.setProgress(fraction)
+      answer(link, wakeUi, Reply.Done { ok: shown })
+    }
+    Command.OpenUrl { url } => {
+      let opened = run platform.openUrl(String.view(&url))
+      answer(link, wakeUi, Reply.Done { ok: opened })
+    }
+    Command.RevealPath { path } => {
+      let shown = run platform.revealPath(String.view(&path))
+      answer(link, wakeUi, Reply.Done { ok: shown })
+    }
+    Command.StartFileDrag { window, paths } => {
+      let started = run platform.startFileDrag(window, paths.asSlice())
+      answer(link, wakeUi, Reply.Done { ok: started })
+    }
+    Command.Accessibility { window, update } => {
+      let at = bridgeOf(&platform.*, &mut bridges, window.value)
+      run bridges.asMutSlice()[at].bridge.update(move update, true)
+    }
+
+    // servePlatform runs these on its web views.
+    Command.WebView { .. } => {}
+    Command.PlaceWebView { .. } => {}
+  }
+}
+
+effect fn answerDialog(
+  link: &Arc<Mutex<Link>>,
+  wakeUi: &Unparker,
+  opened: Result<DialogId, WindowError | OutOfMemoryError>,
+) -> ()
+  ! OutOfMemoryError {
+  match move opened {
+    Result.Success { value } => answer(link, wakeUi, Reply.Dialog { dialog: value })
+    Result.Failure { error } => match move error {
+      WindowError failure => answer(link, wakeUi, Reply.Failed { error: failure })
+      OutOfMemoryError failure => {
+        answer(link, wakeUi, Reply.Failed { error: WindowError.CreationFailed })
+        fail move failure
+      }
+    }
+  }
+}
+
+/// Seconds on the monotonic clock.
+effect fn seconds(clock: &mut Clock) -> f64 {
+  return run clock.seconds()
+}
+
+/// The UI thread's view of the platform: a `Platform` whose calls go to the platform thread.
+pub struct PlatformProxy {
+  link: Arc<Mutex<Link>>,
+  waker: Waker,
+  parker: Parker,
+  clock: Clock,
+  /// The surface of the window the proxy opened.
+  lastRaw: RawSurface,
+}
+
+impl PlatformProxy {
+  /// The proxy for a launched app.
+  pub fn make(launched: Launched) -> PlatformProxy {
+    let Launched { link, waker, parker } = move launched
+    return PlatformProxy {
+      link: move link,
+      waker: waker,
+      parker: move parker,
+      clock: Clock.make(),
+      lastRaw: RawSurface.None,
+    }
+  }
+
+  effect fn send(self: &mut Self, command: Command) -> ()
+    ! OutOfMemoryError {
+    let mut heap = Allocator.systemAllocatorProvider()
+    let mut guard = self.link.get().lock()
+    run guard.getMut().commands.append(move command) |> Effect.provideMut<Allocator>(&mut heap)
+    drop guard
+    self.waker.wake()
+  }
+
+  /// Sends `command` and waits for the platform thread's reply.
+  effect fn call(self: &mut Self, command: Command) -> Reply
+    ! OutOfMemoryError {
+    run self.send(move command)
+    while true {
+      let mut guard = self.link.get().lock()
+      let taken = Intrinsic.replace(guard.getMut().reply, Option<Reply>.None)
+      drop guard
+      match move taken {
+        Option<Reply>.Some { value } => {
+          return move value
+        }
+        Option<Reply>.None => {
+          self.parker.park()
+        }
+      }
+    }
+    return Reply.Failed { error: WindowError.Unsupported }
+  }
+
+  /// Sends wheel events to `compositor` first.
+  pub fn setCompositor(self: &mut Self, compositor: Compositor) -> () {
+    let mut guard = self.link.get().lock()
+    let state = guard.getMut()
+    state.compositor = Option<Compositor>.some(move compositor)
+  }
+
+  /// Stops sending wheel events to the compositor, before its render thread stops.
+  pub fn clearCompositor(self: &mut Self) -> () {
+    let mut guard = self.link.get().lock()
+    let state = guard.getMut()
+    state.compositor = Option<Compositor>.None
+  }
+
+  /// Moves the offsets the compositor set into `out`.
+  pub effect fn takeFastScrolls(self: &mut Self, out: &mut List<FastScrolled>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut guard = self.link.get().lock()
+    let state = guard.getMut()
+    run out.appendSlice(state.fastScrolls.asSlice())
+    state.fastScrolls.clear()
+  }
+
+  /// The accessibility side of the link.
+  pub fn accessLink(self: &Self) -> AccessLink {
+    return AccessLink { link: self.link.clone(), waker: self.waker }
+  }
+
+  /// Whether the platform thread left offsets or actions for the UI thread.
+  fn hasSideWork(self: &Self) -> bool {
+    let guard = self.link.get().lock()
+    let state = guard.get()
+    return state.fastScrolls.length() != 0 || state.actions.length() != 0 || state.nudged
+      || state.webViewEvents.length() != 0
+  }
+
+  fn nudge(self: &Self) -> Nudge {
+    return Nudge.Proxied { link: self.link.clone(), wake: self.parker.unparker() }
+  }
+
+  fn takeNudged(self: &Self) -> bool {
+    let mut guard = self.link.get().lock()
+    let state = guard.getMut()
+    let nudged = state.nudged
+    state.nudged = false
+    return nudged
+  }
+
+  fn popEvent(self: &Self) -> Option<Event> {
+    let mut guard = self.link.get().lock()
+    let state = guard.getMut()
+    if state.events.length() == 0 {
+      return Option<Event>.None
+    }
+    return Option<Event>.some(state.events.remove(0))
+  }
+
+  effect fn bytesOf(bytes: &[u8]) -> Bytes
+    ! OutOfMemoryError {
+    let mut heap = Allocator.systemAllocatorProvider()
+    return run Bytes.copy(bytes) |> Effect.provideMut<Allocator>(&mut heap)
+  }
+
+  effect fn copyOf(text: string) -> String
+    ! OutOfMemoryError {
+    let mut heap = Allocator.systemAllocatorProvider()
+    return run String.copy(text) |> Effect.provideMut<Allocator>(&mut heap)
+  }
+}
+
+// The window host ends before the client that gave a waker closes what it wakes.
+impl Drop for PlatformProxy {
+  fn drop(self: &mut Self) -> () {
+    let mut guard = self.link.get().lock()
+    let state = guard.getMut()
+    state.also = Option<AlsoWake>.None
+  }
+}
+
+impl Platform for PlatformProxy {
+  effect fn openWindow(self: &mut Self, options: &WindowOptions<'_>) -> WindowId
+    ! WindowError | OutOfMemoryError
+    ? &mut Allocator {
+    let title = run PlatformProxy.copyOf(options.title)
+    let reply = run self.call(
+      Command.OpenWindow {
+        title: move title,
+        size: options.size,
+        minSize: options.minSize,
+        resizable: options.resizable,
+        titleBar: options.titleBar,
+        titleBarHeight: options.titleBarHeight,
+        controlsLeft: options.controlsLeft,
+        controlsTop: options.controlsTop,
+        visible: options.visible,
+        transparent: options.transparent,
+      },
+    )
+    return match move reply {
+      Reply.Window { window, raw, .. } => {
+        self.lastRaw = raw
+        window
+      }
+      Reply.Failed { error } => {
+        fail error
+      }
+      _ => {
+        fail WindowError.CreationFailed
+      }
+    }
+  }
+
+  fn closeWindow(self: &mut Self, window: WindowId) -> () {
+    drop run Effect.result(self.send(Command.CloseWindow { window: window }))
+  }
+
+  effect fn nextEvent(self: &mut Self, wait: Wait) -> Option<Event>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let start = run seconds(&mut self.clock)
+    while true {
+      let next = self.popEvent()
+      if next.isSome() {
+        return move next
+      }
+      if self.takeNudged() {
+        return Option<Event>.None
+      }
+      match wait {
+        Wait.Poll => {
+          return Option<Event>.None
+        }
+        Wait.Forever => self.parker.park()
+        Wait.Seconds { seconds: limit } => {
+          let left = limit - ((run seconds(&mut self.clock)) - start)
+          if left <= 0.0 {
+            return Option<Event>.None
+          }
+          drop self.parker.parkTimeout(f64.toU64(left * 1000000000.0))
+        }
+      }
+
+      // The platform thread also wakes this thread for what is not an event (compositor
+      // scrolls, accessibility actions): the caller looks for those on each return.
+      if self.hasSideWork() {
+        return self.popEvent()
+      }
+    }
+    return Option<Event>.None
+  }
+
+  fn requestFrame(self: &mut Self, window: WindowId) -> () {
+    drop run Effect.result(self.send(Command.RequestFrame { window: window }))
+  }
+
+  fn contentSize(self: &Self, window: WindowId) -> Size2<f64> {
+    let guard = self.link.get().lock()
+    let state = guard.get()
+    let others = state.others.asSlice()
+    let mut o: usize = 0
+    while o < others.length {
+      if others[o].window == window.value {
+        return others[o].size
+      }
+      o = o + 1
+    }
+    return state.size
+  }
+
+  fn scaleFactor(self: &Self, window: WindowId) -> f64 {
+    let guard = self.link.get().lock()
+    let state = guard.get()
+    let others = state.others.asSlice()
+    let mut o: usize = 0
+    while o < others.length {
+      if others[o].window == window.value {
+        return others[o].scale
+      }
+      o = o + 1
+    }
+    return state.scale
+  }
+
+  fn rawSurface(self: &Self, window: WindowId) -> RawSurface {
+    return self.lastRaw
+  }
+
+  effect fn setTitle(self: &mut Self, window: WindowId, title: string) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let owned = run PlatformProxy.copyOf(title)
+    run self.send(Command.SetTitle { window: window, title: move owned })
+  }
+
+  fn setContentSize(self: &mut Self, window: WindowId, size: Size2<f64>) -> () {
+    drop run Effect.result(self.send(Command.SetContentSize { window: window, size: size }))
+  }
+
+  fn setMinContentSize(self: &mut Self, window: WindowId, size: Size2<f64>) -> () {
+    drop run Effect.result(self.send(Command.SetMinContentSize { window: window, size: size }))
+  }
+
+  fn setVisible(self: &mut Self, window: WindowId, visible: bool) -> () {
+    drop run Effect.result(self.send(Command.SetVisible { window: window, visible: visible }))
+  }
+
+  fn focus(self: &mut Self, window: WindowId) -> () {
+    drop run Effect.result(self.send(Command.Focus { window: window }))
+  }
+
+  fn minimize(self: &mut Self, window: WindowId) -> () {
+    drop run Effect.result(self.send(Command.Minimize { window: window }))
+  }
+
+  fn toggleFullScreen(self: &mut Self, window: WindowId) -> () {
+    drop run Effect.result(self.send(Command.ToggleFullScreen { window: window }))
+  }
+
+  fn startWindowDrag(self: &mut Self, window: WindowId) -> () {
+    drop run Effect.result(self.send(Command.StartWindowDrag { window: window }))
+  }
+
+  fn setCursor(self: &mut Self, window: WindowId, cursor: Cursor) -> () {
+    drop run Effect.result(self.send(Command.SetCursor { window: window, cursor: cursor }))
+  }
+
+  /// Sent without waiting for the answer, so true whenever the image fits.
+  effect fn setCursorImage(self: &mut Self, window: WindowId, image: &CursorImage<'_>) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if !cursorImageFits(image) {
+      return false
+    }
+    let pixels = run Bytes.copy(image.pixels)
+    run self.send(Command.SetCursorImage {
+      window: window,
+      width: image.width,
+      height: image.height,
+      pixels: move pixels,
+      hotX: image.hotX,
+      hotY: image.hotY,
+      scale: image.scale,
+    })
+    return true
+  }
+
+  fn setIme(self: &mut Self, window: WindowId, ime: ImeState) -> () {
+    drop run Effect.result(self.send(Command.SetIme { window: window, ime: ime }))
+  }
+
+  effect fn setMenuBar(self: &mut Self, bar: &MenuBar) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let copy = run copyMenuBar(bar)
+    run self.send(Command.SetMenuBar { bar: move copy })
+  }
+
+  /// Opens the menu on the platform thread; whether the system shows it is not known here,
+  /// so this says true.
+  effect fn showContextMenu(self: &mut Self, window: WindowId, x: f64, y: f64, menu: &MenuBar) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let copy = run copyMenuBar(menu)
+    run self.send(Command.ShowContextMenu { window: window, x: x, y: y, menu: move copy })
+    return true
+  }
+
+  effect fn openFileDialog(self: &mut Self, options: &OpenDialog<'_>) -> DialogId
+    ! WindowError | OutOfMemoryError
+    ? &mut Allocator {
+    let title = run PlatformProxy.copyOf(options.title)
+    let extensions = run PlatformProxy.copyOf(options.extensions)
+    let directory = run copyOptional(options.directory)
+    let reply = run self.call(
+      Command.OpenFileDialog {
+        title: move title,
+        directory: move directory,
+        files: options.files,
+        directories: options.directories,
+        multiple: options.multiple,
+        extensions: move extensions,
+        parent: options.parent,
+      },
+    )
+    return run dialogOf(move reply)
+  }
+
+  effect fn saveFileDialog(self: &mut Self, options: &SaveDialog<'_>) -> DialogId
+    ! WindowError | OutOfMemoryError
+    ? &mut Allocator {
+    let title = run PlatformProxy.copyOf(options.title)
+    let name = run PlatformProxy.copyOf(options.name)
+    let extensions = run PlatformProxy.copyOf(options.extensions)
+    let directory = run copyOptional(options.directory)
+    let reply = run self.call(
+      Command.SaveFileDialog {
+        title: move title,
+        directory: move directory,
+        name: move name,
+        extensions: move extensions,
+        parent: options.parent,
+      },
+    )
+    return run dialogOf(move reply)
+  }
+
+  effect fn readClipboard(self: &mut Self) -> Option<String>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let reply = run self.call(Command.ReadClipboard)
+    return match move reply {
+      Reply.Clipboard { text } => move text
+      _ => Option<String>.None
+    }
+  }
+
+  effect fn writeClipboard(self: &mut Self, text: string) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let owned = run PlatformProxy.copyOf(text)
+    run self.send(Command.WriteClipboard { text: move owned })
+  }
+
+  effect fn clipboardTypes(self: &mut Self) -> List<String>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let reply = run self.call(Command.ClipboardTypes)
+    return match move reply {
+      Reply.ClipboardTypes { types } => move types
+      _ => List<String>.make()
+    }
+  }
+
+  effect fn readClipboardType(self: &mut Self, mime: string) -> Option<Bytes>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let owned = run PlatformProxy.copyOf(mime)
+    let reply = run self.call(Command.ReadClipboardType { mime: move owned })
+    return match move reply {
+      Reply.ClipboardData { data } => move data
+      _ => Option<Bytes>.None
+    }
+  }
+
+  effect fn writeClipboardItem(self: &mut Self, entries: &[ClipboardEntry]) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut heap = Allocator.systemAllocatorProvider()
+    let mut owned = List<ClipboardEntry>.make()
+    let mut i: usize = 0
+    while i < entries.length {
+      run owned.append(ClipboardEntry { mime: run PlatformProxy.copyOf(entries[i].mime.view()), data: run PlatformProxy.bytesOf(entries[i].data.asSlice()) }) |> Effect.provideMut<Allocator>(&mut heap)
+      i = i + 1
+    }
+    run self.send(Command.WriteClipboardItem { entries: move owned })
+  }
+
+  fn appearance(self: &Self) -> Appearance {
+    return self.link.get().lock().get().appearance
+  }
+
+  effect fn setTray(self: &mut Self, tray: &Tray<'_>) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut heap = Allocator.systemAllocatorProvider()
+    let mut pixels = List<u8>.make()
+    run pixels.appendSlice(tray.icon.pixels) |> Effect.provideMut<Allocator>(&mut heap)
+    let tooltip = run PlatformProxy.copyOf(tray.tooltip)
+    let menu = run copyMenuBar(tray.menu)
+    let reply = run self.call(
+      Command.SetTray {
+        pixels: move pixels,
+        width: tray.icon.width,
+        height: tray.icon.height,
+        template: tray.icon.template,
+        tooltip: move tooltip,
+        menu: move menu,
+      },
+    )
+    return doneOf(move reply)
+  }
+
+  fn removeTray(self: &mut Self) -> () {
+    drop Effect.result(self.send(Command.RemoveTray))
+  }
+
+  effect fn registerShortcut(self: &mut Self, id: u32, code: KeyCode, modifiers: Modifiers) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let reply = run self.call(Command.RegisterShortcut { id: id, code: code, modifiers: modifiers })
+    return doneOf(move reply)
+  }
+
+  fn unregisterShortcut(self: &mut Self, id: u32) -> () {
+    drop Effect.result(self.send(Command.UnregisterShortcut { id: id }))
+  }
+
+  effect fn notify(self: &mut Self, notification: &Notification<'_>) -> u32
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let title = run PlatformProxy.copyOf(notification.title)
+    let body = run PlatformProxy.copyOf(notification.body)
+    let reply = run self.call(Command.Notify { title: move title, body: move body })
+    return match move reply {
+      Reply.Notified { id } => id
+      _ => 0
+    }
+  }
+
+  effect fn setBadge(self: &mut Self, text: string) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let owned = run PlatformProxy.copyOf(text)
+    return doneOf(run self.call(Command.SetBadge { text: move owned }))
+  }
+
+  effect fn setProgress(self: &mut Self, fraction: f64) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return doneOf(run self.call(Command.SetProgress { fraction: fraction }))
+  }
+
+  effect fn openUrl(self: &mut Self, url: string) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let owned = run PlatformProxy.copyOf(url)
+    return doneOf(run self.call(Command.OpenUrl { url: move owned }))
+  }
+
+  effect fn revealPath(self: &mut Self, path: string) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let owned = run PlatformProxy.copyOf(path)
+    return doneOf(run self.call(Command.RevealPath { path: move owned }))
+  }
+
+  effect fn startFileDrag(self: &mut Self, window: WindowId, paths: &[String]) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut owned = List<String>.make()
+    let mut i: usize = 0
+    while i < paths.length {
+      run owned.append(run PlatformProxy.copyOf(String.view(&paths[i])))
+      i = i + 1
+    }
+    return doneOf(run self.call(Command.StartFileDrag { window: window, paths: move owned }))
+  }
+}
+
+fn doneOf(reply: Reply) -> bool {
+  return match move reply {
+    Reply.Done { ok } => ok
+    _ => false
+  }
+}
+
+effect fn dialogOf(reply: Reply) -> DialogId
+  ! WindowError {
+  return match move reply {
+    Reply.Dialog { dialog } => dialog
+    Reply.Failed { error } => {
+      fail error
+    }
+    _ => {
+      fail WindowError.CreationFailed
+    }
+  }
+}
+
+effect fn copyOptional(text: Option<string>) -> Option<String>
+  ! OutOfMemoryError {
+  return match text {
+    Option<string>.Some { value } => Option<String>.some(run PlatformProxy.copyOf(value))
+    Option<string>.None => Option<String>.None
+  }
+}
+
+/// A copy of `bar` in the process heap.
+effect fn copyMenuBar(bar: &MenuBar) -> MenuBar
+  ! OutOfMemoryError {
+  let mut heap = Allocator.systemAllocatorProvider()
+  let mut copy = MenuBar.make()
+  let entries = bar.entries.asSlice()
+  let mut i: usize = 0
+  while i < entries.length {
+    let entry = match &entries[i] {
+      MenuEntry.Begin { title } => MenuEntry.Begin {
+        title: run PlatformProxy.copyOf(String.view(&title)),
+      }
+      MenuEntry.End => MenuEntry.End
+      MenuEntry.Action { title, action, shortcut, enabled, checked } => MenuEntry.Action {
+        title: run PlatformProxy.copyOf(String.view(&title)),
+        action: action,
+        shortcut: shortcut,
+        enabled: enabled,
+        checked: checked,
+      }
+      MenuEntry.Separator => MenuEntry.Separator
+      MenuEntry.System { item } => MenuEntry.System { item: item }
+    }
+    run copy.entries.append(move entry) |> Effect.provideMut<Allocator>(&mut heap)
+    i = i + 1
+  }
+  return move copy
+}
+
+/// The platform as the window host and its clients see it: the platform itself on a one-thread
+/// loop, a [`PlatformProxy`] to the platform thread of a launched app, or no display at all for
+/// a headless run (see `headless.silk`).
+pub union HostPlatform {
+  Direct { platform: NativePlatform },
+  Proxied { proxy: PlatformProxy },
+  Headless { platform: HeadlessPlatform },
+}
+
+impl HostPlatform {
+  /// The platform on this thread.
+  pub fn direct(platform: NativePlatform) -> HostPlatform {
+    return HostPlatform.Direct { platform: move platform }
+  }
+
+  /// No display: windows are records and nothing is shown, for a headless run.
+  pub fn headless() -> HostPlatform {
+    return HostPlatform.Headless { platform: HeadlessPlatform.make() }
+  }
+
+  /// The platform thread of a launched app.
+  pub fn proxied(launched: Launched) -> HostPlatform {
+    return HostPlatform.Proxied { proxy: PlatformProxy.make(move launched) }
+  }
+
+  /// Makes window events and nudges also wake `waker`, for a client that waits itself
+  /// (`WindowClient.waitsItself`). A platform on this thread has no thread to wake it from.
+  pub fn alsoWake(self: &mut Self, waker: AlsoWake) -> () {
+    match &mut self.* {
+      HostPlatform.Proxied { proxy } => {
+        let mut guard = proxy.link.get().lock()
+        let state = guard.getMut()
+        state.also = Option<AlsoWake>.some(move waker)
+      }
+      _ => {
+        drop waker
+      }
+    }
+  }
+
+  /// A handle that ends this thread's wait in `nextEvent` from any thread.
+  pub fn nudge(self: &Self) -> Nudge {
+    return match &self.* {
+      HostPlatform.Proxied { proxy } => proxy.nudge()
+      _ => Nudge.Direct { waker: Waker.make() }
+    }
+  }
+
+  /// Whether calls go to a platform thread.
+  pub fn threaded(self: &Self) -> bool {
+    return match &self.* {
+      HostPlatform.Proxied { .. } => true
+      _ => false
+    }
+  }
+
+  /// Sends wheel events to `compositor` first, when the platform runs on its own thread.
+  pub fn setCompositor(self: &mut Self, compositor: Compositor) -> () {
+    match &mut self.* {
+      HostPlatform.Proxied { proxy } => proxy.setCompositor(move compositor)
+      _ => {
+        drop compositor
+      }
+    }
+  }
+
+  pub fn clearCompositor(self: &mut Self) -> () {
+    match &mut self.* {
+      HostPlatform.Proxied { proxy } => proxy.clearCompositor()
+      _ => ()
+    }
+  }
+
+  /// Moves the offsets the compositor set since the last call into `out`.
+  pub effect fn takeFastScrolls(self: &mut Self, out: &mut List<FastScrolled>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    match &mut self.* {
+      HostPlatform.Proxied { proxy } => {
+        run proxy.takeFastScrolls(&mut out)
+      }
+      _ => ()
+    }
+  }
+
+  /// Where accessibility snapshots go and OS actions come from.
+  /// Runs web view call `op` (`webview.wire`) for window `window` on the platform thread, where
+  /// the views live. The answer is 1 when an open call opened its view. Web views need the
+  /// platform thread: on this thread's platform and headless, nothing opens.
+  pub effect fn webView(self: &mut Self, op: u32, window: WindowId, text: string) -> f64
+    ! OutOfMemoryError {
+    match &mut self.* {
+      HostPlatform.Proxied { proxy } => {
+        let copied = run PlatformProxy.copyOf(text)
+        let command = Command.WebView { op: op, window: window.value, text: move copied }
+        if op == OP_OPEN {
+          return if doneOf(run proxy.call(move command)) {
+            1.0
+          } else {
+            0.0
+          }
+        }
+        run proxy.send(move command)
+        return 0.0
+      }
+      _ => {
+        return 0.0
+      }
+    }
+  }
+
+  /// Moves, clips, shows or hides web view `view`.
+  pub effect fn placeWebView(self: &mut Self, view: u32, placement: Placement) -> ()
+    ! OutOfMemoryError {
+    if let HostPlatform.Proxied { proxy } = &mut self.* {
+      run proxy.send(Command.PlaceWebView { view: view, placement: placement })
+    }
+  }
+
+  /// Moves what the web views reported since the last call onto the end of `out`.
+  pub effect fn takeWebViewEvents(self: &mut Self, out: &mut List<WireEvent>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if let HostPlatform.Proxied { proxy } = &mut self.* {
+      let mut guard = proxy.link.get().lock()
+      let mut taken = Intrinsic.replace(guard.getMut().webViewEvents, List<WireEvent>.make())
+      drop guard
+      while taken.length() != 0 {
+        run out.append(taken.remove(0))
+      }
+    }
+  }
+
+  pub fn accessLink(self: &Self) -> Option<AccessLink> {
+    return match &self.* {
+      HostPlatform.Proxied { proxy } => Option<AccessLink>.some(proxy.accessLink())
+      _ => Option<AccessLink>.None
+    }
+  }
+}
+
+impl Platform for HostPlatform {
+  effect fn openWindow(self: &mut Self, options: &WindowOptions<'_>) -> WindowId
+    ! WindowError | OutOfMemoryError
+    ? &mut Allocator {
+    return match &mut self.* {
+      HostPlatform.Direct { platform } => run platform.openWindow(options)
+      HostPlatform.Headless { platform } => run platform.openWindow(options)
+      HostPlatform.Proxied { proxy } => run proxy.openWindow(options)
+    }
+  }
+
+  fn closeWindow(self: &mut Self, window: WindowId) -> () {
+    return match &mut self.* {
+      HostPlatform.Direct { platform } => platform.closeWindow(window)
+      HostPlatform.Headless { platform } => platform.closeWindow(window)
+      HostPlatform.Proxied { proxy } => proxy.closeWindow(window)
+    }
+  }
+
+  effect fn nextEvent(self: &mut Self, wait: Wait) -> Option<Event>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return match &mut self.* {
+      HostPlatform.Direct { platform } => run platform.nextEvent(wait)
+      HostPlatform.Headless { platform } => run platform.nextEvent(wait)
+      HostPlatform.Proxied { proxy } => run proxy.nextEvent(wait)
+    }
+  }
+
+  fn requestFrame(self: &mut Self, window: WindowId) -> () {
+    return match &mut self.* {
+      HostPlatform.Direct { platform } => platform.requestFrame(window)
+      HostPlatform.Headless { platform } => platform.requestFrame(window)
+      HostPlatform.Proxied { proxy } => proxy.requestFrame(window)
+    }
+  }
+
+  fn contentSize(self: &Self, window: WindowId) -> Size2<f64> {
+    return match &self.* {
+      HostPlatform.Direct { platform } => platform.contentSize(window)
+      HostPlatform.Headless { platform } => platform.contentSize(window)
+      HostPlatform.Proxied { proxy } => proxy.contentSize(window)
+    }
+  }
+
+  fn scaleFactor(self: &Self, window: WindowId) -> f64 {
+    return match &self.* {
+      HostPlatform.Direct { platform } => platform.scaleFactor(window)
+      HostPlatform.Headless { platform } => platform.scaleFactor(window)
+      HostPlatform.Proxied { proxy } => proxy.scaleFactor(window)
+    }
+  }
+
+  fn rawSurface(self: &Self, window: WindowId) -> RawSurface {
+    return match &self.* {
+      HostPlatform.Direct { platform } => platform.rawSurface(window)
+      HostPlatform.Headless { platform } => platform.rawSurface(window)
+      HostPlatform.Proxied { proxy } => proxy.rawSurface(window)
+    }
+  }
+
+  effect fn setTitle(self: &mut Self, window: WindowId, title: string) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return match &mut self.* {
+      HostPlatform.Direct { platform } => run platform.setTitle(window, title)
+      HostPlatform.Headless { platform } => run platform.setTitle(window, title)
+      HostPlatform.Proxied { proxy } => run proxy.setTitle(window, title)
+    }
+  }
+
+  fn setContentSize(self: &mut Self, window: WindowId, size: Size2<f64>) -> () {
+    return match &mut self.* {
+      HostPlatform.Direct { platform } => platform.setContentSize(window, size)
+      HostPlatform.Headless { platform } => platform.setContentSize(window, size)
+      HostPlatform.Proxied { proxy } => proxy.setContentSize(window, size)
+    }
+  }
+
+  fn setMinContentSize(self: &mut Self, window: WindowId, size: Size2<f64>) -> () {
+    return match &mut self.* {
+      HostPlatform.Direct { platform } => platform.setMinContentSize(window, size)
+      HostPlatform.Headless { platform } => platform.setMinContentSize(window, size)
+      HostPlatform.Proxied { proxy } => proxy.setMinContentSize(window, size)
+    }
+  }
+
+  fn setVisible(self: &mut Self, window: WindowId, visible: bool) -> () {
+    return match &mut self.* {
+      HostPlatform.Direct { platform } => platform.setVisible(window, visible)
+      HostPlatform.Headless { platform } => platform.setVisible(window, visible)
+      HostPlatform.Proxied { proxy } => proxy.setVisible(window, visible)
+    }
+  }
+
+  fn focus(self: &mut Self, window: WindowId) -> () {
+    return match &mut self.* {
+      HostPlatform.Direct { platform } => platform.focus(window)
+      HostPlatform.Headless { platform } => platform.focus(window)
+      HostPlatform.Proxied { proxy } => proxy.focus(window)
+    }
+  }
+
+  fn minimize(self: &mut Self, window: WindowId) -> () {
+    return match &mut self.* {
+      HostPlatform.Direct { platform } => platform.minimize(window)
+      HostPlatform.Headless { platform } => platform.minimize(window)
+      HostPlatform.Proxied { proxy } => proxy.minimize(window)
+    }
+  }
+
+  fn toggleFullScreen(self: &mut Self, window: WindowId) -> () {
+    return match &mut self.* {
+      HostPlatform.Direct { platform } => platform.toggleFullScreen(window)
+      HostPlatform.Headless { platform } => platform.toggleFullScreen(window)
+      HostPlatform.Proxied { proxy } => proxy.toggleFullScreen(window)
+    }
+  }
+
+  fn startWindowDrag(self: &mut Self, window: WindowId) -> () {
+    return match &mut self.* {
+      HostPlatform.Direct { platform } => platform.startWindowDrag(window)
+      HostPlatform.Headless { platform } => platform.startWindowDrag(window)
+      HostPlatform.Proxied { proxy } => proxy.startWindowDrag(window)
+    }
+  }
+
+  fn setCursor(self: &mut Self, window: WindowId, cursor: Cursor) -> () {
+    return match &mut self.* {
+      HostPlatform.Direct { platform } => platform.setCursor(window, cursor)
+      HostPlatform.Headless { platform } => platform.setCursor(window, cursor)
+      HostPlatform.Proxied { proxy } => proxy.setCursor(window, cursor)
+    }
+  }
+
+  effect fn setCursorImage(self: &mut Self, window: WindowId, image: &CursorImage<'_>) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return match &mut self.* {
+      HostPlatform.Direct { platform } => run platform.setCursorImage(window, image)
+      HostPlatform.Headless { platform } => run platform.setCursorImage(window, image)
+      HostPlatform.Proxied { proxy } => run proxy.setCursorImage(window, image)
+    }
+  }
+
+  fn setIme(self: &mut Self, window: WindowId, ime: ImeState) -> () {
+    return match &mut self.* {
+      HostPlatform.Direct { platform } => platform.setIme(window, ime)
+      HostPlatform.Headless { platform } => platform.setIme(window, ime)
+      HostPlatform.Proxied { proxy } => proxy.setIme(window, ime)
+    }
+  }
+
+  effect fn setMenuBar(self: &mut Self, bar: &MenuBar) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return match &mut self.* {
+      HostPlatform.Direct { platform } => run platform.setMenuBar(bar)
+      HostPlatform.Headless { platform } => run platform.setMenuBar(bar)
+      HostPlatform.Proxied { proxy } => run proxy.setMenuBar(bar)
+    }
+  }
+
+  effect fn showContextMenu(self: &mut Self, window: WindowId, x: f64, y: f64, menu: &MenuBar) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return match &mut self.* {
+      HostPlatform.Direct { platform } => run platform.showContextMenu(window, x, y, menu)
+      HostPlatform.Headless { platform } => run platform.showContextMenu(window, x, y, menu)
+      HostPlatform.Proxied { proxy } => run proxy.showContextMenu(window, x, y, menu)
+    }
+  }
+
+  effect fn openFileDialog(self: &mut Self, options: &OpenDialog<'_>) -> DialogId
+    ! WindowError | OutOfMemoryError
+    ? &mut Allocator {
+    return match &mut self.* {
+      HostPlatform.Direct { platform } => run platform.openFileDialog(options)
+      HostPlatform.Headless { platform } => run platform.openFileDialog(options)
+      HostPlatform.Proxied { proxy } => run proxy.openFileDialog(options)
+    }
+  }
+
+  effect fn saveFileDialog(self: &mut Self, options: &SaveDialog<'_>) -> DialogId
+    ! WindowError | OutOfMemoryError
+    ? &mut Allocator {
+    return match &mut self.* {
+      HostPlatform.Direct { platform } => run platform.saveFileDialog(options)
+      HostPlatform.Headless { platform } => run platform.saveFileDialog(options)
+      HostPlatform.Proxied { proxy } => run proxy.saveFileDialog(options)
+    }
+  }
+
+  effect fn readClipboard(self: &mut Self) -> Option<String>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return match &mut self.* {
+      HostPlatform.Direct { platform } => run platform.readClipboard()
+      HostPlatform.Headless { platform } => run platform.readClipboard()
+      HostPlatform.Proxied { proxy } => run proxy.readClipboard()
+    }
+  }
+
+  effect fn writeClipboard(self: &mut Self, text: string) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return match &mut self.* {
+      HostPlatform.Direct { platform } => run platform.writeClipboard(text)
+      HostPlatform.Headless { platform } => run platform.writeClipboard(text)
+      HostPlatform.Proxied { proxy } => run proxy.writeClipboard(text)
+    }
+  }
+
+  effect fn clipboardTypes(self: &mut Self) -> List<String>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return match &mut self.* {
+      HostPlatform.Direct { platform } => run platform.clipboardTypes()
+      HostPlatform.Headless { platform } => run platform.clipboardTypes()
+      HostPlatform.Proxied { proxy } => run proxy.clipboardTypes()
+    }
+  }
+
+  effect fn readClipboardType(self: &mut Self, mime: string) -> Option<Bytes>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return match &mut self.* {
+      HostPlatform.Direct { platform } => run platform.readClipboardType(mime)
+      HostPlatform.Headless { platform } => run platform.readClipboardType(mime)
+      HostPlatform.Proxied { proxy } => run proxy.readClipboardType(mime)
+    }
+  }
+
+  effect fn writeClipboardItem(self: &mut Self, entries: &[ClipboardEntry]) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return match &mut self.* {
+      HostPlatform.Direct { platform } => run platform.writeClipboardItem(entries)
+      HostPlatform.Headless { platform } => run platform.writeClipboardItem(entries)
+      HostPlatform.Proxied { proxy } => run proxy.writeClipboardItem(entries)
+    }
+  }
+
+  fn appearance(self: &Self) -> Appearance {
+    return match &self.* {
+      HostPlatform.Direct { platform } => platform.appearance()
+      HostPlatform.Headless { platform } => Platform.appearance(&platform)
+      HostPlatform.Proxied { proxy } => proxy.appearance()
+    }
+  }
+
+  effect fn setTray(self: &mut Self, tray: &Tray<'_>) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return match &mut self.* {
+      HostPlatform.Direct { platform } => run platform.setTray(tray)
+      HostPlatform.Headless { platform } => run platform.setTray(tray)
+      HostPlatform.Proxied { proxy } => run proxy.setTray(tray)
+    }
+  }
+
+  fn removeTray(self: &mut Self) -> () {
+    return match &mut self.* {
+      HostPlatform.Direct { platform } => platform.removeTray()
+      HostPlatform.Headless { platform } => platform.removeTray()
+      HostPlatform.Proxied { proxy } => proxy.removeTray()
+    }
+  }
+
+  effect fn registerShortcut(self: &mut Self, id: u32, code: KeyCode, modifiers: Modifiers) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return match &mut self.* {
+      HostPlatform.Direct { platform } => run platform.registerShortcut(id, code, modifiers)
+      HostPlatform.Headless { platform } => run platform.registerShortcut(id, code, modifiers)
+      HostPlatform.Proxied { proxy } => run proxy.registerShortcut(id, code, modifiers)
+    }
+  }
+
+  fn unregisterShortcut(self: &mut Self, id: u32) -> () {
+    return match &mut self.* {
+      HostPlatform.Direct { platform } => platform.unregisterShortcut(id)
+      HostPlatform.Headless { platform } => platform.unregisterShortcut(id)
+      HostPlatform.Proxied { proxy } => proxy.unregisterShortcut(id)
+    }
+  }
+
+  effect fn notify(self: &mut Self, notification: &Notification<'_>) -> u32
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return match &mut self.* {
+      HostPlatform.Direct { platform } => run platform.notify(notification)
+      HostPlatform.Headless { platform } => run platform.notify(notification)
+      HostPlatform.Proxied { proxy } => run proxy.notify(notification)
+    }
+  }
+
+  effect fn setBadge(self: &mut Self, text: string) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return match &mut self.* {
+      HostPlatform.Direct { platform } => run platform.setBadge(text)
+      HostPlatform.Headless { platform } => run platform.setBadge(text)
+      HostPlatform.Proxied { proxy } => run proxy.setBadge(text)
+    }
+  }
+
+  effect fn setProgress(self: &mut Self, fraction: f64) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return match &mut self.* {
+      HostPlatform.Direct { platform } => run platform.setProgress(fraction)
+      HostPlatform.Headless { platform } => run platform.setProgress(fraction)
+      HostPlatform.Proxied { proxy } => run proxy.setProgress(fraction)
+    }
+  }
+
+  effect fn openUrl(self: &mut Self, url: string) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return match &mut self.* {
+      HostPlatform.Direct { platform } => run platform.openUrl(url)
+      HostPlatform.Headless { platform } => run platform.openUrl(url)
+      HostPlatform.Proxied { proxy } => run proxy.openUrl(url)
+    }
+  }
+
+  effect fn revealPath(self: &mut Self, path: string) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return match &mut self.* {
+      HostPlatform.Direct { platform } => run platform.revealPath(path)
+      HostPlatform.Headless { platform } => run platform.revealPath(path)
+      HostPlatform.Proxied { proxy } => run proxy.revealPath(path)
+    }
+  }
+
+  effect fn startFileDrag(self: &mut Self, window: WindowId, paths: &[String]) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return match &mut self.* {
+      HostPlatform.Direct { platform } => run platform.startFileDrag(window, paths)
+      HostPlatform.Headless { platform } => run platform.startFileDrag(window, paths)
+      HostPlatform.Proxied { proxy } => run proxy.startFileDrag(window, paths)
+    }
+  }
+}
+
+/// The accessibility side of the link, held by the window host's `HostState`.
+pub struct AccessLink {
+  link: Arc<Mutex<Link>>,
+  waker: Waker,
+}
+
+impl AccessLink {
+  /// Sends `update` for `window`'s accessibility tree to the platform thread. Its values must
+  /// use the system allocator.
+  pub effect fn publish(self: &Self, window: WindowId, update: TreeUpdate) -> ()
+    ! OutOfMemoryError {
+    let mut heap = Allocator.systemAllocatorProvider()
+    let mut guard = self.link.get().lock()
+    run guard.getMut().commands.append(
+      Command.Accessibility { window: window, update: move update },
+    )
+      |> Effect.provideMut<Allocator>(&mut heap)
+    drop guard
+    self.waker.wake()
+  }
+
+  /// Whether assistive technology asked for `window`'s elements.
+  pub fn wanted(self: &Self, window: WindowId) -> bool {
+    let guard = self.link.get().lock()
+    let windows = guard.get().accessWanted.asSlice()
+    let mut i: usize = 0
+    while i < windows.length {
+      if windows[i] == window.value {
+        return true
+      }
+      i = i + 1
+    }
+    return false
+  }
+
+  /// The actions the OS asked for on `window` since the last call.
+  pub effect fn take(self: &Self, window: WindowId) -> List<ActionRequest>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut taken = List<ActionRequest>.make()
+    let mut guard = self.link.get().lock()
+    let actions = &mut guard.getMut().actions
+    let mut i: usize = 0
+    while i < actions.length() {
+      if actions.asSlice()[i].window == window.value {
+        let action = actions.remove(i)
+        run taken.append(move action.request)
+      } else {
+        i = i + 1
+      }
+    }
+    return move taken
+  }
+}

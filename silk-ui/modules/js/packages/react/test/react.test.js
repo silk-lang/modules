@@ -1,0 +1,193 @@
+import assert from "node:assert/strict";
+import { test } from "node:test";
+import { installMock } from "../../core/test/mock.js";
+
+const mock = installMock();
+const { createElement: h, useState } = await import("react");
+const { createRoot, flushSync, VirtualList } = await import("../src/index.js");
+const { createBox } = await import("@silkui/core");
+
+function find(calls, name, predicate = () => true) {
+  return calls.filter((call) => call[0] === name && predicate(call));
+}
+
+test("virtual rows follow the tree request including disjoint accessibility pins", () => {
+  const container = createBox();
+  const rendered = [];
+  createRoot(container).render(h(VirtualList, {
+    items: Array.from({ length: 100 }, (_, i) => i), itemKey: i => i, rowHeight: 32
+  }, i => { rendered.push(i); return String(i); }));
+  const port = container.firstChild;
+  assert.deepEqual(rendered, []);
+  mock.native.virtualRequest(port.nodeId, 1, 75, 76);
+  assert.deepEqual(rendered, [1, 75, 76]);
+  const pinned = port.firstChild;
+  mock.native.virtualRequest(port.nodeId, 1, 88);
+  assert.equal(port.firstChild, pinned);
+  assert.deepEqual(find(mock.calls, "virtualItems").at(-1),
+    ["virtualItems", port.nodeId, 1, pinned.nodeId, 88, port.lastChild.nodeId]);
+});
+
+test("a component renders nodes, styles, attributes and text", () => {
+  const container = createBox();
+  mock.take();
+  createRoot(container).render(
+    h("box", { style: { width: 100 }, hoverStyle: { color: "red" }, testId: "greeting", tabIndex: 0 }, "Hello ", "world"),
+  );
+  const calls = mock.take();
+  const box = find(calls, "create", (call) => call[2] === 0)[0][1];
+  assert.deepEqual(find(calls, "style"), [["style", box, "width:100px;", 0], ["style", box, "color:red;", 1]]);
+  assert.deepEqual(find(calls, "attribute"), [["attribute", box, "testId", "greeting"], ["attribute", box, "tabIndex", 0]]);
+  assert.deepEqual(find(calls, "setText").map((call) => call[2]), ["Hello ", "world"]);
+  assert.deepEqual(find(calls, "append").at(-1), ["append", container.nodeId, box]);
+});
+
+test("a click updates state and commits before the dispatch returns", () => {
+  let button;
+  function Counter() {
+    const [clicks, setClicks] = useState(0);
+    return h("box", { ref: (node) => (button = node), onClick: () => setClicks(clicks + 1) }, "Clicked " + clicks);
+  }
+  createRoot(createBox()).render(h(Counter));
+  const label = button.firstChild;
+  assert.equal(label.data, "Clicked 0");
+  mock.click(label.nodeId);
+  assert.equal(label.data, "Clicked 1");
+  mock.click(label.nodeId);
+  assert.equal(label.data, "Clicked 2");
+});
+
+test("a retained box dispatches only the latest handlers for each phase", () => {
+  const container = createBox();
+  const root = createRoot(container);
+  const events = [];
+  root.render(h("box", { className: "target", onClick: () => events.push("first") }, "label"));
+  const leaf = container.firstChild.firstChild;
+  mock.click(leaf.nodeId);
+  root.render(h("box", { onClickCapture: () => events.push("capture"), onClick: () => events.push("second") }, "label"));
+  mock.click(leaf.nodeId);
+  root.render(h("box", {}, "label"));
+  mock.click(leaf.nodeId);
+  assert.deepEqual(events, ["first", "capture", "second"]);
+  root.unmount();
+});
+
+test("props that change update the node, and props that go away are reset", () => {
+  const root = createRoot(createBox());
+  root.render(h("box", { style: { width: 1, height: 2 }, label: "one", onClick() {} }));
+  mock.take();
+  root.render(h("box", { style: { width: 3 } }));
+  const calls = mock.take();
+  const id = calls[0][1];
+  assert.deepEqual(calls, [["clearStyle", id, 0], ["style", id, "width:3px;", 0], ["attribute", id, "label", ""]]);
+});
+
+test("removed elements are destroyed", () => {
+  const container = createBox();
+  const root = createRoot(container);
+  root.render(h("box", null, h("box", { key: "a" }), h("box", { key: "b" })));
+  const [a] = container.firstChild.childNodes;
+  mock.take();
+  root.render(h("box", null, h("box", { key: "b" })));
+  assert.deepEqual(mock.take(), [["destroy", a.nodeId]]);
+  root.unmount();
+  assert.equal(container.childNodes.length, 0);
+});
+
+test("a controlled input keeps the value the component gives it", () => {
+  let input;
+  function Field() {
+    const [value, setValue] = useState("");
+    return h("input", { ref: (node) => (input = node), value, onInput: (event) => setValue(event.value.toUpperCase().slice(0, 3)) });
+  }
+  createRoot(createBox()).render(h(Field));
+  mock.input(input.nodeId, "ab");
+  assert.equal(input.value, "AB");
+  assert.equal(mock.textOf(input.nodeId), "AB");
+  mock.input(input.nodeId, "ABcd");
+  assert.equal(input.value, "ABC");
+});
+
+test("flushSync commits a state change made outside an event", () => {
+  let set;
+  let label;
+  function App() {
+    const [text, setText] = useState("a");
+    set = setText;
+    return h("box", { ref: (node) => (label = node?.firstChild) }, text);
+  }
+  createRoot(createBox()).render(h(App));
+  flushSync(() => set("b"));
+  assert.equal(label.data, "b");
+});
+
+test("a rich input defines its marks and atoms and keeps the document it is given", () => {
+  let input;
+  const bold = { fontWeight: 700 };
+  const chip = { paddingLeft: 4 };
+  function Composer() {
+    const [document, setDocument] = useState({ text: "hi", marks: [{ start: 0, end: 2, marks: ["bold"] }], atoms: [] });
+    return h("richinput", {
+      ref: (node) => (input = node),
+      marks: { bold },
+      atoms: { mention: chip },
+      document,
+      // Only the first three characters are accepted.
+      onInput: (event) => setDocument(event.document.text.length > 3 ? document : event.document),
+    });
+  }
+  mock.take();
+  createRoot(createBox()).render(h(Composer));
+  const calls = mock.take();
+  assert.equal(find(calls, "mark").length, 1);
+  assert.equal(find(calls, "atomStyle").length, 1);
+  assert.deepEqual(find(calls, "richText")[0].slice(2), ["hi", "0,2,1;", ""]);
+  globalThis.__ui.dispatch(11, input.nodeId, 3, 3, 0, 1, 0, "hi!", "insertText", "0,3,1;", "");
+  assert.equal(input.document.text, "hi!");
+  assert.equal(find(mock.take(), "richText").length, 0);
+  globalThis.__ui.dispatch(11, input.nodeId, 4, 4, 0, 1, 0, "hi!?", "insertText", "0,4,1;", "");
+  assert.equal(input.document.text, "hi!");
+  assert.deepEqual(input.document.marks, [{ start: 0, end: 3, marks: ["bold"] }]);
+});
+
+test("class, id, data and ARIA props update and disappear on the retained node", () => {
+  const container = createBox();
+  const root = createRoot(container);
+  root.render(h("box", { id: "save", className: "button primary", "data-state": "open", "aria-expanded": false }));
+  const node = container.firstChild;
+  const number = node.nodeId;
+  assert.equal(node.id, "save");
+  assert.equal(node.classList.contains("primary"), true);
+  assert.equal(node.getAttribute("data-state"), "open");
+  assert.equal(node.getAttribute("aria-expanded"), "false");
+  root.render(h("box", { className: "button" }));
+  assert.equal(container.firstChild, node);
+  assert.equal(node.nodeId, number);
+  assert.equal(node.id, "");
+  assert.equal(node.className, "button");
+  assert.equal(node.getAttribute("data-state"), null);
+  assert.equal(node.getAttribute("aria-expanded"), null);
+  root.unmount();
+});
+
+test("inline svg markup renders as one icon, and an image takes a data: URL", () => {
+  const root = createRoot(createBox());
+  const Check = ({ color }) =>
+    h("svg", { width: 24, height: 24, viewBox: "0 0 24 24", fill: "none", stroke: "currentColor", strokeWidth: 2, strokeLinecap: "round", className: "size-4" },
+      h("path", { d: "M20 6 9 17l-5-5", stroke: color }),
+      h("text", null, "ok"));
+  mock.take();
+  root.render(h("box", null, h(Check, { color: undefined }), h("img", { src: "data:image/png;base64,AAAA", alt: "Dot" })));
+  let calls = mock.take();
+  assert.equal(find(calls, "create", (call) => call[2] === 4).length, 1, "the svg is one icon node, its children no nodes");
+  assert.deepEqual(find(calls, "defineIcon").map((call) => call[2]), [
+    '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M20 6 9 17l-5-5"/><text>ok</text></svg>',
+  ]);
+  assert.ok(find(calls, "attribute", (call) => call[2] === "class" && call[3] === "size-4").length === 1);
+  assert.deepEqual(find(calls, "load").map((call) => call.slice(2)), [["data:image/png;base64,AAAA", false]]);
+  root.render(h("box", null, h(Check, { color: "red" }), h("img", { src: "data:image/png;base64,AAAA", alt: "Dot" })));
+  calls = mock.take();
+  assert.equal(find(calls, "defineIcon").length, 1);
+  assert.ok(find(calls, "defineIcon")[0][2].includes('<path d="M20 6 9 17l-5-5" stroke="red"/>'));
+  assert.equal(find(calls, "create").length, 0, "an svg change creates no node");
+});

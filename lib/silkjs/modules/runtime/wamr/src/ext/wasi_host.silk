@@ -1,0 +1,1244 @@
+//! WASI Preview 1 in Silk, for the runtime's WASI binding (ext/wasi_native): what uvwasi 0.0.23
+//! (with the runtime's descriptor-ownership patch) did, with its semantics, so `node:wasi` links
+//! no libuv (the loop plan, docs/composable-runtime.md). Files go through
+//! `silk.platform.native.file`; the rest is POSIX.
+//!
+//! The descriptor table, rights, the path resolver (paths normalized against a descriptor's mapped
+//! path, sandboxed to it, then rebased onto its host path, following up to 32 symbolic links with
+//! the lookup flag), and each call's checks are uvwasi's, quirks included: times are set in whole
+//! seconds, `fd_fdstat_get` reports the host's open flags, `fd_readdir` reopens the directory by
+//! path, and `poll_oneoff` waits for every polled descriptor or the earliest clock.
+//!
+//! Each call takes and returns the native records uvwasi used, which have the guest's layout: an
+//! fdstat (24 bytes), filestat (64), prestat (8), event (32) and subscription (48). Guest memory
+//! reaches a call as native pointers to its bytes.
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.mem.pointer { Pointer }
+import silk.mem.layout { Layout }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.core.effect { Effect }
+import silk.core.result { Result }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.num.i32
+import silk.num.i64
+import silk.num.isize
+import silk.num.u8
+import silk.num.u16
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+import silk.platform.native.file { Directory, DirectoryEntry, EntryKind, FileStatus, NativeFile, NativeFileError, Timestamp }
+import silk.platform.native.file
+import silk.system.random { Random }
+import silk.system.random_native { OsRandom }
+import silkjs.js_libc_platform as platform
+
+unsafe extern "C" fn calloc(count: usize, size: usize) -> ?*mut u8
+unsafe extern "C" fn free(data: ?*mut u8) -> ()
+unsafe extern "C" fn lseek(fd: i32, offset: i64, whence: i32) -> i64
+unsafe extern "C" fn fcntl(fd: i32, command: i32, ...) -> i32
+unsafe extern "C" fn isatty(fd: i32) -> i32
+@foreign(noCapture: ("value", "length"))
+unsafe extern "C" fn getsockopt(fd: i32, level: i32, option: i32, value: *mut i32, length: *mut u32) -> i32
+@foreign(noCapture: .("vectors"))
+unsafe extern "C" fn readv(fd: i32, vectors: *mut HostIovec, count: i32) -> isize
+@foreign(noCapture: .("vectors"))
+unsafe extern "C" fn writev(fd: i32, vectors: *mut HostIovec, count: i32) -> isize
+@foreign(noCapture: .("vectors"))
+unsafe extern "C" fn preadv(fd: i32, vectors: *mut HostIovec, count: i32, offset: i64) -> isize
+@foreign(noCapture: .("vectors"))
+unsafe extern "C" fn pwritev(fd: i32, vectors: *mut HostIovec, count: i32, offset: i64) -> isize
+unsafe extern "C" fn sched_yield() -> i32
+unsafe extern "C" fn getpid() -> i32
+unsafe extern "C" fn kill(pid: i32, signal: i32) -> i32
+unsafe extern "C" fn exit(status: i32) -> ()
+@foreign(noCapture: .("result"))
+unsafe extern "C" fn clock_getres(clock: i32, result: *mut WasiTimespec) -> i32
+static if Intrinsic.targetOperatingSystem() == "darwin" {
+  @foreign(noCapture: .("result"))
+  unsafe extern "C" fn darwinClock(clock: u32, result: *mut WasiTimespec) -> i32 as "clock_gettime"
+  unsafe fn clockNow(clock: i32, result: *mut WasiTimespec) -> i32 { return unsafe darwinClock(i32.toU32(clock), result) }
+  @foreign(noCapture: .("fds"))
+  unsafe extern "C" fn darwinPoll(fds: *mut WasiPollFd, count: u32, timeout: i32) -> i32 as "poll"
+  unsafe fn pollNow(fds: *mut WasiPollFd, count: usize, timeout: i32) -> i32 { return unsafe darwinPoll(fds, usize.toU32(count), timeout) }
+} else {
+  @foreign(noCapture: .("result"))
+  unsafe extern "C" fn linuxClock(clock: i32, result: *mut WasiTimespec) -> i32 as "clock_gettime"
+  unsafe fn clockNow(clock: i32, result: *mut WasiTimespec) -> i32 { return unsafe linuxClock(clock, result) }
+  @foreign(noCapture: .("fds"))
+  unsafe extern "C" fn linuxPoll(fds: *mut WasiPollFd, count: usize, timeout: i32) -> i32 as "poll"
+  unsafe fn pollNow(fds: *mut WasiPollFd, count: usize, timeout: i32) -> i32 { return unsafe linuxPoll(fds, count, timeout) }
+}
+
+extern "C" struct WasiTimespec { seconds: i64, nanoseconds: i64 }
+impl Copy for WasiTimespec {}
+extern "C" struct WasiPollFd { fd: i32, events: i16, revents: i16 }
+impl Copy for WasiPollFd {}
+extern "C" struct HostIovec { base: ?*mut u8, length: usize }
+/// One guest buffer of a read or write, as uvwasi's iovec: its bytes and their length.
+pub extern "C" struct Iovec { pub data: ?*mut u8, pub length: u32 }
+impl Copy for Iovec {}
+
+// WASI's errno values.
+const ESUCCESS: u16 = 0
+const EBADF: u16 = 8
+const EINVAL: u16 = 28
+const EIO: u16 = 29
+const ELOOP: u16 = 32
+const ENOBUFS: u16 = 42
+const ENOENT: u16 = 44
+const ENOMEM: u16 = 48
+const ENOSYS: u16 = 52
+const ENOTDIR: u16 = 54
+const ENOTSOCK: u16 = 57
+const ENOTSUP: u16 = 58
+const EPERM: u16 = 63
+const ENOTCAPABLE: u16 = 76
+
+// File types.
+const UNKNOWN: u8 = 0
+const BLOCK_DEVICE: u8 = 1
+const CHARACTER_DEVICE: u8 = 2
+const DIRECTORY: u8 = 3
+const REGULAR_FILE: u8 = 4
+const SOCKET_DGRAM: u8 = 5
+const SOCKET_STREAM: u8 = 6
+const SYMBOLIC_LINK: u8 = 7
+
+// Rights.
+const FD_DATASYNC: u64 = 1
+const FD_READ: u64 = 2
+const FD_SEEK: u64 = 4
+const FD_FDSTAT_SET_FLAGS: u64 = 8
+const FD_SYNC: u64 = 16
+const FD_TELL: u64 = 32
+const FD_WRITE: u64 = 64
+const FD_ADVISE: u64 = 128
+const FD_ALLOCATE: u64 = 256
+const PATH_CREATE_DIRECTORY: u64 = 512
+const PATH_CREATE_FILE: u64 = 1024
+const PATH_LINK_SOURCE: u64 = 2048
+const PATH_LINK_TARGET: u64 = 4096
+const PATH_OPEN: u64 = 8192
+const FD_READDIR: u64 = 16384
+const PATH_READLINK: u64 = 32768
+const PATH_RENAME_SOURCE: u64 = 65536
+const PATH_RENAME_TARGET: u64 = 131072
+const PATH_FILESTAT_GET: u64 = 262144
+const PATH_FILESTAT_SET_SIZE: u64 = 524288
+const PATH_FILESTAT_SET_TIMES: u64 = 1048576
+const FD_FILESTAT_GET: u64 = 2097152
+const FD_FILESTAT_SET_SIZE: u64 = 4194304
+const FD_FILESTAT_SET_TIMES: u64 = 8388608
+const PATH_SYMLINK: u64 = 16777216
+const PATH_REMOVE_DIRECTORY: u64 = 33554432
+const PATH_UNLINK_FILE: u64 = 67108864
+const POLL_FD_READWRITE: u64 = 134217728
+const SOCK_SHUTDOWN: u64 = 268435456
+const SOCK_ACCEPT: u64 = 536870912
+
+const NANOS: u64 = 1000000000
+
+fn directoryBase() -> u64 {
+  return FD_FDSTAT_SET_FLAGS | FD_SYNC | FD_ADVISE | PATH_CREATE_DIRECTORY | PATH_CREATE_FILE | PATH_LINK_SOURCE | PATH_LINK_TARGET
+    | PATH_OPEN | FD_READDIR | PATH_READLINK | PATH_RENAME_SOURCE | PATH_RENAME_TARGET | PATH_FILESTAT_GET | PATH_FILESTAT_SET_SIZE
+    | PATH_FILESTAT_SET_TIMES | FD_FILESTAT_GET | FD_FILESTAT_SET_TIMES | PATH_SYMLINK | PATH_UNLINK_FILE | PATH_REMOVE_DIRECTORY | POLL_FD_READWRITE
+}
+fn regularFileBase() -> u64 {
+  return FD_DATASYNC | FD_READ | FD_SEEK | FD_FDSTAT_SET_FLAGS | FD_SYNC | FD_TELL | FD_WRITE | FD_ADVISE | FD_ALLOCATE
+    | FD_FILESTAT_GET | FD_FILESTAT_SET_SIZE | FD_FILESTAT_SET_TIMES | POLL_FD_READWRITE
+}
+fn socketBase() -> u64 { return FD_READ | FD_FDSTAT_SET_FLAGS | FD_WRITE | FD_FILESTAT_GET | POLL_FD_READWRITE | SOCK_SHUTDOWN | SOCK_ACCEPT }
+fn ttyBase() -> u64 { return FD_READ | FD_FDSTAT_SET_FLAGS | FD_WRITE | FD_FILESTAT_GET | POLL_FD_READWRITE }
+fn allRights() -> u64 {
+  return FD_DATASYNC | FD_READ | FD_SEEK | FD_FDSTAT_SET_FLAGS | FD_SYNC | FD_TELL | FD_WRITE | FD_ADVISE | FD_ALLOCATE
+    | PATH_CREATE_DIRECTORY | PATH_CREATE_FILE | PATH_LINK_SOURCE | PATH_LINK_TARGET | PATH_OPEN | FD_READDIR | PATH_READLINK
+    | PATH_RENAME_SOURCE | PATH_RENAME_TARGET | PATH_FILESTAT_GET | PATH_FILESTAT_SET_SIZE | PATH_FILESTAT_SET_TIMES | FD_FILESTAT_GET
+    | FD_FILESTAT_SET_TIMES | FD_FILESTAT_SET_SIZE | PATH_SYMLINK | PATH_UNLINK_FILE | PATH_REMOVE_DIRECTORY | POLL_FD_READWRITE
+    | SOCK_SHUTDOWN | SOCK_ACCEPT
+}
+
+// A descriptor of the guest: its host descriptor, its mapped path (what the guest calls it), its
+// host path, and the mapped path normalized, which paths relative to it resolve against.
+struct Entry {
+  used: bool, fd: i32, path: List<u8>, real: List<u8>, normalized: List<u8>,
+  kind: u8, base: u64, inheriting: u64, preopen: bool, owned: bool,
+}
+
+/// One WASI instance: its arguments and environment, NUL-separated as the guest reads them, and
+/// its descriptor table.
+pub struct Wasi { argv: List<u8>, argc: u32, env: List<u8>, envc: u32, fds: List<Entry> }
+
+unsafe fn nn<T>(p: ?*mut T) -> *mut T { return unsafe Intrinsic.pointerRequalify<?*mut T, *mut T>(p) }
+unsafe fn byteAt(p: *mut u8, index: usize) -> *mut u8 { return unsafe Pointer.atMut<u8>(unsafe Pointer.assumeManyMut<u8>(p), index) }
+unsafe fn putByte(p: ?*mut u8, index: usize, value: u8) -> () { unsafe Pointer.put<u8>(unsafe byteAt(unsafe nn(p), index), value) }
+unsafe fn getByte(p: ?*mut u8, index: usize) -> u8 { return unsafe Pointer.read<u8>(unsafe byteAt(unsafe nn(p), index)) }
+// Little-endian scalar stores and loads at a byte offset, the guest's order.
+unsafe fn store(p: ?*mut u8, offset: usize, value: u64, size: usize) -> () {
+  let mut v = value let mut i: usize = 0
+  while i < size { unsafe putByte(p, offset + i, u64.wrappingToU8(v)) v = v / 256 i = i + 1 }
+}
+unsafe fn load(p: ?*mut u8, offset: usize, size: usize) -> u64 {
+  let mut v: u64 = 0 let mut i: usize = size
+  while i > 0 { i = i - 1 v = v * 256 + u8.toU64(unsafe getByte(p, offset + i)) }
+  return v
+}
+unsafe fn putU32(p: *mut u32, value: u32) -> () { unsafe Pointer.put<u32>(p, value) }
+unsafe fn putU64(p: *mut u64, value: u64) -> () { unsafe Pointer.put<u64>(p, value) }
+// The bytes of a guest path, up to its first NUL.
+unsafe fn bytesOf<'a>(anchor: &'a (), p: ?*mut u8, length: u32) -> &'a [u8] {
+  if length == 0 || Pointer.isNull<u8>(p) { return b"" }
+  let all = unsafe Pointer.borrowMany<(), u8>(anchor, unsafe Pointer.assumeMany<u8>(unsafe nn(p)), u32.toUsize(length))
+  return all
+}
+
+/// WASI's errno for a host errno, as uvwasi's uv error translation; ENOSYS for the others.
+pub fn fromErrno(code: i32) -> u16 {
+  static if Intrinsic.targetOperatingSystem() == "darwin" {
+    let table: [i32; 58] = [7, 13, 48, 49, 47, 35, 37, 9, 16, 89, 53, 61, 54, 39, 17, 14, 27, 65, 4, 22, 5, 56, 21, 62, 24, 31, 40, 63, 50, 51, 23, 55, 19, 2, 12, 42, 28, 78, 57, 20, 66, 38, 45, 6, 1, 32, 100, 43, 41, 34, 30, 29, 3, 60, 26, 18, 102, 0]
+    return mapped(code, &table)
+  } else {
+    let table: [i32; 58] = [7, 13, 98, 99, 97, 11, 114, 9, 16, 125, 103, 111, 104, 89, 17, 14, 27, 113, 4, 22, 5, 106, 21, 40, 24, 31, 90, 36, 100, 101, 23, 105, 19, 2, 12, 92, 28, 38, 107, 20, 39, 88, 95, 6, 1, 32, 71, 93, 91, 34, 30, 29, 3, 110, 26, 18, 0, 0]
+    return mapped(code, &table)
+  }
+}
+// The WASI errno at each index of the errno tables above.
+fn mapped(code: i32, table: &[i32; 58]) -> u16 {
+  let wasi: [u16; 56] = [1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 13, 14, 15, 17, 20, 21, 22, 23, 27, 28, 29, 30, 31, 32, 33, 34, 35, 37, 38, 40, 41, 42, 43, 44, 48, 50, 51, 52, 53, 54, 55, 57, 58, 60, 63, 64, 65, 66, 67, 68, 69, 70, 71, 73, 74, 75]
+  if code == 0 { return ESUCCESS }
+  let mut i: usize = 0
+  while i < 56 { if table[i] == code { return wasi[i] } i = i + 1 }
+  // EOPNOTSUPP is ENOTSUP's number on Linux; Darwin has EOPNOTSUPP 102 apart.
+  if table[56] != 0 && code == table[56] { return ENOTSUP }
+  return ENOSYS
+}
+fn failed(error: NativeFileError) -> u16 { return fromErrno(error.code) }
+fn lastError() -> u16 { return fromErrno(unsafe platform.errno()) }
+
+/// uvwasi's name for an errno, as `uvwasi_embedder_err_code_to_string` gives it.
+pub fn errorName(code: u16) -> &'static [u8] {
+  let names: [&'static [u8]; 77] = [b"UVWASI_ESUCCESS", b"UVWASI_E2BIG", b"UVWASI_EACCES", b"UVWASI_EADDRINUSE", b"UVWASI_EADDRNOTAVAIL", b"UVWASI_EAFNOSUPPORT", b"UVWASI_EAGAIN", b"UVWASI_EALREADY", b"UVWASI_EBADF", b"UVWASI_EBADMSG", b"UVWASI_EBUSY", b"UVWASI_ECANCELED", b"UVWASI_ECHILD", b"UVWASI_ECONNABORTED", b"UVWASI_ECONNREFUSED", b"UVWASI_ECONNRESET", b"UVWASI_EDEADLK", b"UVWASI_EDESTADDRREQ", b"UVWASI_EDOM", b"UVWASI_EDQUOT", b"UVWASI_EEXIST", b"UVWASI_EFAULT", b"UVWASI_EFBIG", b"UVWASI_EHOSTUNREACH", b"UVWASI_EIDRM", b"UVWASI_EILSEQ", b"UVWASI_EINPROGRESS", b"UVWASI_EINTR", b"UVWASI_EINVAL", b"UVWASI_EIO", b"UVWASI_EISCONN", b"UVWASI_EISDIR", b"UVWASI_ELOOP", b"UVWASI_EMFILE", b"UVWASI_EMLINK", b"UVWASI_EMSGSIZE", b"UVWASI_EMULTIHOP", b"UVWASI_ENAMETOOLONG", b"UVWASI_ENETDOWN", b"UVWASI_ENETRESET", b"UVWASI_ENETUNREACH", b"UVWASI_ENFILE", b"UVWASI_ENOBUFS", b"UVWASI_ENODEV", b"UVWASI_ENOENT", b"UVWASI_ENOEXEC", b"UVWASI_ENOLCK", b"UVWASI_ENOLINK", b"UVWASI_ENOMEM", b"UVWASI_ENOMSG", b"UVWASI_ENOPROTOOPT", b"UVWASI_ENOSPC", b"UVWASI_ENOSYS", b"UVWASI_ENOTCONN", b"UVWASI_ENOTDIR", b"UVWASI_ENOTEMPTY", b"UVWASI_ENOTRECOVERABLE", b"UVWASI_ENOTSOCK", b"UVWASI_ENOTSUP", b"UVWASI_ENOTTY", b"UVWASI_ENXIO", b"UVWASI_EOVERFLOW", b"UVWASI_EOWNERDEAD", b"UVWASI_EPERM", b"UVWASI_EPIPE", b"UVWASI_EPROTO", b"UVWASI_EPROTONOSUPPORT", b"UVWASI_EPROTOTYPE", b"UVWASI_ERANGE", b"UVWASI_EROFS", b"UVWASI_ESPIPE", b"UVWASI_ESRCH", b"UVWASI_ESTALE", b"UVWASI_ETIMEDOUT", b"UVWASI_ETXTBSY", b"UVWASI_EXDEV", b"UVWASI_ENOTCAPABLE"]
+  if u16.toUsize(code) >= 77 { return b"UVWASI_UNKNOWN_ERROR" }
+  return names[u16.toUsize(code)]
+}
+
+// ---- File types, rights and statuses ----
+
+fn typeOfMode(mode: u32) -> u8 {
+  let format = mode & 61440
+  if format == 32768 { return REGULAR_FILE }
+  if format == 16384 { return DIRECTORY }
+  if format == 8192 { return CHARACTER_DEVICE }
+  if format == 40960 { return SYMBOLIC_LINK }
+  if format == 49152 { return SOCKET_STREAM }
+  if format == 4096 { return SOCKET_STREAM }
+  if format == 24576 { return BLOCK_DEVICE }
+  return UNKNOWN
+}
+fn socketLevel() -> i32 { static if Intrinsic.targetOperatingSystem() == "darwin" { return 65535 } return 1 }
+fn socketTypeOption() -> i32 { static if Intrinsic.targetOperatingSystem() == "darwin" { return 4104 } return 3 }
+// uvwasi__get_filetype_by_fd: a socket whose type is SOCK_DGRAM is a datagram socket.
+fn typeOfDescriptor(fd: i32, kind: &mut u8) -> u16 {
+  let stat = run Effect.result(NativeFile.statusOf(fd))
+  let status = match move stat { Result<FileStatus, NativeFileError>.Success { value } => value Result<FileStatus, NativeFileError>.Failure { error } => { kind.* = UNKNOWN return failed(move error) } }
+  kind.* = typeOfMode(status.mode)
+  if kind.* == SOCKET_STREAM && (status.mode & 61440) == 49152 {
+    let mut value: i32 = 0 let mut length: u32 = 4
+    if unsafe getsockopt(fd, socketLevel(), socketTypeOption(), Pointer.fromMutRef<i32>(&mut value), Pointer.fromMutRef<u32>(&mut length)) == 0 && value == 2 { kind.* = SOCKET_DGRAM }
+  }
+  return ESUCCESS
+}
+// uvwasi__get_rights: the type's rights, less reading or writing for an open of one direction.
+fn rightsOf(fd: i32, flags: i32, kind: u8, base: &mut u64, inheriting: &mut u64) -> u16 {
+  if kind == UNKNOWN { return EINVAL }
+  if kind == REGULAR_FILE { base.* = regularFileBase() inheriting.* = 0 }
+  else if kind == DIRECTORY { base.* = directoryBase() inheriting.* = directoryBase() | regularFileBase() }
+  else if kind == SOCKET_STREAM || kind == SOCKET_DGRAM { base.* = socketBase() inheriting.* = allRights() }
+  else if kind == CHARACTER_DEVICE {
+    if unsafe isatty(fd) == 1 { base.* = ttyBase() inheriting.* = 0 } else { base.* = allRights() inheriting.* = allRights() }
+  } else if kind == BLOCK_DEVICE { base.* = allRights() inheriting.* = allRights() }
+  else { base.* = 0 inheriting.* = 0 }
+  let access = flags & 3
+  if access == file.OPEN_READ_ONLY { base.* = base.* - (base.* & FD_WRITE) }
+  else if access == file.OPEN_WRITE_ONLY { base.* = base.* - (base.* & FD_READ) }
+  return ESUCCESS
+}
+fn timestamp(time: Timestamp) -> u64 { return i64.wrappingToU64(time.seconds) * NANOS + u32.toU64(time.nanoseconds) }
+// uvwasi__stat_to_filestat into a native filestat record.
+unsafe fn writeFilestat(record: ?*mut u8, status: &FileStatus) -> () {
+  let mut i: usize = 0 while i < 64 { unsafe putByte(record, i, 0) i = i + 1 }
+  unsafe store(record, 0, status.device, 8)
+  unsafe store(record, 8, status.inode, 8)
+  unsafe store(record, 16, u8.toU64(typeOfMode(status.mode)), 1)
+  unsafe store(record, 24, status.links, 8)
+  unsafe store(record, 32, status.size, 8)
+  unsafe store(record, 40, timestamp(status.accessed), 8)
+  unsafe store(record, 48, timestamp(status.modified), 8)
+  unsafe store(record, 56, timestamp(status.changed), 8)
+}
+
+// ---- Instances and the descriptor table ----
+
+effect fn copyText(text: &[u8]) -> List<u8> ! OutOfMemoryError ? &mut Allocator {
+  let mut copy = List<u8>.make()
+  run copy.appendSlice(text)
+  return move copy
+}
+// uvwasi_fd_table_insert: the first free slot, or a new one at the end.
+effect fn insert(w: &mut Wasi, fd: i32, mapped: &[u8], real: &[u8], kind: u8, base: u64, inheriting: u64, preopen: bool) -> u32 ! OutOfMemoryError ? &mut Allocator {
+  let mut normalized = List<u8>.make()
+  run normalize(mapped, &mut normalized)
+  let entry = Entry { used: true, fd: fd, path: run copyText(mapped), real: run copyText(real), normalized: move normalized, kind: kind, base: base, inheriting: inheriting, preopen: preopen, owned: true }
+  let mut free = w.fds.length()
+  let mut index: usize = 0
+  while index < w.fds.length() { if !w.fds.asSlice()[index].used { free = index break } index = index + 1 }
+  if free == w.fds.length() { run w.fds.append(move entry) }
+  else { let slots = w.fds.asMutSlice() slots[free] = move entry }
+  return usize.toU32(free)
+}
+// uvwasi_fd_table_get: the slot of `id`, when it has every right asked for.
+fn lookup(w: &Wasi, id: u32, base: u64, inheriting: u64, slot: &mut usize) -> u16 {
+  let index = u32.toUsize(id)
+  if index >= w.fds.length() { return EBADF }
+  let slots = w.fds.asSlice()
+  let value = &slots[index]
+  if !value.used { return EBADF }
+  if (value.base & base) != base || (value.inheriting & inheriting) != inheriting { return ENOTCAPABLE }
+  slot.* = index
+  return ESUCCESS
+}
+fn entryAt<'a>(w: &'a Wasi, index: usize) -> &'a Entry {
+  let slots = w.fds.asSlice()
+  return &slots[index]
+}
+fn entryAtMut<'a>(w: &'a mut Wasi, index: usize) -> &'a mut Entry {
+  let slots = w.fds.asMutSlice()
+  return &mut slots[index]
+}
+fn emptyEntry() -> Entry {
+  return Entry { used: false, fd: -1, path: List<u8>.make(), real: List<u8>.make(), normalized: List<u8>.make(), kind: 0, base: 0, inheriting: 0, preopen: false, owned: false }
+}
+
+/// One preopened directory: the path the guest sees and the host path it is.
+pub struct Preopen { pub mapped: List<u8>, pub real: List<u8> }
+
+/// uvwasi_init: `input`, `output` and `error` become descriptors 0 to 2 (borrowed: the instance
+/// does not close them at dispose), then each preopen, by its real path. Returns the instance, or
+/// null with the errno in `status`.
+pub effect fn make(arguments: &List<List<u8>>, environment: &List<List<u8>>, preopens: &List<Preopen>, input: i32, output: i32, errors: i32, status: &mut u16) -> ?*mut Wasi ! OutOfMemoryError ? &mut Allocator {
+  let mut w = Wasi { argv: List<u8>.make(), argc: usize.toU32(arguments.length()), env: List<u8>.make(), envc: usize.toU32(environment.length()), fds: List<Entry>.make() }
+  let args = arguments.asSlice() let mut i: usize = 0
+  while i < args.length { run w.argv.appendSlice(args[i].asSlice()) run w.argv.append(0) i = i + 1 }
+  let envs = environment.asSlice() i = 0
+  while i < envs.length { run w.env.appendSlice(envs[i].asSlice()) run w.env.append(0) i = i + 1 }
+  status.* = ESUCCESS
+  let stdio: [i32; 3] = [input, output, errors]
+  let names: [&'static [u8]; 3] = [b"<stdin>", b"<stdout>", b"<stderr>"]
+  i = 0
+  while i < 3 {
+    let mut kind: u8 = UNKNOWN let mut base: u64 = 0 let mut inheriting: u64 = 0
+    let typed = typeOfDescriptor(stdio[i], &mut kind)
+    if typed != ESUCCESS { status.* = typed unsafe teardown(&mut w) return Pointer.null<Wasi>() }
+    let ruled = rightsOf(stdio[i], file.OPEN_READ_WRITE, kind, &mut base, &mut inheriting)
+    if ruled != ESUCCESS { status.* = ruled unsafe teardown(&mut w) return Pointer.null<Wasi>() }
+    let id = run insert(&mut w, stdio[i], names[i], names[i], kind, base, inheriting, false)
+    let borrowed = entryAtMut(&mut w, u32.toUsize(id)) borrowed.owned = false
+    if u32.toUsize(id) != i { status.* = EBADF unsafe teardown(&mut w) return Pointer.null<Wasi>() }
+    i = i + 1
+  }
+  let opens = preopens.asSlice() i = 0
+  while i < opens.length {
+    let mut real: [u8; 4096] = [0; 4096]
+    let resolved = run Effect.result(NativeFile.realPath(opens[i].real.asSlice(), &mut real))
+    let length = match move resolved { Result<usize, NativeFileError>.Success { value } => value Result<usize, NativeFileError>.Failure { error } => { status.* = failed(move error) unsafe teardown(&mut w) return Pointer.null<Wasi>() } }
+    let realPath = Slice.view<u8>(&real, 0, length)
+    let opened = run Effect.result(NativeFile.open(realPath, file.OPEN_READ_ONLY | file.OPEN_CLOSE_ON_EXEC, 438))
+    let fd = match move opened { Result<i32, NativeFileError>.Success { value } => value Result<i32, NativeFileError>.Failure { error } => { status.* = failed(move error) unsafe teardown(&mut w) return Pointer.null<Wasi>() } }
+    let mut kind: u8 = UNKNOWN
+    let mut code = typeOfDescriptor(fd, &mut kind)
+    if code == ESUCCESS && kind != DIRECTORY { code = ENOTDIR }
+    if code != ESUCCESS { let _closed = run Effect.result(NativeFile.close(fd)) status.* = code unsafe teardown(&mut w) return Pointer.null<Wasi>() }
+    let _id = run insert(&mut w, fd, opens[i].mapped.asSlice(), realPath, DIRECTORY, directoryBase(), directoryBase() | regularFileBase(), true)
+    i = i + 1
+  }
+  let memory = unsafe calloc(1, Layout.of<Wasi>().bytes)
+  if Pointer.isNull<u8>(memory) { unsafe teardown(&mut w) fail OutOfMemoryError {} }
+  let pointer = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut Wasi>(unsafe nn(memory))
+  unsafe Pointer.put<Wasi>(pointer, move w)
+  return pointer
+}
+// uvwasi_destroy's closing of owned descriptors.
+unsafe fn teardown(w: &mut Wasi) -> () {
+  let mut i: usize = 0
+  while i < w.fds.length() {
+    let entry = entryAt(&w, i)
+    if entry.used && entry.owned { let _closed = run Effect.result(NativeFile.close(entry.fd)) }
+    let slots = w.fds.asMutSlice() slots[i] = emptyEntry()
+    i = i + 1
+  }
+}
+/// uvwasi_destroy: closes the descriptors the instance owns, and frees it.
+pub unsafe fn destroy(pointer: *mut Wasi) -> () {
+  let mut owned = unsafe Pointer.take<Wasi>(pointer)
+  unsafe teardown(&mut owned)
+  drop owned
+  unsafe free(unsafe Intrinsic.pointerReinterpret<*mut Wasi, *mut u8>(pointer))
+}
+unsafe fn instance<'a>(anchor: &'a mut (), pointer: *mut Wasi) -> &'a mut Wasi { return unsafe Pointer.borrowMut<(), Wasi>(&mut anchor, pointer) }
+
+// ---- Paths ----
+
+// uvwasi__normalize_path, over the text up to the first NUL.
+effect fn normalize(input: &[u8], out: &mut List<u8>) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut end: usize = 0
+  while end < input.length && input[end] != 0 { end = end + 1 }
+  let path = Slice.view<u8>(input, 0, end)
+  let trailing = path.length > 0 && path[path.length - 1] == 47
+  let absolute = path.length > 0 && path[0] == 47
+  out.truncate(0)
+  let mut start: usize = 0
+  while true {
+    let mut stop = start
+    while stop < path.length && path[stop] != 47 { stop = stop + 1 }
+    let more = stop < path.length
+    let length = stop - start
+    if length == 0 {
+      if out.length() == 0 && more && absolute { run out.append(47) }
+    } else if length == 1 && path[start] == 46 {
+    } else if length == 2 && path[start] == 46 && path[start + 1] == 46 {
+      let current = out.length()
+      let text = out.asSlice()
+      let mut last = current
+      while true { if last < current && text[last] == 47 { break } if last == 0 { break } last = last - 1 }
+      let dots = current == 0 || (last + 2 == current && text[last] == 46 && text[last + 1] == 46)
+        || (last + 3 == current && text[last] == 47 && text[last + 1] == 46 && text[last + 2] == 46)
+      if dots {
+        if current != 0 && text[current - 1] != 47 { run out.append(47) }
+        run out.append(46) run out.append(46)
+      } else if last == 0 && current > 0 && text[0] == 47 { out.truncate(1) }
+      else { out.truncate(last) }
+    } else {
+      let current = out.length()
+      if current != 0 && out.asSlice()[current - 1] != 47 { run out.append(47) }
+      run out.appendSlice(Slice.view<u8>(path, start, length))
+    }
+    if !more { break }
+    start = stop + 1
+  }
+  if out.length() == 0 { run out.append(if absolute { 47 } else { 46 }) }
+  if trailing && out.asSlice()[out.length() - 1] != 47 { run out.append(47) }
+}
+fn startsWith(text: &[u8], prefix: &[u8]) -> bool {
+  if prefix.length > text.length { return false }
+  let mut i: usize = 0 while i < prefix.length { if text[i] != prefix[i] { return false } i = i + 1 }
+  return true
+}
+fn isDotDot(text: &[u8], length: usize) -> bool {
+  return (length == 2 && text.length >= 2 && text[0] == 46 && text[1] == 46) || (length > 2 && text.length > 2 && text[0] == 46 && text[1] == 46 && text[2] == 47)
+}
+// uvwasi__is_path_sandboxed: `path` (of length `length`, uvwasi's count) stays under `base`.
+fn sandboxed(path: &[u8], length: usize, base: &[u8]) -> bool {
+  if base.length > 0 && base[0] == 47 { return startsWith(path, base) }
+  if (base.length == 1 && base[0] == 46) || (base.length == 2 && base[0] == 46 && base[1] == 47) { return !isDotDot(path, length) }
+  if !startsWith(path, base) { return false }
+  if length < base.length + 2 { return true }
+  let mut rest = Slice.view<u8>(path, base.length, path.length - base.length)
+  let mut remaining = length - base.length
+  if rest.length > 0 && rest[0] == 47 { rest = Slice.view<u8>(rest, 1, rest.length - 1) remaining = remaining - 1 }
+  return !isDotDot(rest, remaining)
+}
+fn isDot(text: &[u8]) -> bool { return (text.length == 1 && text[0] == 46) || (text.length == 2 && text[0] == 46 && text[1] == 47) }
+// uvwasi__resolve_path: the host path of `path` under the descriptor `entry`, following symbolic
+// links with `follow`.
+effect fn resolve(entry: &Entry, path: &[u8], follow: bool, host: &mut List<u8>) -> u16 ! OutOfMemoryError ? &mut Allocator {
+  if path.length > 0 && path[0] == 47 { return ENOTCAPABLE }
+  let mut input = run copyText(path)
+  let mut follows: usize = 0
+  while true {
+    let text = input.asSlice()
+    // A NUL before the last byte, or an empty path.
+    if text.length == 0 { return EINVAL }
+    let mut i: usize = 0 while i + 1 < text.length { if text[i] == 0 { return EINVAL } i = i + 1 }
+    let mut normalized = List<u8>.make()
+    let base = entry.normalized.asSlice()
+    if text[0] == 47 {
+      run normalize(text, &mut normalized)
+      if !sandboxed(normalized.asSlice(), text.length, base) { return ENOTCAPABLE }
+    } else {
+      let mut combined = List<u8>.make()
+      run combined.appendSlice(base) run combined.append(47)
+      let mut end: usize = 0 while end < text.length && text[end] != 0 { end = end + 1 }
+      run combined.appendSlice(Slice.view<u8>(text, 0, end))
+      run normalize(combined.asSlice(), &mut normalized)
+      if !sandboxed(normalized.asSlice(), normalized.length(), base) { return ENOTCAPABLE }
+    }
+    // uvwasi__resolve_path_to_host.
+    let fake = if isDot(base) { 0 } else { base.length }
+    let norm = normalized.asSlice()
+    host.truncate(0)
+    run host.appendSlice(entry.real.asSlice())
+    if norm.length >= fake {
+      let stripped = Slice.view<u8>(norm, fake, norm.length - fake)
+      if stripped.length > 1 || (stripped.length == 1 && stripped[0] != 47) {
+        if stripped[0] != 47 { run host.append(47) }
+        run host.appendSlice(stripped)
+      }
+    }
+    if !follow { return ESUCCESS }
+    let mut target: [u8; 4096] = [0; 4096]
+    let read = run Effect.result(NativeFile.readLink(host.asSlice(), &mut target))
+    let length = match move read {
+      Result<usize, NativeFileError>.Success { value } => value
+      // Not a link, or nothing there: both resolve to the path itself.
+      Result<usize, NativeFileError>.Failure { error } => { let code = failed(move error) return if code == EINVAL || code == ENOENT { ESUCCESS } else { code } }
+    }
+    follows = follows + 1
+    if follows >= 32 { return ELOOP }
+    let link = Slice.view<u8>(&target, 0, length)
+    let mut next = List<u8>.make()
+    if length > 0 && link[0] == 47 { run next.appendSlice(link) }
+    else {
+      run next.appendSlice(norm) run next.appendSlice(b"/../") run next.appendSlice(link)
+    }
+    input = move next
+  }
+  return ESUCCESS
+}
+// A guest path call: the descriptor's slot after a rights check, and the host path.
+unsafe effect fn hostPath(w: &Wasi, id: u32, rights: u64, p: ?*mut u8, length: u32, follow: bool, host: &mut List<u8>) -> u16 ! OutOfMemoryError ? &mut Allocator {
+  let mut slot: usize = 0
+  let found = lookup(&w, id, rights, 0, &mut slot)
+  if found != ESUCCESS { return found }
+  let anchor = ()
+  return run resolve(entryAt(&w, slot), unsafe bytesOf(&anchor, p, length), follow, &mut host)
+}
+
+// Runs `body` with the system allocator; an allocation failure is ENOMEM.
+fn guarded(outcome: Result<u16, OutOfMemoryError>) -> u16 {
+  return match move outcome { Result<u16, OutOfMemoryError>.Success { value } => value Result<u16, OutOfMemoryError>.Failure { .. } => ENOMEM }
+}
+
+// ---- Arguments, environment, clocks ----
+
+unsafe fn listGet(text: &List<u8>, count: u32, pointers: ?*mut u8, buffer: ?*mut u8) -> u16 {
+  if Pointer.isNull<u8>(pointers) || Pointer.isNull<u8>(buffer) { return EINVAL }
+  let bytes = text.asSlice()
+  let mut index: u32 = 0 let mut i: usize = 0
+  while i < bytes.length {
+    if index < count && (i == 0 || bytes[i - 1] == 0) {
+      let address = Pointer.address<u8>(unsafe nn(buffer)) + i
+      unsafe store(pointers, u32.toUsize(index) * Layout.of<?*mut u8>().bytes, usize.toU64(address), Layout.of<?*mut u8>().bytes)
+      index = index + 1
+    }
+    unsafe putByte(buffer, i, bytes[i])
+    i = i + 1
+  }
+  return ESUCCESS
+}
+pub unsafe fn argsGet(pointer: *mut Wasi, argv: ?*mut u8, buffer: ?*mut u8) -> u16 { let mut a = () let w = unsafe instance(&mut a, pointer) return unsafe listGet(&w.argv, w.argc, argv, buffer) }
+pub unsafe fn argsSizesGet(pointer: *mut Wasi, count: *mut u32, size: *mut u32) -> u16 {
+  let mut a = () let w = unsafe instance(&mut a, pointer) unsafe putU32(count, w.argc) unsafe putU32(size, usize.toU32(w.argv.length())) return ESUCCESS
+}
+pub unsafe fn environGet(pointer: *mut Wasi, environ: ?*mut u8, buffer: ?*mut u8) -> u16 { let mut a = () let w = unsafe instance(&mut a, pointer) return unsafe listGet(&w.env, w.envc, environ, buffer) }
+pub unsafe fn environSizesGet(pointer: *mut Wasi, count: *mut u32, size: *mut u32) -> u16 {
+  let mut a = () let w = unsafe instance(&mut a, pointer) unsafe putU32(count, w.envc) unsafe putU32(size, usize.toU32(w.env.length())) return ESUCCESS
+}
+fn hostClock(id: u32) -> i32 {
+  static if Intrinsic.targetOperatingSystem() == "darwin" {
+    if id == 0 { return 0 } if id == 1 { return 6 } if id == 2 { return 12 } return 16
+  }
+  return u32.toI32(id)
+}
+fn readClock(clock: i32, time: &mut u64) -> u16 {
+  let mut ts = WasiTimespec { seconds: 0, nanoseconds: 0 }
+  if unsafe clockNow(clock, Pointer.fromMutRef<WasiTimespec>(&mut ts)) != 0 { return lastError() }
+  time.* = i64.wrappingToU64(ts.seconds) * NANOS + i64.wrappingToU64(ts.nanoseconds)
+  return ESUCCESS
+}
+// uvwasi__clock_gettime_realtime: gettimeofday's microseconds.
+fn realtime(time: &mut u64) -> u16 {
+  let mut now: u64 = 0
+  let code = readClock(hostClock(0), &mut now)
+  if code != ESUCCESS { return code }
+  time.* = now / 1000 * 1000
+  return ESUCCESS
+}
+pub unsafe fn clockResGet(pointer: *mut Wasi, id: u32, resolution: *mut u64) -> u16 {
+  if id == 0 || id == 1 { unsafe putU64(resolution, 1) return ESUCCESS }
+  if id == 2 {
+    static if Intrinsic.targetOperatingSystem() == "darwin" { unsafe putU64(resolution, 1000000) return ESUCCESS }
+    let mut ts = WasiTimespec { seconds: 0, nanoseconds: 0 }
+    if unsafe clock_getres(hostClock(2), Pointer.fromMutRef<WasiTimespec>(&mut ts)) != 0 { unsafe putU64(resolution, 1000000) }
+    else { unsafe putU64(resolution, i64.wrappingToU64(ts.seconds) * NANOS + i64.wrappingToU64(ts.nanoseconds)) }
+    return ESUCCESS
+  }
+  if id == 3 {
+    static if Intrinsic.targetOperatingSystem() == "darwin" { unsafe putU64(resolution, 1000000) return ESUCCESS }
+    // uvwasi gives the thread's CPU time here on Linux, a clock_gettime where clock_getres was meant.
+    let mut time: u64 = 0 let code = readClock(hostClock(3), &mut time)
+    if code == ESUCCESS { unsafe putU64(resolution, time) }
+    return code
+  }
+  return EINVAL
+}
+pub unsafe fn clockTimeGet(pointer: *mut Wasi, id: u32, precision: u64, time: *mut u64) -> u16 {
+  let mut value: u64 = 0
+  let code = if id == 0 { realtime(&mut value) } else if id <= 3 { readClock(hostClock(id), &mut value) } else { EINVAL }
+  if code == ESUCCESS { unsafe putU64(time, value) }
+  return code
+}
+
+// ---- Descriptors ----
+
+fn adviceOf(advice: u8) -> i32 {
+  // POSIX_FADV_NORMAL 0, SEQUENTIAL 2, RANDOM 1, WILLNEED 3, DONTNEED 4, NOREUSE 5.
+  if advice == 0 { return 0 } if advice == 1 { return 2 } if advice == 2 { return 1 }
+  if advice == 3 { return 3 } if advice == 4 { return 4 } return 5
+}
+static if Intrinsic.targetOperatingSystem() != "darwin" {
+  unsafe extern "C" fn posix_fadvise(fd: i32, offset: i64, length: i64, advice: i32) -> i32
+}
+pub unsafe fn fdAdvise(pointer: *mut Wasi, id: u32, offset: u64, length: u64, advice: u8) -> u16 {
+  if advice > 5 { return EINVAL }
+  let mut a = () let w = unsafe instance(&mut a, pointer) let mut slot: usize = 0
+  let found = lookup(&w, id, FD_ADVISE, 0, &mut slot) if found != ESUCCESS { return found }
+  let fd = entryAt(&w, slot).fd
+  let stat = run Effect.result(NativeFile.statusOf(fd))
+  let status = match move stat { Result<FileStatus, NativeFileError>.Success { value } => value Result<FileStatus, NativeFileError>.Failure { error } => { return failed(move error) } }
+  if typeOfMode(status.mode) == DIRECTORY { return EBADF }
+  // Darwin has no posix_fadvise, and uvwasi then advises nothing.
+  static if Intrinsic.targetOperatingSystem() != "darwin" {
+    let r = unsafe posix_fadvise(fd, u64.wrappingToI64(offset), u64.wrappingToI64(length), adviceOf(advice))
+    if r != 0 { return fromErrno(r) }
+  }
+  return ESUCCESS
+}
+// uvwasi_fd_allocate without posix_fallocate (uvwasi is built without __POSIX__): grows the file to
+// `offset + length` when it is shorter.
+pub unsafe fn fdAllocate(pointer: *mut Wasi, id: u32, offset: u64, length: u64) -> u16 {
+  let mut a = () let w = unsafe instance(&mut a, pointer) let mut slot: usize = 0
+  let found = lookup(&w, id, FD_ALLOCATE, 0, &mut slot) if found != ESUCCESS { return found }
+  let fd = entryAt(&w, slot).fd
+  let stat = run Effect.result(NativeFile.statusOf(fd))
+  let status = match move stat { Result<FileStatus, NativeFileError>.Success { value } => value Result<FileStatus, NativeFileError>.Failure { error } => { return failed(move error) } }
+  if status.size < offset + length {
+    let grown = run Effect.result(NativeFile.truncateOf(fd, offset + length))
+    if let Result<(), NativeFileError>.Failure { error } = move grown { return failed(move error) }
+  }
+  return ESUCCESS
+}
+pub unsafe fn fdClose(pointer: *mut Wasi, id: u32) -> u16 {
+  let mut a = () let w = unsafe instance(&mut a, pointer) let mut slot: usize = 0
+  let found = lookup(&w, id, 0, 0, &mut slot) if found != ESUCCESS { return found }
+  let closed = run Effect.result(NativeFile.close(entryAt(&w, slot).fd))
+  if let Result<(), NativeFileError>.Failure { error } = move closed { return failed(move error) }
+  let slots = w.fds.asMutSlice() slots[slot] = emptyEntry()
+  return ESUCCESS
+}
+unsafe fn synchronize(pointer: *mut Wasi, id: u32, right: u64, dataOnly: bool) -> u16 {
+  let mut a = () let w = unsafe instance(&mut a, pointer) let mut slot: usize = 0
+  let found = lookup(&w, id, right, 0, &mut slot) if found != ESUCCESS { return found }
+  let synced = run Effect.result(NativeFile.synchronize(entryAt(&w, slot).fd, dataOnly))
+  if let Result<(), NativeFileError>.Failure { error } = move synced { return failed(move error) }
+  return ESUCCESS
+}
+pub unsafe fn fdDatasync(pointer: *mut Wasi, id: u32) -> u16 { return unsafe synchronize(pointer, id, FD_DATASYNC, true) }
+pub unsafe fn fdSync(pointer: *mut Wasi, id: u32) -> u16 { return unsafe synchronize(pointer, id, FD_SYNC, false) }
+// An fdstat record: the type, the host's open flags (as uvwasi reports them) and the rights.
+pub unsafe fn fdFdstatGet(pointer: *mut Wasi, id: u32, record: ?*mut u8) -> u16 {
+  let mut a = () let w = unsafe instance(&mut a, pointer) let mut slot: usize = 0
+  let found = lookup(&w, id, 0, 0, &mut slot) if found != ESUCCESS { return found }
+  let entry = entryAt(&w, slot)
+  let flags = unsafe fcntl(entry.fd, 3)
+  if flags < 0 { return lastError() }
+  let mut i: usize = 0 while i < 24 { unsafe putByte(record, i, 0) i = i + 1 }
+  unsafe store(record, 0, u8.toU64(entry.kind), 1)
+  unsafe store(record, 2, u32.toU64(i32.wrappingToU32(flags)), 2)
+  unsafe store(record, 8, entry.base, 8)
+  unsafe store(record, 16, entry.inheriting, 8)
+  return ESUCCESS
+}
+pub unsafe fn fdFdstatSetFlags(pointer: *mut Wasi, id: u32, flags: u16) -> u16 {
+  let mut a = () let w = unsafe instance(&mut a, pointer) let mut slot: usize = 0
+  let found = lookup(&w, id, FD_FDSTAT_SET_FLAGS, 0, &mut slot) if found != ESUCCESS { return found }
+  let mut mapped: i32 = 0
+  if (flags & 1) != 0 { mapped = mapped | file.OPEN_APPEND }
+  if (flags & 2) != 0 { mapped = mapped | file.OPEN_DATA_SYNCHRONOUS }
+  if (flags & 4) != 0 { mapped = mapped | file.OPEN_NONBLOCK }
+  if (flags & 8) != 0 { mapped = mapped | file.OPEN_SYNCHRONOUS }
+  if (flags & 16) != 0 { mapped = mapped | file.OPEN_SYNCHRONOUS }
+  if unsafe fcntl(entryAt(&w, slot).fd, 4, mapped) < 0 { return lastError() }
+  return ESUCCESS
+}
+pub unsafe fn fdFdstatSetRights(pointer: *mut Wasi, id: u32, base: u64, inheriting: u64) -> u16 {
+  let mut a = () let w = unsafe instance(&mut a, pointer) let mut slot: usize = 0
+  let found = lookup(&w, id, 0, 0, &mut slot) if found != ESUCCESS { return found }
+  let entry = entryAtMut(&mut w, slot)
+  if (base | entry.base) > entry.base { return ENOTCAPABLE }
+  if (inheriting | entry.inheriting) > entry.inheriting { return ENOTCAPABLE }
+  entry.base = base entry.inheriting = inheriting
+  return ESUCCESS
+}
+pub unsafe fn fdFilestatGet(pointer: *mut Wasi, id: u32, record: ?*mut u8) -> u16 {
+  let mut a = () let w = unsafe instance(&mut a, pointer) let mut slot: usize = 0
+  let found = lookup(&w, id, FD_FILESTAT_GET, 0, &mut slot) if found != ESUCCESS { return found }
+  let stat = run Effect.result(NativeFile.statusOf(entryAt(&w, slot).fd))
+  return match move stat { Result<FileStatus, NativeFileError>.Success { value } => { unsafe writeFilestat(record, &value) ESUCCESS } Result<FileStatus, NativeFileError>.Failure { error } => failed(move error) }
+}
+pub unsafe fn fdFilestatSetSize(pointer: *mut Wasi, id: u32, size: u64) -> u16 {
+  let mut a = () let w = unsafe instance(&mut a, pointer) let mut slot: usize = 0
+  let found = lookup(&w, id, FD_FILESTAT_SET_SIZE, 0, &mut slot) if found != ESUCCESS { return found }
+  let truncated = run Effect.result(NativeFile.truncateOf(entryAt(&w, slot).fd, size))
+  if let Result<(), NativeFileError>.Failure { error } = move truncated { return failed(move error) }
+  return ESUCCESS
+}
+// VALIDATE_FSTFLAGS_OR_RETURN.
+fn validTimeFlags(flags: u16) -> bool {
+  if (flags & 65520) != 0 { return false }
+  if (flags & 3) == 3 || (flags & 12) == 12 { return false }
+  return true
+}
+// uvwasi__get_filestat_set_times: the times to set, in whole seconds, with an omitted one kept from
+// the file's status (fstat, or lstat of `path`).
+unsafe fn chooseTimes(access: &mut u64, modified: &mut u64, flags: u16, fd: i32, path: &[u8]) -> u16 {
+  let mut now: u64 = 0
+  if (flags & 10) != 0 { let code = realtime(&mut now) if code != ESUCCESS { return code } }
+  let mut current = FileStatus { device: 0, inode: 0, mode: 0, links: 0, user: 0, group: 0, specialDevice: 0, size: 0, blockSize: 0, blocks: 0, flags: 0, generation: 0, accessed: Timestamp { seconds: 0, nanoseconds: 0 }, modified: Timestamp { seconds: 0, nanoseconds: 0 }, changed: Timestamp { seconds: 0, nanoseconds: 0 }, born: Timestamp { seconds: 0, nanoseconds: 0 } }
+  if (flags & 3) == 0 || (flags & 12) == 0 {
+    let stat = if fd >= 0 { run Effect.result(NativeFile.statusOf(fd)) } else { run Effect.result(NativeFile.status(path, false)) }
+    current = match move stat { Result<FileStatus, NativeFileError>.Success { value } => value Result<FileStatus, NativeFileError>.Failure { error } => { return failed(move error) } }
+  }
+  if (flags & 2) != 0 { access.* = now / NANOS } else if (flags & 1) != 0 { access.* = access.* / NANOS } else { access.* = timestamp(current.accessed) / NANOS }
+  if (flags & 8) != 0 { modified.* = now / NANOS } else if (flags & 4) != 0 { modified.* = modified.* / NANOS } else { modified.* = timestamp(current.modified) / NANOS }
+  return ESUCCESS
+}
+fn seconds(value: u64) -> Timestamp { return Timestamp { seconds: u64.wrappingToI64(value), nanoseconds: 0 } }
+pub unsafe fn fdFilestatSetTimes(pointer: *mut Wasi, id: u32, accessTime: u64, modifyTime: u64, flags: u16) -> u16 {
+  if !validTimeFlags(flags) { return EINVAL }
+  let mut a = () let w = unsafe instance(&mut a, pointer) let mut slot: usize = 0
+  let found = lookup(&w, id, FD_FILESTAT_SET_TIMES, 0, &mut slot) if found != ESUCCESS { return found }
+  let fd = entryAt(&w, slot).fd
+  let mut access = accessTime let mut modified = modifyTime
+  let chosen = unsafe chooseTimes(&mut access, &mut modified, flags, fd, b"")
+  if chosen != ESUCCESS { return chosen }
+  let set = run Effect.result(NativeFile.setTimesOf(fd, seconds(access), seconds(modified)))
+  if let Result<(), NativeFileError>.Failure { error } = move set { return failed(move error) }
+  return ESUCCESS
+}
+// The guest buffers as host iovecs, in a scratch allocation the caller frees.
+unsafe fn hostVectors(vectors: ?*mut u8, count: u32) -> ?*mut u8 {
+  let host = unsafe calloc(u32.toUsize(count) + 1, Layout.of<HostIovec>().bytes)
+  if Pointer.isNull<u8>(host) { return host }
+  let many = unsafe Pointer.assumeManyMut<HostIovec>(unsafe Intrinsic.pointerReinterpret<*mut u8, *mut HostIovec>(unsafe nn(host)))
+  let guest = unsafe Pointer.assumeManyMut<Iovec>(unsafe Intrinsic.pointerReinterpret<*mut u8, *mut Iovec>(unsafe nn(vectors)))
+  let mut i: u32 = 0
+  while i < count {
+    let item = unsafe Pointer.read<Iovec>(unsafe Pointer.atMut<Iovec>(guest, u32.toUsize(i)))
+    unsafe Pointer.put<HostIovec>(unsafe Pointer.atMut<HostIovec>(many, u32.toUsize(i)), HostIovec { base: item.data, length: u32.toUsize(item.length) })
+    i = i + 1
+  }
+  return host
+}
+// A read or write of `count` buffers: at `offset`, or at the descriptor's position when negative.
+unsafe fn transfer(pointer: *mut Wasi, id: u32, rights: u64, vectors: ?*mut u8, count: u32, offset: i64, writing: bool, done: *mut u32) -> u16 {
+  let mut a = () let w = unsafe instance(&mut a, pointer) let mut slot: usize = 0
+  let found = lookup(&w, id, rights, 0, &mut slot) if found != ESUCCESS { return found }
+  if count == 0 { unsafe putU32(done, 0) return ESUCCESS }
+  let fd = entryAt(&w, slot).fd
+  let host = unsafe hostVectors(vectors, count)
+  if Pointer.isNull<u8>(host) { return ENOMEM }
+  let list = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut HostIovec>(unsafe nn(host))
+  let mut n: isize = 0
+  while true {
+    n = if writing { if offset < 0 { unsafe writev(fd, list, u32.toI32(count)) } else { unsafe pwritev(fd, list, u32.toI32(count), offset) } }
+      else { if offset < 0 { unsafe readv(fd, list, u32.toI32(count)) } else { unsafe preadv(fd, list, u32.toI32(count), offset) } }
+    if n >= 0 || unsafe platform.errno() != 4 { break }
+  }
+  let code = if n < 0 { lastError() } else { ESUCCESS }
+  unsafe free(host)
+  if code == ESUCCESS { unsafe putU32(done, u64.wrappingToU32(i64.wrappingToU64(isize.toI64(n)))) }
+  return code
+}
+pub unsafe fn fdPread(pointer: *mut Wasi, id: u32, vectors: ?*mut u8, count: u32, offset: u64, read: *mut u32) -> u16 { return unsafe transfer(pointer, id, FD_READ | FD_SEEK, vectors, count, u64.wrappingToI64(offset), false, read) }
+pub unsafe fn fdPwrite(pointer: *mut Wasi, id: u32, vectors: ?*mut u8, count: u32, offset: u64, written: *mut u32) -> u16 { return unsafe transfer(pointer, id, FD_WRITE | FD_SEEK, vectors, count, u64.wrappingToI64(offset), true, written) }
+pub unsafe fn fdRead(pointer: *mut Wasi, id: u32, vectors: ?*mut u8, count: u32, read: *mut u32) -> u16 { return unsafe transfer(pointer, id, FD_READ, vectors, count, -1, false, read) }
+pub unsafe fn fdWrite(pointer: *mut Wasi, id: u32, vectors: ?*mut u8, count: u32, written: *mut u32) -> u16 { return unsafe transfer(pointer, id, FD_WRITE, vectors, count, -1, true, written) }
+pub unsafe fn fdPrestatGet(pointer: *mut Wasi, id: u32, record: ?*mut u8) -> u16 {
+  let mut a = () let w = unsafe instance(&mut a, pointer) let mut slot: usize = 0
+  let found = lookup(&w, id, 0, 0, &mut slot) if found != ESUCCESS { return found }
+  let entry = entryAt(&w, slot)
+  if !entry.preopen { return EINVAL }
+  let mut i: usize = 0 while i < 8 { unsafe putByte(record, i, 0) i = i + 1 }
+  unsafe store(record, 4, usize.toU64(textLength(entry.path.asSlice())), 4)
+  return ESUCCESS
+}
+fn textLength(text: &[u8]) -> usize { let mut n: usize = 0 while n < text.length && text[n] != 0 { n = n + 1 } return n }
+pub unsafe fn fdPrestatDirName(pointer: *mut Wasi, id: u32, path: ?*mut u8, length: u32) -> u16 {
+  let mut a = () let w = unsafe instance(&mut a, pointer) let mut slot: usize = 0
+  let found = lookup(&w, id, 0, 0, &mut slot) if found != ESUCCESS { return found }
+  let entry = entryAt(&w, slot)
+  if !entry.preopen { return EBADF }
+  let text = entry.path.asSlice() let size = textLength(text)
+  if size > u32.toUsize(length) { return ENOBUFS }
+  let mut i: usize = 0 while i < size { unsafe putByte(path, i, text[i]) i = i + 1 }
+  return ESUCCESS
+}
+fn direntType(kind: EntryKind) -> u8 {
+  return match kind {
+    EntryKind.File => REGULAR_FILE EntryKind.Directory => DIRECTORY EntryKind.Socket => SOCKET_STREAM
+    EntryKind.SymbolicLink => SYMBOLIC_LINK EntryKind.CharacterDevice => CHARACTER_DEVICE EntryKind.BlockDevice => BLOCK_DEVICE
+    _ => UNKNOWN
+  }
+}
+// The next entry other than `.` and `..`, as libuv's readdir gives them; its name's length.
+fn nextEntry(directory: &mut Directory, name: &mut [u8; 1024], kind: &mut u8) -> i64 {
+  while true {
+    let next = run Effect.result(directory.next(&mut name.*))
+    match move next {
+      Result<Option<DirectoryEntry>, NativeFileError>.Success { value } => match move value {
+        Option<DirectoryEntry>.Some { value: entry } => {
+          if (entry.length == 1 && name[0] == 46) || (entry.length == 2 && name[0] == 46 && name[1] == 46) { continue }
+          kind.* = direntType(entry.kind)
+          return usize.toI64(entry.length)
+        }
+        Option<DirectoryEntry>.None => { return 0 }
+      }
+      Result<Option<DirectoryEntry>, NativeFileError>.Failure { error } => { return 0 - u16.toI64(failed(move error)) }
+    }
+  }
+  return 0
+}
+// uvwasi_fd_readdir: the directory reopened by its host path, `cookie` entries skipped, then each
+// entry's dirent and as much of its name as fits; a buffer that fills reports its whole length.
+pub unsafe fn fdReaddir(pointer: *mut Wasi, id: u32, buffer: ?*mut u8, length: u32, cookie: u64, used: *mut u32) -> u16 {
+  let mut a = () let w = unsafe instance(&mut a, pointer) let mut slot: usize = 0
+  let found = lookup(&w, id, FD_READDIR, 0, &mut slot) if found != ESUCCESS { return found }
+  let opened = run Effect.result(NativeFile.openDirectory(entryAt(&w, slot).real.asSlice()))
+  let mut directory = match move opened { Result<Directory, NativeFileError>.Success { value } => move value Result<Directory, NativeFileError>.Failure { error } => { return failed(move error) } }
+  let mut name: [u8; 1024] = [0; 1024] let mut kind: u8 = 0
+  let mut current: u64 = 0 let mut code = ESUCCESS
+  while current < cookie {
+    let n = nextEntry(&mut directory, &mut name, &mut kind)
+    if n < 0 { code = i64.wrappingToU16(0 - n) break }
+    if n == 0 { break }
+    current = current + 1
+  }
+  let mut bufused: u32 = 0
+  if code == ESUCCESS {
+    while true {
+      let n = nextEntry(&mut directory, &mut name, &mut kind)
+      if n < 0 { code = i64.wrappingToU16(0 - n) break }
+      if n == 0 { break }
+      current = current + 1
+      let nameLength = i64.toU32(n)
+      if 24 + bufused > length { bufused = length break }
+      let at = u32.toUsize(bufused)
+      unsafe store(buffer, at, current, 8) unsafe store(buffer, at + 8, 0, 8)
+      unsafe store(buffer, at + 16, u32.toU64(nameLength), 4) unsafe store(buffer, at + 20, u8.toU64(kind), 1)
+      bufused = bufused + 24
+      let available = length - bufused
+      let copied = if nameLength > available { available } else { nameLength }
+      let mut i: u32 = 0 while i < copied { unsafe putByte(buffer, u32.toUsize(bufused + i), name[u32.toUsize(i)]) i = i + 1 }
+      bufused = bufused + copied
+      if length - bufused == 0 { break }
+    }
+  }
+  let closed = run Effect.result(directory.close())
+  if let Result<(), NativeFileError>.Failure { error } = move closed { return failed(move error) }
+  if code == ESUCCESS { unsafe putU32(used, bufused) }
+  return code
+}
+// uvwasi_fd_table_renumber: `to`'s descriptor is closed, and `from`'s entry moves to `to`.
+pub unsafe fn fdRenumber(pointer: *mut Wasi, from: u32, to: u32) -> u16 {
+  let mut a = () let w = unsafe instance(&mut a, pointer)
+  if from == to { return ESUCCESS }
+  let mut source: usize = 0 let mut target: usize = 0
+  if lookup(&w, to, 0, 0, &mut target) != ESUCCESS || lookup(&w, from, 0, 0, &mut source) != ESUCCESS { return EBADF }
+  let closed = run Effect.result(NativeFile.close(entryAt(&w, target).fd))
+  if let Result<(), NativeFileError>.Failure { error } = move closed { return failed(move error) }
+  let slots = w.fds.asMutSlice()
+  let moved = Intrinsic.replace(slots[source], emptyEntry())
+  slots[target] = move moved
+  return ESUCCESS
+}
+unsafe fn seek(pointer: *mut Wasi, id: u32, rights: u64, offset: i64, whence: u8, position: *mut u64) -> u16 {
+  let mut a = () let w = unsafe instance(&mut a, pointer) let mut slot: usize = 0
+  let found = lookup(&w, id, rights, 0, &mut slot) if found != ESUCCESS { return found }
+  // WASI's SET 0, CUR 1, END 2 are lseek's.
+  if whence > 2 { return EINVAL }
+  let r = unsafe lseek(entryAt(&w, slot).fd, offset, u8.toI32(whence))
+  if r < 0 { return lastError() }
+  unsafe putU64(position, i64.wrappingToU64(r))
+  return ESUCCESS
+}
+pub unsafe fn fdSeek(pointer: *mut Wasi, id: u32, offset: i64, whence: u8, position: *mut u64) -> u16 { return unsafe seek(pointer, id, FD_SEEK, offset, whence, position) }
+pub unsafe fn fdTell(pointer: *mut Wasi, id: u32, position: *mut u64) -> u16 { return unsafe seek(pointer, id, FD_TELL, 0, 1, position) }
+
+// ---- Paths ----
+
+pub unsafe fn pathCreateDirectory(pointer: *mut Wasi, id: u32, path: ?*mut u8, length: u32) -> u16 {
+  let mut a = () let w = unsafe instance(&mut a, pointer)
+  let mut system = Allocator.systemAllocatorProvider()
+  return guarded(run Effect.result(unsafe createDirectory(&w, id, path, length)) |> Effect.provideMut<Allocator>(&mut system))
+}
+unsafe effect fn createDirectory(w: &Wasi, id: u32, path: ?*mut u8, length: u32) -> u16 ! OutOfMemoryError ? &mut Allocator {
+  let mut host = List<u8>.make()
+  let code = run unsafe hostPath(&w, id, PATH_CREATE_DIRECTORY, path, length, false, &mut host) if code != ESUCCESS { return code }
+  let made = run Effect.result(NativeFile.makeDirectory(host.asSlice(), 511))
+  if let Result<(), NativeFileError>.Failure { error } = move made { return failed(move error) }
+  return ESUCCESS
+}
+pub unsafe fn pathFilestatGet(pointer: *mut Wasi, id: u32, flags: u32, path: ?*mut u8, length: u32, record: ?*mut u8) -> u16 {
+  let mut a = () let w = unsafe instance(&mut a, pointer)
+  let mut system = Allocator.systemAllocatorProvider()
+  return guarded(run Effect.result(unsafe filestatAt(&w, id, flags, path, length, record)) |> Effect.provideMut<Allocator>(&mut system))
+}
+unsafe effect fn filestatAt(w: &Wasi, id: u32, flags: u32, path: ?*mut u8, length: u32, record: ?*mut u8) -> u16 ! OutOfMemoryError ? &mut Allocator {
+  let mut host = List<u8>.make()
+  let code = run unsafe hostPath(&w, id, PATH_FILESTAT_GET, path, length, (flags & 1) != 0, &mut host) if code != ESUCCESS { return code }
+  let stat = run Effect.result(NativeFile.status(host.asSlice(), false))
+  return match move stat { Result<FileStatus, NativeFileError>.Success { value } => { unsafe writeFilestat(record, &value) ESUCCESS } Result<FileStatus, NativeFileError>.Failure { error } => failed(move error) }
+}
+pub unsafe fn pathFilestatSetTimes(pointer: *mut Wasi, id: u32, flags: u32, path: ?*mut u8, length: u32, accessTime: u64, modifyTime: u64, timeFlags: u16) -> u16 {
+  let mut a = () let w = unsafe instance(&mut a, pointer)
+  let mut system = Allocator.systemAllocatorProvider()
+  return guarded(run Effect.result(unsafe setTimesAt(&w, id, flags, path, length, accessTime, modifyTime, timeFlags)) |> Effect.provideMut<Allocator>(&mut system))
+}
+unsafe effect fn setTimesAt(w: &Wasi, id: u32, flags: u32, path: ?*mut u8, length: u32, accessTime: u64, modifyTime: u64, timeFlags: u16) -> u16 ! OutOfMemoryError ? &mut Allocator {
+  let mut slot: usize = 0
+  let found = lookup(&w, id, PATH_FILESTAT_SET_TIMES, 0, &mut slot) if found != ESUCCESS { return found }
+  if !validTimeFlags(timeFlags) { return EINVAL }
+  let mut host = List<u8>.make()
+  let anchor = ()
+  let code = run resolve(entryAt(&w, slot), unsafe bytesOf(&anchor, path, length), (flags & 1) != 0, &mut host) if code != ESUCCESS { return code }
+  let mut access = accessTime let mut modified = modifyTime
+  let chosen = unsafe chooseTimes(&mut access, &mut modified, timeFlags, -1, host.asSlice())
+  if chosen != ESUCCESS { return chosen }
+  let set = run Effect.result(NativeFile.setTimes(host.asSlice(), seconds(access), seconds(modified), false))
+  if let Result<(), NativeFileError>.Failure { error } = move set { return failed(move error) }
+  return ESUCCESS
+}
+// The slots of a two-descriptor call, with the source's and the target's rights.
+fn pair(w: &Wasi, from: u32, to: u32, source: u64, target: u64, first: &mut usize, second: &mut usize) -> u16 {
+  if from == to { let code = lookup(&w, from, source | target, 0, &mut first) second.* = first.* return code }
+  let code = lookup(&w, from, source, 0, &mut first) if code != ESUCCESS { return code }
+  return lookup(&w, to, target, 0, &mut second)
+}
+pub unsafe fn pathLink(pointer: *mut Wasi, fromId: u32, flags: u32, fromPath: ?*mut u8, fromLength: u32, toId: u32, toPath: ?*mut u8, toLength: u32) -> u16 {
+  let mut a = () let w = unsafe instance(&mut a, pointer)
+  let mut system = Allocator.systemAllocatorProvider()
+  return guarded(run Effect.result(unsafe twoPaths(&w, 0, fromId, flags, fromPath, fromLength, toId, toPath, toLength)) |> Effect.provideMut<Allocator>(&mut system))
+}
+pub unsafe fn pathRename(pointer: *mut Wasi, fromId: u32, fromPath: ?*mut u8, fromLength: u32, toId: u32, toPath: ?*mut u8, toLength: u32) -> u16 {
+  let mut a = () let w = unsafe instance(&mut a, pointer)
+  let mut system = Allocator.systemAllocatorProvider()
+  return guarded(run Effect.result(unsafe twoPaths(&w, 1, fromId, 0, fromPath, fromLength, toId, toPath, toLength)) |> Effect.provideMut<Allocator>(&mut system))
+}
+// path_link (operation 0) and path_rename (1).
+unsafe effect fn twoPaths(w: &Wasi, operation: i32, fromId: u32, flags: u32, fromPath: ?*mut u8, fromLength: u32, toId: u32, toPath: ?*mut u8, toLength: u32) -> u16 ! OutOfMemoryError ? &mut Allocator {
+  let mut first: usize = 0 let mut second: usize = 0
+  let found = if operation == 0 { pair(&w, fromId, toId, PATH_LINK_SOURCE, PATH_LINK_TARGET, &mut first, &mut second) } else { pair(&w, fromId, toId, PATH_RENAME_SOURCE, PATH_RENAME_TARGET, &mut first, &mut second) }
+  if found != ESUCCESS { return found }
+  let anchor = ()
+  let mut from = List<u8>.make() let mut to = List<u8>.make()
+  let one = run resolve(entryAt(&w, first), unsafe bytesOf(&anchor, fromPath, fromLength), operation == 0 && (flags & 1) != 0, &mut from) if one != ESUCCESS { return one }
+  let two = run resolve(entryAt(&w, second), unsafe bytesOf(&anchor, toPath, toLength), false, &mut to) if two != ESUCCESS { return two }
+  let done = if operation == 0 { run Effect.result(NativeFile.link(from.asSlice(), to.asSlice())) } else { run Effect.result(NativeFile.rename(from.asSlice(), to.asSlice())) }
+  if let Result<(), NativeFileError>.Failure { error } = move done { return failed(move error) }
+  return ESUCCESS
+}
+pub unsafe fn pathOpen(pointer: *mut Wasi, dirId: u32, dirFlags: u32, path: ?*mut u8, length: u32, openFlags: u16, base: u64, inheriting: u64, fdFlags: u16, opened: *mut u32) -> u16 {
+  let mut a = () let w = unsafe instance(&mut a, pointer)
+  let mut system = Allocator.systemAllocatorProvider()
+  return guarded(run Effect.result(unsafe open(&mut w, dirId, dirFlags, path, length, openFlags, base, inheriting, fdFlags, opened)) |> Effect.provideMut<Allocator>(&mut system))
+}
+unsafe effect fn open(w: &mut Wasi, dirId: u32, dirFlags: u32, path: ?*mut u8, length: u32, openFlags: u16, base: u64, inheriting: u64, fdFlags: u16, opened: *mut u32) -> u16 ! OutOfMemoryError ? &mut Allocator {
+  let read = (base & (FD_READ | FD_READDIR)) != 0
+  let write = (base & (FD_DATASYNC | FD_WRITE | FD_ALLOCATE | FD_FILESTAT_SET_SIZE)) != 0
+  let mut flags = if write { if read { file.OPEN_READ_WRITE } else { file.OPEN_WRITE_ONLY } } else { file.OPEN_READ_ONLY }
+  let mut neededBase = PATH_OPEN
+  let mut neededInheriting = base | inheriting
+  if (openFlags & 1) != 0 { flags = flags | file.OPEN_CREATE neededBase = neededBase | PATH_CREATE_FILE }
+  if (openFlags & 2) != 0 { flags = flags | file.OPEN_DIRECTORY }
+  if (openFlags & 4) != 0 { flags = flags | file.OPEN_EXCLUSIVE }
+  if (openFlags & 8) != 0 { flags = flags | file.OPEN_TRUNCATE neededBase = neededBase | PATH_FILESTAT_SET_SIZE }
+  if (fdFlags & 1) != 0 { flags = flags | file.OPEN_APPEND }
+  if (fdFlags & 2) != 0 { flags = flags | file.OPEN_DATA_SYNCHRONOUS neededInheriting = neededInheriting | FD_DATASYNC }
+  if (fdFlags & 4) != 0 { flags = flags | file.OPEN_NONBLOCK }
+  if (fdFlags & 8) != 0 { flags = flags | file.OPEN_SYNCHRONOUS neededInheriting = neededInheriting | FD_SYNC }
+  if (fdFlags & 16) != 0 { flags = flags | file.OPEN_SYNCHRONOUS neededInheriting = neededInheriting | FD_SYNC }
+  if write && (flags & (file.OPEN_APPEND | file.OPEN_TRUNCATE)) == 0 { neededInheriting = neededInheriting | FD_SEEK }
+  let mut slot: usize = 0
+  let found = lookup(&w, dirId, neededBase, neededInheriting, &mut slot) if found != ESUCCESS { return found }
+  let mut host = List<u8>.make()
+  let anchor = ()
+  let code = run resolve(entryAt(&w, slot), unsafe bytesOf(&anchor, path, length), (dirFlags & 1) != 0, &mut host) if code != ESUCCESS { return code }
+  let made = run Effect.result(NativeFile.open(host.asSlice(), flags | file.OPEN_CLOSE_ON_EXEC, 438))
+  let fd = match move made { Result<i32, NativeFileError>.Success { value } => value Result<i32, NativeFileError>.Failure { error } => { return failed(move error) } }
+  let mut kind: u8 = UNKNOWN
+  let mut status = typeOfDescriptor(fd, &mut kind)
+  let hostText = host.asSlice()
+  if status == ESUCCESS && kind != DIRECTORY && ((openFlags & 2) != 0 || (hostText.length > 0 && hostText[hostText.length - 1] == 47)) { status = ENOTDIR }
+  let mut maxBase: u64 = 0 let mut maxInheriting: u64 = 0
+  if status == ESUCCESS { status = rightsOf(fd, flags, kind, &mut maxBase, &mut maxInheriting) }
+  if status != ESUCCESS { let _closed = run Effect.result(NativeFile.close(fd)) return status }
+  let id = run insert(&mut w, fd, hostText, hostText, kind, base & maxBase, inheriting & maxInheriting, false)
+  unsafe putU32(opened, id)
+  return ESUCCESS
+}
+pub unsafe fn pathReadlink(pointer: *mut Wasi, id: u32, path: ?*mut u8, length: u32, buffer: ?*mut u8, size: u32, used: *mut u32) -> u16 {
+  let mut a = () let w = unsafe instance(&mut a, pointer)
+  let mut system = Allocator.systemAllocatorProvider()
+  return guarded(run Effect.result(unsafe readlinkAt(&w, id, path, length, buffer, size, used)) |> Effect.provideMut<Allocator>(&mut system))
+}
+unsafe effect fn readlinkAt(w: &Wasi, id: u32, path: ?*mut u8, length: u32, buffer: ?*mut u8, size: u32, used: *mut u32) -> u16 ! OutOfMemoryError ? &mut Allocator {
+  let mut host = List<u8>.make()
+  let code = run unsafe hostPath(&w, id, PATH_READLINK, path, length, false, &mut host) if code != ESUCCESS { return code }
+  let mut target: [u8; 4096] = [0; 4096]
+  let read = run Effect.result(NativeFile.readLink(host.asSlice(), &mut target))
+  let n = match move read { Result<usize, NativeFileError>.Success { value } => value Result<usize, NativeFileError>.Failure { error } => { return failed(move error) } }
+  let shown = textLength(Slice.view<u8>(&target, 0, n))
+  if shown >= u32.toUsize(size) { return ENOBUFS }
+  let mut i: usize = 0 while i < shown { unsafe putByte(buffer, i, target[i]) i = i + 1 }
+  unsafe putByte(buffer, shown, 0)
+  unsafe putU32(used, usize.toU32(shown))
+  return ESUCCESS
+}
+pub unsafe fn pathRemoveDirectory(pointer: *mut Wasi, id: u32, path: ?*mut u8, length: u32) -> u16 {
+  let mut a = () let w = unsafe instance(&mut a, pointer)
+  let mut system = Allocator.systemAllocatorProvider()
+  return guarded(run Effect.result(unsafe removeAt(&w, id, path, length, true)) |> Effect.provideMut<Allocator>(&mut system))
+}
+pub unsafe fn pathUnlinkFile(pointer: *mut Wasi, id: u32, path: ?*mut u8, length: u32) -> u16 {
+  let mut a = () let w = unsafe instance(&mut a, pointer)
+  let mut system = Allocator.systemAllocatorProvider()
+  return guarded(run Effect.result(unsafe removeAt(&w, id, path, length, false)) |> Effect.provideMut<Allocator>(&mut system))
+}
+unsafe effect fn removeAt(w: &Wasi, id: u32, path: ?*mut u8, length: u32, directory: bool) -> u16 ! OutOfMemoryError ? &mut Allocator {
+  let mut host = List<u8>.make()
+  let code = run unsafe hostPath(&w, id, if directory { PATH_REMOVE_DIRECTORY } else { PATH_UNLINK_FILE }, path, length, false, &mut host) if code != ESUCCESS { return code }
+  let removed = if directory { run Effect.result(NativeFile.removeDirectory(host.asSlice())) } else { run Effect.result(NativeFile.remove(host.asSlice())) }
+  if let Result<(), NativeFileError>.Failure { error } = move removed { return failed(move error) }
+  return ESUCCESS
+}
+pub unsafe fn pathSymlink(pointer: *mut Wasi, target: ?*mut u8, targetLength: u32, id: u32, path: ?*mut u8, length: u32) -> u16 {
+  let mut a = () let w = unsafe instance(&mut a, pointer)
+  let mut system = Allocator.systemAllocatorProvider()
+  return guarded(run Effect.result(unsafe symlinkAt(&w, target, targetLength, id, path, length)) |> Effect.provideMut<Allocator>(&mut system))
+}
+// uvwasi_path_symlink: the target must resolve inside the descriptor too, but the link holds its text.
+unsafe effect fn symlinkAt(w: &Wasi, target: ?*mut u8, targetLength: u32, id: u32, path: ?*mut u8, length: u32) -> u16 ! OutOfMemoryError ? &mut Allocator {
+  let mut slot: usize = 0
+  let found = lookup(&w, id, PATH_SYMLINK, 0, &mut slot) if found != ESUCCESS { return found }
+  let anchor = ()
+  let text = unsafe bytesOf(&anchor, target, targetLength)
+  if text.length > 0 && text[0] == 47 { return EPERM }
+  let mut resolvedTarget = List<u8>.make() let mut host = List<u8>.make()
+  let one = run resolve(entryAt(&w, slot), text, false, &mut resolvedTarget) if one != ESUCCESS { return one }
+  let two = run resolve(entryAt(&w, slot), unsafe bytesOf(&anchor, path, length), false, &mut host) if two != ESUCCESS { return two }
+  let linked = run Effect.result(NativeFile.symbolicLink(Slice.view<u8>(text, 0, textLength(text)), host.asSlice()))
+  if let Result<(), NativeFileError>.Failure { error } = move linked { return failed(move error) }
+  return ESUCCESS
+}
+
+// ---- Polling, processes, random bytes and sockets ----
+
+fn hangupBits() -> i16 {
+  // POLLHUP, and POLLRDHUP on Linux: libuv's UV_DISCONNECT.
+  static if Intrinsic.targetOperatingSystem() == "darwin" { return 16 }
+  return 8208
+}
+fn readinessEvents(kind: u8) -> i16 {
+  // POLLIN or POLLOUT, with POLLRDHUP on Linux for UV_DISCONNECT.
+  static if Intrinsic.targetOperatingSystem() == "darwin" { return if kind == 1 { 1 } else { 4 } }
+  return if kind == 1 { 8193 } else { 8196 }
+}
+// uvwasi_poll_oneoff: waits until every polled descriptor is ready, or the earliest clock
+// subscription's time passes, then reports the descriptors that are (a hangup with its flag), or
+// that clock alone. Descriptors that cannot be polled (EBADF) are reported with their error.
+pub unsafe fn pollOneoff(pointer: *mut Wasi, subscriptions: ?*mut u8, events: ?*mut u8, count: u32, written: *mut u32) -> u16 {
+  if Pointer.isNull<u8>(subscriptions) || Pointer.isNull<u8>(events) || count == 0 { return EINVAL }
+  unsafe putU32(written, 0)
+  let mut a = () let w = unsafe instance(&mut a, pointer)
+  let size = u32.toUsize(count)
+  let fds = unsafe calloc(size + 1, Layout.of<WasiPollFd>().bytes)
+  // Per subscription: its descriptor's poll slot (or -1), its error, and its readiness.
+  let slots = unsafe calloc(size + 1, 16)
+  if Pointer.isNull<u8>(fds) || Pointer.isNull<u8>(slots) { unsafe free(fds) unsafe free(slots) return ENOMEM }
+  let polls = unsafe Pointer.assumeManyMut<WasiPollFd>(unsafe Intrinsic.pointerReinterpret<*mut u8, *mut WasiPollFd>(unsafe nn(fds)))
+  let mut handles: usize = 0
+  let mut timerData: u64 = 0 let mut hasTimeout = false let mut minTimeout: u64 = 0
+  let mut status = ESUCCESS
+  let mut i: usize = 0
+  while i < size {
+    let at = i * 48
+    let kind = u64.wrappingToU8(unsafe load(subscriptions, at + 8, 1))
+    if kind == 0 {
+      let timeout = unsafe load(subscriptions, at + 24, 8)
+      let flags = unsafe load(subscriptions, at + 40, 2)
+      let mut current = timeout
+      if (flags & 1) != 0 { let mut now: u64 = 0 status = realtime(&mut now) if status != ESUCCESS { break } current = timeout - now }
+      if !hasTimeout || current < minTimeout { minTimeout = current timerData = unsafe load(subscriptions, at, 8) hasTimeout = true }
+      unsafe store(slots, i * 16, 18446744073709551615, 8)
+    } else if kind == 1 || kind == 2 {
+      let id = u64.wrappingToU32(unsafe load(subscriptions, at + 16, 4))
+      // A descriptor polled twice shares its first poll slot.
+      let mut shared: i64 = -1 let mut j: usize = 0
+      while j < i {
+        let earlier = u64.wrappingToU8(unsafe load(subscriptions, j * 48 + 8, 1))
+        if (earlier == 1 || earlier == 2) && u64.wrappingToU32(unsafe load(subscriptions, j * 48 + 16, 4)) == id { shared = u64.wrappingToI64(unsafe load(slots, j * 16, 8)) break }
+        j = j + 1
+      }
+      let mut error = ESUCCESS
+      if shared < 0 {
+        let mut slot: usize = 0
+        error = lookup(&w, id, POLL_FD_READWRITE | (if kind == 1 { FD_READ } else { FD_WRITE }), 0, &mut slot)
+        if error != ESUCCESS && error != EBADF { status = error break }
+        if error == ESUCCESS {
+          let fd = entryAt(&w, slot).fd
+          // libuv's epoll refuses regular files and directories (uv_poll_init's EPERM).
+          static if Intrinsic.targetOperatingSystem() != "darwin" {
+            let stat = run Effect.result(NativeFile.statusOf(fd))
+            if let Result<FileStatus, NativeFileError>.Success { value } = move stat {
+              let format = typeOfMode(value.mode)
+              if format == REGULAR_FILE || format == DIRECTORY { status = EPERM break }
+            }
+          }
+          unsafe Pointer.put<WasiPollFd>(unsafe Pointer.atMut<WasiPollFd>(polls, handles), WasiPollFd { fd: fd, events: readinessEvents(kind), revents: 0 })
+          shared = usize.toI64(handles)
+          handles = handles + 1
+        }
+      }
+      unsafe store(slots, i * 16, i64.wrappingToU64(shared), 8)
+      unsafe store(slots, i * 16 + 8, u16.toU64(error), 2)
+    } else { status = EINVAL break }
+    i = i + 1
+  }
+  if status == ESUCCESS {
+    let mut result: usize = 0
+    let mut waiting = handles
+    let mut deadline: u64 = 0
+    if hasTimeout { let mut now: u64 = 0 let _read = readClock(hostClock(1), &mut now) deadline = now / 1000000 * 1000000 + minTimeout / 1000000 * 1000000 }
+    // Each ready descriptor leaves the poll set; the loop ends with the last, or at the time.
+    while waiting > 0 || (hasTimeout && handles == 0) {
+      let mut timeout: i32 = -1
+      if hasTimeout {
+        let mut now: u64 = 0 let _read = readClock(hostClock(1), &mut now)
+        let left = if deadline > now { (deadline - now + 999999) / 1000000 } else { 0 }
+        timeout = if left > 2147483647 { 2147483647 } else { u64.toI32(left) }
+      }
+      if handles == 0 {
+        if timeout > 0 { let mut none = WasiPollFd { fd: -1, events: 0, revents: 0 } let _slept = unsafe pollNow(Pointer.fromMutRef<WasiPollFd>(&mut none), 0, timeout) }
+        break
+      }
+      let n = unsafe pollNow(unsafe Pointer.atMut<WasiPollFd>(polls, 0), handles, timeout)
+      if n < 0 { if unsafe platform.errno() == 4 { continue } status = lastError() break }
+      if n == 0 { break }
+      let mut k: usize = 0
+      while k < handles {
+        let entry = unsafe Pointer.atMut<WasiPollFd>(polls, k)
+        let item = unsafe Pointer.read<WasiPollFd>(entry)
+        if item.revents != 0 && item.events != 0 {
+          // The poll handle stops: its readiness is kept in `revents`, and it no longer waits.
+          unsafe Pointer.put<WasiPollFd>(entry, WasiPollFd { fd: item.fd, events: 0, revents: item.revents })
+          result = result + 1 waiting = waiting - 1
+        } else if item.events != 0 { unsafe Pointer.put<WasiPollFd>(entry, WasiPollFd { fd: item.fd, events: item.events, revents: 0 }) }
+        k = k + 1
+      }
+    }
+    if status == ESUCCESS {
+      let mut out: u32 = 0
+      if result == 0 {
+        let mut z: usize = 0 while z < 32 { unsafe putByte(events, z, 0) z = z + 1 }
+        unsafe store(events, 0, timerData, 8)
+        out = 1
+      } else {
+        i = 0
+        while i < size {
+          let at = i * 48
+          let kind = u64.wrappingToU8(unsafe load(subscriptions, at + 8, 1))
+          if kind == 1 || kind == 2 {
+            let shared = u64.wrappingToI64(unsafe load(slots, i * 16, 8))
+            let error = u64.wrappingToU16(unsafe load(slots, i * 16 + 8, 2))
+            let mut flags: u64 = 0 let mut report = error != ESUCCESS
+            if !report && shared >= 0 {
+              let item = unsafe Pointer.read<WasiPollFd>(unsafe Pointer.atMut<WasiPollFd>(polls, i64.toUsize(shared)))
+              if (item.revents & hangupBits()) != 0 { flags = 1 report = true }
+              else if (item.revents & 13) != 0 { report = true }
+            }
+            if report {
+              let o = u32.toUsize(out) * 32
+              let mut z: usize = 0 while z < 32 { unsafe putByte(events, o + z, 0) z = z + 1 }
+              unsafe store(events, o, unsafe load(subscriptions, at, 8), 8)
+              unsafe store(events, o + 8, u16.toU64(error), 2)
+              unsafe store(events, o + 10, u8.toU64(kind), 1)
+              unsafe store(events, o + 24, flags, 2)
+              out = out + 1
+            }
+          }
+          i = i + 1
+        }
+      }
+      unsafe putU32(written, out)
+    }
+  }
+  unsafe free(fds) unsafe free(slots)
+  return status
+}
+pub unsafe fn procExit(pointer: *mut Wasi, code: u32) -> u16 { unsafe exit(u32.wrappingToI32(code)) return ESUCCESS }
+fn hostSignal(signal: u8) -> i32 {
+  static if Intrinsic.targetOperatingSystem() == "darwin" {
+    let table: [i32; 31] = [-1, 1, 2, 3, 4, 5, 6, 10, 8, 9, 30, 11, 31, 13, 14, 15, 20, 19, 17, 18, 21, 22, 16, 24, 25, 26, -1, -1, -1, -1, 12]
+    return if u8.toUsize(signal) < 31 { table[u8.toUsize(signal)] } else { -1 }
+  } else {
+    let table: [i32; 31] = [-1, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, -1, -1, -1, -1, 31]
+    return if u8.toUsize(signal) < 31 { table[u8.toUsize(signal)] } else { -1 }
+  }
+}
+pub unsafe fn procRaise(pointer: *mut Wasi, signal: u8) -> u16 {
+  let host = hostSignal(signal)
+  if host < 0 { return ENOSYS }
+  if unsafe kill(unsafe getpid(), host) != 0 { return lastError() }
+  return ESUCCESS
+}
+pub unsafe fn randomGet(pointer: *mut Wasi, buffer: ?*mut u8, length: u32) -> u16 {
+  if Pointer.isNull<u8>(buffer) { return EINVAL }
+  if length == 0 { return ESUCCESS }
+  let mut anchor = ()
+  let bytes = unsafe Pointer.borrowManyMut<(), u8>(&mut anchor, unsafe Pointer.assumeManyMut<u8>(unsafe nn(buffer)), u32.toUsize(length))
+  let mut random = OsRandom.make()
+  run Random.fillBytes(move bytes) |> Effect.provideMut<Random>(&mut random)
+  return ESUCCESS
+}
+pub unsafe fn schedYield(pointer: *mut Wasi) -> u16 { if unsafe sched_yield() != 0 { return lastError() } return ESUCCESS }
+// No socket is ever preopened (Node gives none), so a descriptor that has the socket rights has no
+// socket handle: uvwasi's calls there are ENOTSOCK.
+unsafe fn socketCheck(pointer: *mut Wasi, id: u32) -> u16 {
+  let mut a = () let w = unsafe instance(&mut a, pointer) let mut slot: usize = 0
+  let found = lookup(&w, id, socketBase(), 0, &mut slot) if found != ESUCCESS { return found }
+  return ENOTSOCK
+}
+pub unsafe fn sockAccept(pointer: *mut Wasi, id: u32, flags: u16, connected: *mut u32) -> u16 {
+  if (flags & 65531) != 0 { return ENOTSUP }
+  return unsafe socketCheck(pointer, id)
+}
+pub unsafe fn sockRecv(pointer: *mut Wasi, id: u32, vectors: ?*mut u8, count: u32, flags: u16, length: *mut u32, outFlags: *mut u16) -> u16 {
+  if Pointer.isNull<u8>(vectors) { return EINVAL }
+  if flags != 0 { return ENOTSUP }
+  return unsafe socketCheck(pointer, id)
+}
+pub unsafe fn sockSend(pointer: *mut Wasi, id: u32, vectors: ?*mut u8, count: u32, flags: u16, length: *mut u32) -> u16 {
+  if Pointer.isNull<u8>(vectors) || flags != 0 { return EINVAL }
+  return unsafe socketCheck(pointer, id)
+}
+pub unsafe fn sockShutdown(pointer: *mut Wasi, id: u32, how: u8) -> u16 {
+  if (how & 253) != 0 { return ENOTSUP }
+  return unsafe socketCheck(pointer, id)
+}
+
+/// Copies a native record to the guest's layout, which is the same: uvwasi's serdes functions.
+pub unsafe fn copyRecord(destination: ?*mut u8, source: ?*mut u8, size: usize) -> () {
+  let mut i: usize = 0 while i < size { unsafe putByte(destination, i, unsafe getByte(source, i)) i = i + 1 }
+}

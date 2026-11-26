@@ -1,0 +1,178 @@
+//! `fs.watch`'s descriptors without libuv (the loop plan, step 7, in docs/composable-runtime.md):
+//! an inotify instance on Linux and a kqueue with an EVFILT_VNODE filter on Darwin, one for each
+//! watch, whose descriptor joins the runtime reactor. Changes are reported as libuv's uv_fs_event
+//! reports them: UV_RENAME (1) and UV_CHANGE (2), with the name of the entry that changed in a
+//! watched directory, or the last component of the watched path.
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.mem.pointer { Pointer }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.core.ownership { Drop }
+import silk.num.i32
+import silk.num.isize
+import silk.num.u32
+import silk.num.u8
+import silk.num.usize
+import silkjs.js_libc_platform as platform
+
+unsafe extern "C" fn close(fd: i32) -> i32
+@foreign(noCapture: .("data"))
+unsafe extern "C" fn read(fd: i32, data: *mut u8, length: usize) -> isize
+
+pub const RENAME: i32 = 1
+pub const CHANGE: i32 = 2
+
+/// One change: UV_RENAME, UV_CHANGE or both, and the name it concerns.
+pub struct Change { pub events: i32, pub name: List<u8> }
+
+static if Intrinsic.targetOperatingSystem() == "darwin" {
+  import silk.platform.native.kqueue { KernelEvent, TimeSpec, kevent, kqueue }
+  @foreign(noCapture: .("path"))
+  unsafe extern "C" fn open(path: *const u8, flags: i32, ...) -> i32
+  unsafe extern "C" fn fcntl(fd: i32, command: i32, ...) -> i32
+  // O_EVTONLY | O_CLOEXEC.
+  const OPEN_FLAGS: i32 = 16809984
+  const FILTER_VNODE: i16 = -4
+  // NOTE_DELETE, NOTE_WRITE, NOTE_EXTEND, NOTE_ATTRIB, NOTE_RENAME and NOTE_REVOKE, as libuv's.
+  const NOTES: u32 = 111
+  const F_GETPATH: i32 = 50
+} else {
+  unsafe extern "C" fn inotify_init1(flags: i32) -> i32
+  @foreign(noCapture: .("path"))
+  unsafe extern "C" fn inotify_add_watch(fd: i32, path: *const u8, mask: u32) -> i32
+  // IN_NONBLOCK | IN_CLOEXEC.
+  const INIT_FLAGS: i32 = 526336
+  // IN_ATTRIB, IN_CREATE, IN_MODIFY, IN_DELETE, IN_DELETE_SELF, IN_MOVE_SELF, IN_MOVED_FROM and
+  // IN_MOVED_TO, as libuv's.
+  const MASK: u32 = 4038
+  // IN_ATTRIB | IN_MODIFY: a change; anything else is a rename.
+  const CHANGES: u32 = 6
+  // IN_Q_OVERFLOW and IN_IGNORED report no change of a watched name.
+  const QUIET: u32 = 49152
+}
+
+/// A watch of one path. Dropping it closes its descriptors.
+pub struct FileWatch {
+  fd: i32,
+  // Darwin's descriptor of the watched path itself; -1 on Linux.
+  target: i32,
+  // The last component of the watched path, the name of a change that names no entry.
+  base: List<u8>,
+}
+
+impl Drop for FileWatch {
+  fn drop(self: &mut Self) -> () {
+    if self.fd >= 0 { let _closed = unsafe close(self.fd) }
+    if self.target >= 0 { let _closed = unsafe close(self.target) }
+    self.fd = -1 self.target = -1
+  }
+}
+
+effect fn lastComponent(path: &[u8]) -> List<u8> ! OutOfMemoryError ? &mut Allocator {
+  let mut end = path.length
+  while end > 1 && path[end - 1] == 47 { end = end - 1 }
+  let mut start = end
+  while start > 0 && path[start - 1] != 47 { start = start - 1 }
+  let mut base = List<u8>.make()
+  run base.appendSlice(Slice.view<u8>(path, start, end - start))
+  return move base
+}
+
+impl FileWatch {
+  /// Watches `path` (NUL-terminated in `terminated`); the watch, or a negative errno in `status`.
+  pub effect fn open(terminated: &[u8], status: &mut i32) -> FileWatch ! OutOfMemoryError ? &mut Allocator {
+    let path = Slice.view<u8>(terminated, 0, terminated.length - 1)
+    let mut watch = FileWatch { fd: -1, target: -1, base: run lastComponent(path) }
+    status.* = 0
+    static if Intrinsic.targetOperatingSystem() == "darwin" {
+      let target = unsafe open(Pointer.fromRef<u8>(&terminated[0]), OPEN_FLAGS)
+      if target < 0 { status.* = 0 - unsafe platform.errno() return move watch }
+      watch.target = target
+      let queue = unsafe kqueue()
+      if queue < 0 { status.* = 0 - unsafe platform.errno() return move watch }
+      watch.fd = queue
+      let _cloexec = unsafe fcntl(queue, 2, 1)
+      let changes: [KernelEvent; 1] = [KernelEvent.make(i32.toUsize(target), FILTER_VNODE, 1 | 4 | 32, NOTES, 0)]
+      let mut none: [KernelEvent; 1] = [KernelEvent.make(0, 0, 0, 0, 0)]
+      if unsafe kevent(queue, Pointer.fromSlice<KernelEvent>(&changes), 1, Pointer.fromMutSlice<KernelEvent>(&mut none), 0, Pointer.null<TimeSpec>()) < 0 {
+        status.* = 0 - unsafe platform.errno()
+      }
+    } else {
+      let fd = unsafe inotify_init1(INIT_FLAGS)
+      if fd < 0 { status.* = 0 - unsafe platform.errno() return move watch }
+      watch.fd = fd
+      if unsafe inotify_add_watch(fd, Pointer.fromRef<u8>(&terminated[0]), MASK) < 0 { status.* = 0 - unsafe platform.errno() }
+    }
+    return move watch
+  }
+
+  /// The descriptor to register with the reactor for reads.
+  pub fn descriptor(self: &Self) -> i32 { return self.fd }
+
+  /// Appends the changes that arrived to `changes`, without blocking. Returns 0, or a negative errno.
+  pub effect fn read(self: &mut Self, changes: &mut List<Change>) -> i32 ! OutOfMemoryError ? &mut Allocator {
+    static if Intrinsic.targetOperatingSystem() == "darwin" {
+      let mut events: [KernelEvent; 8] = [KernelEvent.make(0, 0, 0, 0, 0); 8]
+      let zero = TimeSpec { seconds: 0, nanoseconds: 0 }
+      let nothing: [KernelEvent; 1] = [KernelEvent.make(0, 0, 0, 0, 0)]
+      while true {
+        let count = unsafe kevent(self.fd, Pointer.fromSlice<KernelEvent>(&nothing), 0, Pointer.fromMutSlice<KernelEvent>(&mut events), 8, Pointer.fromRef<TimeSpec>(&zero))
+        if count < 0 { let code = unsafe platform.errno() if code == 4 { continue } return 0 - code }
+        if count == 0 { return 0 }
+        let mut i: usize = 0
+        while i < i32.toUsize(count) {
+          let flags = events[i].fflags
+          let kind = if (flags & 12) != 0 { CHANGE } else { RENAME }
+          // libuv names the change after the watched path's current name.
+          let mut name = List<u8>.make()
+          let mut current: [u8; 1024] = [0; 1024]
+          if unsafe fcntl(self.target, F_GETPATH, Pointer.fromMutRef<u8>(&mut current[0])) == 0 {
+            let mut length: usize = 0
+            while length < 1024 && current[length] != 0 { length = length + 1 }
+            name = run lastComponent(Slice.view<u8>(&current, 0, length))
+          } else { run name.appendSlice(self.base.asSlice()) }
+          run changes.append(Change { events: kind, name: move name })
+          i = i + 1
+        }
+      }
+      return 0
+    } else {
+      let mut buffer: [u8; 4096] = [0; 4096]
+      while true {
+        let got = unsafe read(self.fd, Pointer.fromMutRef<u8>(&mut buffer[0]), 4096)
+        if got < 0 {
+          let code = unsafe platform.errno()
+          if code == 4 { continue }
+          if code == 11 { return 0 }
+          return 0 - code
+        }
+        if got == 0 { return 0 }
+        let length = isize.toUsize(got)
+        let mut at: usize = 0
+        // struct inotify_event: wd, mask, cookie and len, then len bytes of NUL-padded name.
+        while at + 16 <= length {
+          let mask = word(&buffer, at + 4)
+          let size = u32.toUsize(word(&buffer, at + 12))
+          if (mask & QUIET) == 0 {
+            let mut events: i32 = 0
+            if (mask & CHANGES) != 0 { events = events | CHANGE }
+            if (mask & (4294967295 - CHANGES)) != 0 { events = events | RENAME }
+            let mut name = List<u8>.make()
+            if size > 0 {
+              let mut end: usize = 0
+              while end < size && buffer[at + 16 + end] != 0 { end = end + 1 }
+              run name.appendSlice(Slice.view<u8>(&buffer, at + 16, end))
+            } else { run name.appendSlice(self.base.asSlice()) }
+            run changes.append(Change { events: events, name: move name })
+          }
+          at = at + 16 + size
+        }
+      }
+      return 0
+    }
+  }
+}
+
+fn word(buffer: &[u8; 4096], at: usize) -> u32 {
+  return u8.toU32(buffer[at]) | u8.toU32(buffer[at + 1]) * 256 | u8.toU32(buffer[at + 2]) * 65536 | u8.toU32(buffer[at + 3]) * 16777216
+}

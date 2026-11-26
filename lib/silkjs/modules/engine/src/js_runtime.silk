@@ -1,0 +1,888 @@
+import temporal_zones { ZoneCache }
+import js_debugger_types { State as DebuggerState }
+import js_coverage { State as CoverageState }
+import js_cpu_profile { State as CpuProfileState }
+//! Native low-level runtime ownership and configuration. Allocate through the owning
+//! RuntimeAllocator provider; JS roots use js_gc, never native container destruction.
+//! allocateContextStorage is INTERNAL storage, not JS_NewContextRaw: callers must
+//! construct BasicObjects before exposing a JavaScript context to an embedding.
+import thin_list { ThinList }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.collections.list { List }
+import intl_zone_name { ZoneNames }
+import silk.collections.hash { Hash }
+import silk.collections.hash_map { HashMap }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.mem.pointer { Pointer }
+import silk.mem.layout { Layout }
+import silk.mem.raw_buffer { RawBuffer }
+import silk.mem.slot { Slot }
+import silk.num.u8
+import silk.num.u32
+import silk.num.i32
+import silk.num.usize
+import js_atoms { AtomTable }
+import js_heap { HeapCell, HeapHeader, HeapKind, CellRef }
+import js_value { ValueBits }
+import js_owned_value { Value, lendBits }
+import js_realm { lendRealm }
+import js_core_types { LastMatch, USER_VALUE_COUNT, DeferredSource, ForeignFrameSource }
+import js_core_types { blankConstructEntry, EMPTY_REGEXP_STANDARD, emptyStringCharCode, TransitionEntry, BLANK_TRANSITION_CHAIN, CHAIN_UNVERIFIED, blankReceiverEntry, InstanceCacheEntry, INSTANCE_CACHE_EMPTY,
+  RuntimeState, ContextState, ContextList, ModuleList, HeapList, GcPhase,
+  HostHook, ModuleLoaderHooks, SharedArrayBufferHooks, WeakRefList, WeakRefHeader,
+  ClassDef, NativeFunctionId, StackFrame, ByteStorage, LeakTrackingState, LocaleCallbacks, SlotBits,
+  ModuleDef
+}
+import js_class_data as classes
+import js_runtime_classes as definitions
+import js_gc { HeapHooks }
+import js_gc as gc
+import js_shapes as shapes
+import runtime_memory { RuntimeAllocator, AllocationObserver }
+
+/// 1 MiB of ValueBits for inline call frames (RuntimeState.callFrames).
+const CALL_FRAME_SLOTS: usize = 65536
+fn noHook() -> HostHook {
+  return HostHook { callback: Option<NativeFunctionId>.none(), opaque: Pointer.null<u8>() }
+}
+/// stackTop is supplied by the native embedding's stack probe. Keeping the probe
+/// outside this API avoids pretending an ordinary local address is a frame pointer.
+pub effect fn allocateRuntimeStorage(stackTop: usize) -> *mut HeapHeader
+  ! OutOfMemoryError ? &mut Allocator {
+  let atoms = run AtomTable.make()
+  let mut registry = List<ClassDef>.make()
+  run registry.reserveExact(u32.toUsize(classes.JS_CLASS_INIT_COUNT))
+  let mut id: u32 = 0
+  while id < classes.JS_CLASS_INIT_COUNT {
+    run registry.append(definitions.standardDefinition(id))
+    id = id + 1
+  }
+  // Reserved, not filled: the 128 KB stay untouched (no page faults) until the
+  // first dead cell parks (gc.parkCell fills them then).
+  let cells = run ThinList<?*mut HeapHeader>.makeWithCapacity(gc.SPARE_CELLS * gc.SPARE_BINS)
+  let mut spares = List<ThinList<SlotBits>>.make()
+  run spares.reserveExact(shapes.SPARE_SLOT_BINS * shapes.SPARE_SLOTS_PER_BIN)
+  while spares.length() < shapes.SPARE_SLOT_BINS * shapes.SPARE_SLOTS_PER_BIN { run spares.append(ThinList<SlotBits>.make()) }
+  let mut spareValues = List<ThinList<ValueBits>>.make()
+  run spareValues.reserveExact(shapes.SPARE_VALUE_CAPACITY * shapes.SPARE_VALUES_PER_BIN)
+  while spareValues.length() < shapes.SPARE_VALUE_CAPACITY * shapes.SPARE_VALUES_PER_BIN { run spareValues.append(ThinList<ValueBits>.make()) }
+  // Untouched pages stay unbacked, so the region costs address space only.
+  let callFrameAllocation = run Allocator.allocate(Layout { bytes: CALL_FRAME_SLOTS * Layout.of<ValueBits>().bytes, alignment: Layout.of<ValueBits>().alignment })
+  let mut callFrames = unsafe RawBuffer.from<ValueBits>(move callFrameAllocation, CALL_FRAME_SLOTS)
+  let callFramesBase = Slot.address(RawBuffer.slot<ValueBits>(&mut callFrames, 0))
+  let callFramesEnd = unsafe Pointer.atMut<ValueBits>(unsafe Pointer.assumeManyMut<ValueBits>(callFramesBase), CALL_FRAME_SLOTS)
+  let mut buckets = List<?*mut HeapHeader>.make()
+  run buckets.reserveExact(16)
+  while buckets.length() < 16 { run buckets.append(Pointer.null<HeapHeader>()) }
+  // Until publication every owner is lexical, so any failed allocation drops all
+  // atom/native storage. Standard names are permanent atoms, not dynamic retains.
+  // Zeroed allocator pages keep empty integer/pointer caches unbacked. Their
+  // zero representation is valid; every other field is initialized below.
+  let cell = run HeapCell.allocateZeroedStorage<RuntimeState>(HeapKind.Auxiliary)
+  let mut anchor = ()
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, cell)
+  // The allocator supplies zeroed pages. Leave the all-zero caches untouched
+  // until their first use; initialize every other field in place. The untouched
+  // fields are fieldCache, typedLengthCache, constructPins, retiredShapes,
+  // emptyShapes, literalCache, numberStringKeys, zeroStack, spareVarRefs,
+  // spareScopes, the spare counts, Intl/Temporal IDs and closure caches.
+  unsafe Pointer.put(Pointer.fromMutRef(&mut state.debugger), DebuggerState.make())
+  unsafe Pointer.put(Pointer.fromMutRef(&mut state.coverage), CoverageState.make())
+  state.observeInstructions = false
+  state.adoptFrames = false
+  state.plainRuns = 0
+  state.observeFresh = false
+  state.allocationRealmsUsed = false
+  unsafe Pointer.put(Pointer.fromMutRef(&mut state.cpuProfile), CpuProfileState.make())
+  unsafe Pointer.put(Pointer.fromMutRef(&mut state.runtimeInfo), Option<ByteStorage>.none())
+  unsafe Pointer.put(Pointer.fromMutRef(&mut state.atoms), move atoms)
+  unsafe Pointer.put(Pointer.fromMutRef(&mut state.classes), move registry)
+  state.intlSegmentsClassId = 0
+  state.intlSegmentIteratorClassId = 0
+  state.contexts = ContextList { first: Pointer.null<HeapHeader>(), last: Pointer.null<HeapHeader>() }
+  state.gcObjects = HeapList.make()
+  state.zeroReferenceObjects = HeapList.make()
+  state.temporaryGcObjects = HeapList.make()
+  state.zombieGcObjects = HeapList.make()
+  state.gcArenas = Pointer.null<u8>()
+  state.gcPendingArenas = Pointer.null<u8>()
+  state.gcYoungArenas = Pointer.null<u8>()
+  state.zeroPending = 0
+  state.coldDrains = 0
+  state.weakTargetsDied = false
+  state.gcPhase = GcPhase.None
+  // Larger cells need a 1 MiB threshold to match C QuickJS's GC cadence.
+  state.mallocGcThreshold = 1048576
+  state.layoutIndependent = false
+  state.quietCollections = 0
+  state.gcFullThreshold = 1048576
+  state.gcYoungBase = 0
+  state.gcTenured = false
+  state.gcYoungLimit = usize.MAX
+  state.gcYoungBudget = YOUNG_BUDGET
+  state.gcFullBase = 0
+  state.gcIdleBytes = 0
+  state.gcProbing = false
+  state.gcHeapLimit = usize.MAX
+  state.gcFullCount = 0
+  state.gcYoungCount = 0
+  state.gcTicks = 0
+  state.useStrict = false
+  state.allowNativesSyntax = false
+  state.zeroStackCount = 0
+  state.weakReferences = WeakRefList { first: Pointer.null<WeakRefHeader>(), last: Pointer.null<WeakRefHeader>() }
+  unsafe Pointer.put(Pointer.fromMutRef(&mut state.leakTracking), Option<LeakTrackingState>.none())
+  state.stackSize = 1048576
+  state.stackTop = stackTop
+  state.stackLimit = usize.wrappingSubtract(stackTop, 1048576)
+  state.currentException = ValueBits.Uninitialized
+  state.thrownValue = ValueBits.Undefined
+  state.thrownCode = ValueBits.Undefined
+  state.thrownPc = 0
+  state.thrownNative = false
+  state.thrownLine = 0
+  state.thrownColumn = 0
+  state.thrownLength = 0
+  state.traceUncaught = false
+  state.tracedValue = ValueBits.Undefined
+  state.tracedStack = ValueBits.Undefined
+  state.handlerCode = 0
+  state.handlerPc = 0
+  state.currentExceptionIsUncatchable = false
+  state.inOutOfMemory = false
+  unsafe Pointer.put(Pointer.fromMutRef(&mut state.asyncContext), Value.immediate(ValueBits.Undefined))
+  unsafe Pointer.put(Pointer.fromMutRef(&mut state.syntaxOriginKeys), [Value.immediate(ValueBits.Undefined), Value.immediate(ValueBits.Undefined), Value.immediate(ValueBits.Undefined)])
+  state.asyncHooksEnabled = false
+  state.asyncHookActive = false
+  state.asyncTokenNext = 1
+  state.asyncPromiseParent = ValueBits.Undefined
+  state.currentStackFrame = Pointer.null<StackFrame>()
+  state.interrupt = noHook()
+  state.promiseRejectionTracker = noHook()
+  state.jobs = HeapList.make()
+  state.nextScriptId = 1
+  unsafe Pointer.put(Pointer.fromMutRef(&mut state.moduleLoader), ModuleLoaderHooks { normalize: Option<NativeFunctionId>.none(), load: Option<NativeFunctionId>.none(),
+      checkSupportedImportAttributes: Option<NativeFunctionId>.none(), loaderHasAttributes: false, opaque: Pointer.null<u8>() })
+  unsafe Pointer.put(Pointer.fromMutRef(&mut state.foreignFrames), Option<ForeignFrameSource>.none())
+  unsafe Pointer.put(Pointer.fromMutRef(&mut state.hiddenScripts), List<u32>.make())
+  state.moduleAsyncEvaluationNextTimestamp = 0
+  state.canBlock = false
+  unsafe Pointer.put(Pointer.fromMutRef(&mut state.sharedArrayBuffers), SharedArrayBufferHooks { allocate: Option<NativeFunctionId>.none(), free: Option<NativeFunctionId>.none(),
+      duplicate: Option<NativeFunctionId>.none(), opaque: Pointer.null<u8>() })
+  state.stripFlags = 0
+  state.shapeHashBits = 4
+  state.shapeHashCount = 0
+  unsafe Pointer.put(Pointer.fromMutRef(&mut state.shapeHash), move buckets)
+  state.parkedShapes = HeapList.make()
+  state.parkedShapeCount = 0
+  unsafe Pointer.put(Pointer.fromMutRef(&mut state.spareSlots), move spares)
+  unsafe Pointer.put(Pointer.fromMutRef(&mut state.spareValues), move spareValues)
+  unsafe Pointer.put(Pointer.fromMutRef(&mut state.spareCells), move cells)
+  state.transitions = [TransitionEntry { epoch: 0, target: Pointer.null<HeapHeader>(), atom: 0, flags: 0, chainDepth: CHAIN_UNVERIFIED, baseVersion: 0 }; 2048]
+  state.transitionChains = [BLANK_TRANSITION_CHAIN; 2048]
+  state.nextShapeVersion = 1
+  state.shapeEpoch = 1
+  state.plainCloneVersion = 0
+  state.regexpStandard = EMPTY_REGEXP_STANDARD
+  state.stringCharCode = emptyStringCharCode()
+  state.retiredShapeNext = 0
+  state.receiverCache = [blankReceiverEntry(); 64]
+  state.instanceCache = [InstanceCacheEntry { version: INSTANCE_CACHE_EMPTY, index: 0 }; 64]
+  state.joinCache = [ValueBits.Undefined; 4]
+  state.numberText = [ValueBits.Undefined; 2]
+  state.constructCache = [blankConstructEntry(); 64]
+  state.numberStrings = [ValueBits.Undefined; 1024]
+  unsafe Pointer.put(Pointer.fromMutRef(&mut state.regexpPrograms), List<ValueBits>.make())
+  unsafe Pointer.put(Pointer.fromMutRef(&mut state.dateZone), List<u8>.make())
+  unsafe Pointer.put(Pointer.fromMutRef(&mut state.dateZoneNames), ZoneNames.make())
+  state.dateZoneLinked = false
+  unsafe Pointer.put(Pointer.fromMutRef(&mut state.keptObjects), List<ValueBits>.make())
+  unsafe Pointer.put(Pointer.fromMutRef(&mut state.deferredSources), List<DeferredSource>.make())
+  unsafe Pointer.put(Pointer.fromMutRef(&mut state.deferredAtoms), List<u32>.make())
+  unsafe Pointer.put(Pointer.fromMutRef(&mut state.deferredTexts), List<ValueBits>.make())
+  state.unitStrings = [ValueBits.Undefined; 1537]
+  state.spareVarRefCount = 0
+  state.userOpaque = Pointer.null<u8>()
+  unsafe Pointer.put(Pointer.fromMutRef(&mut state.callFrames), Option<Intrinsic.RawBuffer<ValueBits>>.some(move callFrames))
+  state.callFramesTop = callFramesBase
+  state.callFramesEnd = callFramesEnd
+  unsafe Pointer.put(Pointer.fromMutRef(&mut state.allocationRealms), HashMap<usize, *mut HeapHeader>.make(Hash.seed(0)))
+  state.reactionResolve = ValueBits.Undefined
+  state.parkedForIn = ValueBits.Undefined
+  drop state
+  return cell
+}
+
+/// Allocate a compilation identity, never a filename-derived identity. Failed
+/// compilations may leave gaps; identities are never recycled within a runtime.
+pub unsafe fn allocateScriptId(runtime: *mut HeapHeader) -> u64 {
+  let mut anchor = ()
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  let id = state.nextScriptId
+  if id == 18446744073709551615 { Intrinsic.trap("script identity exhausted") }
+  state.nextScriptId = id + 1
+  return id
+}
+/// Internal allocation for the intrinsic constructor. Every owned slot is valid;
+/// no JS intrinsics or objects have been constructed. Returned context owns one RC.
+/// runtime must outlive the context. No allocation occurs after publication.
+pub unsafe effect fn allocateContextStorage(runtime: *mut HeapHeader) -> *mut HeapHeader
+  ! OutOfMemoryError ? &mut Allocator {
+  let mut anchor = ()
+  let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
+  let count = state.classes.length()
+  let previous = state.contexts.last
+  drop state
+  let mut prototypes = List<ValueBits>.make()
+  run prototypes.reserveExact(count)
+  while prototypes.length() < count { run prototypes.append(ValueBits.Null) }
+  let context = run HeapCell.allocate<ContextState>(HeapKind.Context, ContextState {
+    runtime: runtime, previousContext: previous, nextContext: Pointer.null<HeapHeader>(),
+    binaryObjectCount: 0, recordsAllocationRealm: false, binaryObjectSize: 0,
+    arrayShape: Pointer.null<HeapHeader>(), argumentsShape: Pointer.null<HeapHeader>(), mappedArgumentsShape: Pointer.null<HeapHeader>(),
+    regexpShape: Pointer.null<HeapHeader>(), regexpResultShape: Pointer.null<HeapHeader>(), iterationCode: Pointer.null<HeapHeader>(), reduceCode: Pointer.null<HeapHeader>(), boundShape: Pointer.null<HeapHeader>(), boundNameSource: Value.immediate(ValueBits.Undefined), boundName: Value.immediate(ValueBits.Undefined),
+    regexpExecShape: 0, regexpExecProto: 0, regexpExecSlot: 0, stringCharCodeProtoVersion: 0, stringCharCodeAtom: 0, stringCharCodeSlot: 0, spreadEpoch: 0, promiseSpeciesEpoch: 0, descriptorEpoch: 0, promiseConstructorSlot: 0, promiseSpeciesSlot: 0, promiseThenSlot: 0, spreadIteratorSlot: 0, spreadNextSlot: 0,
+    classPrototypes: move prototypes, functionPrototype: Value.immediate(ValueBits.Null), functionConstructor: Value.immediate(ValueBits.Null),
+    arrayConstructor: Value.immediate(ValueBits.Null), regexpConstructor: Value.immediate(ValueBits.Null), promiseConstructor: Value.immediate(ValueBits.Null),
+    nativeErrorPrototypes: [Value.immediate(ValueBits.Null), Value.immediate(ValueBits.Null), Value.immediate(ValueBits.Null), Value.immediate(ValueBits.Null), Value.immediate(ValueBits.Null), Value.immediate(ValueBits.Null), Value.immediate(ValueBits.Null), Value.immediate(ValueBits.Null), Value.immediate(ValueBits.Null)], iteratorConstructor: Value.immediate(ValueBits.Null), asyncIteratorPrototype: Value.immediate(ValueBits.Null),
+    arrayPrototypeValues: Value.immediate(ValueBits.Null), throwTypeError: Value.immediate(ValueBits.Null), evalObject: Value.immediate(ValueBits.Null),
+    nodeErrorStackGetter: Value.immediate(ValueBits.Null), nodeErrorStackSetter: Value.immediate(ValueBits.Null),
+    nodeErrorConstructor: Value.immediate(ValueBits.Null), nodeErrorFormatter: Value.immediate(ValueBits.Null), lastMatch: LastMatch.empty(), zones: ZoneCache.empty(),
+    userValues: [Value.immediate(ValueBits.Null), Value.immediate(ValueBits.Null), Value.immediate(ValueBits.Null), Value.immediate(ValueBits.Null), Value.immediate(ValueBits.Null), Value.immediate(ValueBits.Null), Value.immediate(ValueBits.Null), Value.immediate(ValueBits.Null)], globalObject: Value.immediate(ValueBits.Null), globalObjectStorage: Value.immediate(ValueBits.Null),
+    globalProxyBindings: Value.immediate(ValueBits.Null), hostImport: Value.immediate(ValueBits.Undefined), globalVarObject: Value.immediate(ValueBits.Null),
+    randomState: 0, interruptCounter: 0,
+    loadedModules: ModuleList { first: Option<CellRef<ModuleDef>>.none(), last: Option<CellRef<ModuleDef>>.none() },
+    regexpCompilerEnabled: false, evalEnabled: false, codeGenerationAllowed: true, privateJobQueue: false,
+    localeCallbacks: Option<LocaleCallbacks>.none(), userOpaque: Pointer.null<u8>()
+  })
+  match Pointer.nonNullMut<HeapHeader>(previous) {
+    Option<*mut HeapHeader>.Some { value } => {
+      let prior = unsafe HeapCell.payloadMut<ContextState, ()>(&mut anchor, value)
+      prior.nextContext = context
+    }
+    Option<*mut HeapHeader>.None => ()
+  }
+  let updated = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  if Pointer.isNull<HeapHeader>(previous) { updated.contexts.first = context }
+  updated.contexts.last = context
+  drop updated
+  unsafe gc.publish(runtime, context)
+  return context
+}
+pub unsafe fn contextRuntime(context: *mut HeapHeader) -> *mut HeapHeader {
+  let anchor = ()
+  unsafe { return HeapCell.payload<ContextState, ()>(&anchor, context).runtime }
+}
+pub unsafe fn duplicateContext(context: *mut HeapHeader) -> *mut HeapHeader {
+  unsafe HeapCell.retain(context)
+  return context
+}
+/// Returns an owned reference to the current async context without allocating.
+pub unsafe fn getAsyncContext(runtime: *mut HeapHeader) -> Value {
+  let anchor = ()
+  let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
+  return state.asyncContext.dup()
+}
+/// Consumes value, installing the replacement before releasing the previous root.
+pub unsafe fn setAsyncContext<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, value: Value) -> () {
+  let mut anchor = ()
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  let previous = Intrinsic.replace(state.asyncContext, move value)
+  drop state
+  unsafe previous.release(&mut hooks, runtime)
+}
+pub unsafe fn setAsyncHooksEnabled(runtime: *mut HeapHeader, enabled: bool) -> () {
+  let mut anchor = ()
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  state.asyncHooksEnabled = enabled
+}
+pub unsafe fn asyncHooksEnabled(runtime: *mut HeapHeader) -> bool {
+  let anchor = ()
+  let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
+  return state.asyncHooksEnabled && !state.asyncHookActive
+}
+/// Zero denotes an unobserved resource. Hook-created resources are not instrumented.
+pub unsafe fn allocateAsyncToken(runtime: *mut HeapHeader) -> usize {
+  let mut anchor = ()
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  if !state.asyncHooksEnabled || state.asyncHookActive { return 0 }
+  let token = state.asyncTokenNext
+  state.asyncTokenNext = token + 1
+  return token
+}
+pub unsafe fn swapAsyncPromiseParent(runtime: *mut HeapHeader, parent: ValueBits) -> ValueBits {
+  let mut anchor = ()
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  return Intrinsic.replace(state.asyncPromiseParent, parent)
+}
+/// The embedding treats a hook's errors as fatal, except one it hands back (true):
+/// that exception is pending and the caller throws it where the event arose.
+/// No mutable runtime borrow survives reentrant delivery.
+pub unsafe effect fn emitAsyncLifecycle<H: HeapHooks>(hooks: &mut H, context: *mut HeapHeader,
+  event: u32, token: usize, parent: usize, resource: ValueBits, parentResource: ValueBits) -> bool ? &mut Allocator {
+  if !resource.isObject() { return false }
+  let runtime = unsafe contextRuntime(context)
+  let mut anchor = ()
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  if !state.asyncHooksEnabled || state.asyncHookActive { return false }
+  state.asyncHookActive = true
+  drop state
+  let thrown = run hooks.asyncLifecycle(unsafe lendRealm(&context, context), event, token, parent, unsafe lendBits(&resource, resource), unsafe lendBits(&parentResource, parentResource))
+  let after = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  after.asyncHookActive = false
+  return thrown
+}
+pub unsafe fn getRuntimeOpaque(runtime: *mut HeapHeader) -> ?*mut u8 {
+  let anchor = ()
+  unsafe { return HeapCell.payload<RuntimeState, ()>(&anchor, runtime).userOpaque }
+}
+pub unsafe fn setRuntimeOpaque(runtime: *mut HeapHeader, opaque: ?*mut u8) -> () {
+  let mut anchor = ()
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  state.userOpaque = opaque
+}
+pub unsafe fn getContextOpaque(context: *mut HeapHeader) -> ?*mut u8 {
+  let anchor = ()
+  unsafe { return HeapCell.payload<ContextState, ()>(&anchor, context).userOpaque }
+}
+pub unsafe fn setContextOpaque(context: *mut HeapHeader, opaque: ?*mut u8) -> () {
+  let mut anchor = ()
+  let state = unsafe HeapCell.payloadMut<ContextState, ()>(&mut anchor, context)
+  state.userOpaque = opaque
+}
+/// Consumes incoming; unlike context user roots, this publishes BEFORE release,
+/// matching set_value, so finalizers may inspect the replacement safely.
+pub unsafe fn setClassPrototype<H: HeapHooks>(hooks: &mut H, context: *mut HeapHeader, classId: u32, incoming: ValueBits) -> () {
+  let mut anchor = ()
+  let data = unsafe HeapCell.payloadMut<ContextState, ()>(&mut anchor, context)
+  let runtime = data.runtime
+  let mut registryAnchor = ()
+  let registry = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut registryAnchor, runtime)
+  if u32.toUsize(classId) >= registry.classes.length() { Intrinsic.trap("QuickJS invariant violated") }
+  if classId == classes.JS_CLASS_STRING { registry.stringCharCode.protoVersion = 0 }
+  drop registry
+  let old = data.classPrototypes.get(u32.toUsize(classId))
+  data.classPrototypes.set(u32.toUsize(classId), incoming)
+  drop data
+  unsafe gc.release(&mut hooks, runtime, old)
+}
+pub unsafe fn getClassPrototype(context: *mut HeapHeader, classId: u32) -> ValueBits {
+  let anchor = ()
+  let data = unsafe HeapCell.payload<ContextState, ()>(&anchor, context)
+  let registryAnchor = ()
+  let registry = unsafe HeapCell.payload<RuntimeState, ()>(&registryAnchor, data.runtime)
+  if u32.toUsize(classId) >= registry.classes.length() { Intrinsic.trap("QuickJS invariant violated") }
+  return unsafe data.classPrototypes.get(u32.toUsize(classId)).retained()
+}
+/// Source JS_SetContextValue releases the old edge BEFORE storing the replacement.
+/// Incoming ownership is consumed even for an invalid index. Caller roots context.
+pub unsafe fn setContextValue<H: HeapHooks>(hooks: &mut H, context: *mut HeapHeader, index: i32, incoming: Value) -> () {
+  let runtime = unsafe contextRuntime(context)
+  if index < 0 || i32.toUsize(index) >= USER_VALUE_COUNT { unsafe incoming.release(&mut hooks, runtime) return () }
+  let mut anchor = ()
+  let updated = unsafe HeapCell.payloadMut<ContextState, ()>(&mut anchor, context)
+  let old = Intrinsic.replace(updated.userValues[i32.toUsize(index)], move incoming)
+  drop updated
+  unsafe old.release(&mut hooks, runtime)
+}
+pub unsafe fn getContextValue(context: *mut HeapHeader, index: i32) -> ValueBits {
+  if index < 0 || i32.toUsize(index) >= USER_VALUE_COUNT { return ValueBits.Undefined }
+  let anchor = ()
+  let data = unsafe HeapCell.payload<ContextState, ()>(&anchor, context)
+  return data.userValues[i32.toUsize(index)].dup().intoBits()
+}
+pub fn setMemoryLimit<A>(allocator: &mut RuntimeAllocator<A>, limit: usize) -> () { allocator.setLimit(limit) }
+pub unsafe fn setGCThreshold(runtime: *mut HeapHeader, threshold: usize) -> () {
+  let mut anchor = ()
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  state.mallocGcThreshold = threshold
+  state.gcFullThreshold = threshold
+}
+/// Bounds the young generation (V8's maxYoungGenerationSizeMb): usage grows at
+/// most limit bytes past what the last collection left before the next one runs.
+/// Turns the address-keyed caches off (RuntimeState.layoutIndependent) while a
+/// heap image is built, and back on before it is saved.
+pub unsafe fn setLayoutIndependent(runtime: *mut HeapHeader, independent: bool) -> () {
+  let mut anchor = ()
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  state.layoutIndependent = independent
+  // The OS zone Date toString looked up is the building machine's: an image
+  // looks it up again where it runs.
+  state.dateZoneLinked = false
+}
+pub unsafe fn setYoungLimit(runtime: *mut HeapHeader, limit: usize) -> () {
+  let mut anchor = ()
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  state.gcYoungLimit = limit
+  state.mallocGcThreshold = lesser(state.mallocGcThreshold, usize.saturatingAdd(state.gcYoungBase, limit))
+}
+/// V8's --use-strict: code compiled from here on is strict, as if each script began with "use strict".
+/// V8's --allow-natives-syntax: whether code compiled from now on may call %Name(...).
+pub unsafe fn setAllowNativesSyntax(runtime: *mut HeapHeader, allow: bool) -> () {
+  let mut anchor = ()
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  state.allowNativesSyntax = allow
+}
+pub unsafe fn setUseStrict(runtime: *mut HeapHeader, strict: bool) -> () {
+  let mut anchor = ()
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  state.useStrict = strict
+}
+/// Keeps collections ahead of a heap budget (the allocator's limit): each one
+/// runs by the time usage has used half of the room left under limit, so the
+/// budget refuses an allocation only when live data fills it, as V8's does.
+pub unsafe fn setHeapLimit(runtime: *mut HeapHeader, limit: usize, used: usize) -> () {
+  let mut anchor = ()
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  state.gcHeapLimit = limit
+  state.mallocGcThreshold = lesser(state.mallocGcThreshold, heapCap(limit, used))
+  state.gcFullThreshold = lesser(state.gcFullThreshold, heapCap(limit, used))
+}
+fn heapCap(limit: usize, used: usize) -> usize {
+  if limit == usize.MAX { return usize.MAX }
+  if used >= limit { return used }
+  return used + (limit - used) / 2
+}
+/// Collections so far and the time they took (RuntimeState.gcTicks).
+pub struct GcCounts { pub full: u32, pub young: u32, pub ticks: usize }
+impl Copy for GcCounts {}
+pub unsafe fn gcCounts(runtime: *mut HeapHeader) -> GcCounts {
+  let anchor = ()
+  let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
+  return GcCounts { full: state.gcFullCount, young: state.gcYoungCount, ticks: state.gcTicks }
+}
+/// The allocator usage the last collection left: what was allocated since is the
+/// young generation, which the next young collection scans.
+pub unsafe fn youngBase(runtime: *mut HeapHeader) -> usize {
+  let anchor = ()
+  return (unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)).gcYoungBase
+}
+/// Native code that builds one large result which stays reachable until it
+/// returns (the rows of a query) defers allocation-triggered collection while it
+/// does: a collection then could only rescan what is being built. Forced
+/// collections still run. Hand the result to resumeCollections; the first
+/// allocation after that collects if usage is over the saved threshold.
+pub unsafe fn deferCollections(runtime: *mut HeapHeader) -> usize {
+  let mut anchor = ()
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  let saved = state.mallocGcThreshold
+  state.mallocGcThreshold = usize.MAX
+  return saved
+}
+/// Ends deferCollections. The deferred result is live, so collecting as soon as
+/// it is returned would only rescan it: the next collection waits for the heap to
+/// grow by half from here, as after a collection that found nothing. A threshold
+/// set in between (by a forced collection or setGCThreshold) is kept.
+pub unsafe fn resumeCollections(allocator: &AllocationObserver, runtime: *mut HeapHeader, saved: usize) -> () {
+  let mut anchor = ()
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  if state.mallocGcThreshold != usize.MAX { return () }
+  let used = allocator.usedBytes()
+  let grown = usize.wrappingAdd(used, used / 2)
+  state.mallocGcThreshold = saved
+  if grown > saved {
+    state.mallocGcThreshold = grown
+    if grown > state.gcFullThreshold { state.gcFullThreshold = grown }
+  }
+}
+/// The most a heap grows past its last full collection while probes put the next
+/// one off (see collectOverThreshold).
+const QUIET_GROWTH_LIMIT: usize = 134217728
+/// Scales the quiet growth cap with base on large heaps so backoff past 128 MiB
+/// does not clamp below the normal 1.5x threshold.
+fn quietGrowthLimit(base: usize) -> usize {
+  if base > QUIET_GROWTH_LIMIT { return base }
+  return QUIET_GROWTH_LIMIT
+}
+/// How much is allocated between a probe's start and the young collection that
+/// ends it: an eighth of the heap, within 1 to 4 MiB.
+fn probeWindow(used: usize) -> usize {
+  let window = used / 8
+  if window < 1048576 { return 1048576 }
+  if window > 4194304 { return 4194304 }
+  return window
+}
+/// Usage growth that triggers a young collection (see collectOverThreshold).
+const YOUNG_BUDGET: usize = 8388608
+/// Below this usage full collections are cheap and young ones are not tried.
+/// Idle pooled memory under this stays with the process after a full collection.
+const IDLE_RELEASE_BYTES: usize = 8388608
+const YOUNG_MIN_USED: usize = 50331648
+/// The usage at which the next young collection runs: none while the heap is
+/// small enough that full collections stay cheap.
+fn youngThreshold(used: usize) -> usize {
+  let next = usize.wrappingAdd(used, YOUNG_BUDGET)
+  if next < YOUNG_MIN_USED { return usize.MAX }
+  return next
+}
+/// The usage at which the next young collection of a tenured runtime runs. Its
+/// survivors become old at the second young collection they live through
+/// (js_gc.ageYoung), so each one rescans about two budgets of cells.
+fn tenuredThreshold(used: usize, budget: usize) -> usize { return usize.wrappingAdd(used, budget) }
+/// The least a tenured runtime's young budget shrinks to (RuntimeState.gcYoungBudget).
+const YOUNG_BUDGET_MIN: usize = 2097152
+/// What a shrunk young budget grows back to, and what a runtime loaded from a heap
+/// image starts with.
+const YOUNG_BUDGET_GROWN: usize = 4194304
+/// The young budget after a young collection of a tenured runtime that saw usage
+/// grow by grown and freed freed of it. One that frees half of the growth halves
+/// the budget (the garbage is short-lived: collecting sooner keeps the peak low and
+/// rescans little); one that frees under an eighth (modules loading, a cache
+/// filling) takes a shrunk budget back up.
+pub fn nextYoungBudget(budget: usize, grown: usize, freed: usize) -> usize {
+  if grown == 0 { return budget }
+  if freed >= grown / 2 { if budget / 2 >= YOUNG_BUDGET_MIN { return budget / 2 } return YOUNG_BUDGET_MIN }
+  if freed < grown / 8 && budget < YOUNG_BUDGET_GROWN { return YOUNG_BUDGET_GROWN }
+  return budget
+}
+/// After a full collection the host forced (gc()): nothing young is left to find,
+/// so the next young collection is a whole budget of growth away.
+pub unsafe fn restartYoung(allocator: &AllocationObserver, runtime: *mut HeapHeader) -> () {
+  let mut anchor = ()
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  if !state.gcTenured || state.mallocGcThreshold == usize.MAX { return () }
+  let used = allocator.usedBytes()
+  state.gcYoungBase = used
+  state.mallocGcThreshold = lesser(lesser(lesser(state.gcFullThreshold, tenuredThreshold(used, state.gcYoungBudget)), usize.saturatingAdd(used, state.gcYoungLimit)), heapCap(state.gcHeapLimit, used))
+}
+/// Makes every live cell old (a heap image's built-ins, before the image is
+/// saved) and from then on lets young collections' survivors age into the old
+/// generation (see RuntimeState.gcTenured). The next collection is a young one: a full
+/// collection waits until usage passes the next threshold by what is old now.
+pub unsafe fn tenure(allocator: &AllocationObserver, runtime: *mut HeapHeader) -> () {
+  unsafe gc.tenureMembers(runtime)
+  let used = allocator.usedBytes()
+  let mut anchor = ()
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  state.gcTenured = true
+  state.gcYoungBase = used
+  let full = usize.saturatingAdd(state.mallocGcThreshold, used)
+  if full > state.gcFullThreshold { state.gcFullThreshold = full }
+  // Under a heap budget a full collection still runs before the budget is spent:
+  // young collections of a tenured runtime never find cycles through old cells.
+  state.gcFullThreshold = lesser(state.gcFullThreshold, heapCap(state.gcHeapLimit, used))
+}
+/// Starts collections of a runtime loaded from a heap image afresh. The thresholds it
+/// was saved with are the building process's: they let a loaded image grow by tens
+/// of MB of garbage before its first collection. Young collections now run every
+/// YOUNG_BUDGET.
+pub unsafe fn startLoadedImage(allocator: &AllocationObserver, runtime: *mut HeapHeader) -> () {
+  let used = allocator.usedBytes()
+  let mut anchor = ()
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  state.gcYoungBase = used
+  // A full collection writes every image cell's header (copying its pages): keep
+  // it for a heap that really grows, at least twice what the image holds.
+  if state.gcFullThreshold < usize.wrappingMultiply(used, 2) { state.gcFullThreshold = usize.wrappingMultiply(used, 2) }
+  state.gcFullThreshold = lesser(state.gcFullThreshold, heapCap(state.gcHeapLimit, used))
+  state.gcYoungBudget = YOUNG_BUDGET_GROWN
+  state.mallocGcThreshold = lesser(lesser(lesser(state.gcFullThreshold, tenuredThreshold(used, state.gcYoungBudget)), usize.saturatingAdd(used, state.gcYoungLimit)), heapCap(state.gcHeapLimit, used))
+}
+@inlineAlways
+fn lesser(left: usize, right: usize) -> usize {
+  if left < right { return left }
+  return right
+}
+/// Gives the pool's idle memory back to the system, as AllocationObserver.releaseIdle
+/// does, and returns the bytes released: what a host calls when its app goes idle
+/// after a burst. On Darwin the pool can only give back an arena that no collector
+/// lists, so the arenas the runtime's cells have left are let go of first; elsewhere
+/// this is the allocator's call alone. allocator is the runtime's. Owner thread,
+/// outside a collection and a parse. The preparser's per-atom mark arrays a parse
+/// left for the next one (about 4 MB for a large bundle's atoms) go too: an idle
+/// app seldom parses again, and a parse that does grows them back.
+pub unsafe fn releaseIdle(allocator: &AllocationObserver, runtime: *mut HeapHeader, reserve: usize) -> usize {
+  let mut anchor = ()
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  drop Intrinsic.replace(state.preparseBinderStamps, List<u32>.make())
+  drop Intrinsic.replace(state.preparseBinderValues, List<u32>.make())
+  drop Intrinsic.replace(state.preparseMarkStamps, List<u32>.make())
+  drop Intrinsic.replace(state.preparseMarkValues, List<u32>.make())
+  drop state
+  static if Intrinsic.targetOperatingSystem() == "darwin" { unsafe gc.unclaimEmptyArenas(runtime) }
+  return allocator.releaseIdle(reserve)
+}
+/// Explicit safepoint, called before allocation. Size arithmetic wraps like size_t.
+/// Usage is sampled again AFTER collection because hooks can allocate/free storage.
+/// Weak callbacks use the caller's allocator capability; the observer only samples usage.
+@inlineAlways
+pub unsafe effect fn triggerGC<H: HeapHooks>(allocator: &AllocationObserver, hooks: &mut H,
+  runtime: *mut HeapHeader, size: usize, force: bool) -> bool ? &mut Allocator {
+  let mut anchor = ()
+  let before = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
+  let threshold = before.mallocGcThreshold
+  drop before
+  if !force && usize.wrappingAdd(allocator.usedBytes(), size) <= threshold { return false }
+  return run unsafe collectOverThreshold(allocator, &mut hooks, runtime, size, threshold, force)
+}
+// Kept out of triggerGC so its threshold check stays small enough to inline.
+@inlineNever
+unsafe effect fn collectOverThreshold<H: HeapHooks>(allocator: &AllocationObserver, hooks: &mut H,
+  runtime: *mut HeapHeader, size: usize, threshold: usize, force: bool) -> bool ? &mut Allocator {
+  // Value drops queue dead cells instead of freeing them; freeing that queue may be enough.
+  if !force {
+    unsafe gc.drainPending(&mut hooks, runtime)
+    if usize.wrappingAdd(allocator.usedBytes(), size) <= threshold { return false }
+  }
+  let mut anchor = ()
+  let before = allocator.usedBytes()
+  let current = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
+  let tenured = current.gcTenured
+  let mut full = force || (!tenured && before < YOUNG_MIN_USED) || usize.wrappingAdd(before, size) > current.gcFullThreshold
+  let probing = current.gcProbing
+  // A full collection of a heap that is only growing rescans all of it to free
+  // nothing. Once one has come back quiet, or once the heap is large enough
+  // (YOUNG_MIN_USED) that rescanning it is a pause of tens of milliseconds, the
+  // next is put off by a probe: the cells so far become old unscanned, and a
+  // young collection a short window later looks at just the window. Little freed
+  // there means the heap is still only growing (a program that made garbage
+  // cycles a moment ago now builds a large live structure), and the full
+  // collection waits for the next threshold; garbage there runs it now, a few
+  // milliseconds later than it would have. However the probes come out, a full
+  // collection runs once the heap has grown QUIET_GROWTH_LIMIT past the start
+  // of the quiet stretch (gcFullBase), which bounds the cycles one can leave
+  // uncollected.
+  let probes = !tenured && current.gcHeapLimit == usize.MAX && current.gcYoungLimit == usize.MAX
+    && (current.quietCollections != 0 || before >= YOUNG_MIN_USED) && before < usize.saturatingAdd(current.gcFullBase, quietGrowthLimit(current.gcFullBase))
+  drop current
+  if probing {
+    let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+    state.gcProbing = false
+    drop state
+  }
+  if probing && !force {
+    run unsafe gc.collectYoung(&mut hooks, runtime)
+    let used = allocator.stats().usedBytes
+    let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+    let grown = usize.wrappingSubtract(before, state.gcYoungBase)
+    let freed = if before > used { before - used } else { 0 }
+    state.gcYoungBase = used
+    if freed < grown / 8 {
+      // The first quiet probe after a productive full collection starts a quiet
+      // stretch: the growth cap counts from here, since what the heap grew before
+      // it was the productive phase's and is bounded by its own threshold.
+      if state.quietCollections == 0 { state.gcFullBase = used }
+      if state.quietCollections < 3 { state.quietCollections = state.quietCollections + 1 }
+      let step = usize.wrappingMultiply(used / 2, 1 + u8.toUsize(state.quietCollections))
+      state.gcFullThreshold = lesser(usize.wrappingAdd(used, step), usize.saturatingAdd(state.gcFullBase, quietGrowthLimit(state.gcFullBase)))
+      state.mallocGcThreshold = state.gcFullThreshold
+      return true
+    }
+    drop state
+    full = true
+  } else if full && !force && probes {
+    unsafe gc.tenureMembers(runtime)
+    let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+    state.gcProbing = true
+    state.gcYoungBase = before
+    state.mallocGcThreshold = usize.saturatingAdd(usize.saturatingAdd(before, size), probeWindow(before))
+    return false
+  }
+  if !full {
+    // Young collection: most cycles die young (a reloaded library, a discarded
+    // closure graph), and finding them costs only the cells published since the
+    // last collection, which are also the ones still in cache.
+    run unsafe gc.collectYoung(&mut hooks, runtime)
+    let used = allocator.stats().usedBytes
+    let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+    // A young collection that frees under an eighth of its growth found mostly
+    // live cells (a growing live heap). Rescanning them young costs more than it
+    // finds, so young collections stop until the next full collection. A tenured
+    // runtime keeps them: its survivors age into the old generation (ageYoung), so
+    // none is rescanned more than twice, and its full threshold (twice a loaded
+    // image) is far off: a server's live start would otherwise stop young
+    // collections and let its garbage cycles pile up to that threshold.
+    let grown = usize.wrappingSubtract(before, state.gcYoungBase)
+    state.gcYoungBase = used
+    if tenured { state.gcYoungBudget = nextYoungBudget(state.gcYoungBudget, grown, if before > used { before - used } else { 0 }) }
+    if tenured || (before > used && before - used >= grown / 8) {
+      state.mallocGcThreshold = lesser(state.gcFullThreshold, if tenured { tenuredThreshold(used, state.gcYoungBudget) } else { youngThreshold(used) })
+    } else {
+      state.mallocGcThreshold = state.gcFullThreshold
+    }
+    state.mallocGcThreshold = lesser(lesser(state.mallocGcThreshold, usize.saturatingAdd(used, state.gcYoungLimit)), heapCap(state.gcHeapLimit, used))
+    return true
+  }
+  run unsafe gc.collect(&mut hooks, runtime, true)
+  let used = allocator.stats().usedBytes
+  let idle = allocator.idleBytes()
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  // Reference counting already frees acyclic garbage, so a collection that
+  // finds under an eighth of the heap dead means the heap is mostly live and
+  // growing. Rescanning it at every 1.5x step costs long pauses for nothing,
+  // so each such collection in a row widens the step by half the usage, up to
+  // 3x. A productive collection goes back to QuickJS's 1.5x.
+  if before > used && before - used >= before / 8 { state.quietCollections = 0 }
+  else if state.quietCollections < 3 { state.quietCollections = state.quietCollections + 1 }
+  let step = usize.wrappingMultiply(used / 2, 1 + u8.toUsize(state.quietCollections))
+  // On large non-tenured heaps that just freed cycles into the idle pool, let
+  // allocations reuse the already-mapped idle arenas before forcing another
+  // full scan (zero extra RSS, avoids mid-pass pauses on cyclic compiler heaps).
+  let reuseIdle = usize.saturatingAdd(used, idle) >= YOUNG_MIN_USED && !tenured && idle > step
+  let nextStep = if reuseIdle { idle } else { step }
+  state.gcFullThreshold = lesser(usize.wrappingAdd(used, nextStep), heapCap(state.gcHeapLimit, used))
+  let prevFullBase = state.gcFullBase
+  state.gcYoungBase = used
+  state.gcFullBase = used
+  // After a peak the arenas left wholly idle go back to the system. Only arenas
+  // that stayed wholly idle and untouched across consecutive non-growing full
+  // collections go: while the heap is growing back into its idle pool (a cyclic
+  // workload like a compiler pass), releasing idle arenas only faults them back
+  // in immediately. A quarter of what is in use stays as well, for a heap that
+  // swings.
+  let prevIdle = state.gcIdleBytes
+  let settled = lesser(idle, prevIdle)
+  state.gcIdleBytes = idle
+  if settled >= IDLE_RELEASE_BYTES && used <= prevFullBase && idle >= prevIdle {
+    drop state
+    static if Intrinsic.targetOperatingSystem() == "darwin" { unsafe gc.unclaimEmptyArenas(runtime) }
+    let released = allocator.releaseSettledIdle(usize.saturatingAdd(idle - settled, used / 4))
+    let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+    if released != 0 {
+      drop Intrinsic.replace(state.preparseBinderStamps, List<u32>.make())
+      drop Intrinsic.replace(state.preparseBinderValues, List<u32>.make())
+      drop Intrinsic.replace(state.preparseMarkStamps, List<u32>.make())
+      drop Intrinsic.replace(state.preparseMarkValues, List<u32>.make())
+    }
+    let young = if tenured { tenuredThreshold(used, state.gcYoungBudget) } else if reuseIdle { usize.MAX } else { youngThreshold(used) }
+    state.mallocGcThreshold = lesser(lesser(lesser(state.gcFullThreshold, young), usize.saturatingAdd(used, state.gcYoungLimit)), heapCap(state.gcHeapLimit, used))
+    return true
+  }
+  let young = if tenured { tenuredThreshold(used, state.gcYoungBudget) } else if reuseIdle { usize.MAX } else { youngThreshold(used) }
+  state.mallocGcThreshold = lesser(lesser(lesser(state.gcFullThreshold, young), usize.saturatingAdd(used, state.gcYoungLimit)), heapCap(state.gcHeapLimit, used))
+  return true
+}
+fn updateStackLimit(state: &mut RuntimeState) -> () {
+  state.stackLimit = 0
+  if state.stackSize != 0 { state.stackLimit = usize.wrappingSubtract(state.stackTop, state.stackSize) }
+}
+/// Gives the inline call frame region room for bytes of frames, so that a
+/// larger setMaxStackSize also deepens JS-to-JS calls. Only before the first
+/// call, while no inline frame is live; the region never shrinks.
+pub unsafe effect fn reserveCallFrames(runtime: *mut HeapHeader, bytes: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  let slots = bytes / Layout.of<ValueBits>().bytes
+  let mut anchor = ()
+  let current = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
+  if let Option<Intrinsic.RawBuffer<ValueBits>>.Some { value } = &current.callFrames { if slots <= RawBuffer.count<ValueBits>(&value) { return () } }
+  drop current
+  let allocation = run Allocator.allocateZeroed(Layout { bytes: slots * Layout.of<ValueBits>().bytes, alignment: Layout.of<ValueBits>().alignment })
+  let mut frames = unsafe RawBuffer.from<ValueBits>(move allocation, slots)
+  let base = Slot.address(RawBuffer.slot<ValueBits>(&mut frames, 0))
+  let mut stateAnchor = ()
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut stateAnchor, runtime)
+  if let Option<Intrinsic.RawBuffer<ValueBits>>.Some { value } = &mut state.callFrames {
+    let oldBase = Slot.address(RawBuffer.slot<ValueBits>(&mut value, 0))
+    if Pointer.address<ValueBits>(unsafe Intrinsic.pointerRequalify<?*mut ValueBits, *mut ValueBits>(state.callFramesTop)) != Pointer.address<ValueBits>(oldBase) {
+      Intrinsic.trap("reserveCallFrames with live inline frames")
+    }
+  }
+  let _old = Intrinsic.replace(state.callFrames, Option<Intrinsic.RawBuffer<ValueBits>>.some(move frames))
+  state.callFramesTop = base
+  state.callFramesEnd = unsafe Pointer.atMut<ValueBits>(unsafe Pointer.assumeManyMut<ValueBits>(base), slots)
+}
+/// The keys a SyntaxError's origin (file name, line, column) goes under from
+/// now on: symbols, held by the runtime, or Undefined for QuickJS's own names.
+pub unsafe fn setSyntaxOriginKeys<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, keys: [ValueBits; 3]) -> () {
+  let mut index: usize = 0
+  while index < 3 {
+    let key = keys[index]
+    let mut held = Value.immediate(ValueBits.Undefined)
+    if key.tag() == -8 { held = unsafe Value.retain(key) }
+    let mut anchor = ()
+    let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+    let old = Intrinsic.replace(state.syntaxOriginKeys[index], move held).intoBits()
+    drop state
+    unsafe gc.release(&mut hooks, runtime, old)
+    index = index + 1
+  }
+}
+pub unsafe fn setMaxStackSize(runtime: *mut HeapHeader, size: usize) -> () {
+  let mut anchor = ()
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  state.stackSize = size
+  updateStackLimit(&mut state)
+  // JS-to-JS calls run in the inline frame region, so size bounds it too (never
+  // below the frames live now): a smaller limit overflows at a smaller depth.
+  if let Option<Intrinsic.RawBuffer<ValueBits>>.Some { value } = &mut state.callFrames {
+    let base = Slot.address(RawBuffer.slot<ValueBits>(&mut value, 0))
+    let cell = Layout.of<ValueBits>().bytes
+    let mut slots = RawBuffer.count<ValueBits>(&value)
+    if size != 0 && size / cell < slots { slots = size / cell }
+    let top = Pointer.address<ValueBits>(unsafe Intrinsic.pointerRequalify<?*mut ValueBits, *mut ValueBits>(state.callFramesTop))
+    let used = (top - Pointer.address<ValueBits>(base)) / cell
+    if slots < used { slots = used }
+    state.callFramesEnd = unsafe Pointer.atMut<ValueBits>(unsafe Pointer.assumeManyMut<ValueBits>(base), slots)
+  }
+}
+/// Starts the context's Math.random stream again from seed, as its creation did
+/// from the clock: a context mapped from a saved heap would otherwise repeat the
+/// stream of the process that saved it.
+pub unsafe fn seedRandom(context: *mut HeapHeader, seed: u64) -> () {
+  let mut anchor = ()
+  let state = unsafe HeapCell.payloadMut<ContextState, ()>(&mut anchor, context)
+  state.randomState = if seed == 0 { 1 } else { seed }
+}
+pub unsafe fn updateStackTop(runtime: *mut HeapHeader, stackTop: usize) -> () {
+  let mut anchor = ()
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  state.stackTop = stackTop
+  updateStackLimit(&mut state)
+}
+/// checked=false is the CONFIG_STACK_CHECK-disabled policy. Downward stack and
+/// wrapping pointer arithmetic match the pinned implementation; zero size disables.
+pub unsafe fn checkStackOverflow(runtime: *mut HeapHeader, stackPointer: usize, allocationSize: usize, checked: bool) -> bool {
+  if !checked { return false }
+  let anchor = ()
+  let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
+  return usize.wrappingSubtract(stackPointer, allocationSize) < state.stackLimit
+}
+pub unsafe fn setRuntimeInfo(runtime: *mut HeapHeader, info: Option<ByteStorage>) -> () {
+  let mut anchor = ()
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  state.runtimeInfo = move info
+}
+pub unsafe fn setInterruptHandler(runtime: *mut HeapHeader, hook: HostHook) -> () {
+  let mut anchor = ()
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  state.interrupt = move hook
+}
+pub unsafe fn setPromiseRejectionTracker(runtime: *mut HeapHeader, hook: HostHook) -> () {
+  let mut anchor = ()
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  state.promiseRejectionTracker = move hook
+}
+pub unsafe fn setForeignFrameSource(runtime: *mut HeapHeader, source: Option<ForeignFrameSource>) -> () {
+  let mut anchor = ()
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  state.foreignFrames = move source
+}
+pub unsafe fn setModuleLoader(runtime: *mut HeapHeader, hooks: ModuleLoaderHooks) -> () {
+  let mut anchor = ()
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  state.moduleLoader = move hooks
+}
+pub unsafe fn setSharedArrayBufferFunctions(runtime: *mut HeapHeader, hooks: SharedArrayBufferHooks) -> () {
+  let mut anchor = ()
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  state.sharedArrayBuffers = move hooks
+}
+pub unsafe fn setLocaleCallbacks(context: *mut HeapHeader, callbacks: Option<LocaleCallbacks>) -> () {
+  let mut anchor = ()
+  let state = unsafe HeapCell.payloadMut<ContextState, ()>(&mut anchor, context)
+  state.localeCallbacks = move callbacks
+}
+pub unsafe fn setCanBlock(runtime: *mut HeapHeader, canBlock: bool) -> () {
+  let mut anchor = ()
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  state.canBlock = canBlock
+}
+pub unsafe fn setStripInfo(runtime: *mut HeapHeader, flags: u8) -> () {
+  let mut anchor = ()
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  state.stripFlags = flags
+}
+pub unsafe fn getStripInfo(runtime: *mut HeapHeader) -> u8 {
+  let anchor = ()
+  unsafe { return HeapCell.payload<RuntimeState, ()>(&anchor, runtime).stripFlags }
+}

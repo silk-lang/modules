@@ -1,0 +1,286 @@
+//! Non-blocking background rasterization of large canvas command lists (`ui_tree_window.canvas_bitmaps`):
+//! settle cooldown debounces interactive changes, background workers draw off the UI thread,
+//! and stale or cancelled results are discarded without presenting or dirtying the tree.
+import ui_fixtures.fixtures as fixtures
+import ui_tree.css { px }
+import ui_tree.css
+import ui_tree.legacy { UiTree, TreeError, Batch, FrameInput, NodeKind, Mutation }
+import ui_tree.mutation { CanvasCommand }
+import ui_tree_window.canvas_bitmaps {
+  CanvasRasterizer,
+  SETTLE_SECONDS,
+  presentCanvasBitmaps,
+}
+import ui_tree_window.canvas_frames { CanvasPresenter }
+import ui_scene.primitives { SURFACE_TEXTURE_BASE }
+import ui_scene.scene { PrimitiveKind, Scene }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.color.rgba { Rgba }
+import silk.concurrency.sync { Parker }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f32
+import silk.num.u32
+import silk.num.usize
+import silk.system.filesystem { FileError }
+import silk.system.host_input { HostInputError }
+import silk.testing.testing { AssertionError, Testing }
+
+fn viewport(time: f64) -> FrameInput {
+  return FrameInput { width: 400.0, height: 300.0, scale: 2.0, time: time }
+}
+
+/// Generates `count` opaque rects in `color` on a grid covering the canvas.
+effect fn gridCommands(count: u32, color: Rgba<f32>) -> List<CanvasCommand>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut commands = List<CanvasCommand>.make()
+  let mut i: u32 = 0
+  while i < count {
+    run commands.append(CanvasCommand.FillRect {
+      x: u32.toF32(i % 40) * 4.0,
+      y: u32.toF32(i / 40) * 4.0,
+      width: 4.0,
+      height: 4.0,
+      radius: 0.0,
+      color: color,
+    })
+    i = i + 1
+  }
+  return move commands
+}
+
+/// How many image sprites of `scene` sample any surface texture.
+fn totalSurfaceSprites(scene: &Scene) -> u32 {
+  let mut count: u32 = 0
+  let mut layer: u32 = 0
+  while layer < scene.layerCount() {
+    let batches = scene.batches(layer)
+    let mut i: usize = 0
+    while i < batches.length {
+      let image = match batches[i].kind {
+        PrimitiveKind.Image => true
+        _ => false
+      }
+      if image && batches[i].texture >= SURFACE_TEXTURE_BASE {
+        count = count + (batches[i].end - batches[i].start)
+      }
+      i = i + 1
+    }
+    layer = layer + 1
+  }
+  return count
+}
+
+/// Polls `rasterizer` at timestamp `now` until all background workers finish, returning whether
+/// any raster was presented.
+effect fn waitWorkers(
+  rasterizer: &mut CanvasRasterizer,
+  presenter: &CanvasPresenter,
+  tree: &mut UiTree<'_>,
+  now: f64,
+) -> bool
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let parker = run Parker.make()
+  let mut changed = false
+  let mut tries: u32 = 0
+  while rasterizer.runningCount() > 0 && tries < 5000 {
+    if run rasterizer.poll(presenter, &mut tree, now) {
+      changed = true
+    }
+    if rasterizer.runningCount() == 0 {
+      break
+    }
+    drop parker.parkTimeout(1000000)
+    tries = tries + 1
+  }
+  return changed
+}
+
+effect fn settleAndNonBlockingBody() -> ()
+  ! AssertionError<'static> | TreeError | FileError | HostInputError | OutOfMemoryError
+  ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run UiTree.make(&fonts)
+  let presenter = run CanvasPresenter.detached()
+  let mut rasterizer = CanvasRasterizer.make()
+
+  let mut batch = Batch.make()
+  run batch.create(1, NodeKind.Box)
+  run batch.root(1)
+  run batch.create(2, NodeKind.Canvas)
+  run batch.push(Mutation.InsertBefore { parent: 1, child: 2, before: Option<u32>.None })
+  run batch.style(2, &[css.width(px(200.0)), css.height(px(200.0))])
+  run batch.create(3, NodeKind.Box)
+  run batch.push(Mutation.InsertBefore { parent: 1, child: 3, before: Option<u32>.None })
+  run batch.style(3, &[css.width(px(10.0)), css.height(px(10.0))])
+
+  let red = Rgba<f32>.new(1.0, 0.0, 0.0, 1.0)
+  let blue = Rgba<f32>.new(0.0, 0.0, 1.0, 1.0)
+  let cmds1 = run gridCommands(400, red)
+  run batch.canvas(2, cmds1.asSlice())
+  run tree.apply(run batch.take())
+  run tree.frame(viewport(0.0))
+
+  // presentCanvasBitmaps itself never synchronously rasterizes canvas commands.
+  run Testing.expect(tree.canvasRasters.wants.length() == 1, "first paint queues a raster want")
+  run Testing.expect(!(run presentCanvasBitmaps(&presenter, &mut tree)), "presentCanvasBitmaps does not synchronously rasterize")
+  run Testing.expect(presenter.copiedFrames() == 0, "no frame presented synchronously")
+  run Testing.expect(tree.canvasRasters.wants.length() == 1, "want remains for CanvasRasterizer")
+
+  // Observing at t=0.0 schedules the settle deadline without starting a worker.
+  run Testing.expect(!(run rasterizer.poll(&presenter, &mut tree, 0.0)), "cooldown prevents immediate rasterization")
+  run Testing.expect(rasterizer.pendingCount() == 1 && rasterizer.runningCount() == 0, "queued in cooldown")
+  let firstDue = match rasterizer.nextDeadline() {
+    Option<f64>.Some { value } => value
+    Option<f64>.None => -1.0
+  }
+  run Testing.expect(firstDue == SETTLE_SECONDS, "deadline is t0 + SETTLE_SECONDS")
+
+  // Repainting an unchanged canvas (e.g. sibling animation) does not push back the cooldown.
+  run batch.style(3, &[css.width(px(14.0)), css.height(px(10.0))])
+  run tree.apply(run batch.take())
+  run tree.frame(viewport(0.1))
+  run Testing.expect(!(run rasterizer.poll(&presenter, &mut tree, 0.1)), "still within cooldown")
+  let keptDue = match rasterizer.nextDeadline() {
+    Option<f64>.Some { value } => value
+    Option<f64>.None => -1.0
+  }
+  run Testing.expect(keptDue == firstDue, "unchanged canvas keeps its original settle deadline")
+
+  // Mutating the canvas during cooldown resets the deadline (pan/zoom debounce).
+  let cmds2 = run gridCommands(400, blue)
+  run batch.canvas(2, cmds2.asSlice())
+  run tree.apply(run batch.take())
+  run tree.frame(viewport(0.15))
+  run Testing.expect(!(run rasterizer.poll(&presenter, &mut tree, 0.15)), "mutation resets cooldown")
+  let resetDue = match rasterizer.nextDeadline() {
+    Option<f64>.Some { value } => value
+    Option<f64>.None => -1.0
+  }
+  run Testing.expect(resetDue > firstDue, "changed canvas resets its settle deadline")
+  run Testing.expect(!(run rasterizer.poll(&presenter, &mut tree, 0.3)), "before reset deadline, still idle")
+  run Testing.expect(rasterizer.runningCount() == 0 && rasterizer.pendingCount() == 1, "still waiting to settle")
+
+  // Once settled, poll kicks off the background worker and returns immediately without blocking.
+  let immediate = run rasterizer.poll(&presenter, &mut tree, resetDue + 0.01)
+  run Testing.expect(!immediate, "poll starts work asynchronously without blocking")
+  run Testing.expect(rasterizer.runningCount() == 1 && rasterizer.pendingCount() == 0, "worker running off-thread")
+
+  // Collect once the worker completes.
+  let presented = run waitWorkers(&mut rasterizer, &presenter, &mut tree, resetDue + 0.02)
+  run Testing.expect(presented, "completed background raster is presented")
+  run Testing.expect(!rasterizer.pending(), "no pending or running work left")
+  run Testing.expect(presenter.copiedFrames() == 1, "one raster bitmap presented")
+
+  let taken = presenter.take()
+  run Testing.expect(taken.frames.length() == 1, "presenter received the raster frame")
+  let frame = &taken.frames.asSlice()[0]
+  let at = (u32.toUsize(2) * u32.toUsize(frame.width) + u32.toUsize(2)) * 4
+  let bytes = frame.pixels.asSlice()
+  run Testing.expect(bytes[at] == 0 && bytes[at + 1] == 0 && bytes[at + 2] == 255, "presented bitmap has latest blue pixels")
+
+  run tree.frame(viewport(resetDue + 0.03))
+  run Testing.expect(totalSurfaceSprites(tree.scene()) == 1, "canvas now paints one surface sprite")
+  run Testing.expect(tree.scene().primitiveCount() < 16, "instead of hundreds of commands")
+
+  // Removing the canvas closes its raster surface cleanly.
+  run batch.push(Mutation.Destroy { id: 2 })
+  run tree.apply(run batch.take())
+  drop run presentCanvasBitmaps(&presenter, &mut tree)
+  let afterClose = presenter.take()
+  run Testing.expect(afterClose.closed.length() == 1, "removing canvas closes its raster surface")
+  rasterizer.stop()
+}
+
+test effect fn nonBlockingRasterizerWaitsForSettleAndPresentsOffThread() -> ()
+  ! AssertionError<'static> | TreeError | FileError | HostInputError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run settleAndNonBlockingBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn staleAndCancelledBody() -> ()
+  ! AssertionError<'static> | TreeError | FileError | HostInputError | OutOfMemoryError
+  ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run UiTree.make(&fonts)
+  let presenter = run CanvasPresenter.detached()
+  let mut rasterizer = CanvasRasterizer.withSettle(0.2)
+
+  let mut batch = Batch.make()
+  run batch.create(1, NodeKind.Box)
+  run batch.root(1)
+  run batch.create(2, NodeKind.Canvas)
+  run batch.push(Mutation.InsertBefore { parent: 1, child: 2, before: Option<u32>.None })
+  run batch.style(2, &[css.width(px(400.0)), css.height(px(300.0))])
+
+  // 1. In-flight worker cancelled when content changes: stale result must be discarded.
+  let heavy1 = run gridCommands(6000, Rgba<f32>.new(1.0, 0.0, 0.0, 1.0))
+  run batch.canvas(2, heavy1.asSlice())
+  run tree.apply(run batch.take())
+  run tree.frame(viewport(0.0))
+  drop run rasterizer.poll(&presenter, &mut tree, 0.0)
+  drop run rasterizer.poll(&presenter, &mut tree, 0.25)
+  run Testing.expect(rasterizer.runningCount() == 1, "worker started for revision 1")
+
+  // Immediately mutate canvas to revision 2 before worker result is collected.
+  let heavy2 = run gridCommands(400, Rgba<f32>.new(0.0, 1.0, 0.0, 1.0))
+  run batch.canvas(2, heavy2.asSlice())
+  run tree.apply(run batch.take())
+  run tree.frame(viewport(0.26))
+  run rasterizer.observe(&mut tree, 0.26)
+  // Drain the cancelled worker before revision 2's settle deadline (0.46).
+  let stalePresented = run waitWorkers(&mut rasterizer, &presenter, &mut tree, 0.3)
+  run Testing.expect(!stalePresented, "cancelled/stale worker result is never presented")
+  run Testing.expect(presenter.copiedFrames() == 0, "no stale frame sent to presenter")
+  run Testing.expect(rasterizer.pendingCount() == 1, "revision 2 remains queued for its cooldown")
+
+  // 2. Content changes after worker finishes, before poll collects it: stale frame discarded.
+  drop run rasterizer.poll(&presenter, &mut tree, 0.5)
+  run Testing.expect(rasterizer.runningCount() == 1, "worker started for revision 2")
+  // Let the small 400-rect worker finish in the background without polling yet.
+  let parker = run Parker.make()
+  let mut waitLoops: u32 = 0
+  while waitLoops < 80 {
+    drop parker.parkTimeout(1000000)
+    waitLoops = waitLoops + 1
+  }
+  // Now shrink the canvas below MIN_COMMANDS so revision 2 is stale.
+  run batch.canvas(2, Slice.view(heavy2.asSlice(), 0, 8))
+  run tree.apply(run batch.take())
+  let afterShrink = run waitWorkers(&mut rasterizer, &presenter, &mut tree, 0.6)
+  run Testing.expect(!afterShrink, "completed raster whose canvas changed is discarded")
+  run Testing.expect(presenter.copiedFrames() == 0, "still no stale frame presented")
+
+  // 3. Stale synchronous RasterFrame in tree.canvasRasters.frames is also discarded by presentCanvasBitmaps.
+  run batch.canvas(2, heavy2.asSlice())
+  run tree.apply(run batch.take())
+  run tree.frame(viewport(0.7))
+  run tree.rasterCanvases()
+  run Testing.expect(tree.canvasRasters.frames.length() == 1, "synchronous raster produced a frame")
+  run batch.canvas(2, heavy1.asSlice())
+  run tree.apply(run batch.take())
+  run Testing.expect(!(run presentCanvasBitmaps(&presenter, &mut tree)), "presentCanvasBitmaps discards stale RasterFrame")
+  run Testing.expect(presenter.copiedFrames() == 0, "presenter never receives stale RasterFrame")
+
+  // 4. Node destroyed while worker is running: cancelled & discarded cleanly.
+  run tree.frame(viewport(0.8))
+  drop run rasterizer.poll(&presenter, &mut tree, 0.8)
+  drop run rasterizer.poll(&presenter, &mut tree, 1.1)
+  run Testing.expect(rasterizer.runningCount() == 1, "worker started before destroy")
+  run batch.push(Mutation.Destroy { id: 2 })
+  run tree.apply(run batch.take())
+  let afterDestroy = run waitWorkers(&mut rasterizer, &presenter, &mut tree, 1.15)
+  run Testing.expect(!afterDestroy, "destroyed node's worker is discarded")
+  run Testing.expect(presenter.copiedFrames() == 0, "no frame presented for destroyed node")
+  rasterizer.stop()
+}
+
+test effect fn staleAndCancelledRastersAreDiscarded() -> ()
+  ! AssertionError<'static> | TreeError | FileError | HostInputError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run staleAndCancelledBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}

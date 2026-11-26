@@ -1,0 +1,887 @@
+//! FSEvents for directory watches on Darwin, as libuv 1.51's src/unix/fsevents.c: one CFRunLoop
+//! thread per loop, one FSEventStream per loop covering every watched directory, recreated on that
+//! thread whenever the set of watched paths changes (uv__fsevents_reschedule), and the conversion of
+//! FSEvents' paths and flags into libuv's (name relative to the watched directory, UV_RENAME 1 and
+//! UV_CHANGE 2). The module does not import the loop: a loop is known by its address, and its
+//! state lives in a process-wide registry (libuv keeps it in uv_loop_t's cf_* fields).
+//!
+//! Threads and locks, as libuv:
+//! - The loop's thread calls `fseventsStart`, `fseventsNext`, `fseventsStop`, `fseventsLoopDelete`
+//!   and `fseventsFork`. The run-loop thread runs CFRunLoopRun and, from it, the signal source's
+//!   perform callback (reschedules) and the stream's callback (events).
+//! - `signalLock` (libuv's loop->cf_mutex) guards the queue of requests to the run-loop thread.
+//! - `lock` (cf_state->fsevent_mutex) guards the list of watches and the reschedule flag. The
+//!   stream callback holds it while it queues events and calls `notify`, so a watch unlinked under
+//!   it is never notified again.
+//! - Each watch's own `lock` (handle->cf_mutex) guards its queued events and error; the loop's
+//!   thread takes them in one batch per drain, as libuv's UV__FSEVENTS_PROCESS.
+//! - `started` (loop->cf_sem) tells the loop that the run loop exists; `closed`
+//!   (cf_state->fsevent_sem) tells a stopping watch that the stream was rebuilt without it.
+//!
+//! CoreFoundation and CoreServices are opened with dlopen and their functions found with dlsym, once
+//! per process (uv__fsevents_global_init), so the executable links no framework. The callbacks that
+//! CoreFoundation keeps (the run-loop source's perform and the stream's callback) are handed over as
+//! addresses inside CF's own records and run on the run-loop thread; they touch only memory reached
+//! through their `info` pointer, under the locks above.
+import silk.mem.pointer { Pointer }
+import silk.mem.layout { Layout }
+import silk.concurrency.atomic { Atomic, MemoryOrder, CompareExchange }
+import silk.core.ownership { Copy }
+import silk.num.i32
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+import silk.num.isize
+
+static if Intrinsic.targetOperatingSystem() == "darwin" {
+  unsafe extern "C" fn calloc(count: usize, size: usize) -> ?*mut u8
+  unsafe extern "C" fn malloc(size: usize) -> ?*mut u8
+  unsafe extern "C" fn free(pointer: ?*mut u8) -> ()
+  unsafe extern "C" fn abort() -> ()
+  @foreign(noCapture: .("text"))
+  unsafe extern "C" fn strlen(text: *const u8) -> usize
+  @foreign(noCapture: .("dest", "source"))
+  unsafe extern "C" fn memcpy(dest: *mut u8, source: *const u8, count: usize) -> *mut u8
+  // Given a buffer of PATH_MAX bytes, both of Darwin's realpath variants (the header picks
+  // realpath$DARWIN_EXTSN, which libuv calls with NULL) resolve an existing path the same way.
+  @foreign(noCapture: .("path"))
+  unsafe extern "C" fn realpath(path: *const u8, resolved: *mut u8) -> ?*mut u8
+  unsafe extern "C" fn dlopen(path: *const u8, flags: i32) -> ?*mut u8
+  unsafe extern "C" fn dlsym(handle: *mut u8, name: *const u8) -> ?*mut u8
+  unsafe extern "C" fn dlclose(handle: *mut u8) -> i32
+  unsafe extern "C" fn __error() -> *mut i32
+  unsafe extern "C" fn pthread_mutex_init(mutex: *mut u8, attributes: ?*const u8) -> i32
+  unsafe extern "C" fn pthread_mutex_destroy(mutex: *mut u8) -> i32
+  unsafe extern "C" fn pthread_mutex_lock(mutex: *mut u8) -> i32
+  unsafe extern "C" fn pthread_mutex_unlock(mutex: *mut u8) -> i32
+  unsafe extern "C" fn pthread_cond_init(condition: *mut u8, attributes: ?*const u8) -> i32
+  unsafe extern "C" fn pthread_cond_destroy(condition: *mut u8) -> i32
+  unsafe extern "C" fn pthread_cond_wait(condition: *mut u8, mutex: *mut u8) -> i32
+  unsafe extern "C" fn pthread_cond_signal(condition: *mut u8) -> i32
+  @threadCallbacks("start")
+  unsafe extern "C" fn pthread_create(thread: *mut usize, attributes: ?*const u8, start: extern "C" fn(?*mut u8) -> ?*mut u8, argument: ?*mut u8) -> i32
+  unsafe extern "C" fn pthread_join(thread: usize, result: ?*mut ?*mut u8) -> i32
+  unsafe extern "C" fn pthread_attr_init(attributes: *mut u8) -> i32
+  unsafe extern "C" fn pthread_attr_setstacksize(attributes: *mut u8, size: usize) -> i32
+  unsafe extern "C" fn pthread_attr_destroy(attributes: *mut u8) -> i32
+  unsafe extern "C" fn getrlimit(resource: i32, limit: *mut [u64; 2]) -> i32
+  unsafe extern "C" fn getpagesize() -> i32
+
+  // Room for a pthread mutex (64 bytes), condition variable (48) or attribute set (64): sizeof in
+  // <pthread/pthread_impl.h> of the macOS 15.5 SDK.
+  const LOCK_BYTES: usize = 128
+  // <sys/errno.h>
+  const UV_ENOENT: i32 = -2
+  const UV_ENOMEM: i32 = -12
+  const UV_EMFILE: i32 = -24
+  const UV_ENOSYS: i32 = -78
+  // <dlfcn.h>: RTLD_LAZY | RTLD_LOCAL.
+  const RTLD_LAZY_LOCAL: i32 = 5
+  // <sys/resource.h>: RLIMIT_STACK, RLIM_INFINITY.
+  const RLIMIT_STACK: i32 = 3
+  const RLIM_INFINITY: u64 = 9223372036854775807
+  // <limits.h>: PTHREAD_STACK_MIN (16384 on arm64, 8192 on x86_64); libuv's floor is 8192.
+  static if Intrinsic.targetArchitecture() == "aarch64" { const MIN_STACK: u64 = 16384 } else { const MIN_STACK: u64 = 8192 }
+  // <sys/syslimits.h>: PATH_MAX.
+  const PATH_MAX: usize = 1024
+  // uv.h
+  const UV_RENAME: i32 = 1
+  const UV_CHANGE: i32 = 2
+  const UV_FS_EVENT_RECURSIVE: u32 = 4
+  // FSEvents.h (CoreServices.framework/Frameworks/FSEvents.framework/Headers) of the macOS 15.5 SDK.
+  const CREATE_NO_DEFER: u32 = 2
+  const CREATE_FILE_EVENTS: u32 = 16
+  const EVENT_ID_SINCE_NOW: u64 = 18446744073709551615
+  // kFSEventStreamEventFlagUserDropped 2 | KernelDropped 4 | EventIdsWrapped 8 | HistoryDone 16 |
+  // RootChanged 32 | Mount 64 | Unmount 128: libuv's kFSEventsSystem.
+  const FLAGS_SYSTEM: u32 = 254
+  // ItemCreated 256 | ItemRemoved 512 | ItemRenamed 2048: libuv's kFSEventsRenamed.
+  const FLAGS_RENAMED: u32 = 2816
+  // ItemInodeMetaMod 1024 | ItemModified 4096 | ItemFinderInfoMod 8192 | ItemChangeOwner 16384 |
+  // ItemXattrMod 32768: libuv's kFSEventsModified.
+  const FLAGS_MODIFIED: u32 = 62464
+  const FLAG_ITEM_IS_DIR: u32 = 131072
+
+  // CFRunLoopSourceContext (CFRunLoop.h): version, info, then eight callbacks; perform is the last
+  // word (80 bytes, perform at 72). FSEventStreamContext (FSEvents.h): version, info, retain,
+  // release, copyDescription (40 bytes). Unused callbacks are null.
+  extern "C" struct SourceContext { version: isize, info: ?*mut u8, retain: usize, release: usize, copyDescription: usize, equal: usize, hash: usize, schedule: usize, cancel: usize, perform: usize }
+  extern "C" struct StreamContext { version: isize, info: ?*mut u8, retain: usize, release: usize, copyDescription: usize }
+
+  // The functions found with dlsym, as addresses; `fn*` turn them into callable values.
+  type ArrayCreate = extern "C" fn(?*mut u8, *const ?*mut u8, isize, ?*const u8) -> ?*mut u8
+  type OneArgument = extern "C" fn(?*mut u8) -> ()
+  type ThreeArguments = extern "C" fn(?*mut u8, ?*mut u8, ?*mut u8) -> ()
+  type GetCurrent = extern "C" fn() -> ?*mut u8
+  type NoArguments = extern "C" fn() -> ()
+  type SourceCreate = extern "C" fn(?*mut u8, isize, *const SourceContext) -> ?*mut u8
+  type StringCreate = extern "C" fn(?*mut u8, *const u8) -> ?*mut u8
+  type StreamCreate = extern "C" fn(?*mut u8, ?*mut u8, *const StreamContext, ?*mut u8, u64, f64, u32) -> ?*mut u8
+  type StreamStart = extern "C" fn(?*mut u8) -> u8
+  struct Api {
+    arrayCreate: usize, release: usize, addSource: usize, getCurrent: usize, removeSource: usize, runLoopRun: usize,
+    sourceCreate: usize, sourceSignal: usize, stop: usize, wakeUp: usize, stringCreate: usize, defaultMode: usize,
+    streamCreate: usize, streamInvalidate: usize, streamRelease: usize, streamSchedule: usize, streamStart: usize, streamStop: usize,
+    typeArrayCallBacks: usize
+  }
+  impl Copy for Api {}
+
+  /// The process's FSEvents bookkeeping: the libraries (opened once, never closed, as libuv), the
+  /// loops that have a run-loop thread, and whether the process forked with one running.
+  struct Registry { lock: *mut u8, foundation: ?*mut u8, services: ?*mut u8, forked: u32, first: ?*mut LoopState, api: Api }
+  /// One loop's run-loop thread and stream (libuv's cf_* fields of uv_loop_t and its
+  /// uv__cf_loop_state_t). Freed by fseventsLoopDelete.
+  struct LoopState {
+    next: ?*mut LoopState, key: usize, api: Api, thread: usize,
+    signalLock: *mut u8, started: *mut Semaphore, signalFirst: ?*mut Signal, signalLast: ?*mut Signal,
+    runLoop: ?*mut u8, source: ?*mut u8, needReschedule: bool, stream: ?*mut u8,
+    closed: *mut Semaphore, lock: *mut u8, first: ?*mut Watch, last: ?*mut Watch, count: u32
+  }
+  /// A request to the run-loop thread (uv__cf_loop_signal_t): reschedule for `watch`, or stop the
+  /// run loop when it is null.
+  struct Signal { next: ?*mut Signal, watch: ?*mut Watch, closing: bool }
+  /// One directory watch: the `state` the loop keeps for its handle.
+  struct Watch {
+    previous: ?*mut Watch, next: ?*mut Watch, owner: *mut LoopState,
+    realpath: *mut u8, length: usize, flags: u32,
+    notify: extern "C" fn(*mut u8) -> (), context: *mut u8,
+    // Under `lock`: events the stream queued, and an error to report after them.
+    lock: *mut u8, first: ?*mut Event, last: ?*mut Event, error: i32,
+    // The loop's thread only: the batch being handed over, its error, and the event last returned.
+    batch: ?*mut Event, batchError: i32, open: bool, current: ?*mut Event
+  }
+  /// A queued event; its NUL-terminated name follows the record.
+  extern "C" struct Event { next: ?*mut Event, events: i32, reserved: i32 }
+  /// libuv's uv_sem_t, as a count under a mutex and condition variable.
+  struct Semaphore { lock: *mut u8, condition: *mut u8, count: u32 }
+
+  unsafe fn nn<T>(pointer: ?*mut T) -> *mut T { return unsafe Intrinsic.pointerRequalify<?*mut T, *mut T>(pointer) }
+  unsafe fn cast<T>(pointer: *mut u8) -> *mut T { return unsafe Intrinsic.pointerReinterpret<*mut u8, *mut T>(pointer) }
+  unsafe fn bytes<T>(pointer: *mut T) -> *mut u8 { return unsafe Intrinsic.pointerReinterpret<*mut T, *mut u8>(pointer) }
+  unsafe fn errno() -> i32 { return unsafe Pointer.read<i32>(unsafe __error()) }
+  unsafe fn addressPointer(address: usize) -> ?*mut u8 {
+    let word = address
+    return unsafe Pointer.read<?*mut u8>(unsafe Intrinsic.pointerReinterpret<*const usize, *const ?*mut u8>(Pointer.fromRef<usize>(&word)))
+  }
+  // A function value from its address, and an exported function's address.
+  unsafe fn function<F: Copy>(address: usize) -> F { let word = address return unsafe Pointer.read<F>(unsafe Intrinsic.pointerReinterpret<*const usize, *const F>(Pointer.fromRef<usize>(&word))) }
+  unsafe fn addressOf<F: Copy>(f: F) -> usize { return unsafe Pointer.read<usize>(unsafe Intrinsic.pointerReinterpret<*const F, *const usize>(Pointer.fromRef<F>(&f))) }
+  fn text(value: &[u8]) -> *const u8 { return Pointer.fromRef<u8>(&value[0]) }
+  unsafe fn byteAt(text: *const u8, index: usize) -> u8 { return unsafe Pointer.read<u8>(unsafe Pointer.at<u8>(unsafe Pointer.assumeMany<u8>(text), index)) }
+
+  unsafe fn newLock() -> ?*mut u8 {
+    let made = unsafe calloc(1, LOCK_BYTES)
+    if Pointer.isNull<u8>(made) { return made }
+    if unsafe pthread_mutex_init(unsafe nn(made), Pointer.null<u8>()) != 0 { unsafe free(made) return Pointer.null<u8>() }
+    return made
+  }
+  unsafe fn freeLock(lock: *mut u8) -> () { let _ignored = unsafe pthread_mutex_destroy(lock) unsafe free(lock) }
+  unsafe fn lock(mutex: *mut u8) -> () { if unsafe pthread_mutex_lock(mutex) != 0 { unsafe abort() } }
+  unsafe fn unlock(mutex: *mut u8) -> () { if unsafe pthread_mutex_unlock(mutex) != 0 { unsafe abort() } }
+
+  unsafe fn newSemaphore() -> ?*mut Semaphore {
+    let made = unsafe calloc(1, Layout.of<Semaphore>().bytes)
+    if Pointer.isNull<u8>(made) { return Pointer.null<Semaphore>() }
+    let mutex = unsafe newLock()
+    let condition = unsafe calloc(1, LOCK_BYTES)
+    if Pointer.isNull<u8>(mutex) || Pointer.isNull<u8>(condition) || unsafe pthread_cond_init(unsafe nn(condition), Pointer.null<u8>()) != 0 {
+      if !Pointer.isNull<u8>(mutex) { unsafe freeLock(unsafe nn(mutex)) }
+      unsafe free(condition) unsafe free(made)
+      return Pointer.null<Semaphore>()
+    }
+    let semaphore = unsafe cast<Semaphore>(unsafe nn(made))
+    unsafe Pointer.put<Semaphore>(semaphore, Semaphore { lock: unsafe nn(mutex), condition: unsafe nn(condition), count: 0 })
+    return semaphore
+  }
+  unsafe fn freeSemaphore(semaphore: *mut Semaphore) -> () {
+    let anchor = () let s = unsafe Pointer.borrow<(), Semaphore>(&anchor, semaphore)
+    let mutex = s.lock let condition = s.condition drop s
+    let _ignored = unsafe pthread_cond_destroy(condition)
+    unsafe free(condition) unsafe freeLock(mutex) unsafe free(unsafe bytes<Semaphore>(semaphore))
+  }
+  unsafe fn post(semaphore: *mut Semaphore) -> () {
+    let mut anchor = () let s = unsafe Pointer.borrowMut<(), Semaphore>(&mut anchor, semaphore)
+    let mutex = s.lock let condition = s.condition drop s
+    unsafe lock(mutex)
+    let s2 = unsafe Pointer.borrowMut<(), Semaphore>(&mut anchor, semaphore)
+    s2.count = s2.count + 1 drop s2
+    if unsafe pthread_cond_signal(condition) != 0 { unsafe abort() }
+    unsafe unlock(mutex)
+  }
+  unsafe fn wait(semaphore: *mut Semaphore) -> () {
+    let mut anchor = () let s = unsafe Pointer.borrowMut<(), Semaphore>(&mut anchor, semaphore)
+    let mutex = s.lock let condition = s.condition drop s
+    unsafe lock(mutex)
+    while true {
+      let s2 = unsafe Pointer.borrowMut<(), Semaphore>(&mut anchor, semaphore)
+      if s2.count > 0 { s2.count = s2.count - 1 break }
+      drop s2
+      if unsafe pthread_cond_wait(condition, mutex) != 0 { unsafe abort() }
+    }
+    unsafe unlock(mutex)
+  }
+
+  // ---- The registry and the libraries ---------------------------------------------------------
+  fn registryWord() -> *mut u64 { return Intrinsic.processWord() }
+  unsafe fn emptyApi() -> Api {
+    return Api { arrayCreate: 0, release: 0, addSource: 0, getCurrent: 0, removeSource: 0, runLoopRun: 0, sourceCreate: 0, sourceSignal: 0, stop: 0, wakeUp: 0, stringCreate: 0, defaultMode: 0, streamCreate: 0, streamInvalidate: 0, streamRelease: 0, streamSchedule: 0, streamStart: 0, streamStop: 0, typeArrayCallBacks: 0 }
+  }
+  unsafe fn registry(create: bool) -> ?*mut Registry {
+    let word = registryWord()
+    let current = unsafe Atomic.load<u64>(word, MemoryOrder.Acquire)
+    if current != 0 { return unsafe Intrinsic.pointerReinterpret<?*mut u8, ?*mut Registry>(unsafe addressPointer(u64.toUsize(current))) }
+    if !create { return Pointer.null<Registry>() }
+    let made = unsafe calloc(1, Layout.of<Registry>().bytes)
+    if Pointer.isNull<u8>(made) { return Pointer.null<Registry>() }
+    let mutex = unsafe newLock()
+    if Pointer.isNull<u8>(mutex) { unsafe free(made) return Pointer.null<Registry>() }
+    let fresh = unsafe cast<Registry>(unsafe nn(made))
+    unsafe Pointer.put<Registry>(fresh, Registry { lock: unsafe nn(mutex), foundation: Pointer.null<u8>(), services: Pointer.null<u8>(), forked: 0, first: Pointer.null<LoopState>(), api: unsafe emptyApi() })
+    let raced = unsafe Atomic.compareExchange<u64>(word, 0, usize.toU64(Pointer.address<u8>(made)), MemoryOrder.AcquireRelease, MemoryOrder.Acquire)
+    match move raced {
+      CompareExchange<u64>.Exchanged => { return fresh }
+      CompareExchange<u64>.Observed { value } => {
+        unsafe freeLock(unsafe nn(mutex)) unsafe free(made)
+        return unsafe Intrinsic.pointerReinterpret<?*mut u8, ?*mut Registry>(unsafe addressPointer(u64.toUsize(value)))
+      }
+    }
+  }
+  unsafe fn symbol(library: *mut u8, name: &[u8], missing: &mut bool) -> usize {
+    let found = unsafe dlsym(library, text(name))
+    if Pointer.isNull<u8>(found) { missing.* = true return 0 }
+    return Pointer.address<u8>(found)
+  }
+  // uv__fsevents_global_init: under the registry's lock, opens CoreFoundation and CoreServices and
+  // finds the eighteen symbols libuv uses and kCFTypeArrayCallBacks; UV_ENOSYS when a library is missing, UV_ENOENT for a symbol. A
+  // failure closes what it opened, so the next watch tries again.
+  unsafe fn globalInit(registry: *mut Registry) -> i32 {
+    let mut anchor = () let r = unsafe Pointer.borrowMut<(), Registry>(&mut anchor, registry)
+    let mutex = r.lock drop r
+    unsafe lock(mutex)
+    let r2 = unsafe Pointer.borrowMut<(), Registry>(&mut anchor, registry)
+    if !Pointer.isNull<u8>(r2.foundation) { drop r2 unsafe unlock(mutex) return 0 }
+    drop r2
+    let mut status = UV_ENOSYS
+    let foundation = unsafe dlopen(text(b"/System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation\0"), RTLD_LAZY_LOCAL)
+    let mut services: ?*mut u8 = Pointer.null<u8>()
+    if !Pointer.isNull<u8>(foundation) { services = unsafe dlopen(text(b"/System/Library/Frameworks/CoreServices.framework/Versions/A/CoreServices\0"), RTLD_LAZY_LOCAL) }
+    if !Pointer.isNull<u8>(services) {
+      let cf = unsafe nn(foundation) let cs = unsafe nn(services)
+      let mut missing = false
+      let api = Api {
+        arrayCreate: unsafe symbol(cf, b"CFArrayCreate\0", &mut missing),
+        release: unsafe symbol(cf, b"CFRelease\0", &mut missing),
+        addSource: unsafe symbol(cf, b"CFRunLoopAddSource\0", &mut missing),
+        getCurrent: unsafe symbol(cf, b"CFRunLoopGetCurrent\0", &mut missing),
+        removeSource: unsafe symbol(cf, b"CFRunLoopRemoveSource\0", &mut missing),
+        runLoopRun: unsafe symbol(cf, b"CFRunLoopRun\0", &mut missing),
+        sourceCreate: unsafe symbol(cf, b"CFRunLoopSourceCreate\0", &mut missing),
+        sourceSignal: unsafe symbol(cf, b"CFRunLoopSourceSignal\0", &mut missing),
+        stop: unsafe symbol(cf, b"CFRunLoopStop\0", &mut missing),
+        wakeUp: unsafe symbol(cf, b"CFRunLoopWakeUp\0", &mut missing),
+        stringCreate: unsafe symbol(cf, b"CFStringCreateWithFileSystemRepresentation\0", &mut missing),
+        defaultMode: unsafe symbol(cf, b"kCFRunLoopDefaultMode\0", &mut missing),
+        streamCreate: unsafe symbol(cs, b"FSEventStreamCreate\0", &mut missing),
+        streamInvalidate: unsafe symbol(cs, b"FSEventStreamInvalidate\0", &mut missing),
+        streamRelease: unsafe symbol(cs, b"FSEventStreamRelease\0", &mut missing),
+        streamSchedule: unsafe symbol(cs, b"FSEventStreamScheduleWithRunLoop\0", &mut missing),
+        streamStart: unsafe symbol(cs, b"FSEventStreamStart\0", &mut missing),
+        streamStop: unsafe symbol(cs, b"FSEventStreamStop\0", &mut missing),
+        typeArrayCallBacks: unsafe symbol(cf, b"kCFTypeArrayCallBacks\0", &mut missing)
+      }
+      if missing { status = UV_ENOENT }
+      else {
+        let r3 = unsafe Pointer.borrowMut<(), Registry>(&mut anchor, registry)
+        r3.api = api r3.foundation = foundation r3.services = services drop r3
+        status = 0
+      }
+    }
+    if status != 0 {
+      if !Pointer.isNull<u8>(services) { let _closed = unsafe dlclose(unsafe nn(services)) }
+      if !Pointer.isNull<u8>(foundation) { let _closed = unsafe dlclose(unsafe nn(foundation)) }
+    }
+    unsafe unlock(mutex)
+    return status
+  }
+
+  // ---- CoreFoundation calls -------------------------------------------------------------------
+  unsafe fn defaultMode(api: &Api) -> ?*mut u8 { return unsafe Pointer.read<?*mut u8>(unsafe cast<?*mut u8>(unsafe nn(unsafe addressPointer(api.defaultMode)))) }
+  unsafe fn cfRelease(api: &Api, object: ?*mut u8) -> () { let f = unsafe function<OneArgument>(api.release) unsafe f(object) }
+
+  // The thread's stack: RLIMIT_STACK rounded down to the page size when it is finite and at least
+  // the minimum (uv__thread_stack_size), else 0 for the system's default.
+  unsafe fn stackSize() -> usize {
+    let mut limit: [u64; 2] = [0; 2]
+    if unsafe getrlimit(RLIMIT_STACK, Pointer.fromMutRef<[u64; 2]>(&mut limit)) != 0 { return 0 }
+    if limit[0] == RLIM_INFINITY { return 0 }
+    let page = i32.toU64(unsafe getpagesize())
+    let rounded = limit[0] - limit[0] % page
+    if rounded >= MIN_STACK { return u64.toUsize(rounded) }
+    return 0
+  }
+
+  // ---- The run-loop thread --------------------------------------------------------------------
+  // The thread's body (uv__cf_loop_runner): it adds the signal source to its run loop, tells the
+  // loop it is ready, and runs until the termination request stops the run loop.
+  export "C" fn silkFseventsRunner(argument: ?*mut u8) -> ?*mut u8 {
+    let state = unsafe cast<LoopState>(unsafe nn(argument))
+    let mut anchor = () let s = unsafe Pointer.borrowMut<(), LoopState>(&mut anchor, state)
+    let api = s.api let source = s.source let started = s.started drop s
+    let current = unsafe function<GetCurrent>(api.getCurrent)
+    let runLoop = unsafe current()
+    let s2 = unsafe Pointer.borrowMut<(), LoopState>(&mut anchor, state)
+    s2.runLoop = runLoop drop s2
+    let mode = unsafe defaultMode(&api)
+    let add = unsafe function<ThreeArguments>(api.addSource)
+    unsafe add(runLoop, source, mode)
+    unsafe post(started)
+    let runLoopRun = unsafe function<NoArguments>(api.runLoopRun)
+    unsafe runLoopRun()
+    let remove = unsafe function<ThreeArguments>(api.removeSource)
+    unsafe remove(runLoop, source, mode)
+    let s3 = unsafe Pointer.borrowMut<(), LoopState>(&mut anchor, state)
+    s3.runLoop = Pointer.null<u8>()
+    return Pointer.null<u8>()
+  }
+  // The signal source's perform callback, on the run-loop thread (uv__cf_loop_cb): takes the queued
+  // requests and runs each.
+  export "C" fn silkFseventsPerform(info: ?*mut u8) -> () {
+    let state = unsafe cast<LoopState>(unsafe nn(info))
+    let mut anchor = () let s = unsafe Pointer.borrowMut<(), LoopState>(&mut anchor, state)
+    let mutex = s.signalLock drop s
+    unsafe lock(mutex)
+    let s2 = unsafe Pointer.borrowMut<(), LoopState>(&mut anchor, state)
+    let mut item = s2.signalFirst s2.signalFirst = Pointer.null<Signal>() s2.signalLast = Pointer.null<Signal>() drop s2
+    unsafe unlock(mutex)
+    while !Pointer.isNull<Signal>(item) {
+      let pointer = unsafe nn(item)
+      let second = () let request = unsafe Pointer.borrow<(), Signal>(&second, pointer)
+      let next = request.next let terminate = Pointer.isNull<Watch>(request.watch) let closing = request.closing drop request
+      if terminate {
+        let s3 = unsafe Pointer.borrow<(), LoopState>(&anchor, state)
+        let stop = unsafe function<OneArgument>(s3.api.stop) let runLoop = s3.runLoop drop s3
+        unsafe stop(runLoop)
+      } else { unsafe reschedule(state, closing) }
+      unsafe free(unsafe bytes<Signal>(pointer))
+      item = next
+    }
+  }
+  // Queues a request for the run-loop thread and wakes it (uv__cf_loop_signal). Loop thread.
+  unsafe fn loopSignal(state: *mut LoopState, watch: ?*mut Watch, closing: bool) -> i32 {
+    let made = unsafe malloc(Layout.of<Signal>().bytes)
+    if Pointer.isNull<u8>(made) { return UV_ENOMEM }
+    let item = unsafe cast<Signal>(unsafe nn(made))
+    unsafe Pointer.put<Signal>(item, Signal { next: Pointer.null<Signal>(), watch: watch, closing: closing })
+    let mut anchor = () let s = unsafe Pointer.borrowMut<(), LoopState>(&mut anchor, state)
+    let mutex = s.signalLock drop s
+    unsafe lock(mutex)
+    let s2 = unsafe Pointer.borrowMut<(), LoopState>(&mut anchor, state)
+    if Pointer.isNull<Signal>(s2.signalLast) { s2.signalFirst = item }
+    else { let mut second = () let tail = unsafe Pointer.borrowMut<(), Signal>(&mut second, unsafe nn(s2.signalLast)) tail.next = item }
+    s2.signalLast = item
+    let api = s2.api let source = s2.source let runLoop = s2.runLoop drop s2
+    let signal = unsafe function<OneArgument>(api.sourceSignal)
+    unsafe signal(source)
+    let wake = unsafe function<OneArgument>(api.wakeUp)
+    unsafe wake(runLoop)
+    unsafe unlock(mutex)
+    return 0
+  }
+
+  // ---- The stream -----------------------------------------------------------------------------
+  // Appends a list of events, or an error, to a watch and notifies its loop
+  // (uv__fsevents_push_event). Run-loop thread, under the state's `lock`.
+  unsafe fn pushEvents(watch: *mut Watch, first: ?*mut Event, last: ?*mut Event, error: i32) -> () {
+    let mut anchor = () let w = unsafe Pointer.borrowMut<(), Watch>(&mut anchor, watch)
+    let mutex = w.lock let notify = w.notify let context = w.context drop w
+    unsafe lock(mutex)
+    let w2 = unsafe Pointer.borrowMut<(), Watch>(&mut anchor, watch)
+    if !Pointer.isNull<Event>(first) {
+      if Pointer.isNull<Event>(w2.last) { w2.first = first }
+      else { let mut second = () let tail = unsafe Pointer.borrowMut<(), Event>(&mut second, unsafe nn(w2.last)) tail.next = first }
+      w2.last = last
+    }
+    if error != 0 { w2.error = error }
+    drop w2
+    unsafe unlock(mutex)
+    unsafe notify(context)
+  }
+  // The name of an event: the record's trailing bytes.
+  unsafe fn eventName(event: *mut Event) -> *mut u8 {
+    return unsafe Pointer.atMut<u8>(unsafe Pointer.assumeManyMut<u8>(unsafe bytes<Event>(event)), Layout.of<Event>().bytes)
+  }
+  // The stream's callback, on the run-loop thread (uv__fsevents_event_cb): for each watch, the
+  // events under its directory, named relative to it, in one list.
+  export "C" fn silkFseventsStreamEvent(stream: ?*mut u8, info: ?*mut u8, count: usize, eventPaths: ?*mut u8, eventFlags: ?*const u32, eventIds: ?*const u64) -> () {
+    let state = unsafe cast<LoopState>(unsafe nn(info))
+    let paths = unsafe Pointer.assumeManyMut<?*const u8>(unsafe cast<?*const u8>(unsafe nn(eventPaths)))
+    let flagList = unsafe Pointer.assumeMany<u32>(unsafe Intrinsic.pointerRequalify<?*const u32, *const u32>(eventFlags))
+    let mut anchor = () let s = unsafe Pointer.borrowMut<(), LoopState>(&mut anchor, state)
+    let mutex = s.lock drop s
+    unsafe lock(mutex)
+    let s2 = unsafe Pointer.borrow<(), LoopState>(&anchor, state)
+    let mut cursor = s2.first drop s2
+    while !Pointer.isNull<Watch>(cursor) {
+      let watch = unsafe nn(cursor)
+      let second = () let w = unsafe Pointer.borrow<(), Watch>(&second, watch)
+      let next = w.next let realpath = w.realpath let length = w.length let recursive = (w.flags & UV_FS_EVENT_RECURSIVE) != 0 drop w
+      let mut first: ?*mut Event = Pointer.null<Event>() let mut last: ?*mut Event = Pointer.null<Event>()
+      let mut index: usize = 0
+      while index < count {
+        let mut flags = unsafe Pointer.read<u32>(unsafe Pointer.at<u32>(flagList, index))
+        index = index + 1
+        // Ignore system events.
+        if (flags & FLAGS_SYSTEM) != 0 { continue }
+        let path = unsafe Intrinsic.pointerRequalify<?*const u8, *const u8>(unsafe Pointer.read<?*const u8>(unsafe Pointer.atMut<?*const u8>(paths, index - 1)))
+        let mut len = unsafe strlen(path)
+        if length == 0 { continue }
+        // Paths outside the watched directory.
+        if len < length { continue }
+        // The realpath must name a directory of the path (unless it is "/", the only realpath
+        // with a trailing slash), or be the whole path.
+        if length != len && length > 1 && unsafe byteAt(path, length) != 47 { continue }
+        let mut same = true
+        let mut at: usize = 0
+        while at < length { if unsafe byteAt(path, at) != unsafe byteAt(unsafe Intrinsic.pointerRequalify<*mut u8, *const u8>(realpath), at) { same = false break } at = at + 1 }
+        if !same { continue }
+        let mut start: usize = 0
+        if !(length == 1 && unsafe byteAt(unsafe Intrinsic.pointerRequalify<*mut u8, *const u8>(realpath), 0) == 47) {
+          // Remove the common prefix, unless the watched directory is "/".
+          start = length len = len - length
+          if len == 0 {
+            // An event of the watched directory itself: report its own name. Created and Removed
+            // seem to be always set there, and mean nothing.
+            while len < length && unsafe byteAt(path, start - 1) != 47 { start = start - 1 len = len + 1 }
+            flags = flags & (FLAGS_RENAMED ^ 4294967295)
+          } else {
+            // Skip the slash.
+            start = start + 1 len = len - 1
+          }
+        }
+        // No events from subdirectories without UV_FS_EVENT_RECURSIVE.
+        if !recursive && unsafe byteAt(path, start) != 0 {
+          let mut nested = false
+          let mut scan = start + 1
+          while unsafe byteAt(path, scan) != 0 { if unsafe byteAt(path, scan) == 47 { nested = true break } scan = scan + 1 }
+          if nested { continue }
+        }
+        let made = unsafe malloc(Layout.of<Event>().bytes + len + 1)
+        if Pointer.isNull<u8>(made) { break }
+        let event = unsafe cast<Event>(unsafe nn(made))
+        let mut events = UV_RENAME
+        if (flags & FLAGS_RENAMED) == 0 { if (flags & FLAGS_MODIFIED) != 0 || (flags & FLAG_ITEM_IS_DIR) == 0 { events = UV_CHANGE } }
+        unsafe Pointer.put<Event>(event, Event { next: Pointer.null<Event>(), events: events, reserved: 0 })
+        let _copied = unsafe memcpy(unsafe eventName(event), unsafe Pointer.at<u8>(unsafe Pointer.assumeMany<u8>(path), start), len + 1)
+        if Pointer.isNull<Event>(last) { first = event }
+        else { let mut third = () let tail = unsafe Pointer.borrowMut<(), Event>(&mut third, unsafe nn(last)) tail.next = event }
+        last = event
+      }
+      if !Pointer.isNull<Event>(first) { unsafe pushEvents(watch, first, last, 0) }
+      cursor = next
+    }
+    unsafe unlock(mutex)
+  }
+  // Creates and starts the loop's stream over `paths` (uv__fsevents_create_stream). Run-loop thread.
+  unsafe fn createStream(state: *mut LoopState, paths: ?*mut u8) -> i32 {
+    let mut anchor = () let s = unsafe Pointer.borrowMut<(), LoopState>(&mut anchor, state)
+    let api = s.api let runLoop = s.runLoop drop s
+    let context = StreamContext { version: 0, info: unsafe bytes<LoopState>(state), retain: 0, release: 0, copyDescription: 0 }
+    let create = unsafe function<StreamCreate>(api.streamCreate)
+    // NoDefer: a burst is reported `latency` after its first event instead of after it ends.
+    // FileEvents: events for files, not only directories.
+    let made = unsafe create(Pointer.null<u8>(), unsafe addressPointer(unsafe addressOf<extern "C" fn(?*mut u8, ?*mut u8, usize, ?*mut u8, ?*const u32, ?*const u64) -> ()>(silkFseventsStreamEvent)), Pointer.fromRef<StreamContext>(&context), paths, EVENT_ID_SINCE_NOW, 0.05, CREATE_NO_DEFER | CREATE_FILE_EVENTS)
+    // libuv asserts the stream is made; a release build would crash on null, this reports it.
+    if Pointer.isNull<u8>(made) { return UV_ENOMEM }
+    let schedule = unsafe function<ThreeArguments>(api.streamSchedule)
+    unsafe schedule(made, runLoop, unsafe defaultMode(&api))
+    let start = unsafe function<StreamStart>(api.streamStart)
+    if unsafe start(made) == 0 {
+      let invalidate = unsafe function<OneArgument>(api.streamInvalidate) unsafe invalidate(made)
+      let release = unsafe function<OneArgument>(api.streamRelease) unsafe release(made)
+      return UV_EMFILE
+    }
+    let s2 = unsafe Pointer.borrowMut<(), LoopState>(&mut anchor, state)
+    s2.stream = made
+    return 0
+  }
+  // Stops and releases the loop's stream, if any (uv__fsevents_destroy_stream). Run-loop thread.
+  unsafe fn destroyStream(state: *mut LoopState) -> () {
+    let mut anchor = () let s = unsafe Pointer.borrowMut<(), LoopState>(&mut anchor, state)
+    let stream = s.stream let api = s.api s.stream = Pointer.null<u8>() drop s
+    if Pointer.isNull<u8>(stream) { return }
+    let stop = unsafe function<OneArgument>(api.streamStop) unsafe stop(stream)
+    let invalidate = unsafe function<OneArgument>(api.streamInvalidate) unsafe invalidate(stream)
+    let release = unsafe function<OneArgument>(api.streamRelease) unsafe release(stream)
+  }
+  // Rebuilds the stream over every watched realpath when the set changed (uv__fsevents_reschedule):
+  // a failure is reported to every watch; a stopping watch waits for `closed`. Run-loop thread.
+  unsafe fn reschedule(state: *mut LoopState, closing: bool) -> () {
+    let mut anchor = () let s = unsafe Pointer.borrowMut<(), LoopState>(&mut anchor, state)
+    let mutex = s.lock let api = s.api let closed = s.closed drop s
+    unsafe lock(mutex)
+    let s2 = unsafe Pointer.borrowMut<(), LoopState>(&mut anchor, state)
+    let needed = s2.needReschedule s2.needReschedule = false drop s2
+    unsafe unlock(mutex)
+    let mut status: i32 = 0
+    if needed {
+      unsafe destroyStream(state)
+      // Any failure below is a memory failure.
+      status = UV_ENOMEM
+      unsafe lock(mutex)
+      let s3 = unsafe Pointer.borrow<(), LoopState>(&anchor, state)
+      let count = u32.toUsize(s3.count) let mut cursor = s3.first drop s3
+      let mut strings: ?*mut u8 = Pointer.null<u8>()
+      let mut made: usize = 0
+      let mut complete = true
+      if count != 0 {
+        strings = unsafe malloc(count * 8)
+        if Pointer.isNull<u8>(strings) { complete = false }
+        else {
+          let list = unsafe Pointer.assumeManyMut<?*mut u8>(unsafe cast<?*mut u8>(unsafe nn(strings)))
+          let create = unsafe function<StringCreate>(api.stringCreate)
+          while made < count {
+            let second = () let w = unsafe Pointer.borrow<(), Watch>(&second, unsafe nn(cursor))
+            let realpath = w.realpath cursor = w.next drop w
+            let string = unsafe create(Pointer.null<u8>(), unsafe Intrinsic.pointerRequalify<*mut u8, *const u8>(realpath))
+            if Pointer.isNull<u8>(string) { complete = false break }
+            unsafe Pointer.write<?*mut u8>(unsafe Pointer.atMut<?*mut u8>(list, made), string)
+            made = made + 1
+          }
+        }
+      }
+      unsafe unlock(mutex)
+      if complete {
+        status = 0
+        if count != 0 {
+          let arrayCreate = unsafe function<ArrayCreate>(api.arrayCreate)
+          let array = unsafe arrayCreate(Pointer.null<u8>(), unsafe Intrinsic.pointerRequalify<*mut ?*mut u8, *const ?*mut u8>(unsafe cast<?*mut u8>(unsafe nn(strings))), usize.toIsize(count), unsafe Intrinsic.pointerRequalify<?*mut u8, ?*const u8>(unsafe addressPointer(api.typeArrayCallBacks)))
+          if Pointer.isNull<u8>(array) { status = UV_ENOMEM }
+          else {
+            status = unsafe createStream(state, array)
+            // The array retains the strings (kCFTypeArrayCallBacks), and the stream keeps what it
+            // needs of the array, so both are released here. libuv makes the array without
+            // callbacks and never releases the array, the strings or the C array.
+            unsafe cfRelease(&api, array)
+          }
+        }
+      }
+      if !Pointer.isNull<u8>(strings) {
+        let list = unsafe Pointer.assumeManyMut<?*mut u8>(unsafe cast<?*mut u8>(unsafe nn(strings)))
+        let mut index: usize = 0
+        while index < made { unsafe cfRelease(&api, unsafe Pointer.read<?*mut u8>(unsafe Pointer.atMut<?*mut u8>(list, index))) index = index + 1 }
+        unsafe free(strings)
+      }
+      if status != 0 {
+        // Broadcast the error to all watches.
+        unsafe lock(mutex)
+        let s4 = unsafe Pointer.borrow<(), LoopState>(&anchor, state)
+        let mut each = s4.first drop s4
+        while !Pointer.isNull<Watch>(each) {
+          let third = () let w = unsafe Pointer.borrow<(), Watch>(&third, unsafe nn(each))
+          let next = w.next drop w
+          unsafe pushEvents(unsafe nn(each), Pointer.null<Event>(), Pointer.null<Event>(), status)
+          each = next
+        }
+        unsafe unlock(mutex)
+      }
+    }
+    // The loop's thread waits in fseventsStop until the watch is out of the stream.
+    if closing { unsafe post(closed) }
+  }
+
+  // ---- The loop's side ------------------------------------------------------------------------
+  unsafe fn findState(registry: *mut Registry, key: usize) -> ?*mut LoopState {
+    let anchor = () let r = unsafe Pointer.borrow<(), Registry>(&anchor, registry)
+    let mutex = r.lock drop r
+    unsafe lock(mutex)
+    let r2 = unsafe Pointer.borrow<(), Registry>(&anchor, registry)
+    let mut cursor = r2.first drop r2
+    while !Pointer.isNull<LoopState>(cursor) {
+      let s = unsafe Pointer.borrow<(), LoopState>(&anchor, unsafe nn(cursor))
+      if s.key == key { break }
+      cursor = s.next
+    }
+    unsafe unlock(mutex)
+    return cursor
+  }
+  // Takes a loop's state out of the registry, or null. `locked` is false after fork, when the
+  // child is single-threaded and another thread may have held the lock at the fork.
+  unsafe fn unlinkState(registry: *mut Registry, key: usize, locked: bool) -> ?*mut LoopState {
+    let mut anchor = () let r = unsafe Pointer.borrowMut<(), Registry>(&mut anchor, registry)
+    let mutex = r.lock drop r
+    if locked { unsafe lock(mutex) }
+    let r2 = unsafe Pointer.borrowMut<(), Registry>(&mut anchor, registry)
+    let mut previous: ?*mut LoopState = Pointer.null<LoopState>()
+    let mut cursor = r2.first drop r2
+    while !Pointer.isNull<LoopState>(cursor) {
+      let mut second = () let s = unsafe Pointer.borrowMut<(), LoopState>(&mut second, unsafe nn(cursor))
+      if s.key == key {
+        let next = s.next s.next = Pointer.null<LoopState>() drop s
+        if Pointer.isNull<LoopState>(previous) { let r3 = unsafe Pointer.borrowMut<(), Registry>(&mut anchor, registry) r3.first = next }
+        else { let mut third = () let p = unsafe Pointer.borrowMut<(), LoopState>(&mut third, unsafe nn(previous)) p.next = next }
+        break
+      }
+      previous = cursor cursor = s.next
+    }
+    if locked { unsafe unlock(mutex) }
+    return cursor
+  }
+  unsafe fn freeState(state: *mut LoopState) -> () {
+    let anchor = () let s = unsafe Pointer.borrow<(), LoopState>(&anchor, state)
+    let signalLock = s.signalLock let started = s.started let closed = s.closed let mutex = s.lock drop s
+    unsafe freeLock(signalLock) unsafe freeSemaphore(started) unsafe freeSemaphore(closed) unsafe freeLock(mutex)
+    unsafe free(unsafe bytes<LoopState>(state))
+  }
+  // The loop's state, made with its run-loop thread on first use (uv__fsevents_loop_init).
+  unsafe fn loopInit(loop: *mut u8, out: &mut ?*mut LoopState) -> i32 {
+    let found = unsafe registry(true)
+    if Pointer.isNull<Registry>(found) { return UV_ENOMEM }
+    let registry = unsafe nn(found)
+    let key = Pointer.address<u8>(loop)
+    let existing = unsafe findState(registry, key)
+    if !Pointer.isNull<LoopState>(existing) { out.* = existing return 0 }
+    let loaded = unsafe globalInit(registry)
+    if loaded != 0 { return loaded }
+    let anchor = () let r = unsafe Pointer.borrow<(), Registry>(&anchor, registry)
+    let api = r.api drop r
+    let made = unsafe calloc(1, Layout.of<LoopState>().bytes)
+    if Pointer.isNull<u8>(made) { return UV_ENOMEM }
+    let signalLock = unsafe newLock() let started = unsafe newSemaphore() let closed = unsafe newSemaphore() let mutex = unsafe newLock()
+    if Pointer.isNull<u8>(signalLock) || Pointer.isNull<Semaphore>(started) || Pointer.isNull<Semaphore>(closed) || Pointer.isNull<u8>(mutex) {
+      if !Pointer.isNull<u8>(signalLock) { unsafe freeLock(unsafe nn(signalLock)) }
+      if !Pointer.isNull<Semaphore>(started) { unsafe freeSemaphore(unsafe nn(started)) }
+      if !Pointer.isNull<Semaphore>(closed) { unsafe freeSemaphore(unsafe nn(closed)) }
+      if !Pointer.isNull<u8>(mutex) { unsafe freeLock(unsafe nn(mutex)) }
+      unsafe free(made)
+      return UV_ENOMEM
+    }
+    let state = unsafe cast<LoopState>(unsafe nn(made))
+    unsafe Pointer.put<LoopState>(state, LoopState {
+      next: Pointer.null<LoopState>(), key: key, api: api, thread: 0,
+      signalLock: unsafe nn(signalLock), started: unsafe nn(started), signalFirst: Pointer.null<Signal>(), signalLast: Pointer.null<Signal>(),
+      runLoop: Pointer.null<u8>(), source: Pointer.null<u8>(), needReschedule: false, stream: Pointer.null<u8>(),
+      closed: unsafe nn(closed), lock: unsafe nn(mutex), first: Pointer.null<Watch>(), last: Pointer.null<Watch>(), count: 0
+    })
+    let context = SourceContext { version: 0, info: made, retain: 0, release: 0, copyDescription: 0, equal: 0, hash: 0, schedule: 0, cancel: 0, perform: unsafe addressOf<extern "C" fn(?*mut u8) -> ()>(silkFseventsPerform) }
+    let sourceCreate = unsafe function<SourceCreate>(api.sourceCreate)
+    let source = unsafe sourceCreate(Pointer.null<u8>(), 0, Pointer.fromRef<SourceContext>(&context))
+    if Pointer.isNull<u8>(source) { unsafe freeState(state) return UV_ENOMEM }
+    let mut second = () let s = unsafe Pointer.borrowMut<(), LoopState>(&mut second, state)
+    s.source = source drop s
+    let mut attributes: [u8; 128] = [0; 128]
+    if unsafe pthread_attr_init(Pointer.fromMutRef<u8>(&mut attributes[0])) != 0 { unsafe abort() }
+    // libuv aborts when the size is refused; 0 (an unlimited RLIMIT_STACK) keeps the default.
+    let size = unsafe stackSize()
+    if size != 0 { if unsafe pthread_attr_setstacksize(Pointer.fromMutRef<u8>(&mut attributes[0]), size) != 0 { unsafe abort() } }
+    let mut thread: usize = 0
+    let created = unsafe pthread_create(Pointer.fromMutRef<usize>(&mut thread), Pointer.fromRef<u8>(&attributes[0]), silkFseventsRunner, made)
+    if unsafe pthread_attr_destroy(Pointer.fromMutRef<u8>(&mut attributes[0])) != 0 { unsafe abort() }
+    if created != 0 { unsafe cfRelease(&api, source) unsafe freeState(state) return -created }
+    let s2 = unsafe Pointer.borrowMut<(), LoopState>(&mut second, state)
+    s2.thread = thread let started2 = s2.started drop s2
+    // Wait for the run loop.
+    unsafe wait(started2)
+    let mut third = () let r2 = unsafe Pointer.borrowMut<(), Registry>(&mut third, registry)
+    let mutex2 = r2.lock drop r2
+    unsafe lock(mutex2)
+    let r3 = unsafe Pointer.borrowMut<(), Registry>(&mut third, registry)
+    let s3 = unsafe Pointer.borrowMut<(), LoopState>(&mut second, state)
+    s3.next = r3.first r3.first = state drop s3 drop r3
+    unsafe unlock(mutex2)
+    out.* = state
+    return 0
+  }
+  unsafe fn freeEvents(first: ?*mut Event) -> () {
+    let mut cursor = first
+    while !Pointer.isNull<Event>(cursor) {
+      let anchor = () let e = unsafe Pointer.borrow<(), Event>(&anchor, unsafe nn(cursor))
+      let next = e.next drop e
+      unsafe free(unsafe bytes<Event>(unsafe nn(cursor)))
+      cursor = next
+    }
+  }
+
+  /// Starts watching the directory `path` for the loop at `loop` (`flags` may hold
+  /// UV_FS_EVENT_RECURSIVE, 4), as libuv's uv__fsevents_init. On success `state` receives the
+  /// watch's state, and the run-loop thread calls `notify(context)` each time it queues events or
+  /// an error. 0, or a negative errno: UV_ENOSYS or UV_ENOENT when FSEvents cannot be loaded, the
+  /// errno of realpath, UV_ENOMEM.
+  pub unsafe fn fseventsStart(loop: *mut u8, path: *const u8, flags: u32, notify: extern "C" fn(*mut u8) -> (), context: *mut u8, state: *mut ?*mut u8) -> i32 {
+    let mut owner: ?*mut LoopState = Pointer.null<LoopState>()
+    let initialized = unsafe loopInit(loop, &mut owner)
+    if initialized != 0 { return initialized }
+    let looped = unsafe nn(owner)
+    // The absolute path of the directory.
+    let mut buffer: [u8; 1024] = [0; 1024]
+    if Pointer.isNull<u8>(unsafe realpath(path, Pointer.fromMutRef<u8>(&mut buffer[0]))) { return -(unsafe errno()) }
+    let length = unsafe strlen(Pointer.fromRef<u8>(&buffer[0]))
+    let copy = unsafe malloc(length + 1)
+    if Pointer.isNull<u8>(copy) { return UV_ENOMEM }
+    let _copied = unsafe memcpy(unsafe nn(copy), Pointer.fromRef<u8>(&buffer[0]), length + 1)
+    let mutex = unsafe newLock()
+    let made = unsafe calloc(1, Layout.of<Watch>().bytes)
+    if Pointer.isNull<u8>(mutex) || Pointer.isNull<u8>(made) {
+      if !Pointer.isNull<u8>(mutex) { unsafe freeLock(unsafe nn(mutex)) }
+      unsafe free(made) unsafe free(copy)
+      return UV_ENOMEM
+    }
+    let watch = unsafe cast<Watch>(unsafe nn(made))
+    unsafe Pointer.put<Watch>(watch, Watch {
+      previous: Pointer.null<Watch>(), next: Pointer.null<Watch>(), owner: looped,
+      realpath: unsafe nn(copy), length: length, flags: flags, notify: notify, context: context,
+      lock: unsafe nn(mutex), first: Pointer.null<Event>(), last: Pointer.null<Event>(), error: 0,
+      batch: Pointer.null<Event>(), batchError: 0, open: false, current: Pointer.null<Event>()
+    })
+    // Into the loop's list, at the tail.
+    let mut anchor = () let s = unsafe Pointer.borrowMut<(), LoopState>(&mut anchor, looped)
+    let listLock = s.lock drop s
+    unsafe lock(listLock)
+    let s2 = unsafe Pointer.borrowMut<(), LoopState>(&mut anchor, looped)
+    let mut second = () let w = unsafe Pointer.borrowMut<(), Watch>(&mut second, watch)
+    w.previous = s2.last drop w
+    if Pointer.isNull<Watch>(s2.last) { s2.first = watch }
+    else { let mut third = () let tail = unsafe Pointer.borrowMut<(), Watch>(&mut third, unsafe nn(s2.last)) tail.next = watch }
+    s2.last = watch s2.count = s2.count + 1 s2.needReschedule = true drop s2
+    unsafe unlock(listLock)
+    // Reschedule the stream.
+    let signalled = unsafe loopSignal(looped, watch, false)
+    if signalled != 0 {
+      // libuv leaves the handle in the list here; it is taken out, so the stream never names it.
+      unsafe unlinkWatch(looped, watch)
+      unsafe freeLock(unsafe nn(mutex)) unsafe free(copy) unsafe free(made)
+      return signalled
+    }
+    unsafe Pointer.write<?*mut u8>(state, made)
+    return 0
+  }
+  unsafe fn unlinkWatch(state: *mut LoopState, watch: *mut Watch) -> () {
+    let mut anchor = () let s = unsafe Pointer.borrowMut<(), LoopState>(&mut anchor, state)
+    let listLock = s.lock drop s
+    unsafe lock(listLock)
+    let mut second = () let w = unsafe Pointer.borrowMut<(), Watch>(&mut second, watch)
+    let before = w.previous let after = w.next w.previous = Pointer.null<Watch>() w.next = Pointer.null<Watch>() drop w
+    let s2 = unsafe Pointer.borrowMut<(), LoopState>(&mut anchor, state)
+    if Pointer.isNull<Watch>(before) { s2.first = after }
+    else { let mut third = () let b = unsafe Pointer.borrowMut<(), Watch>(&mut third, unsafe nn(before)) b.next = after }
+    if Pointer.isNull<Watch>(after) { s2.last = before }
+    else { let mut third = () let a = unsafe Pointer.borrowMut<(), Watch>(&mut third, unsafe nn(after)) a.previous = before }
+    s2.count = s2.count - 1 s2.needReschedule = true drop s2
+    unsafe unlock(listLock)
+  }
+
+  /// Takes the next event on the loop's thread, as libuv's UV__FSEVENTS_PROCESS: the first call of a
+  /// drain takes everything queued so far, and the calls that follow hand it over in order, then the
+  /// error reported with it (`name` null, `status` negative), then false, which ends the drain.
+  /// `name` is null for an empty name, and stays valid until the next call or `fseventsStop`.
+  pub unsafe fn fseventsNext(state: *mut u8, name: *mut ?*const u8, events: *mut i32, status: *mut i32) -> bool {
+    let watch = unsafe cast<Watch>(state)
+    let mut anchor = () let w = unsafe Pointer.borrowMut<(), Watch>(&mut anchor, watch)
+    let previous = w.current w.current = Pointer.null<Event>()
+    let open = w.open let mutex = w.lock drop w
+    unsafe free(unsafe Intrinsic.pointerReinterpret<?*mut Event, ?*mut u8>(previous))
+    if !open {
+      // Split off all events and the error.
+      unsafe lock(mutex)
+      let w2 = unsafe Pointer.borrowMut<(), Watch>(&mut anchor, watch)
+      w2.batch = w2.first w2.first = Pointer.null<Event>() w2.last = Pointer.null<Event>()
+      w2.batchError = w2.error w2.error = 0 w2.open = true drop w2
+      unsafe unlock(mutex)
+    }
+    let w3 = unsafe Pointer.borrowMut<(), Watch>(&mut anchor, watch)
+    if !Pointer.isNull<Event>(w3.batch) {
+      let event = unsafe nn(w3.batch)
+      let mut second = () let e = unsafe Pointer.borrowMut<(), Event>(&mut second, event)
+      w3.batch = e.next w3.current = event
+      let kind = e.events e.next = Pointer.null<Event>() drop e drop w3
+      let text = unsafe eventName(event)
+      let empty = unsafe Pointer.read<u8>(text) == 0
+      unsafe Pointer.write<?*const u8>(name, if empty { Pointer.null<u8>() } else { unsafe Intrinsic.pointerRequalify<*mut u8, *const u8>(text) })
+      unsafe Pointer.write<i32>(events, kind)
+      unsafe Pointer.write<i32>(status, 0)
+      return true
+    }
+    if w3.batchError != 0 {
+      let error = w3.batchError w3.batchError = 0 drop w3
+      unsafe Pointer.write<?*const u8>(name, Pointer.null<u8>())
+      unsafe Pointer.write<i32>(events, 0)
+      unsafe Pointer.write<i32>(status, error)
+      return true
+    }
+    w3.open = false
+    return false
+  }
+
+  /// Stops a watch, as libuv's uv__fsevents_close: out of the loop's list (so no `notify` after
+  /// this returns), the stream rebuilt without it (this waits for the run-loop thread), then the
+  /// events still queued and the state are freed.
+  pub unsafe fn fseventsStop(state: *mut u8) -> () {
+    let watch = unsafe cast<Watch>(state)
+    let mut anchor = () let w = unsafe Pointer.borrowMut<(), Watch>(&mut anchor, watch)
+    let owner = w.owner drop w
+    unsafe unlinkWatch(owner, watch)
+    // Reschedule the stream, and wait for it. When the request cannot be queued (out of memory)
+    // the watch is out of the list all the same, so nothing can notify it; libuv returns the error
+    // and keeps the handle's state.
+    if unsafe loopSignal(owner, watch, true) == 0 {
+      let second = () let s = unsafe Pointer.borrow<(), LoopState>(&second, owner)
+      let closed = s.closed drop s
+      unsafe wait(closed)
+    }
+    // Free the events still queued.
+    let w2 = unsafe Pointer.borrowMut<(), Watch>(&mut anchor, watch)
+    let current = w2.current let batch = w2.batch let first = w2.first let mutex = w2.lock let realpath = w2.realpath drop w2
+    unsafe free(unsafe Intrinsic.pointerReinterpret<?*mut Event, ?*mut u8>(current))
+    unsafe freeEvents(batch) unsafe freeEvents(first)
+    unsafe freeLock(mutex) unsafe free(realpath)
+    unsafe free(state)
+  }
+
+  /// Ends the loop's run-loop thread and frees its state, as libuv's uv__fsevents_loop_delete, from
+  /// uv_loop_close. Nothing when the loop never watched a directory.
+  pub unsafe fn fseventsLoopDelete(loop: *mut u8) -> () {
+    let found = unsafe registry(false)
+    if Pointer.isNull<Registry>(found) { return }
+    let taken = unsafe unlinkState(unsafe nn(found), Pointer.address<u8>(loop), true)
+    if Pointer.isNull<LoopState>(taken) { return }
+    let state = unsafe nn(taken)
+    if unsafe loopSignal(state, Pointer.null<Watch>(), false) != 0 { unsafe abort() }
+    let anchor = () let s = unsafe Pointer.borrow<(), LoopState>(&anchor, state)
+    let thread = s.thread drop s
+    let _joined = unsafe pthread_join(thread, Pointer.null<?*mut u8>())
+    // Requests the thread did not run.
+    let s2 = unsafe Pointer.borrow<(), LoopState>(&anchor, state)
+    let mut item = s2.signalFirst let api = s2.api let source = s2.source drop s2
+    while !Pointer.isNull<Signal>(item) {
+      let r = unsafe Pointer.borrow<(), Signal>(&anchor, unsafe nn(item))
+      let next = r.next drop r
+      unsafe free(unsafe Intrinsic.pointerReinterpret<?*mut Signal, ?*mut u8>(item))
+      item = next
+    }
+    unsafe cfRelease(&api, source)
+    unsafe freeState(state)
+  }
+
+  /// In the child after fork (uv_loop_fork), as libuv's uv__io_fork: CoreFoundation's thread is
+  /// gone and cannot be touched or restarted, so the loop forgets its state (freeing only the
+  /// record), and from then on the process watches directories with kqueue (`fseventsForked`).
+  pub unsafe fn fseventsFork(loop: *mut u8) -> () {
+    let found = unsafe registry(false)
+    if Pointer.isNull<Registry>(found) { return }
+    let registry = unsafe nn(found)
+    let taken = unsafe unlinkState(registry, Pointer.address<u8>(loop), false)
+    if Pointer.isNull<LoopState>(taken) { return }
+    let mut anchor = () let r = unsafe Pointer.borrowMut<(), Registry>(&mut anchor, registry)
+    unsafe Atomic.store<u32>(Pointer.fromMutRef<u32>(&mut r.forked), 1, MemoryOrder.Relaxed)
+    drop r
+    unsafe free(unsafe Intrinsic.pointerReinterpret<?*mut LoopState, ?*mut u8>(taken))
+  }
+  /// Whether this process forked while a loop had a run-loop thread (libuv's
+  /// uv__has_forked_with_cfrunloop): directory watches then use kqueue, and stopping a watch
+  /// started before the fork leaves its state alone.
+  pub unsafe fn fseventsForked() -> bool {
+    let found = unsafe registry(false)
+    if Pointer.isNull<Registry>(found) { return false }
+    let mut anchor = () let r = unsafe Pointer.borrowMut<(), Registry>(&mut anchor, unsafe nn(found))
+    return unsafe Atomic.load<u32>(Pointer.fromMutRef<u32>(&mut r.forked), MemoryOrder.Relaxed) != 0
+  }
+}

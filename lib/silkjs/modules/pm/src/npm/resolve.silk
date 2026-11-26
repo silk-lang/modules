@@ -1,0 +1,1758 @@
+//! Resolves the dependencies of a project into a graph of exact package versions.
+//!
+//! The walk is breadth first and in waves: every package a wave needs metadata for is asked of
+//! the [`Registry`] in one call, so the fetches run at the same time. A range is satisfied by a
+//! version already in the graph when one fits, which keeps one copy of a package where the
+//! ranges allow it, and else by the version npm would pick. Packages for other platforms stay in
+//! the graph, so one resolution serves every machine.
+//!
+//! A workspace is resolved as one graph. Each of its packages is an importer: it has its own
+//! dependencies, and they share the packages behind them. A dependency with the `workspace:`
+//! protocol is a link to another package of the workspace and never asks the registry.
+//!
+//! A package gets its peer dependencies from the packages above it: the nearest one that depends
+//! on something under that name, up to the importer. The same version of a package can so be in
+//! the graph more than once, as one node for each set of peers it is used with, which is what
+//! lets two packages of a workspace use one plugin with two versions of its host. A peer that
+//! nothing above provides falls back to a fitting version already in the graph, or is resolved
+//! like a dependency of the package that asks for it; an optional one is left out.
+//!
+//! A dependency can also name a tarball, by its URL or, in a package of the workspace, as
+//! `file:` and its path. Such a tarball is fetched while the graph is resolved, since its
+//! `package.json` is the only place that says what it is and what it depends on. Its package has
+//! the name and version of that file, and after the version a `+` and a few digits of the digest
+//! of the tarball, so it is never taken for a version of the registry. `file:` and the path of a
+//! directory is the same with the files of the directory for the tarball: they are installed as
+//! a copy, with the dependencies the directory declares, and a change to them is a new package.
+//!
+//! A dependency can name a git repository on GitHub, GitLab or Bitbucket, in any of the
+//! spellings of [`npm.git`]. The host is asked which commit the branch or tag is at, and the
+//! tarball it serves of that commit is then a tarball dependency like any other. No git is run.
+//!
+//! `link:` and a path, in a package of the workspace, is a directory to link as it is. The graph
+//! has no package for it and nothing of it is resolved.
+
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.core.result { Result }
+import silk.core.target { Arch, OperatingSystem, Target }
+import silk.num.u8
+import silk.num.u64
+import silk.num.usize
+import npm.git { Repository, tagged }
+import npm.manifest { DEVELOPMENT, Manifest, OPTIONAL, PEER, PRODUCTION }
+import npm.packument { Packument }
+import npm.registry { Fetched, Registry, RegistryError }
+import npm.workspace { Workspace }
+import pkg.files { joined, readOptional }
+import pkg.git_refs { commitOf, isHex }
+import pkg.integrity { integrityOf }
+import pkg.names { Names }
+import pkg.semver { Range, Version }
+import pkg.store { PackageFiles, Store, StoreError, directoryFiles, fileOf }
+import pkg.text { compare, endsWith, same, startsWith }
+
+/// The machine packages are installed for, in the words of the `os`, `cpu` and `libc` fields.
+pub struct Host {
+  pub os: &'static [u8],
+  pub cpu: &'static [u8],
+  /// Empty when the system has no notion of a C library flavor.
+  pub libc: &'static [u8],
+}
+
+impl Copy for Host {}
+
+impl Host {
+  /// The machine this program was built for. Linux is taken to be glibc.
+  pub fn current() -> Host {
+    let os: &'static [u8] = match Target.operatingSystem() {
+      OperatingSystem.Darwin => b"darwin"
+      OperatingSystem.Linux => b"linux"
+      OperatingSystem.Windows => b"win32"
+      _ => b"unknown"
+    }
+    let cpu: &'static [u8] = match Target.arch() {
+      Arch.Aarch64 => b"arm64"
+      Arch.X86_64 => b"x64"
+      _ => b"wasm32"
+    }
+    let libc: &'static [u8] = match Target.operatingSystem() {
+      OperatingSystem.Linux => b"glibc"
+      _ => b""
+    }
+    return Host { os: os, cpu: cpu, libc: libc }
+  }
+}
+
+/// A dependency link: the name the dependent sees, and the package behind it.
+pub struct Edge {
+  /// The interned name the package is installed under for the dependent.
+  pub alias: usize,
+  /// The index of the package in the graph.
+  pub target: usize,
+}
+
+impl Copy for Edge {}
+
+struct Place {
+  start: usize,
+  length: usize,
+}
+
+impl Copy for Place {}
+
+/// A `link:` dependency on a directory that is not a package of the workspace: the name the
+/// dependent sees, and where the directory is.
+pub struct Outside {
+  /// The interned name the directory is linked under.
+  pub alias: usize,
+  path: Place,
+}
+
+impl Copy for Outside {}
+
+// A peer a package asks for.
+struct PeerLink {
+  alias: usize,
+  // What the peer is when nothing above the package provides it: a package index plus one, or 0.
+  fallback: usize,
+}
+
+impl Copy for PeerLink {}
+
+// One use of a package: the package with the peers it has here.
+struct Node {
+  package: usize,
+  // What tells this node from the others of its package; empty for a package without peers.
+  suffix: Place,
+  // The targets are nodes.
+  edges: List<Edge>,
+}
+
+/// One exact version of a package in the graph.
+pub struct Package {
+  /// The interned name of the package on the registry.
+  pub name: usize,
+  version: Place,
+  tarball: Place,
+  integrity: Place,
+  shasum: Place,
+  /// The manifest of this version.
+  pub manifest: Manifest,
+  // What the package depends on, peers apart; the targets are packages.
+  edges: List<Edge>,
+  peers: List<PeerLink>,
+  // The next package with the same name, plus one; 0 at the end of the chain.
+  next: usize,
+  // Whether a resolution took it from a tarball a dependency names, and not from the registry.
+  remote: bool,
+}
+
+// One package of the workspace, with what it depends on.
+struct Importer {
+  path: Place,
+  // The targets are nodes; while the graph is resolved, packages.
+  edges: List<Edge>,
+  // The other packages of the workspace it depends on; the target is an importer.
+  locals: List<Edge>,
+  // The directories outside the workspace it links.
+  outside: List<Outside>,
+}
+
+/// The resolved packages of a workspace and the links between them.
+///
+/// A package is one version of a name, with its tarball and manifest. A node is a package as it
+/// is installed: with its dependencies, and with the peers it found. Most packages have one
+/// node. The links of the graph are between nodes.
+pub struct Graph {
+  /// The names of packages and aliases; an [`Edge`] and a [`Package`] hold numbers of it.
+  pub names: Names,
+  text: Bytes,
+  packages: List<Package>,
+  nodes: List<Node>,
+  importers: List<Importer>,
+}
+
+impl Graph {
+  fn slice(self: &Self, place: Place) -> &[u8] {
+    return Slice.view<u8>(Bytes.asSlice(&self.text), place.start, place.length)
+  }
+
+  /// A graph with no packages.
+  pub fn make() -> Graph {
+    return Graph { names: Names.make(), text: Bytes.make(), packages: List<Package>.make(), nodes: List<Node>.make(), importers: List<Importer>.make() }
+  }
+
+  /// Adds a package and returns its index.
+  pub effect fn addPackage(
+    self: &mut Self,
+    name: &[u8],
+    version: &[u8],
+    tarball: &[u8],
+    integrity: &[u8],
+    shasum: &[u8],
+    manifest: Manifest,
+  ) -> usize ! OutOfMemoryError ? &mut Allocator {
+    let id = run Names.intern(&mut self.names, name)
+    let package = Package {
+      name: id,
+      version: run keep(&mut self.text, version),
+      tarball: run keep(&mut self.text, tarball),
+      integrity: run keep(&mut self.text, integrity),
+      shasum: run keep(&mut self.text, shasum),
+      manifest: move manifest,
+      edges: List<Edge>.make(),
+      peers: List<PeerLink>.make(),
+      next: 0,
+      remote: false,
+    }
+    run self.packages.append(move package)
+    return List<Package>.length(&self.packages) - 1
+  }
+
+  /// Adds a node of the package at `package` and returns its index. `suffix` tells it from the
+  /// other nodes of that package, and is empty when there is one.
+  pub effect fn addNode(self: &mut Self, package: usize, suffix: &[u8]) -> usize ! OutOfMemoryError ? &mut Allocator {
+    let place = run keep(&mut self.text, suffix)
+    run self.nodes.append(Node { package: package, suffix: place, edges: List<Edge>.make() })
+    return List<Node>.length(&self.nodes) - 1
+  }
+
+  /// Makes the node at `from` depend on the node at `target` under the name `alias`.
+  pub effect fn addEdge(self: &mut Self, from: usize, alias: &[u8], target: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+    let id = run Names.intern(&mut self.names, alias)
+    run List<Edge>.append(&mut List<Node>.asMutSlice(&mut self.nodes)[from].edges, Edge { alias: id, target: target })
+  }
+
+  /// Adds an importer, the package of the workspace in the directory `path` of the root, and
+  /// returns its index. The root project has the path `.`.
+  pub effect fn addImporter(self: &mut Self, path: &[u8]) -> usize ! OutOfMemoryError ? &mut Allocator {
+    let place = run keep(&mut self.text, path)
+    run self.importers.append(Importer { path: place, edges: List<Edge>.make(), locals: List<Edge>.make(), outside: List<Outside>.make() })
+    return List<Importer>.length(&self.importers) - 1
+  }
+
+  /// Makes importer `from` depend on the node at `target` under the name `alias`.
+  pub effect fn addImporterEdge(self: &mut Self, from: usize, alias: &[u8], target: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+    let id = run Names.intern(&mut self.names, alias)
+    run List<Edge>.append(&mut List<Importer>.asMutSlice(&mut self.importers)[from].edges, Edge { alias: id, target: target })
+  }
+
+  /// Gives the dependency of importer `from` that it has under the name `alias` the name
+  /// `renamed`, for a dependency whose name was not known before it was resolved.
+  pub effect fn renameImporterEdge(self: &mut Self, from: usize, alias: &[u8], renamed: &[u8]) -> () ! OutOfMemoryError ? &mut Allocator {
+    let old = run Names.intern(&mut self.names, alias)
+    let new = run Names.intern(&mut self.names, renamed)
+    let edges = List<Edge>.asMutSlice(&mut List<Importer>.asMutSlice(&mut self.importers)[from].edges)
+    let mut index: usize = 0
+    while index < edges.length {
+      if edges[index].alias == old {
+        edges[index].alias = new
+      }
+      index = index + 1
+    }
+  }
+
+  /// Makes importer `from` depend on importer `target` under the name `alias`.
+  pub effect fn addLocalEdge(self: &mut Self, from: usize, alias: &[u8], target: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+    let id = run Names.intern(&mut self.names, alias)
+    run List<Edge>.append(&mut List<Importer>.asMutSlice(&mut self.importers)[from].locals, Edge { alias: id, target: target })
+  }
+
+  /// Makes importer `from` link the directory at `path` under the name `alias`. The path is
+  /// absolute, or starts from the root of the workspace.
+  pub effect fn addOutsideEdge(self: &mut Self, from: usize, alias: &[u8], path: &[u8]) -> () ! OutOfMemoryError ? &mut Allocator {
+    let id = run Names.intern(&mut self.names, alias)
+    let place = run keep(&mut self.text, path)
+    run List<Outside>.append(&mut List<Importer>.asMutSlice(&mut self.importers)[from].outside, Outside { alias: id, path: place })
+  }
+
+  /// Whether the package at `index` is for `host`, by its `os`, `cpu` and `libc` fields. An
+  /// install leaves out the packages that are not.
+  pub fn supports(self: &Self, index: usize, host: Host) -> bool {
+    return Manifest.supports(&Graph.package(self, index).manifest, host.os, host.cpu, host.libc)
+  }
+
+  /// How many packages the graph has.
+  pub fn count(self: &Self) -> usize {
+    return List<Package>.length(&self.packages)
+  }
+
+  /// The package at `index`.
+  pub fn package(self: &Self, index: usize) -> &Package {
+    return &List<Package>.asSlice(&self.packages)[index]
+  }
+
+  /// The registry name of the package at `index`.
+  pub fn name(self: &Self, index: usize) -> &[u8] {
+    return Names.bytes(&self.names, Graph.package(self, index).name)
+  }
+
+  /// The version of the package at `index`.
+  pub fn version(self: &Self, index: usize) -> &[u8] {
+    return Graph.slice(self, Graph.package(self, index).version)
+  }
+
+  /// The tarball URL of the package at `index`.
+  pub fn tarball(self: &Self, index: usize) -> &[u8] {
+    return Graph.slice(self, Graph.package(self, index).tarball)
+  }
+
+  /// The integrity string of the tarball. Empty when the registry has none.
+  pub fn integrity(self: &Self, index: usize) -> &[u8] {
+    return Graph.slice(self, Graph.package(self, index).integrity)
+  }
+
+  /// The hex SHA-1 of the tarball. Empty when the registry has none.
+  pub fn shasum(self: &Self, index: usize) -> &[u8] {
+    return Graph.slice(self, Graph.package(self, index).shasum)
+  }
+
+  /// How many nodes the graph has.
+  pub fn nodeCount(self: &Self) -> usize {
+    return List<Node>.length(&self.nodes)
+  }
+
+  /// The index of the package that the node at `node` is a use of.
+  pub fn nodePackage(self: &Self, node: usize) -> usize {
+    return List<Node>.asSlice(&self.nodes)[node].package
+  }
+
+  /// What tells the node at `node` from the other nodes of its package: empty, or text that
+  /// starts with `_` and names the peers it has.
+  pub fn nodeSuffix(self: &Self, node: usize) -> &[u8] {
+    return Graph.slice(self, List<Node>.asSlice(&self.nodes)[node].suffix)
+  }
+
+  /// What the node at `node` depends on, peers included. The targets are nodes.
+  pub fn nodeEdges(self: &Self, node: usize) -> &[Edge] {
+    return List<Edge>.asSlice(&List<Node>.asSlice(&self.nodes)[node].edges)
+  }
+
+  /// How many importers the graph has.
+  pub fn importerCount(self: &Self) -> usize {
+    return List<Importer>.length(&self.importers)
+  }
+
+  /// The directory of importer `index`, relative to the root; `.` for the root project.
+  pub fn importerPath(self: &Self, index: usize) -> &[u8] {
+    return Graph.slice(self, List<Importer>.asSlice(&self.importers)[index].path)
+  }
+
+  /// The importer in the directory `path` of the root.
+  pub fn importerAt(self: &Self, path: &[u8]) -> Option<usize> {
+    let mut index: usize = 0
+    while index < Graph.importerCount(self) {
+      if same(Graph.importerPath(self, index), path) {
+        return Option<usize>.some(index)
+      }
+      index = index + 1
+    }
+    return Option<usize>.none()
+  }
+
+  /// The nodes importer `index` depends on.
+  pub fn importerEdges(self: &Self, index: usize) -> &[Edge] {
+    return List<Edge>.asSlice(&List<Importer>.asSlice(&self.importers)[index].edges)
+  }
+
+  /// The directories outside the workspace that importer `index` links.
+  pub fn importerOutside(self: &Self, index: usize) -> &[Outside] {
+    return List<Outside>.asSlice(&List<Importer>.asSlice(&self.importers)[index].outside)
+  }
+
+  /// Where the directory of `link` is: an absolute path, or one from the root of the workspace.
+  pub fn outsidePath(self: &Self, link: Outside) -> &[u8] {
+    return Graph.slice(self, link.path)
+  }
+
+  /// The packages of the workspace importer `index` depends on. The target of each edge is an
+  /// importer.
+  pub fn importerLocals(self: &Self, index: usize) -> &[Edge] {
+    return List<Edge>.asSlice(&List<Importer>.asSlice(&self.importers)[index].locals)
+  }
+}
+
+/// Why a resolution failed.
+pub enum ResolveErrorKind {
+  /// The dependency uses a protocol that is not supported yet.
+  Unsupported,
+  /// A `catalog:` dependency names a package the catalog of the root project does not have.
+  Catalog,
+  /// A `workspace:` dependency names no package of the workspace, or one whose version the
+  /// range does not allow.
+  Workspace,
+  /// The registry could not give the metadata of the package, or the tarball a dependency names
+  /// could not be fetched.
+  Registry,
+  /// No published version satisfies the range, or the tag does not exist.
+  NoVersion,
+  /// The metadata of the package is not valid.
+  Metadata,
+}
+
+/// A failed resolution.
+pub struct ResolveError {
+  pub kind: ResolveErrorKind,
+  /// The dependency as written, such as `left-pad@^1.0.0`.
+  pub subject: Bytes,
+  /// A short description for people.
+  pub message: string<'static>,
+}
+
+// A dependency waiting to be resolved.
+struct Pending {
+  // The dependent's package index plus one; 0 for an importer.
+  parent: usize,
+  // The importer that depends, when `parent` is 0.
+  importer: usize,
+  alias: usize,
+  // The interned registry name.
+  name: usize,
+  // The range or tag, in the graph's text.
+  selector: Place,
+  // The spec as written, in the graph's text.
+  spec: Place,
+  optional: bool,
+  unsupported: bool,
+  // A `workspace:` dependency: `name` is a package of the workspace.
+  local: bool,
+  // A tarball by URL or path, which `selector` is.
+  remote: bool,
+  // A `link:` to a directory, whose path `selector` is.
+  outside: bool,
+  // A git repository, which `selector` names; `remote` is set too.
+  git: bool,
+  // A `file:` directory, whose path `selector` has; `remote` is set too.
+  directory: bool,
+}
+
+impl Copy for Pending {}
+
+/// Where the tarballs of resolved packages are fetched to. The resolver names each package as
+/// soon as it is in the graph and puts the downloads in the same round of requests as the
+/// metadata it waits for next, so downloading starts while the graph still grows.
+pub service Tarballs {
+  /// Notes that package `index` of `graph` is going to be installed.
+  effect fn expect(graph: &Graph, index: usize) -> () ! OutOfMemoryError ? &mut Tarballs | &mut Allocator
+  /// Notes that package `index` of `graph` is going to be installed, and hands over its
+  /// tarball, which the resolver had to fetch to know the package.
+  effect fn supply(graph: &Graph, index: usize, tarball: Bytes) -> () ! OutOfMemoryError ? &mut Tarballs | &mut Allocator
+  /// The URLs to fetch in the next round, or none. Each call hands out URLs once.
+  effect fn next() -> List<Bytes> ! OutOfMemoryError ? &mut Tarballs | &mut Allocator
+  /// Takes the answers for the URLs that `next` returned last, in the same order.
+  effect fn take(answers: List<Result<Bytes, RegistryError>>) -> () ! OutOfMemoryError ? &mut Tarballs | &mut Allocator
+}
+
+struct Work {
+  graph: Graph,
+  packuments: List<Packument>,
+  // Per name: 0 not asked for, 1 asked for and not available, else the packument index plus two.
+  documents: List<usize>,
+  // Per name: the first package of that name, plus one.
+  first: List<usize>,
+}
+
+effect fn reject(kind: ResolveErrorKind, work: &Work, pending: &Pending, message: string<'static>) -> never
+  ! ResolveError | OutOfMemoryError ? &mut Allocator {
+  let mut subject = run Bytes.copy(Names.bytes(&work.graph.names, pending.alias))
+  run subject.append(b"@")
+  run subject.append(Graph.slice(&work.graph, pending.spec))
+  fail ResolveError { kind: kind, subject: move subject, message: message }
+}
+
+// Queues one dependency: works out the registry name and the range or tag its spec asks for.
+effect fn queue(work: &mut Work, wave: &mut List<Pending>, parent: usize, importer: usize, alias: &[u8], spec: &[u8], optional: bool) -> ()
+  ! OutOfMemoryError ? &mut Allocator {
+  let aliasId = run Names.intern(&mut work.graph.names, alias)
+  let specStart = Bytes.length(&work.graph.text)
+  run work.graph.text.append(spec)
+  let mut pending = Pending {
+    parent: parent,
+    importer: importer,
+    alias: aliasId,
+    name: aliasId,
+    selector: Place { start: specStart, length: spec.length },
+    spec: Place { start: specStart, length: spec.length },
+    optional: optional,
+    unsupported: false,
+    local: false,
+    remote: false,
+    outside: false,
+    git: false,
+    directory: false,
+  }
+  if startsWith(spec, b"workspace:") {
+    // `workspace:range`, or `workspace:name@range` for a package under another name. Only the
+    // packages of the workspace can ask for one another.
+    pending.local = true
+    pending.unsupported = parent != 0
+    let mut at: usize = 10
+    let mut index: usize = 11
+    while index < spec.length {
+      if spec[index] == 64 {
+        at = index
+      }
+      index = index + 1
+    }
+    if at > 10 {
+      pending.name = run Names.intern(&mut work.graph.names, Slice.view<u8>(spec, 10, at - 10))
+      at = at + 1
+    }
+    pending.selector = Place { start: specStart + at, length: spec.length - at }
+  } else if startsWith(spec, b"npm:") {
+    // `npm:name@range`. The name may start with the `@` of a scope.
+    let mut at = spec.length
+    let mut index: usize = 5
+    while index < spec.length {
+      if spec[index] == 64 {
+        at = index
+      }
+      index = index + 1
+    }
+    pending.name = run Names.intern(&mut work.graph.names, Slice.view<u8>(spec, 4, at - 4))
+    if at < spec.length {
+      pending.selector = Place { start: specStart + at + 1, length: spec.length - at - 1 }
+    } else {
+      pending.selector = Place { start: specStart, length: 0 }
+    }
+  } else if startsWith(spec, b"link:") {
+    // A directory, as it is: nothing of it is installed. The path starts from the package
+    // that names it, which only one of the workspace has.
+    pending.outside = true
+    pending.unsupported = parent != 0
+    pending.selector = Place { start: specStart + 5, length: spec.length - 5 }
+  } else if Option.isSome(&Repository.parse(spec)) {
+    pending.remote = true
+    pending.git = true
+  } else if (startsWith(spec, b"https://") || startsWith(spec, b"http://")) && endsWith(spec, b".git") == false {
+    pending.remote = true
+  } else if startsWith(spec, b"file:") {
+    // A tarball or a directory. The path starts from the package that names it, which only
+    // one of the workspace has.
+    pending.remote = true
+    pending.directory = isTarball(spec) == false
+    pending.unsupported = parent != 0
+  } else {
+    // Anything else with a `:` or a `/` is a protocol, a path or a repository shorthand.
+    let mut index: usize = 0
+    while index < spec.length {
+      if spec[index] == 58 || spec[index] == 47 {
+        pending.unsupported = true
+      }
+      index = index + 1
+    }
+  }
+  run wave.append(pending)
+}
+
+// Fetches the metadata the wave needs and does not have, and with it the tarballs that wait.
+effect fn fetch(work: &mut Work, wave: &[Pending]) -> () ! OutOfMemoryError ? &mut Registry | &mut Tarballs | &mut Allocator {
+  let total = Names.count(&work.graph.names)
+  let known = List<usize>.length(&work.documents)
+  if known < total {
+    run work.documents.appendRepeated(0, total - known)
+  }
+  let mut wanted = List<usize>.make()
+  let mut index: usize = 0
+  while index < wave.length {
+    let pending = wave[index]
+    if pending.unsupported == false && pending.local == false && pending.remote == false && pending.outside == false && List<usize>.get(&work.documents, pending.name) == 0 {
+      List<usize>.set(&mut work.documents, pending.name, 1)
+      run wanted.append(pending.name)
+    }
+    index = index + 1
+  }
+  if List<usize>.length(&wanted) == 0 {
+    return ()
+  }
+  let urls = run Tarballs.next()
+  let Fetched { documents, tarballs } = run Registry.fetch(&work.graph.names, List<usize>.asSlice(&wanted), List<Bytes>.asSlice(&urls))
+  run Tarballs.take(move tarballs)
+  let mut answers = move documents
+  // Results are in order; take them from the end.
+  index = List<usize>.length(&wanted)
+  while index > 0 {
+    index = index - 1
+    match move List<Result<Bytes, RegistryError>>.pop(&mut answers) {
+      Option.None => {}
+      Option.Some { value: answer } => match move answer {
+        Result.Failure {..} => {}
+        Result.Success { value: document } => match move run Packument.parse(move document) {
+          Option.None => {}
+          Option.Some { value: packument } => {
+            let name = List<usize>.get(&wanted, index)
+            let slot = List<Packument>.length(&work.packuments) + 2
+            List<usize>.set(&mut work.documents, name, slot)
+            run work.packuments.append(move packument)
+          }
+        }
+      }
+    }
+  }
+}
+
+// The highest package of `name` already in the graph that satisfies `range`, plus one; 0 for none.
+fn existing(work: &Work, name: usize, range: &Range<'_>) -> usize {
+  let mut best: usize = 0
+  let mut at = if name < List<usize>.length(&work.first) { List<usize>.get(&work.first, name) } else { 0 }
+  while at != 0 {
+    match Version.parse(Graph.version(&work.graph, at - 1)) {
+      Option.None => {}
+      Option.Some { value: version } => {
+        if Range.satisfies(range, &version, false) {
+          let better = if best == 0 {
+            true
+          } else {
+            match Version.parse(Graph.version(&work.graph, best - 1)) {
+              Option.None => true
+              Option.Some { value: current } => Version.compare(&version, &current) > 0
+            }
+          }
+          if better {
+            best = at
+          }
+        }
+      }
+    }
+    at = Graph.package(&work.graph, at - 1).next
+  }
+  return best
+}
+
+// The package of `name` spelled `version` already in the graph, plus one; 0 for none.
+fn exact(work: &Work, name: usize, version: &[u8]) -> usize {
+  let mut at = if name < List<usize>.length(&work.first) { List<usize>.get(&work.first, name) } else { 0 }
+  while at != 0 {
+    if same(Graph.version(&work.graph, at - 1), version) {
+      return at
+    }
+    at = Graph.package(&work.graph, at - 1).next
+  }
+  return 0
+}
+
+effect fn keep(text: &mut Bytes, value: &[u8]) -> Place ! OutOfMemoryError ? &mut Allocator {
+  let start = Bytes.length(&text)
+  run text.append(value)
+  return Place { start: start, length: value.length }
+}
+
+effect fn link(work: &mut Work, pending: &Pending, target: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  let edge = Edge { alias: pending.alias, target: target }
+  if pending.parent == 0 {
+    run List<Edge>.append(&mut List<Importer>.asMutSlice(&mut work.graph.importers)[pending.importer].edges, edge)
+  } else {
+    run List<Edge>.append(&mut List<Package>.asMutSlice(&mut work.graph.packages)[pending.parent - 1].edges, edge)
+  }
+}
+
+// Links an importer to the package of the workspace its `workspace:` dependency names.
+effect fn linkLocal(work: &mut Work, workspace: &Workspace, pending: &Pending) -> ()
+  ! ResolveError | OutOfMemoryError ? &mut Allocator {
+  let target = match Workspace.named(workspace, Names.bytes(&work.graph.names, pending.name)) {
+    Option.Some { value } => value
+    Option.None => {
+      if pending.optional {
+        return ()
+      }
+      run reject(ResolveErrorKind.Workspace, &work, pending, "no package of the workspace has this name")
+    }
+  }
+  // `*`, `^` and `~` take the package whatever its version; a range has to allow it.
+  let selector = run Bytes.copy(Graph.slice(&work.graph, pending.selector))
+  let wanted = Bytes.asSlice(&selector)
+  if wanted.length > 0 && same(wanted, b"*") == false && same(wanted, b"^") == false && same(wanted, b"~") == false {
+    let manifest = &Workspace.all(workspace)[target].manifest
+    let allowed = match move run Range.parse(wanted) {
+      Option.None => false
+      Option.Some { value: range } => match Version.parse(Manifest.text(manifest, manifest.version)) {
+        Option.None => false
+        Option.Some { value: version } => Range.satisfies(&range, &version, true)
+      }
+    }
+    if allowed == false {
+      run reject(ResolveErrorKind.Workspace, &work, pending, "the package of the workspace does not have a version this range allows")
+    }
+  }
+  let edge = Edge { alias: pending.alias, target: target }
+  run List<Edge>.append(&mut List<Importer>.asMutSlice(&mut work.graph.importers)[pending.importer].locals, edge)
+}
+
+// Adds a package to the graph and queues its dependencies. Returns the package index. A
+// `chained` package is one that ranges of its name can be satisfied by.
+effect fn insert(
+  work: &mut Work,
+  next: &mut List<Pending>,
+  name: usize,
+  optional: bool,
+  manifest: Manifest,
+  versionText: &[u8],
+  tarball: &[u8],
+  integrity: &[u8],
+  shasum: &[u8],
+  chained: bool,
+) -> usize ! OutOfMemoryError ? &mut Allocator {
+  let version = run keep(&mut work.graph.text, versionText)
+  let tarballPlace = run keep(&mut work.graph.text, tarball)
+  let integrityPlace = run keep(&mut work.graph.text, integrity)
+  let shasumPlace = run keep(&mut work.graph.text, shasum)
+
+  let position = List<Package>.length(&work.graph.packages)
+  let dependencies = Manifest.allDependencies(&manifest)
+  let mut each: usize = 0
+  while each < dependencies.length {
+    let dependency = dependencies[each]
+    if dependency.kind == PRODUCTION || dependency.kind == OPTIONAL {
+      run queue(
+        &mut work,
+        &mut next,
+        position + 1,
+        0,
+        Manifest.text(&manifest, dependency.name),
+        Manifest.text(&manifest, dependency.spec),
+        dependency.kind == OPTIONAL || optional,
+      )
+    }
+    each = each + 1
+  }
+
+  let total = Names.count(&work.graph.names)
+  let known = List<usize>.length(&work.first)
+  if known < total {
+    run work.first.appendRepeated(0, total - known)
+  }
+  let package = Package {
+    name: name,
+    version: version,
+    tarball: tarballPlace,
+    integrity: integrityPlace,
+    shasum: shasumPlace,
+    manifest: move manifest,
+    edges: List<Edge>.make(),
+    peers: List<PeerLink>.make(),
+    next: if chained { List<usize>.get(&work.first, name) } else { 0 },
+    remote: chained == false,
+  }
+  run work.graph.packages.append(move package)
+  if chained {
+    List<usize>.set(&mut work.first, name, position + 1)
+  }
+  return position
+}
+
+// Adds version `index` of a packument to the graph and queues its dependencies. Returns the
+// package index plus one.
+effect fn add(work: &mut Work, next: &mut List<Pending>, pending: &Pending, document: usize, index: usize) -> usize
+  ! ResolveError | OutOfMemoryError ? &mut Tarballs | &mut Allocator {
+  let parsed = run Manifest.parse(Packument.object(&List<Packument>.asSlice(&work.packuments)[document], index))
+  let manifest = match move parsed {
+    Option.Some { value } => move value
+    Option.None => { run reject(ResolveErrorKind.Metadata, &work, pending, "the registry metadata of this version is not valid") }
+  }
+  let tarball = run Packument.tarball(&List<Packument>.asSlice(&work.packuments)[document], index)
+  let integrity = run Packument.integrity(&List<Packument>.asSlice(&work.packuments)[document], index)
+  let shasum = run Packument.shasum(&List<Packument>.asSlice(&work.packuments)[document], index)
+  let versionText = run Bytes.copy(Packument.versionText(&List<Packument>.asSlice(&work.packuments)[document], index))
+  let position = run insert(
+    &mut work,
+    &mut next,
+    pending.name,
+    pending.optional,
+    move manifest,
+    Bytes.asSlice(&versionText),
+    Bytes.asSlice(&tarball),
+    Bytes.asSlice(&integrity),
+    Bytes.asSlice(&shasum),
+    true,
+  )
+  run Tarballs.expect(&work.graph, position)
+  return position + 1
+}
+
+// The package of the graph that came from the tarball at `location`, or from a tarball a
+// dependency names that has the digest `integrity`, plus one; 0 for none. An empty value
+// matches nothing.
+fn held(graph: &Graph, location: &[u8], integrity: &[u8]) -> usize {
+  let mut index: usize = 0
+  while index < Graph.count(graph) {
+    if (location.length > 0 && same(Graph.tarball(graph, index), location))
+      || (integrity.length > 0 && Graph.package(graph, index).remote && same(Graph.integrity(graph, index), integrity)) {
+      return index + 1
+    }
+    index = index + 1
+  }
+  return 0
+}
+
+/// Whether what a graph records as the tarball of a package is one, going by its name, and not
+/// a directory.
+pub fn isTarball(location: &[u8]) -> bool {
+  return endsWith(location, b".tgz") || endsWith(location, b".tar.gz")
+}
+
+/// The path of what a graph records as `location`, which is `file:` and a path: an absolute
+/// one, or one below `root`, the directory of the workspace.
+pub effect fn localPath(root: &[u8], location: &[u8]) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+  let below = Slice.view<u8>(location, 5, location.length - 5)
+  let mut path = Bytes.make()
+  if below.length == 0 || below[0] != 47 {
+    run path.append(root)
+    run path.append(b"/")
+  }
+  run path.append(below)
+  return move path
+}
+
+/// The bytes of the tarball a graph records as `location`, which is `file:` and a path. None
+/// when it cannot be read.
+pub effect fn localTarball(root: &[u8], location: &[u8]) -> Option<Bytes> ! OutOfMemoryError ? &mut Allocator {
+  let path = run localPath(root, location)
+  return run readOptional(Bytes.asSlice(&path))
+}
+
+/// The digest of the files of the directory a graph records as `location`, which is `file:`
+/// and a path, as the graph has it for the integrity of the package. None when the directory
+/// cannot be read.
+pub effect fn directoryDigest(root: &[u8], location: &[u8]) -> Option<Bytes> ! OutOfMemoryError ? &mut Allocator {
+  let path = run localPath(root, location)
+  return match move run Effect.result(directoryFiles(Bytes.asSlice(&path), Option<&Store>.none())) {
+    Result.Success { value: found } => match move found {
+      Option.Some { value: files } => Option<Bytes>.some(run PackageFiles.digest(&files))
+      Option.None => Option<Bytes>.none()
+    }
+    Result.Failure { error } => match move error {
+      StoreError _ => Option<Bytes>.none()
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+}
+
+// Fetches what is at the URL `location`, in one round with the tarballs that wait.
+effect fn download(work: &Work, location: &[u8]) -> Option<Bytes>
+  ! OutOfMemoryError ? &mut Registry | &mut Tarballs | &mut Allocator {
+  let mut urls = run Tarballs.next()
+  run urls.append(run Bytes.copy(location))
+  let none = List<usize>.make()
+  let Fetched { documents, tarballs } = run Registry.fetch(&work.graph.names, List<usize>.asSlice(&none), List<Bytes>.asSlice(&urls))
+  drop documents
+  let mut answers = move tarballs
+  let own = List<Result<Bytes, RegistryError>>.pop(&mut answers)
+  run Tarballs.take(move answers)
+  return match move own {
+    Option.None => Option<Bytes>.none()
+    Option.Some { value: answer } => match move answer {
+      Result.Success { value } => Option<Bytes>.some(move value)
+      Result.Failure {..} => Option<Bytes>.none()
+    }
+  }
+}
+
+// The address of the tarball of the commit that a dependency on a git repository asks for.
+// None when the host does not answer, or the repository has no such branch, tag or commit.
+effect fn commitTarball(work: &Work, spec: &[u8]) -> Option<Bytes>
+  ! OutOfMemoryError ? &mut Registry | &mut Tarballs | &mut Allocator {
+  let repository = match move Repository.parse(spec) {
+    Option.Some { value } => move value
+    Option.None => { return Option<Bytes>.none() }
+  }
+  let wanted = repository.committish
+  if wanted.length == 40 && isHex(wanted) {
+    // A whole commit needs no question.
+    return Option<Bytes>.some(run Repository.archiveUrl(&repository, wanted))
+  }
+  let address = run Repository.refsUrl(&repository)
+  let listing = match move run download(work, Bytes.asSlice(&address)) {
+    Option.Some { value } => move value
+    Option.None => { return Option<Bytes>.none() }
+  }
+  let refs = Bytes.asSlice(&listing)
+  let commit = if startsWith(wanted, b"semver:") {
+    match move run Range.parse(Slice.view<u8>(wanted, 7, wanted.length - 7)) {
+      Option.Some { value: range } => tagged(refs, &range)
+      Option.None => Option<&[u8]>.none()
+    }
+  } else {
+    commitOf(refs, wanted)
+  }
+  return match commit {
+    Option.Some { value } => Option<Bytes>.some(run Repository.archiveUrl(&repository, value))
+    Option.None => Option<Bytes>.none()
+  }
+}
+
+effect fn manifestIn(tarball: &[u8]) -> Option<Bytes> ! StoreError | OutOfMemoryError ? &mut Allocator {
+  return run fileOf(tarball, b"package.json")
+}
+
+// Resolves a dependency on a tarball: fetches it, reads what package it is, and adds it.
+effect fn settleRemote(work: &mut Work, next: &mut List<Pending>, pending: &Pending, workspace: &Workspace) -> ()
+  ! ResolveError | OutOfMemoryError ? &mut Registry | &mut Tarballs | &mut Allocator {
+  let spec = run Bytes.copy(Graph.slice(&work.graph, pending.selector))
+  let mut location = Bytes.make()
+  if pending.git {
+    // The graph has the tarball of the commit, so the lockfile pins the commit.
+    location = match move run commitTarball(&work, Bytes.asSlice(&spec)) {
+      Option.Some { value } => move value
+      Option.None => {
+        if pending.optional {
+          return ()
+        }
+        run reject(ResolveErrorKind.Registry, &work, pending, "the repository could not be reached, or has no such branch, tag or commit")
+      }
+    }
+  } else if startsWith(Bytes.asSlice(&spec), b"file:") {
+    // The graph has the path as seen from the root of the workspace.
+    let path = run joined(Graph.importerPath(&work.graph, pending.importer), Slice.view<u8>(Bytes.asSlice(&spec), 5, Bytes.length(&spec) - 5))
+    run location.append(b"file:")
+    run location.append(Bytes.asSlice(&path))
+  } else {
+    run location.append(Bytes.asSlice(&spec))
+  }
+  let mut target = held(&work.graph, Bytes.asSlice(&location), b"")
+  if target != 0 {
+    run link(&mut work, pending, target - 1)
+    return ()
+  }
+  let mut content = Bytes.make()
+  let integrity = if pending.directory {
+    match move run directoryDigest(Workspace.root(workspace), Bytes.asSlice(&location)) {
+      Option.Some { value } => move value
+      Option.None => {
+        if pending.optional {
+          return ()
+        }
+        run reject(ResolveErrorKind.Registry, &work, pending, "the directory cannot be read")
+      }
+    }
+  } else {
+    let fetched = if startsWith(Bytes.asSlice(&location), b"file:") {
+      run localTarball(Workspace.root(workspace), Bytes.asSlice(&location))
+    } else {
+      run download(&work, Bytes.asSlice(&location))
+    }
+    content = match move fetched {
+      Option.Some { value } => move value
+      Option.None => {
+        if pending.optional {
+          return ()
+        }
+        run reject(ResolveErrorKind.Registry, &work, pending, "the tarball could not be fetched")
+      }
+    }
+    run integrityOf(Bytes.asSlice(&content))
+  }
+  // The same bytes under another address are the same package.
+  target = held(&work.graph, b"", Bytes.asSlice(&integrity))
+  if target != 0 {
+    run link(&mut work, pending, target - 1)
+    return ()
+  }
+  let document = if pending.directory {
+    let mut path = run localPath(Workspace.root(workspace), Bytes.asSlice(&location))
+    run path.append(b"/package.json")
+    match move run readOptional(Bytes.asSlice(&path)) {
+      Option.Some { value } => move value
+      Option.None => { run reject(ResolveErrorKind.Metadata, &work, pending, "the directory has no package.json") }
+    }
+  } else {
+    match move run Effect.result(manifestIn(Bytes.asSlice(&content))) {
+      Result.Success { value: found } => match move found {
+        Option.Some { value } => move value
+        Option.None => { run reject(ResolveErrorKind.Metadata, &work, pending, "the tarball has no package.json") }
+      }
+      Result.Failure { error } => match move error {
+        StoreError _ => { run reject(ResolveErrorKind.Metadata, &work, pending, "this is not a package tarball") }
+        OutOfMemoryError exhausted => { fail move exhausted }
+      }
+    }
+  }
+  let manifest = match move run Manifest.parse(Bytes.asSlice(&document)) {
+    Option.Some { value } => move value
+    Option.None => { run reject(ResolveErrorKind.Metadata, &work, pending, "the package.json of this dependency is not valid") }
+  }
+  let name = if Manifest.text(&manifest, manifest.name).length > 0 {
+    run Names.intern(&mut work.graph.names, Manifest.text(&manifest, manifest.name))
+  } else {
+    pending.alias
+  }
+  let mut version = Bytes.make()
+  let written = Manifest.text(&manifest, manifest.version)
+  if Option.isSome(&Version.parse(written)) {
+    run version.append(written)
+  } else {
+    run version.append(b"0.0.0")
+  }
+  let mut build = false
+  let mut index: usize = 0
+  while index < Bytes.length(&version) {
+    if Bytes.asSlice(&version)[index] == 43 {
+      build = true
+    }
+    index = index + 1
+  }
+  run version.append(if build { b"." } else { b"+" })
+  let mut digest: u64 = 14695981039346656037
+  index = 0
+  while index < Bytes.length(&integrity) {
+    digest = u64.wrappingMultiply(u64.bitXor(digest, u8.toU64(Bytes.asSlice(&integrity)[index])), 1099511628211)
+    index = index + 1
+  }
+  index = 0
+  while index < 8 {
+    run version.append(Slice.view<u8>(HEX, u64.wrappingToUsize(digest % 16), 1))
+    digest = digest / 16
+    index = index + 1
+  }
+  let position = run insert(
+    &mut work,
+    &mut next,
+    name,
+    pending.optional,
+    move manifest,
+    Bytes.asSlice(&version),
+    Bytes.asSlice(&location),
+    Bytes.asSlice(&integrity),
+    b"",
+    false,
+  )
+  if pending.directory {
+    run Tarballs.expect(&work.graph, position)
+  } else {
+    run Tarballs.supply(&work.graph, position, move content)
+  }
+  run link(&mut work, pending, position)
+}
+
+// The highest version of `name` in an earlier graph that satisfies `range` and is still
+// published, as an index into the packument.
+fn preferred(earlier: &Graph, fresh: &[Bytes], work: &Work, name: usize, document: usize, range: &Range<'_>) -> Option<usize> {
+  let wanted = Names.bytes(&work.graph.names, name)
+  let mut skipped: usize = 0
+  while skipped < fresh.length {
+    if same(Bytes.asSlice(&fresh[skipped]), wanted) {
+      return Option<usize>.none()
+    }
+    skipped = skipped + 1
+  }
+  let id = match Names.find(&earlier.names, wanted) {
+    Option.Some { value } => value
+    Option.None => { return Option<usize>.none() }
+  }
+  let packument = &List<Packument>.asSlice(&work.packuments)[document]
+  let mut best = Option<usize>.none()
+  let mut index: usize = 0
+  while index < Graph.count(earlier) {
+    if Graph.package(earlier, index).name == id {
+      match Version.parse(Graph.version(earlier, index)) {
+        Option.None => {}
+        Option.Some { value: version } => {
+          if Range.satisfies(range, &version, true) {
+            match Packument.exact(packument, Graph.version(earlier, index)) {
+              Option.None => {}
+              Option.Some { value: found } => {
+                let better = match best {
+                  Option.None => true
+                  Option.Some { value: current } => Version.compare(&version, &Packument.version(packument, current)) > 0
+                }
+                if better {
+                  best = Option<usize>.some(found)
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    index = index + 1
+  }
+  return best
+}
+
+// Resolves one dependency: links the dependent to a package, adding the package when it is new.
+effect fn settle(work: &mut Work, next: &mut List<Pending>, pending: &Pending, workspace: &Workspace, previous: Option<&Graph>, fresh: &[Bytes]) -> ()
+  ! ResolveError | OutOfMemoryError ? &mut Registry | &mut Tarballs | &mut Allocator {
+  if pending.local && pending.unsupported == false {
+    run linkLocal(&mut work, workspace, pending)
+    return ()
+  }
+  if pending.unsupported {
+    if pending.optional {
+      return ()
+    }
+    run reject(ResolveErrorKind.Unsupported, &work, pending, "this kind of dependency is not supported yet")
+  }
+  if pending.remote {
+    run settleRemote(&mut work, &mut next, pending, workspace)
+    return ()
+  }
+  if pending.outside {
+    let wanted = run Bytes.copy(Graph.slice(&work.graph, pending.selector))
+    let path = run joined(Graph.importerPath(&work.graph, pending.importer), Bytes.asSlice(&wanted))
+    let alias = run Bytes.copy(Names.bytes(&work.graph.names, pending.alias))
+    // The importers are the packages of the workspace, in their order.
+    match Workspace.at(workspace, Bytes.asSlice(&path)) {
+      Option.Some { value: member } => { run Graph.addLocalEdge(&mut work.graph, pending.importer, Bytes.asSlice(&alias), member) }
+      Option.None => { run Graph.addOutsideEdge(&mut work.graph, pending.importer, Bytes.asSlice(&alias), Bytes.asSlice(&path)) }
+    }
+    return ()
+  }
+  let state = List<usize>.get(&work.documents, pending.name)
+  if state < 2 {
+    if pending.optional {
+      return ()
+    }
+    run reject(ResolveErrorKind.Registry, &work, pending, "the registry did not give the metadata of this package")
+  }
+  let document = state - 2
+  let selector = run Bytes.copy(Graph.slice(&work.graph, pending.selector))
+  let mut target: usize = 0
+  let mut chosen = Option<usize>.none()
+  match move run Range.parse(Bytes.asSlice(&selector)) {
+    Option.Some { value: range } => {
+      target = existing(&work, pending.name, &range)
+      if target == 0 {
+        chosen = match previous {
+          Option.Some { value: earlier } => preferred(earlier, fresh, &work, pending.name, document, &range)
+          Option.None => Option<usize>.none()
+        }
+      }
+      if target == 0 && Option.isSome(&chosen) == false {
+        chosen = Packument.pick(&List<Packument>.asSlice(&work.packuments)[document], &range)
+      }
+    }
+    Option.None => {
+      chosen = Packument.tagged(&List<Packument>.asSlice(&work.packuments)[document], Bytes.asSlice(&selector))
+    }
+  }
+  if target == 0 {
+    let index = match chosen {
+      Option.Some { value } => value
+      Option.None => {
+        if pending.optional {
+          return ()
+        }
+        run reject(ResolveErrorKind.NoVersion, &work, pending, "no published version matches")
+      }
+    }
+    let versionText = run Bytes.copy(Packument.versionText(&List<Packument>.asSlice(&work.packuments)[document], index))
+    target = exact(&work, pending.name, Bytes.asSlice(&versionText))
+    if target == 0 {
+      target = run add(&mut work, &mut next, pending, document, index)
+    }
+  }
+  if target != 0 {
+    run link(&mut work, pending, target - 1)
+  }
+}
+
+// Resolves a wave and every wave it leads to.
+effect fn drain(work: &mut Work, first: List<Pending>, workspace: &Workspace, previous: Option<&Graph>, fresh: &[Bytes]) -> ()
+  ! ResolveError | OutOfMemoryError ? &mut Registry | &mut Tarballs | &mut Allocator {
+  let mut wave = move first
+  while List<Pending>.length(&wave) > 0 {
+    run fetch(&mut work, List<Pending>.asSlice(&wave))
+    let mut next = List<Pending>.make()
+    let mut index: usize = 0
+    while index < List<Pending>.length(&wave) {
+      let pending = List<Pending>.get(&wave, index)
+      run settle(&mut work, &mut next, &pending, workspace, previous, fresh)
+      index = index + 1
+    }
+    wave = move next
+  }
+}
+
+// A peer a package asks for, copied out of its manifest.
+struct Peer {
+  package: usize,
+  name: Place,
+  spec: Place,
+  optional: bool,
+}
+
+impl Copy for Peer {}
+
+fn hasEdge(edges: &[Edge], alias: usize) -> Option<usize> {
+  let mut index: usize = 0
+  while index < edges.length {
+    if edges[index].alias == alias {
+      return Option<usize>.some(edges[index].target)
+    }
+    index = index + 1
+  }
+  return Option<usize>.none()
+}
+
+// Settles what the peers of the packages from `from` on fall back to. Peers nothing in the
+// graph can satisfy are queued into `wave` as dependencies of the package that asks.
+effect fn peers(work: &mut Work, from: usize, wave: &mut List<Pending>) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut scratch = Bytes.make()
+  let mut wants = List<Peer>.make()
+  let mut index = from
+  while index < Graph.count(&work.graph) {
+    let manifest = &Graph.package(&work.graph, index).manifest
+    let dependencies = Manifest.allDependencies(manifest)
+    let mut each: usize = 0
+    while each < dependencies.length {
+      if dependencies[each].kind == PEER {
+        let name = run keep(&mut scratch, Manifest.text(manifest, dependencies[each].name))
+        let spec = run keep(&mut scratch, Manifest.text(manifest, dependencies[each].spec))
+        run wants.append(Peer { package: index, name: name, spec: spec, optional: dependencies[each].optionalPeer })
+      }
+      each = each + 1
+    }
+    index = index + 1
+  }
+  let all = List<Peer>.asSlice(&wants)
+  index = 0
+  while index < all.length {
+    let want = all[index]
+    let name = Slice.view<u8>(Bytes.asSlice(&scratch), want.name.start, want.name.length)
+    let spec = Slice.view<u8>(Bytes.asSlice(&scratch), want.spec.start, want.spec.length)
+    let alias = run Names.intern(&mut work.graph.names, name)
+    index = index + 1
+    if Option.isSome(&hasEdge(List<Edge>.asSlice(&Graph.package(&work.graph, want.package).edges), alias)) {
+      continue
+    }
+    // What an importer installs under that name is what the package is most likely to find
+    // above it, so nothing else is resolved for the peer; the root project is asked first.
+    let mut target: usize = 0
+    let mut importer: usize = 0
+    while target == 0 && importer < Graph.importerCount(&work.graph) {
+      target = match hasEdge(Graph.importerEdges(&work.graph, importer), alias) {
+        Option.Some { value } => value + 1
+        Option.None => 0
+      }
+      importer = importer + 1
+    }
+    if target == 0 && want.optional == false {
+      target = match move run Range.parse(spec) {
+        Option.Some { value: range } => existing(&work, alias, &range)
+        Option.None => 0
+      }
+    }
+    if target != 0 || want.optional {
+      run List<PeerLink>.append(&mut List<Package>.asMutSlice(&mut work.graph.packages)[want.package].peers, PeerLink { alias: alias, fallback: target })
+    } else {
+      // A peer that cannot be found is not an error: the package is installed without it.
+      run queue(&mut work, &mut wave, want.package + 1, 0, name, spec, true)
+    }
+  }
+}
+
+// A peer name that a package, or something below it, looks for above the package, and what it
+// found there.
+struct Binding {
+  alias: usize,
+  // The node that was found. When `loose`, the node is still being made, and this is its package.
+  target: usize,
+  loose: bool,
+  // Where a loose binding was found.
+  scope: usize,
+  slot: usize,
+}
+
+impl Copy for Binding {}
+
+// What an importer or a node depends on, which is where the nodes below look for their peers.
+struct Scope {
+  // The scope above, plus one; 0 for an importer.
+  parent: usize,
+  // The targets are packages.
+  edges: List<Edge>,
+  // Per edge: 0 before its node is made, 1 while it is being made, else the node plus two.
+  children: List<usize>,
+}
+
+// A peer edge of a node whose target was still being made.
+struct Patch {
+  node: usize,
+  alias: usize,
+  scope: usize,
+  slot: usize,
+}
+
+impl Copy for Patch {}
+
+struct Found {
+  scope: usize,
+  slot: usize,
+}
+
+struct Instances {
+  // Per package: the peer names that it, or anything below it, takes from above.
+  needs: List<List<usize>>,
+  scopes: List<Scope>,
+  // Per node: what its package's needs were bound to.
+  bindings: List<List<Binding>>,
+  // Per node: the next node of the same package, plus one.
+  following: List<usize>,
+  // Per package: its newest node, plus one.
+  newest: List<usize>,
+  patches: List<Patch>,
+}
+
+fn holds(list: &List<usize>, value: usize) -> bool {
+  let mut index: usize = 0
+  while index < List<usize>.length(list) {
+    if List<usize>.get(list, index) == value {
+      return true
+    }
+    index = index + 1
+  }
+  return false
+}
+
+// Adds to the needs of package `index` the needs of package `child` that `index` does not
+// provide itself. Returns whether anything was added.
+effect fn inherit(graph: &Graph, needs: &mut List<List<usize>>, index: usize, child: usize) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let edges = List<Edge>.asSlice(&Graph.package(graph, index).edges)
+  let mut added = false
+  let mut each: usize = 0
+  while each < List<usize>.length(&List<List<usize>>.asSlice(&needs)[child]) {
+    let name = List<usize>.get(&List<List<usize>>.asSlice(&needs)[child], each)
+    each = each + 1
+    if Option.isSome(&hasEdge(edges, name)) || holds(&List<List<usize>>.asSlice(&needs)[index], name) {
+      continue
+    }
+    run List<usize>.append(&mut List<List<usize>>.asMutSlice(&mut needs)[index], name)
+    added = true
+  }
+  return added
+}
+
+// Per package: the peer names it takes from above, for itself or for what is below it.
+effect fn peerNeeds(graph: &Graph) -> List<List<usize>> ! OutOfMemoryError ? &mut Allocator {
+  let mut needs = List<List<usize>>.make()
+  let mut index: usize = 0
+  while index < Graph.count(graph) {
+    let peers = List<PeerLink>.asSlice(&Graph.package(graph, index).peers)
+    let mut own = List<usize>.make()
+    let mut each: usize = 0
+    while each < peers.length {
+      run own.append(peers[each].alias)
+      each = each + 1
+    }
+    run needs.append(move own)
+    index = index + 1
+  }
+  let mut changed = true
+  while changed {
+    changed = false
+    index = 0
+    while index < Graph.count(graph) {
+      let edges = List<Edge>.asSlice(&Graph.package(graph, index).edges)
+      let peers = List<PeerLink>.asSlice(&Graph.package(graph, index).peers)
+      let mut each: usize = 0
+      while each < edges.length {
+        if run inherit(graph, &mut needs, index, edges[each].target) {
+          changed = true
+        }
+        each = each + 1
+      }
+      each = 0
+      while each < peers.length {
+        if peers[each].fallback != 0 {
+          if run inherit(graph, &mut needs, index, peers[each].fallback - 1) {
+            changed = true
+          }
+        }
+        each = each + 1
+      }
+      index = index + 1
+    }
+  }
+  return move needs
+}
+
+// The nearest scope from `from` upward that has an edge named `alias`.
+fn lookup(state: &Instances, from: usize, alias: usize) -> Option<Found> {
+  let scopes = List<Scope>.asSlice(&state.scopes)
+  let mut at = from + 1
+  while at != 0 {
+    let edges = List<Edge>.asSlice(&scopes[at - 1].edges)
+    let mut slot: usize = 0
+    while slot < edges.length {
+      if edges[slot].alias == alias {
+        return Option<Found>.some(Found { scope: at - 1, slot: slot })
+      }
+      slot = slot + 1
+    }
+    at = scopes[at - 1].parent
+  }
+  return Option<Found>.none()
+}
+
+fn bindingOf(bound: &List<Binding>, alias: usize) -> Option<Binding> {
+  let mut index: usize = 0
+  while index < List<Binding>.length(bound) {
+    let binding = List<Binding>.get(bound, index)
+    if binding.alias == alias {
+      return Option<Binding>.some(binding)
+    }
+    index = index + 1
+  }
+  return Option<Binding>.none()
+}
+
+fn sameBindings(left: &List<Binding>, right: &List<Binding>) -> bool {
+  if List<Binding>.length(left) != List<Binding>.length(right) {
+    return false
+  }
+  let mut index: usize = 0
+  while index < List<Binding>.length(left) {
+    let one = List<Binding>.get(left, index)
+    let other = List<Binding>.get(right, index)
+    if one.alias != other.alias || one.target != other.target || one.loose != other.loose {
+      return false
+    }
+    index = index + 1
+  }
+  return true
+}
+
+// The node for edge `slot` of scope `scope`, plus one; 0 while that node is being made.
+effect fn settled(graph: &mut Graph, state: &mut Instances, scope: usize, slot: usize) -> usize ! OutOfMemoryError ? &mut Allocator {
+  let current = List<usize>.get(&List<Scope>.asSlice(&state.scopes)[scope].children, slot)
+  if current == 1 {
+    return 0
+  }
+  if current >= 2 {
+    return current - 1
+  }
+  List<usize>.set(&mut List<Scope>.asMutSlice(&mut state.scopes)[scope].children, slot, 1)
+  let node = run instance(&mut graph, &mut state, scope, slot)
+  List<usize>.set(&mut List<Scope>.asMutSlice(&mut state.scopes)[scope].children, slot, node + 2)
+  return node + 1
+}
+
+// Finds or makes the node for edge `slot` of scope `scope`: the package of the edge, with the
+// peers that it and what is below it find from that scope upward.
+effect fn instance(graph: &mut Graph, state: &mut Instances, scope: usize, slot: usize) -> usize ! OutOfMemoryError ? &mut Allocator {
+  let package = List<Edge>.get(&List<Scope>.asSlice(&state.scopes)[scope].edges, slot).target
+  let mut bound = List<Binding>.make()
+  let mut each: usize = 0
+  while each < List<usize>.length(&List<List<usize>>.asSlice(&state.needs)[package]) {
+    let alias = List<usize>.get(&List<List<usize>>.asSlice(&state.needs)[package], each)
+    each = each + 1
+    let found = match move lookup(&state, scope, alias) {
+      Option.None => { continue }
+      Option.Some { value } => move value
+    }
+    if found.scope == scope && found.slot == slot {
+      // The package itself, under the name of its own peer.
+      continue
+    }
+    let got = run settled(&mut graph, &mut state, found.scope, found.slot)
+    if got == 0 {
+      let base = List<Edge>.get(&List<Scope>.asSlice(&state.scopes)[found.scope].edges, found.slot).target
+      run bound.append(Binding { alias: alias, target: base, loose: true, scope: found.scope, slot: found.slot })
+    } else {
+      run bound.append(Binding { alias: alias, target: got - 1, loose: false, scope: 0, slot: 0 })
+    }
+  }
+  let mut at = List<usize>.get(&state.newest, package)
+  while at != 0 {
+    if sameBindings(&List<List<Binding>>.asSlice(&state.bindings)[at - 1], &bound) {
+      return at - 1
+    }
+    at = List<usize>.get(&state.following, at - 1)
+  }
+
+  let node = run Graph.addNode(&mut graph, package, b"")
+  // What is below finds this node when it looks for the edge it is made for.
+  List<usize>.set(&mut List<Scope>.asMutSlice(&mut state.scopes)[scope].children, slot, node + 2)
+  run state.following.append(List<usize>.get(&state.newest, package))
+  List<usize>.set(&mut state.newest, package, node + 1)
+  let mut kept = List<Binding>.make()
+  each = 0
+  while each < List<Binding>.length(&bound) {
+    run kept.append(List<Binding>.get(&bound, each))
+    each = each + 1
+  }
+  run state.bindings.append(move kept)
+
+  // What the package depends on: its dependencies, and the peers nothing above provides.
+  let mut edges = List<Edge>.make()
+  let mut children = List<usize>.make()
+  let dependencies = List<Edge>.length(&Graph.package(&graph, package).edges)
+  each = 0
+  while each < dependencies {
+    run edges.append(List<Edge>.get(&Graph.package(&graph, package).edges, each))
+    run children.append(0)
+    each = each + 1
+  }
+  let peers = List<PeerLink>.length(&Graph.package(&graph, package).peers)
+  each = 0
+  while each < peers {
+    let peer = List<PeerLink>.get(&Graph.package(&graph, package).peers, each)
+    if peer.fallback != 0 && Option.isSome(&bindingOf(&bound, peer.alias)) == false {
+      run edges.append(Edge { alias: peer.alias, target: peer.fallback - 1 })
+      run children.append(0)
+    }
+    each = each + 1
+  }
+  let below = List<Edge>.length(&edges)
+  let own = List<Scope>.length(&state.scopes)
+  run state.scopes.append(Scope { parent: scope + 1, edges: move edges, children: move children })
+
+  let mut links = List<Edge>.make()
+  each = 0
+  while each < below {
+    let alias = List<Edge>.get(&List<Scope>.asSlice(&state.scopes)[own].edges, each).alias
+    let child = run settled(&mut graph, &mut state, own, each)
+    if child != 0 {
+      run links.append(Edge { alias: alias, target: child - 1 })
+    }
+    each = each + 1
+  }
+  each = 0
+  while each < peers {
+    let peer = List<PeerLink>.get(&Graph.package(&graph, package).peers, each)
+    match bindingOf(&bound, peer.alias) {
+      Option.None => {}
+      Option.Some { value: binding } => {
+        if binding.loose {
+          run state.patches.append(Patch { node: node, alias: peer.alias, scope: binding.scope, slot: binding.slot })
+        } else {
+          run links.append(Edge { alias: peer.alias, target: binding.target })
+        }
+      }
+    }
+    each = each + 1
+  }
+  let nodes = List<Node>.asMutSlice(&mut graph.nodes)
+  nodes[node].edges = move links
+  return node
+}
+
+const HEX: &'static [u8] = b"0123456789abcdef"
+
+// Names the nodes that have peers: `_name@version` for each peer found, in the order of the
+// names, with a number after it when two nodes of a package would have the same text.
+effect fn nameNodes(graph: &mut Graph, state: &Instances) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut node: usize = 0
+  while node < Graph.nodeCount(&graph) {
+    let bound = &List<List<Binding>>.asSlice(&state.bindings)[node]
+    let count = List<Binding>.length(bound)
+    if count == 0 {
+      node = node + 1
+      continue
+    }
+    // The bindings in the order of their names.
+    let mut order = List<usize>.make()
+    let mut each: usize = 0
+    while each < count {
+      let name = Names.bytes(&graph.names, List<Binding>.get(bound, each).alias)
+      let mut at = each
+      run order.append(each)
+      let places = List<usize>.asMutSlice(&mut order)
+      while at > 0 && compare(Names.bytes(&graph.names, List<Binding>.get(bound, places[at - 1]).alias), name) > 0 {
+        places[at] = places[at - 1]
+        at = at - 1
+      }
+      places[at] = each
+      each = each + 1
+    }
+    let mut text = Bytes.make()
+    each = 0
+    while each < count {
+      let binding = List<Binding>.get(bound, List<usize>.get(&order, each))
+      let package = if binding.loose { binding.target } else { Graph.nodePackage(&graph, binding.target) }
+      run text.append(b"_")
+      let start = Bytes.length(&text)
+      run text.append(Names.bytes(&graph.names, binding.alias))
+      let written = Bytes.asMutSlice(&mut text)
+      let mut index = start
+      while index < written.length {
+        if written[index] == 47 {
+          written[index] = 43
+        }
+        index = index + 1
+      }
+      run text.append(b"@")
+      run text.append(Graph.version(&graph, package))
+      each = each + 1
+    }
+    if Bytes.length(&text) > 96 {
+      // A long list of peers is named by a digest of it, so paths stay short.
+      let mut digest: u64 = 14695981039346656037
+      let all = Bytes.asSlice(&text)
+      let mut index: usize = 0
+      while index < all.length {
+        digest = u64.wrappingMultiply(u64.bitXor(digest, u8.toU64(all[index])), 1099511628211)
+        index = index + 1
+      }
+      let mut short = run Bytes.copy(b"_")
+      let mut digit: usize = 0
+      while digit < 16 {
+        run short.append(Slice.view<u8>(HEX, u64.wrappingToUsize(digest % 16), 1))
+        digest = digest / 16
+        digit = digit + 1
+      }
+      text = move short
+    }
+    let package = Graph.nodePackage(&graph, node)
+    let mut twins: usize = 1
+    let mut earlier: usize = 0
+    while earlier < node {
+      if Graph.nodePackage(&graph, earlier) == package {
+        let other = Graph.nodeSuffix(&graph, earlier)
+        if startsWith(other, Bytes.asSlice(&text)) {
+          let rest = other.length - Bytes.length(&text)
+          if rest == 0 || other[Bytes.length(&text)] == 46 {
+            twins = twins + 1
+          }
+        }
+      }
+      earlier = earlier + 1
+    }
+    if twins > 1 {
+      run text.append(b".")
+      let mut digits: [u8; 20] = [0; 20]
+      let mut length: usize = 0
+      let mut left = twins
+      while left > 0 {
+        digits[length] = usize.toU8(48 + left % 10)
+        length = length + 1
+        left = left / 10
+      }
+      while length > 0 {
+        length = length - 1
+        run text.append(Slice.view<u8>(&digits, length, 1))
+      }
+    }
+    let place = run keep(&mut graph.text, Bytes.asSlice(&text))
+    let nodes = List<Node>.asMutSlice(&mut graph.nodes)
+    nodes[node].suffix = place
+    node = node + 1
+  }
+}
+
+// Makes the nodes of a resolved graph: walks down from each importer, and gives every package
+// the peers it finds above it there.
+effect fn instantiate(graph: &mut Graph) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut state = Instances {
+    needs: run peerNeeds(&graph),
+    scopes: List<Scope>.make(),
+    bindings: List<List<Binding>>.make(),
+    following: List<usize>.make(),
+    newest: List<usize>.make(),
+    patches: List<Patch>.make(),
+  }
+  run state.newest.appendRepeated(0, Graph.count(&graph))
+  let mut importer: usize = 0
+  while importer < Graph.importerCount(&graph) {
+    let mut edges = List<Edge>.make()
+    let mut children = List<usize>.make()
+    let asked = Graph.importerEdges(&graph, importer).length
+    let mut each: usize = 0
+    while each < asked {
+      run edges.append(Graph.importerEdges(&graph, importer)[each])
+      run children.append(0)
+      each = each + 1
+    }
+    let scope = List<Scope>.length(&state.scopes)
+    run state.scopes.append(Scope { parent: 0, edges: move edges, children: move children })
+    let mut links = List<Edge>.make()
+    each = 0
+    while each < asked {
+      let alias = List<Edge>.get(&List<Scope>.asSlice(&state.scopes)[scope].edges, each).alias
+      let child = run settled(&mut graph, &mut state, scope, each)
+      if child != 0 {
+        run links.append(Edge { alias: alias, target: child - 1 })
+      }
+      each = each + 1
+    }
+    let importers = List<Importer>.asMutSlice(&mut graph.importers)
+    importers[importer].edges = move links
+    importer = importer + 1
+  }
+  let mut patch: usize = 0
+  while patch < List<Patch>.length(&state.patches) {
+    let waiting = List<Patch>.get(&state.patches, patch)
+    let made = List<usize>.get(&List<Scope>.asSlice(&state.scopes)[waiting.scope].children, waiting.slot)
+    if made >= 2 {
+      run List<Edge>.append(&mut List<Node>.asMutSlice(&mut graph.nodes)[waiting.node].edges, Edge { alias: waiting.alias, target: made - 2 })
+    }
+    patch = patch + 1
+  }
+  run nameNodes(&mut graph, &state)
+}
+
+/// Resolves the production, development and optional dependencies of every package of
+/// `workspace`. The graph has an importer for each of them, in the same order.
+///
+/// The graph is the same on every machine: packages for other platforms are part of it, and
+/// [`Graph.supports`] tells an install which ones to leave out. With `previous`, the graph of an
+/// earlier resolution, a version that graph has is preferred over a newer one wherever the range
+/// allows, so changing one dependency does not move the others. The packages named in `fresh`
+/// are the exception: they get the newest version their ranges allow, which is an update.
+///
+/// # Errors
+///
+/// - [`ResolveError`] for a dependency that cannot be resolved. An optional dependency that
+///   cannot be resolved is left out instead.
+pub effect fn resolve(workspace: &Workspace, previous: Option<&Graph>, fresh: &[Bytes]) -> Graph
+  ! ResolveError | OutOfMemoryError ? &mut Registry | &mut Tarballs | &mut Allocator {
+  let mut work = Work {
+    graph: Graph.make(),
+    packuments: List<Packument>.make(),
+    documents: List<usize>.make(),
+    first: List<usize>.make(),
+  }
+  let mut wave = List<Pending>.make()
+  let members = Workspace.all(workspace)
+  let mut member: usize = 0
+  while member < members.length {
+    let root = &members[member].manifest
+    let importer = run Graph.addImporter(&mut work.graph, Bytes.asSlice(&members[member].path))
+    let dependencies = Manifest.allDependencies(root)
+    let mut index: usize = 0
+    while index < dependencies.length {
+      let dependency = dependencies[index]
+      if dependency.kind == PRODUCTION || dependency.kind == DEVELOPMENT || dependency.kind == OPTIONAL {
+        let name = Manifest.text(root, dependency.name)
+        let mut spec = Manifest.text(root, dependency.spec)
+        if startsWith(spec, b"catalog:") {
+          // The range is the one the root project keeps for that name.
+          let catalog = Slice.view<u8>(spec, 8, spec.length - 8)
+          spec = match Manifest.catalogSpec(&members[0].manifest, catalog, name) {
+            Option.Some { value } => value
+            Option.None => {
+              let mut subject = run Bytes.copy(name)
+              run subject.append(b"@")
+              run subject.append(spec)
+              fail ResolveError { kind: ResolveErrorKind.Catalog, subject: move subject, message: "the catalog of the root project has no entry for" }
+            }
+          }
+        }
+        run queue(&mut work, &mut wave, 0, importer, name, spec, dependency.kind == OPTIONAL)
+      }
+      index = index + 1
+    }
+    member = member + 1
+  }
+  run drain(&mut work, move wave, workspace, previous, fresh)
+  let mut linked: usize = 0
+  while linked < Graph.count(&work.graph) {
+    let mut more = List<Pending>.make()
+    let until = Graph.count(&work.graph)
+    run peers(&mut work, linked, &mut more)
+    linked = until
+    run drain(&mut work, move more, workspace, previous, fresh)
+  }
+  let Work { graph, packuments, documents, first } = move work
+  drop packuments
+  drop documents
+  drop first
+  let mut settled = move graph
+  run instantiate(&mut settled)
+  return move settled
+}

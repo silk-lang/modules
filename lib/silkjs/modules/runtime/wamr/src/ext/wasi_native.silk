@@ -1,0 +1,738 @@
+//! Node WASI Preview 1 on ext/wasi_host (uvwasi 0.0.23's semantics, in Silk). Host ID 10000 is wasiNative.
+//! No native callbacks or JS reentry occur inside a syscall. The current branded
+//! memory backing is supplied afresh by the JS binding on every invocation.
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silkjsruntime.ext.diagnostics_fatal { RuntimeHeap }
+import silkjs.js_owned_value { lendFor }
+import silkjs.js_realm { lendRealm }
+import silk.core.effect { Effect }
+import silk.core.result { Result }
+import silk.collections.list { List }
+import silk.mem.pointer { Pointer }
+import silk.mem.layout { Layout }
+import silk.num.i32
+import silk.num.i64
+import silk.num.u8
+import silk.num.u16
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+import silk.num.f64
+import silkjs.js_engine { Engine }
+import silkjs.js_heap { HeapHeader }
+import silkjs.js_value { ValueBits }
+import silkjs.js_core_types { FrameSlots, NativeErrorKind }
+import silkjs.js_exceptions { JsException }
+import silkjs.js_coercion_host { CoercionHooks }
+import silkjs.js_string_types { StringLengthError }
+import silkjsruntime.libs.core.owners { Scope }
+import silkjsruntime.libs.core.owners as owners
+import silkjsruntime.libs.core.common as common
+import silkjs.js_std_support as text
+import silkjs.js_buffer_storage as buffers
+import silkjs.js_bigint_coercions as bigint
+import silkjs.js_proxy_core as core
+import silkjs.js_errors as errors
+import silkjs.js_runtime as runtime
+import silkjs.js_exceptions as exceptions
+import silkjsruntime.libs.core.capabilities { Composition }
+import silkjsruntime.libs.core.host as host
+import ext.wasi_abi as c
+import ext.wasi_host as wasi
+
+pub struct State { first: ?*mut Handle, next: i32 }
+struct Handle { next: ?*mut Handle, id: i32, uv: *mut wasi.Wasi }
+struct Temp { next: ?*mut Temp, data: *mut u8, offset: u32, written: u32 }
+struct Arena { first: ?*mut Temp, last: ?*mut Temp, error: u16 }
+struct Call { arena: Arena, memory: buffers.BufferState }
+fn nil() -> ?*mut u8 { return Pointer.null<u8>() }
+unsafe fn nn<T>(p: ?*mut T) -> *mut T { return unsafe Intrinsic.pointerRequalify<?*mut T, *mut T>(p) }
+unsafe fn raw<T>(p: *mut T) -> *mut u8 { return unsafe Intrinsic.pointerReinterpret<*mut T, *mut u8>(p) }
+unsafe fn cast<T>(p: ?*mut u8) -> *mut T { return unsafe Intrinsic.pointerReinterpret<*mut u8, *mut T>(unsafe nn(p)) }
+unsafe fn at<T>(p: *mut T, index: usize) -> *mut T { return unsafe Pointer.atMut<T>(unsafe Pointer.assumeManyMut<T>(p), index) }
+fn number(value: ValueBits) -> u32 { if value.isNumber() { return f64.toU32(value.numericValue()) } return 0 }
+effect fn allocate<T>() -> *mut T ! OutOfMemoryError {
+  let p = unsafe c.calloc(1, Layout.of<T>().bytes)
+  if Pointer.isNull<u8>(p) { fail OutOfMemoryError {} }
+  return unsafe cast<T>(p)
+}
+pub effect fn open(allocator: *mut RuntimeHeap) -> *mut State ! OutOfMemoryError {
+  let p = run allocate<State>()
+  unsafe Pointer.put<State>(p, State { first: Pointer.null<Handle>(), next: 1 })
+  return p
+}
+unsafe fn lookup(state: *mut State, id: i32) -> ?*mut Handle {
+  let a = () let s = unsafe Pointer.borrow<(), State>(&a, state) let mut p = s.first drop s
+  while !Pointer.isNull<Handle>(p) {
+    let h = unsafe Pointer.borrow<(), Handle>(&a, unsafe nn(p))
+    if h.id == id { return p } p = h.next
+  }
+  return Pointer.null<Handle>()
+}
+unsafe fn dispose(state: *mut State, id: i32) -> () {
+  let mut a = () let s = unsafe Pointer.borrowMut<(), State>(&mut a, state)
+  let mut link = Pointer.fromMutRef<?*mut Handle>(&mut s.first) drop s
+  while !Pointer.isNull<Handle>(unsafe Pointer.read<?*mut Handle>(link)) {
+    let p = unsafe nn(unsafe Pointer.read<?*mut Handle>(link))
+    let h = unsafe Pointer.borrowMut<(), Handle>(&mut a, p)
+    if h.id == id {
+      unsafe Pointer.put<?*mut Handle>(link, h.next) let uv = h.uv drop h
+      unsafe wasi.destroy(uv)
+      let owned = unsafe Pointer.take<Handle>(p) drop owned unsafe c.free(unsafe raw(p)) return ()
+    }
+    link = Pointer.fromMutRef<?*mut Handle>(&mut h.next) drop h
+  }
+}
+pub unsafe fn close<'m, C: Composition>(engine: &mut Engine<'m, host.Services<C>>, context: *mut HeapHeader, state: *mut State) -> () {
+  let a = ()
+  while true {
+    let s = unsafe Pointer.borrow<(), State>(&a, state) let p = s.first drop s
+    if Pointer.isNull<Handle>(p) { break }
+    let h = unsafe Pointer.borrow<(), Handle>(&a, unsafe nn(p)) let id = h.id drop h
+    unsafe dispose(state, id)
+  }
+  let owned = unsafe Pointer.take<State>(state) drop owned unsafe c.free(unsafe raw(state))
+}
+// One allocation holds both bookkeeping and aligned native scratch. No retained
+// guest pointers survive a call; uvwasi copies its constructor strings itself.
+unsafe fn scratch(arena: &mut Arena, size: usize) -> ?*mut u8 {
+  if arena.error != 0 { return nil() }
+  if size > usize.MAX - Layout.of<Temp>().bytes - 1 { arena.error = 48 return nil() }
+  let p = unsafe c.calloc(1, Layout.of<Temp>().bytes + size + 1)
+  if Pointer.isNull<u8>(p) { arena.error = 48 return nil() }
+  let data = unsafe at<u8>(unsafe nn(p), Layout.of<Temp>().bytes)
+  let entry = unsafe cast<Temp>(p)
+  unsafe Pointer.put<Temp>(entry, Temp { next: Pointer.null<Temp>(), data: data, offset: 0, written: 0 })
+  if Pointer.isNull<Temp>(arena.last) { arena.first = entry }
+  else {
+    let mut a = () let previous = unsafe Pointer.borrowMut<(), Temp>(&mut a, unsafe nn(arena.last))
+    previous.next = entry
+  }
+  arena.last = entry
+  return data
+}
+unsafe fn clear(arena: &mut Arena) -> () {
+  let mut p = arena.first arena.first = Pointer.null<Temp>() arena.last = Pointer.null<Temp>()
+  while !Pointer.isNull<Temp>(p) {
+    let entry = unsafe Pointer.take<Temp>(unsafe nn(p)) let next = entry.next drop entry
+    unsafe c.free(unsafe raw(unsafe nn(p))) p = next
+  }
+}
+fn bounds(call: &mut Call, offset: u32, size: u64) -> bool {
+  // Node's WASI binding reports guest-memory bounds failures as EOVERFLOW.
+  if u32.toU64(offset) + size > call.memory.byteLength { call.arena.error = 61 return false }
+  return true
+}
+unsafe fn region(call: &mut Call, offset: u32, size: u32, input: bool) -> ?*mut u8 {
+  if !bounds(&mut call, offset, u32.toU64(size)) || call.arena.error != 0 { return nil() }
+  if call.memory.physicalCapacity == 0 { return unsafe buffers.dataAt(call.memory.data, u32.toU64(offset)) }
+  let p = unsafe scratch(&mut call.arena, u32.toUsize(size))
+  if Pointer.isNull<u8>(p) { return nil() }
+  let mut a = () let entry = unsafe Pointer.borrowMut<(), Temp>(&mut a, unsafe nn(call.arena.last))
+  entry.offset = offset drop entry
+  if input {
+    let mut i: u32 = 0
+    while i < size {
+      unsafe Pointer.put<u8>(unsafe at<u8>(unsafe nn(p), u32.toUsize(i)), u64.toU8(unsafe buffers.loadScalar(call.memory, u32.toU64(offset) + u32.toU64(i), 0)))
+      i = i + 1
+    }
+  }
+  return p
+}
+unsafe fn publish(call: &mut Call, data: ?*mut u8, size: u32) -> () {
+  if call.memory.physicalCapacity == 0 || size == 0 { return () }
+  let mut p = call.arena.first let mut a = ()
+  while !Pointer.isNull<Temp>(p) {
+    let entry = unsafe Pointer.borrowMut<(), Temp>(&mut a, unsafe nn(p))
+    if Pointer.address(entry.data) == Pointer.address(unsafe nn(data)) { entry.written = size return () }
+    p = entry.next
+  }
+}
+unsafe fn commit(call: &mut Call) -> () {
+  let mut p = call.arena.first let a = ()
+  while !Pointer.isNull<Temp>(p) {
+    let entry = unsafe Pointer.borrow<(), Temp>(&a, unsafe nn(p)) let mut i: u32 = 0
+    while i < entry.written {
+      let byte = unsafe Pointer.read<u8>(unsafe at<u8>(entry.data, u32.toUsize(i)))
+      unsafe buffers.storeScalar(call.memory, u32.toU64(entry.offset) + u32.toU64(i), 0, u8.toU64(byte)) i = i + 1
+    }
+    p = entry.next
+  }
+}
+unsafe fn scalar(call: &mut Call, offset: u32, log2: u32, value: u64) -> () {
+  unsafe buffers.storeScalar(call.memory, u32.toU64(offset), log2, value)
+}
+unsafe fn recordRange(call: &mut Call, offset: u32, source: ?*mut u8, size: u32) -> () {
+  if call.memory.physicalCapacity == 0 {
+    let _copied = unsafe c.memcpy(unsafe buffers.dataAt(call.memory.data, u32.toU64(offset)), unsafe nn(source), u32.toUsize(size))
+    return ()
+  }
+  let mut i: u32 = 0
+  while i < size {
+    let byte = unsafe Pointer.read<u8>(unsafe at<u8>(unsafe nn(source), u32.toUsize(i)))
+    unsafe buffers.storeScalar(call.memory, u32.toU64(offset) + u32.toU64(i), 0, u8.toU64(byte)) i = i + 1
+  }
+}
+// uvwasi's serdes leaves padding and inactive union members untouched. Publish
+// exactly those fields, including for shared memory where rewriting padding
+// could lose a concurrent guest write.
+unsafe fn record(call: &mut Call, offset: u32, source: ?*mut u8, size: u32) -> () {
+  let p = unsafe nn(source)
+  if size == 8 {
+    unsafe recordRange(&mut call, offset, p, 1)
+    unsafe recordRange(&mut call, offset + 4, unsafe at<u8>(p, 4), 4)
+  } else if size == 24 {
+    unsafe recordRange(&mut call, offset, p, 1)
+    unsafe recordRange(&mut call, offset + 2, unsafe at<u8>(p, 2), 2)
+    unsafe recordRange(&mut call, offset + 8, unsafe at<u8>(p, 8), 16)
+  } else if size == 64 {
+    unsafe recordRange(&mut call, offset, p, 17)
+    unsafe recordRange(&mut call, offset + 24, unsafe at<u8>(p, 24), 40)
+  } else if size == 32 {
+    unsafe recordRange(&mut call, offset, p, 11)
+    let kind = unsafe Pointer.read<u8>(unsafe at<u8>(p, 10))
+    if kind == 1 || kind == 2 {
+      unsafe recordRange(&mut call, offset + 16, unsafe at<u8>(p, 16), 8)
+      unsafe recordRange(&mut call, offset + 24, unsafe at<u8>(p, 24), 2)
+    }
+  } else { Intrinsic.trap("Invalid WASI record size") }
+}
+unsafe fn readRecord(call: &mut Call, offset: u32, destination: *mut u8, size: u32) -> () {
+  if call.memory.physicalCapacity == 0 {
+    let _copied = unsafe c.memcpy(destination, unsafe buffers.dataAt(call.memory.data, u32.toU64(offset)), u32.toUsize(size))
+    return ()
+  }
+  let mut i: u32 = 0
+  while i < size {
+    unsafe Pointer.put<u8>(unsafe at<u8>(destination, u32.toUsize(i)), u64.toU8(unsafe buffers.loadScalar(call.memory, u32.toU64(offset) + u32.toU64(i), 0)))
+    i = i + 1
+  }
+}
+unsafe fn vectors(call: &mut Call, offset: u32, count: u32, input: bool) -> ?*mut u8 {
+  if !bounds(&mut call, offset, u32.toU64(count) * 8) { return nil() }
+  let p = unsafe scratch(&mut call.arena, u32.toUsize(count) * Layout.of<wasi.Iovec>().bytes)
+  if Pointer.isNull<u8>(p) { return nil() }
+  let mut i: u32 = 0
+  while i < count {
+    let base = u64.toU32(unsafe buffers.loadScalar(call.memory, u32.toU64(offset) + u32.toU64(i) * 8, 2))
+    let size = u64.toU32(unsafe buffers.loadScalar(call.memory, u32.toU64(offset) + u32.toU64(i) * 8 + 4, 2))
+    let data = unsafe region(&mut call, base, size, input)
+    if call.arena.error != 0 { return nil() }
+    unsafe Pointer.put<wasi.Iovec>(unsafe at<wasi.Iovec>(unsafe cast<wasi.Iovec>(p), u32.toUsize(i)), wasi.Iovec { data: data, length: size })
+    i = i + 1
+  }
+  return p
+}
+unsafe fn publishVectors(call: &mut Call, vectors: ?*mut u8, count: u32, written: u32) -> () {
+  let mut left = written let mut i: u32 = 0 let a = ()
+  while i < count && left != 0 {
+    let v = unsafe Pointer.borrow<(), wasi.Iovec>(&a, unsafe at<wasi.Iovec>(unsafe cast<wasi.Iovec>(vectors), u32.toUsize(i)))
+    let mut size = v.length if size > left { size = left }
+    unsafe publish(&mut call, v.data, size) left = left - size i = i + 1
+  }
+}
+unsafe effect fn integer<'m, C: Composition>(engine: &mut Engine<'m, host.Services<C>>, context: *mut HeapHeader, value: ValueBits) -> u64 ! OutOfMemoryError | JsException ? &mut Allocator {
+  if !value.isBigInt() { return u32.toU64(number(value)) }
+  let mut n: i64 = 0 let outcome = run Effect.result(bigint.toBigInt64(&mut engine, unsafe lendRealm(&context, context), &mut n, unsafe lendFor(value)))
+  match move outcome {
+    Result<(), OutOfMemoryError | StringLengthError | JsException>.Success { .. } => ()
+    Result<(), OutOfMemoryError | StringLengthError | JsException>.Failure { error } => { return run core.materialize(&mut engine, unsafe lendRealm(&context, context), move error) }
+  }
+  return i64.wrappingToU64(n)
+}
+// Each of `count` JS strings at `values`, as bytes without the C terminator.
+unsafe effect fn texts<'m, C: Composition>(engine: &mut Engine<'m, host.Services<C>>, context: *mut HeapHeader, values: ValueBits, count: u32, out: &mut List<List<u8>>) -> () ! OutOfMemoryError | JsException ? &mut Allocator {
+  let mut i: u32 = 0
+  while i < count {
+    let value = run unsafe owners.getIndex(&mut engine, context, values, i)
+    let converted = run Effect.result(text.ctext(&mut engine, unsafe lendRealm(&context, context), unsafe lendFor(value)))
+    unsafe owners.release(&mut engine, context, value)
+    let mut bytes = match move converted {
+      Result<List<u8>, OutOfMemoryError | JsException>.Success { value: encoded } => move encoded
+      Result<List<u8>, OutOfMemoryError | JsException>.Failure { error } => { fail move error }
+    }
+    let size = bytes.length()
+    if size > 0 && bytes.asSlice()[size - 1] == 0 { bytes.truncate(size - 1) }
+    run out.append(move bytes)
+    i = i + 1
+  }
+}
+unsafe effect fn initError<'m, C: Composition>(engine: &mut Engine<'m, host.Services<C>>, context: *mut HeapHeader, status: u16, scope: &mut Scope) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
+  let memory = engine.memory scope.values[10] = run errors.newError(&mut engine, memory, unsafe lendRealm(&context, context))
+  scope.values[11] = (run text.string(&mut engine, unsafe lendRealm(&context, context), wasi.errorName(status))).intoBits()
+  run unsafe common.define(&mut engine, context, scope.values[10], b"code", unsafe scope.values[11].retained(), 7)
+  let syscall = run text.string(&mut engine, unsafe lendRealm(&context, context), b"uvwasi_init")
+  run unsafe common.define(&mut engine, context, scope.values[10], b"syscall", syscall.intoBits(), 7)
+  run unsafe common.define(&mut engine, context, scope.values[10], b"errno", ValueBits.Int { value: u16.toI32(status) }, 7)
+  let mut messageBytes = run text.text(&mut engine, unsafe lendRealm(&context, context), unsafe lendFor(scope.values[11]))
+  let suffix = b", uvwasi_init" let mut i: usize = 0
+  while i < suffix.length { run messageBytes.append(suffix[i]) i = i + 1 }
+  let message = run text.string(&mut engine, unsafe lendRealm(&context, context), messageBytes.asSlice())
+  run unsafe common.define(&mut engine, context, scope.values[10], b"message", message.intoBits(), 7)
+  return run unsafe exceptions.throwValue<ValueBits, Engine<'m, host.Services<C>>>(&mut engine, unsafe runtime.contextRuntime(context), scope.take(10))
+}
+unsafe effect fn create<'m, C: Composition>(engine: &mut Engine<'m, host.Services<C>>, context: *mut HeapHeader, state: *mut State, arena: &mut Arena, scope: &mut Scope) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
+  // Preopened directories are the host's file system. A program whose files are its own
+  // (Files.direct is false: MemoryFiles, RootedFiles) has no host directory to give a guest, so a
+  // preopen fails as uvwasi's own capability check does (UVWASI_ENOTCAPABLE).
+  static if !Composition.filesDirect() {
+    if number(scope.values[4]) > 0 { return run unsafe initError(&mut engine, context, 76, &mut scope) }
+  }
+  let mut arguments = List<List<u8>>.make()
+  run unsafe texts(&mut engine, context, scope.values[1], number(scope.values[0]), &mut arguments)
+  let mut environment = List<List<u8>>.make()
+  run unsafe texts(&mut engine, context, scope.values[3], number(scope.values[2]), &mut environment)
+  let mut paths = List<List<u8>>.make()
+  run unsafe texts(&mut engine, context, scope.values[5], number(scope.values[4]) * 2, &mut paths)
+  let mut preopens = List<wasi.Preopen>.make()
+  let mut pairs = paths.asMutSlice() let mut k: usize = 0
+  while k + 1 < pairs.length {
+    let mapped = Intrinsic.replace(pairs[k], List<u8>.make()) let real = Intrinsic.replace(pairs[k + 1], List<u8>.make())
+    run preopens.append(wasi.Preopen { mapped: move mapped, real: move real })
+    k = k + 2
+  }
+  let mut status: u16 = 0
+  let made = run wasi.make(&arguments, &environment, &preopens, u32.toI32(number(scope.values[6])), u32.toI32(number(scope.values[7])), u32.toI32(number(scope.values[8])), &mut status)
+  if Pointer.isNull<wasi.Wasi>(made) { return run unsafe initError(&mut engine, context, status, &mut scope) }
+  let h = run Effect.result(allocate<Handle>())
+  let handle = match move h {
+    Result<*mut Handle, OutOfMemoryError>.Success { value } => value
+    Result<*mut Handle, OutOfMemoryError>.Failure { error } => { unsafe wasi.destroy(unsafe nn(made)) fail move error }
+  }
+  let mut a = ()
+  let s = unsafe Pointer.borrowMut<(), State>(&mut a, state) let id = s.next s.next = s.next + 1
+  unsafe Pointer.put<Handle>(handle, Handle { next: s.first, id: id, uv: unsafe nn(made) }) s.first = handle
+  return ValueBits.Int { value: id }
+}
+
+// Guest offsets are checked in u64 before any native pointer is formed. Native
+// records are serialized explicitly; never cast a packed guest record to C.
+unsafe fn syscall(uv: *mut wasi.Wasi, call: &mut Call, op: u32, a: &[u64; 9]) -> u16 {
+  let mut n: u32 = 0 let mut n2: u32 = 0 let mut wide: u64 = 0 let mut small: u16 = 0
+  let mut nativeRecord: [u64; 8] = [0; 8] let mut guestRecord: [u64; 8] = [0; 8]
+  let nr = unsafe raw(Pointer.fromMutRef<u64>(&mut nativeRecord[0]))
+  let gr = unsafe raw(Pointer.fromMutRef<u64>(&mut guestRecord[0]))
+  // args_get
+  if op == 2 {
+    let sizes = unsafe wasi.argsSizesGet(uv, Pointer.fromMutRef<u32>(&mut n), Pointer.fromMutRef<u32>(&mut n2))
+    if sizes != 0 { return sizes }
+    if !bounds(&mut call, u64.toU32(a[0]), u32.toU64(n) * 4) { return 61 }
+    if !bounds(&mut call, u64.toU32(a[1]), u32.toU64(n2)) { return 61 }
+    let pointers = unsafe scratch(&mut call.arena, (u32.toUsize(n) + 1) * Layout.of<?*mut u8>().bytes)
+    let data = unsafe region(&mut call, u64.toU32(a[1]), n2, false)
+    if call.arena.error != 0 { return call.arena.error }
+    let status = unsafe wasi.argsGet(uv, pointers, data)
+    if status == 0 {
+      unsafe publish(&mut call, data, n2) unsafe commit(&mut call)
+      let mut i: u32 = 0
+      while i < n {
+        let ptr = unsafe Pointer.read<?*mut u8>(unsafe at<?*mut u8>(unsafe cast<?*mut u8>(pointers), u32.toUsize(i)))
+        let relative = Pointer.address(unsafe nn(ptr)) - Pointer.address(unsafe nn(data))
+        unsafe scalar(&mut call, u64.toU32(a[0]) + i * 4, 2, a[1] + usize.toU64(relative)) i = i + 1
+      }
+    }
+    return status
+  }
+  // args_sizes_get
+  if op == 3 {
+    if !bounds(&mut call, u64.toU32(a[0]), 4) { return 61 }
+    if !bounds(&mut call, u64.toU32(a[1]), 4) { return 61 }
+    let status = unsafe wasi.argsSizesGet(uv, Pointer.fromMutRef<u32>(&mut n), Pointer.fromMutRef<u32>(&mut n2))
+    if status == 0 { unsafe scalar(&mut call, u64.toU32(a[0]), 2, u32.toU64(n)) unsafe scalar(&mut call, u64.toU32(a[1]), 2, u32.toU64(n2)) }
+    return status
+  }
+  // clock_res_get
+  if op == 4 {
+    if !bounds(&mut call, u64.toU32(a[1]), 8) { return 61 }
+    let status = unsafe wasi.clockResGet(uv, u64.wrappingToU32(a[0]), Pointer.fromMutRef<u64>(&mut wide))
+    if status == 0 { unsafe scalar(&mut call, u64.toU32(a[1]), 3, wide) }
+    return status
+  }
+  // clock_time_get
+  if op == 5 {
+    if !bounds(&mut call, u64.toU32(a[2]), 8) { return 61 }
+    let status = unsafe wasi.clockTimeGet(uv, u64.wrappingToU32(a[0]), a[1], Pointer.fromMutRef<u64>(&mut wide))
+    if status == 0 { unsafe scalar(&mut call, u64.toU32(a[2]), 3, wide) }
+    return status
+  }
+  // environ_get
+  if op == 6 {
+    let sizes = unsafe wasi.environSizesGet(uv, Pointer.fromMutRef<u32>(&mut n), Pointer.fromMutRef<u32>(&mut n2))
+    if sizes != 0 { return sizes }
+    if !bounds(&mut call, u64.toU32(a[0]), u32.toU64(n) * 4) { return 61 }
+    if !bounds(&mut call, u64.toU32(a[1]), u32.toU64(n2)) { return 61 }
+    let pointers = unsafe scratch(&mut call.arena, (u32.toUsize(n) + 1) * Layout.of<?*mut u8>().bytes)
+    let data = unsafe region(&mut call, u64.toU32(a[1]), n2, false)
+    if call.arena.error != 0 { return call.arena.error }
+    let status = unsafe wasi.environGet(uv, pointers, data)
+    if status == 0 {
+      unsafe publish(&mut call, data, n2) unsafe commit(&mut call)
+      let mut i: u32 = 0
+      while i < n {
+        let ptr = unsafe Pointer.read<?*mut u8>(unsafe at<?*mut u8>(unsafe cast<?*mut u8>(pointers), u32.toUsize(i)))
+        let relative = Pointer.address(unsafe nn(ptr)) - Pointer.address(unsafe nn(data))
+        unsafe scalar(&mut call, u64.toU32(a[0]) + i * 4, 2, a[1] + usize.toU64(relative)) i = i + 1
+      }
+    }
+    return status
+  }
+  // environ_sizes_get
+  if op == 7 {
+    if !bounds(&mut call, u64.toU32(a[0]), 4) { return 61 }
+    if !bounds(&mut call, u64.toU32(a[1]), 4) { return 61 }
+    let status = unsafe wasi.environSizesGet(uv, Pointer.fromMutRef<u32>(&mut n), Pointer.fromMutRef<u32>(&mut n2))
+    if status == 0 { unsafe scalar(&mut call, u64.toU32(a[0]), 2, u32.toU64(n)) unsafe scalar(&mut call, u64.toU32(a[1]), 2, u32.toU64(n2)) }
+    return status
+  }
+  // fd_advise
+  if op == 8 {
+    return unsafe wasi.fdAdvise(uv, u64.wrappingToU32(a[0]), a[1], a[2], u64.wrappingToU8(a[3]))
+  }
+  // fd_allocate
+  if op == 9 {
+    return unsafe wasi.fdAllocate(uv, u64.wrappingToU32(a[0]), a[1], a[2])
+  }
+  // fd_close
+  if op == 10 {
+    return unsafe wasi.fdClose(uv, u64.wrappingToU32(a[0]))
+  }
+  // fd_datasync
+  if op == 11 {
+    return unsafe wasi.fdDatasync(uv, u64.wrappingToU32(a[0]))
+  }
+  // fd_fdstat_get
+  if op == 12 {
+    if !bounds(&mut call, u64.toU32(a[1]), 24) { return 61 }
+    let status = unsafe wasi.fdFdstatGet(uv, u64.wrappingToU32(a[0]), nr)
+    if status == 0 { unsafe wasi.copyRecord(gr, nr, 24) unsafe record(&mut call, u64.toU32(a[1]), gr, 24) }
+    return status
+  }
+  // fd_fdstat_set_flags
+  if op == 13 {
+    return unsafe wasi.fdFdstatSetFlags(uv, u64.wrappingToU32(a[0]), u64.wrappingToU16(a[1]))
+  }
+  // fd_fdstat_set_rights
+  if op == 14 {
+    return unsafe wasi.fdFdstatSetRights(uv, u64.wrappingToU32(a[0]), a[1], a[2])
+  }
+  // fd_filestat_get
+  if op == 15 {
+    if !bounds(&mut call, u64.toU32(a[1]), 64) { return 61 }
+    let status = unsafe wasi.fdFilestatGet(uv, u64.wrappingToU32(a[0]), nr)
+    if status == 0 { unsafe wasi.copyRecord(gr, nr, 64) unsafe record(&mut call, u64.toU32(a[1]), gr, 64) }
+    return status
+  }
+  // fd_filestat_set_size
+  if op == 16 {
+    return unsafe wasi.fdFilestatSetSize(uv, u64.wrappingToU32(a[0]), a[1])
+  }
+  // fd_filestat_set_times
+  if op == 17 {
+    return unsafe wasi.fdFilestatSetTimes(uv, u64.wrappingToU32(a[0]), a[1], a[2], u64.wrappingToU16(a[3]))
+  }
+  // fd_pread
+  if op == 18 {
+    if !bounds(&mut call, u64.toU32(a[4]), 4) { return 61 }
+    let iovs = unsafe vectors(&mut call, u64.toU32(a[1]), u64.toU32(a[2]), false)
+    if call.arena.error != 0 { return call.arena.error }
+    let status = unsafe wasi.fdPread(uv, u64.wrappingToU32(a[0]), iovs, u64.wrappingToU32(a[2]), a[3], Pointer.fromMutRef<u32>(&mut n))
+    if status == 0 {
+      unsafe publishVectors(&mut call, iovs, u64.toU32(a[2]), n) unsafe commit(&mut call)
+      unsafe scalar(&mut call, u64.toU32(a[4]), 2, u32.toU64(n))
+    }
+    return status
+  }
+  // fd_prestat_get
+  if op == 19 {
+    if !bounds(&mut call, u64.toU32(a[1]), 8) { return 61 }
+    let status = unsafe wasi.fdPrestatGet(uv, u64.wrappingToU32(a[0]), nr)
+    if status == 0 { unsafe wasi.copyRecord(gr, nr, 8) unsafe record(&mut call, u64.toU32(a[1]), gr, 8) }
+    return status
+  }
+  // fd_prestat_dir_name
+  if op == 20 {
+    if !bounds(&mut call, u64.toU32(a[1]), a[2]) { return 61 }
+    let status = unsafe wasi.fdPrestatGet(uv, u64.wrappingToU32(a[0]), nr)
+    if status != 0 { return status }
+    unsafe wasi.copyRecord(gr, nr, 8)
+    let length = unsafe Pointer.read<u32>(unsafe Intrinsic.pointerReinterpret<*mut u8, *mut u32>(unsafe at<u8>(gr, 4)))
+    let data = unsafe region(&mut call, u64.toU32(a[1]), u64.toU32(a[2]), false)
+    if call.arena.error != 0 { return call.arena.error }
+    let result = unsafe wasi.fdPrestatDirName(uv, u64.wrappingToU32(a[0]), data, u64.wrappingToU32(a[2]))
+    if result == 0 { unsafe publish(&mut call, data, length) unsafe commit(&mut call) }
+    return result
+  }
+  // fd_pwrite
+  if op == 21 {
+    if !bounds(&mut call, u64.toU32(a[4]), 4) { return 61 }
+    let iovs = unsafe vectors(&mut call, u64.toU32(a[1]), u64.toU32(a[2]), true)
+    if call.arena.error != 0 { return call.arena.error }
+    let status = unsafe wasi.fdPwrite(uv, u64.wrappingToU32(a[0]), iovs, u64.wrappingToU32(a[2]), a[3], Pointer.fromMutRef<u32>(&mut n))
+    if status == 0 {
+      unsafe scalar(&mut call, u64.toU32(a[4]), 2, u32.toU64(n))
+    }
+    return status
+  }
+  // fd_read
+  if op == 22 {
+    if !bounds(&mut call, u64.toU32(a[3]), 4) { return 61 }
+    let iovs = unsafe vectors(&mut call, u64.toU32(a[1]), u64.toU32(a[2]), false)
+    if call.arena.error != 0 { return call.arena.error }
+    let status = unsafe wasi.fdRead(uv, u64.wrappingToU32(a[0]), iovs, u64.wrappingToU32(a[2]), Pointer.fromMutRef<u32>(&mut n))
+    if status == 0 {
+      unsafe publishVectors(&mut call, iovs, u64.toU32(a[2]), n) unsafe commit(&mut call)
+      unsafe scalar(&mut call, u64.toU32(a[3]), 2, u32.toU64(n))
+    }
+    return status
+  }
+  // fd_readdir
+  if op == 23 {
+    if !bounds(&mut call, u64.toU32(a[4]), 4) { return 61 }
+    let data = unsafe region(&mut call, u64.toU32(a[1]), u64.toU32(a[2]), false)
+    if call.arena.error != 0 { return call.arena.error }
+    let status = unsafe wasi.fdReaddir(uv, u64.wrappingToU32(a[0]), data, u64.wrappingToU32(a[2]), a[3], Pointer.fromMutRef<u32>(&mut n))
+    if status == 0 { unsafe publish(&mut call, data, n) unsafe commit(&mut call) unsafe scalar(&mut call, u64.toU32(a[4]), 2, u32.toU64(n)) }
+    return status
+  }
+  // fd_renumber
+  if op == 24 {
+    return unsafe wasi.fdRenumber(uv, u64.wrappingToU32(a[0]), u64.wrappingToU32(a[1]))
+  }
+  // fd_seek
+  if op == 25 {
+    if !bounds(&mut call, u64.toU32(a[3]), 8) { return 61 }
+    let status = unsafe wasi.fdSeek(uv, u64.wrappingToU32(a[0]), u64.wrappingToI64(a[1]), u64.wrappingToU8(a[2]), Pointer.fromMutRef<u64>(&mut wide))
+    if status == 0 { unsafe scalar(&mut call, u64.toU32(a[3]), 3, wide) }
+    return status
+  }
+  // fd_sync
+  if op == 26 {
+    return unsafe wasi.fdSync(uv, u64.wrappingToU32(a[0]))
+  }
+  // fd_tell
+  if op == 27 {
+    if !bounds(&mut call, u64.toU32(a[1]), 8) { return 61 }
+    let status = unsafe wasi.fdTell(uv, u64.wrappingToU32(a[0]), Pointer.fromMutRef<u64>(&mut wide))
+    if status == 0 { unsafe scalar(&mut call, u64.toU32(a[1]), 3, wide) }
+    return status
+  }
+  // fd_write
+  if op == 28 {
+    if !bounds(&mut call, u64.toU32(a[3]), 4) { return 61 }
+    let iovs = unsafe vectors(&mut call, u64.toU32(a[1]), u64.toU32(a[2]), true)
+    if call.arena.error != 0 { return call.arena.error }
+    let status = unsafe wasi.fdWrite(uv, u64.wrappingToU32(a[0]), iovs, u64.wrappingToU32(a[2]), Pointer.fromMutRef<u32>(&mut n))
+    if status == 0 {
+      unsafe scalar(&mut call, u64.toU32(a[3]), 2, u32.toU64(n))
+    }
+    return status
+  }
+  // path_create_directory
+  if op == 29 {
+    let p1 = unsafe region(&mut call, u64.toU32(a[1]), u64.toU32(a[2]), true)
+    if call.arena.error != 0 { return call.arena.error }
+    return unsafe wasi.pathCreateDirectory(uv, u64.wrappingToU32(a[0]), p1, u64.wrappingToU32(a[2]))
+  }
+  // path_filestat_get
+  if op == 30 {
+    if !bounds(&mut call, u64.toU32(a[4]), 64) { return 61 }
+    let path = unsafe region(&mut call, u64.toU32(a[2]), u64.toU32(a[3]), true)
+    if call.arena.error != 0 { return call.arena.error }
+    let status = unsafe wasi.pathFilestatGet(uv, u64.wrappingToU32(a[0]), u64.wrappingToU32(a[1]), path, u64.wrappingToU32(a[3]), nr)
+    if status == 0 { unsafe wasi.copyRecord(gr, nr, 64) unsafe record(&mut call, u64.toU32(a[4]), gr, 64) }
+    return status
+  }
+  // path_filestat_set_times
+  if op == 31 {
+    let p2 = unsafe region(&mut call, u64.toU32(a[2]), u64.toU32(a[3]), true)
+    if call.arena.error != 0 { return call.arena.error }
+    return unsafe wasi.pathFilestatSetTimes(uv, u64.wrappingToU32(a[0]), u64.wrappingToU32(a[1]), p2, u64.wrappingToU32(a[3]), a[4], a[5], u64.wrappingToU16(a[6]))
+  }
+  // path_link
+  if op == 32 {
+    let p2 = unsafe region(&mut call, u64.toU32(a[2]), u64.toU32(a[3]), true)
+    let p5 = unsafe region(&mut call, u64.toU32(a[5]), u64.toU32(a[6]), true)
+    if call.arena.error != 0 { return call.arena.error }
+    return unsafe wasi.pathLink(uv, u64.wrappingToU32(a[0]), u64.wrappingToU32(a[1]), p2, u64.wrappingToU32(a[3]), u64.wrappingToU32(a[4]), p5, u64.wrappingToU32(a[6]))
+  }
+  // path_open
+  if op == 33 {
+    if !bounds(&mut call, u64.toU32(a[8]), 4) { return 61 }
+    let path = unsafe region(&mut call, u64.toU32(a[2]), u64.toU32(a[3]), true)
+    if call.arena.error != 0 { return call.arena.error }
+    let status = unsafe wasi.pathOpen(uv, u64.wrappingToU32(a[0]), u64.wrappingToU32(a[1]), path, u64.wrappingToU32(a[3]), u64.wrappingToU16(a[4]), a[5], a[6], u64.wrappingToU16(a[7]), Pointer.fromMutRef<u32>(&mut n))
+    if status == 0 { unsafe scalar(&mut call, u64.toU32(a[8]), 2, u32.toU64(n)) }
+    return status
+  }
+  // path_readlink
+  if op == 34 {
+    if !bounds(&mut call, u64.toU32(a[5]), 4) { return 61 }
+    let data = unsafe region(&mut call, u64.toU32(a[3]), u64.toU32(a[4]), false)
+    let path = unsafe region(&mut call, u64.toU32(a[1]), u64.toU32(a[2]), true)
+    if call.arena.error != 0 { return call.arena.error }
+    let status = unsafe wasi.pathReadlink(uv, u64.wrappingToU32(a[0]), path, u64.wrappingToU32(a[2]), data, u64.wrappingToU32(a[4]), Pointer.fromMutRef<u32>(&mut n))
+    if status == 0 { unsafe publish(&mut call, data, n) unsafe commit(&mut call) unsafe scalar(&mut call, u64.toU32(a[5]), 2, u32.toU64(n)) }
+    return status
+  }
+  // path_remove_directory
+  if op == 35 {
+    let p1 = unsafe region(&mut call, u64.toU32(a[1]), u64.toU32(a[2]), true)
+    if call.arena.error != 0 { return call.arena.error }
+    return unsafe wasi.pathRemoveDirectory(uv, u64.wrappingToU32(a[0]), p1, u64.wrappingToU32(a[2]))
+  }
+  // path_rename
+  if op == 36 {
+    let p1 = unsafe region(&mut call, u64.toU32(a[1]), u64.toU32(a[2]), true)
+    let p4 = unsafe region(&mut call, u64.toU32(a[4]), u64.toU32(a[5]), true)
+    if call.arena.error != 0 { return call.arena.error }
+    return unsafe wasi.pathRename(uv, u64.wrappingToU32(a[0]), p1, u64.wrappingToU32(a[2]), u64.wrappingToU32(a[3]), p4, u64.wrappingToU32(a[5]))
+  }
+  // path_symlink
+  if op == 37 {
+    let p0 = unsafe region(&mut call, u64.toU32(a[0]), u64.toU32(a[1]), true)
+    let p3 = unsafe region(&mut call, u64.toU32(a[3]), u64.toU32(a[4]), true)
+    if call.arena.error != 0 { return call.arena.error }
+    return unsafe wasi.pathSymlink(uv, p0, u64.wrappingToU32(a[1]), u64.wrappingToU32(a[2]), p3, u64.wrappingToU32(a[4]))
+  }
+  // path_unlink_file
+  if op == 38 {
+    let p1 = unsafe region(&mut call, u64.toU32(a[1]), u64.toU32(a[2]), true)
+    if call.arena.error != 0 { return call.arena.error }
+    return unsafe wasi.pathUnlinkFile(uv, u64.wrappingToU32(a[0]), p1, u64.wrappingToU32(a[2]))
+  }
+  // poll_oneoff
+  if op == 39 {
+    if !bounds(&mut call, u64.toU32(a[0]), a[2] * 48) { return 61 }
+    if !bounds(&mut call, u64.toU32(a[1]), a[2] * 32) { return 61 }
+    if !bounds(&mut call, u64.toU32(a[3]), 4) { return 61 }
+    let subscriptions = unsafe scratch(&mut call.arena, u64.toUsize(a[2]) * 48)
+    let events = unsafe scratch(&mut call.arena, u64.toUsize(a[2]) * 32)
+    if call.arena.error != 0 { return call.arena.error }
+    let mut i: u32 = 0
+    while i < u64.toU32(a[2]) {
+      unsafe readRecord(&mut call, u64.toU32(a[0]) + i * 48, gr, 48)
+      unsafe wasi.copyRecord(unsafe at<u8>(unsafe nn(subscriptions), u32.toUsize(i) * 48), gr, 48)
+      i = i + 1
+    }
+    let status = unsafe wasi.pollOneoff(uv, subscriptions, events, u64.wrappingToU32(a[2]), Pointer.fromMutRef<u32>(&mut n))
+    if status == 0 {
+      i = 0
+      while i < n {
+        unsafe wasi.copyRecord(gr, unsafe at<u8>(unsafe nn(events), u32.toUsize(i) * 32), 32)
+        unsafe record(&mut call, u64.toU32(a[1]) + i * 32, gr, 32) i = i + 1
+      }
+      unsafe scalar(&mut call, u64.toU32(a[3]), 2, u32.toU64(n))
+    }
+    return status
+  }
+  // proc_exit
+  if op == 40 {
+    return unsafe wasi.procExit(uv, u64.wrappingToU32(a[0]))
+  }
+  // proc_raise
+  if op == 41 {
+    return unsafe wasi.procRaise(uv, u64.wrappingToU8(a[0]))
+  }
+  // random_get
+  if op == 42 {
+    let data = unsafe region(&mut call, u64.toU32(a[0]), u64.toU32(a[1]), false)
+    if call.arena.error != 0 { return call.arena.error }
+    let status = unsafe wasi.randomGet(uv, data, u64.wrappingToU32(a[1]))
+    if status == 0 { unsafe publish(&mut call, data, u64.toU32(a[1])) unsafe commit(&mut call) }
+    return status
+  }
+  // sched_yield
+  if op == 43 {
+    return unsafe wasi.schedYield(uv)
+  }
+  // sock_accept
+  if op == 44 {
+    if !bounds(&mut call, u64.toU32(a[2]), 4) { return 61 }
+    let status = unsafe wasi.sockAccept(uv, u64.wrappingToU32(a[0]), u64.wrappingToU16(a[1]), Pointer.fromMutRef<u32>(&mut n))
+    if status == 0 { unsafe scalar(&mut call, u64.toU32(a[2]), 2, u32.toU64(n)) }
+    return status
+  }
+  // sock_recv
+  if op == 45 {
+    if !bounds(&mut call, u64.toU32(a[4]), 4) { return 61 }
+    if !bounds(&mut call, u64.toU32(a[5]), 4) { return 61 }
+    let iovs = unsafe vectors(&mut call, u64.toU32(a[1]), u64.toU32(a[2]), false)
+    if call.arena.error != 0 { return call.arena.error }
+    let status = unsafe wasi.sockRecv(uv, u64.wrappingToU32(a[0]), iovs, u64.wrappingToU32(a[2]), u64.wrappingToU16(a[3]), Pointer.fromMutRef<u32>(&mut n), Pointer.fromMutRef<u16>(&mut small))
+    if status == 0 {
+      unsafe publishVectors(&mut call, iovs, u64.toU32(a[2]), n) unsafe commit(&mut call)
+      unsafe scalar(&mut call, u64.toU32(a[4]), 2, u32.toU64(n))
+      unsafe scalar(&mut call, u64.toU32(a[5]), 1, u16.toU64(small))
+    }
+    return status
+  }
+  // sock_send
+  if op == 46 {
+    if !bounds(&mut call, u64.toU32(a[4]), 4) { return 61 }
+    let iovs = unsafe vectors(&mut call, u64.toU32(a[1]), u64.toU32(a[2]), true)
+    if call.arena.error != 0 { return call.arena.error }
+    let status = unsafe wasi.sockSend(uv, u64.wrappingToU32(a[0]), iovs, u64.wrappingToU32(a[2]), u64.wrappingToU16(a[3]), Pointer.fromMutRef<u32>(&mut n))
+    if status == 0 {
+      unsafe scalar(&mut call, u64.toU32(a[4]), 2, u32.toU64(n))
+    }
+    return status
+  }
+  // sock_shutdown
+  if op == 47 {
+    return unsafe wasi.sockShutdown(uv, u64.wrappingToU32(a[0]), u64.wrappingToU8(a[1]))
+  }
+  return 28
+}
+
+unsafe effect fn dispatchBody<'m, C: Composition>(engine: &mut Engine<'m, host.Services<C>>, context: *mut HeapHeader, state: *mut State, argv: &FrameSlots, scope: &mut Scope) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
+  let op = number(unsafe common.argument(argv, 0))
+  let id = u32.wrappingToI32(number(unsafe common.argument(argv, 1)))
+  if op == 1 { unsafe dispose(state, id) return ValueBits.Undefined }
+  let input = unsafe common.argument(argv, 3)
+  let mut i: u32 = 0
+  while i < 9 { scope.values[u32.toUsize(i)] = run unsafe owners.getIndex(&mut engine, context, input, i) i = i + 1 }
+  if op == 0 {
+    let mut arena = Arena { first: Pointer.null<Temp>(), last: Pointer.null<Temp>(), error: 0 }
+    let result = run Effect.result(unsafe create(&mut engine, context, state, &mut arena, &mut scope))
+    unsafe clear(&mut arena)
+    return match move result {
+      Result<ValueBits, OutOfMemoryError | JsException>.Success { value } => value
+      Result<ValueBits, OutOfMemoryError | JsException>.Failure { error } => { fail move error }
+    }
+  }
+  let hp = unsafe lookup(state, id)
+  if Pointer.isNull<Handle>(hp) { return run engine.throwError(unsafe lendRealm(&context, context), NativeErrorKind.Type, b"WASI instance has been disposed") }
+  let anchor = () let h = unsafe Pointer.borrow<(), Handle>(&anchor, unsafe nn(hp)) let uv = h.uv drop h
+  let mut arguments: [u64; 9] = [0; 9] i = 0
+  while i < 9 { arguments[u32.toUsize(i)] = run unsafe integer(&mut engine, context, scope.values[u32.toUsize(i)]) i = i + 1 }
+  // All coercion is finished before obtaining raw backing. The C API does not
+  // reenter JS or grow/detach memory, so private buffers need no snapshot.
+  let memory = run buffers.getArrayBuffer(&mut engine, unsafe lendRealm(&context, context), unsafe lendFor(unsafe common.argument(argv, 2)))
+  let mut call = Call { arena: Arena { first: Pointer.null<Temp>(), last: Pointer.null<Temp>(), error: 0 }, memory: memory }
+  let status = unsafe syscall(uv, &mut call, op, &arguments)
+  unsafe clear(&mut call.arena)
+  return ValueBits.Int { value: u16.toI32(status) }
+}
+pub unsafe effect fn dispatch<'m, C: Composition>(engine: &mut Engine<'m, host.Services<C>>, context: *mut HeapHeader, state: *mut State, id: u32, argc: i32, argv: &FrameSlots) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
+  let mut scope = Scope.make()
+  let outcome = run Effect.result(unsafe dispatchBody(&mut engine, context, state, argv, &mut scope))
+  unsafe owners.cleanup(&mut engine, context, move scope)
+  return match move outcome {
+    Result<ValueBits, OutOfMemoryError | JsException>.Success { value } => value
+    Result<ValueBits, OutOfMemoryError | JsException>.Failure { error } => { fail move error }
+  }
+}
+
+/// The handles still open, which a startup snapshot cannot keep: their ids name entries of
+/// this process's state, and a start from the snapshot has a state of its own.
+pub unsafe fn openHandles(state: *mut State) -> usize {
+  let mut anchor = () let s = unsafe Pointer.borrowMut<(), State>(&mut anchor, state)
+  let mut cursor = s.first drop s
+  let mut count: usize = 0
+  while !Pointer.isNull<Handle>(cursor) {
+    let mut held = () let h = unsafe Pointer.borrowMut<(), Handle>(&mut held, unsafe Intrinsic.pointerRequalify<?*mut Handle, *mut Handle>(cursor))
+    if true { count = count + 1 }
+    cursor = h.next drop h
+  }
+  return count
+}

@@ -1,0 +1,2596 @@
+//! An inline `<svg>` kept live: the elements of an SVG icon node whose attributes the client
+//! changes one at a time, painted as paths through the path cache.
+//!
+//! A client that animates an `<svg>` (lottie-web, a chart, a progress ring) writes a few
+//! attributes on a few elements each frame. Parsing and rendering the whole document again
+//! for that costs the whole document; here each element keeps its attributes parsed, and paint
+//! walks the elements, resolving inherited properties as it goes. Each fill and stroke goes
+//! through `PathCache` under an id made of the node, the element and the element's geometry
+//! generation, so only the shapes whose geometry or 2x2 transform changed are rasterized again.
+//!
+//! What it draws: `svg`, `g`, `path`, `rect`, `circle`, `ellipse`, `line`, `polyline`,
+//! `polygon`, with `defs`, `clipPath`, `linearGradient`, `radialGradient` and `stop` as
+//! resources. Presentation attributes and the `style` attribute set fill and stroke paints
+//! (colors, `currentColor`, gradients), their opacities, the stroke width, caps, joins, miter
+//! limit and dashes, `fill-rule`, `opacity`, `display`, `visibility`, `transform` and
+//! `clip-path`. Clients keep any other content as markup drawn by lib-svg.
+import ui_scene.primitives { Background, ColorStop, ContentMask, GradientShape, Isolation, StopsGradient }
+import ui_scene.scene { Scene }
+import ui_scene.path_cache { PathCache }
+import vector.geometry { Affine }
+import vector.path { Path as VectorPath }
+import vector.path as vector_path_verbs
+import vector.strips { NONZERO, EVENODD }
+import vector.stroke { Stroke, CAP_BUTT, CAP_ROUND, CAP_SQUARE, JOIN_MITER, JOIN_ROUND, JOIN_BEVEL }
+import svg_core.vector_path
+import svg_core.scene { RenderError }
+import svg_geometry.geometry { Path as ShapePath, Rect as ShapeRect }
+import svg_geometry.svg as shapes
+import svg_geometry.bounds { Result as BoundsResult }
+import svg_geometry.bounds
+import svg_css.lexer
+import svg_css.tokens { Limits, CssError }
+import svg_css.input { Input }
+import svg_css.value_cursor { Cursor }
+import svg_css.colors
+import svg_css.colors { Color, Context as ColorContext }
+import silk.collections.hash { Hash }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.color.color { ColorSpace, Interpolation }
+import silk.color.rgba { Rgba }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.geometry.rect { Rect }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f32
+import silk.num.f64
+import silk.num.u32
+import silk.num.u64
+import silk.num.u8
+import silk.num.usize
+import silk.collections.bytes { Bytes }
+
+/// No element: the parent of the root, the end of a sibling list.
+pub const NO_ELEMENT: u32 = 4294967295
+
+/// How deep paint follows nested groups; deeper content is not drawn.
+const MAX_DEPTH: u32 = 256
+
+pub enum Tag {
+  Svg,
+  G,
+  Path,
+  Rect,
+  Circle,
+  Ellipse,
+  Line,
+  Polyline,
+  Polygon,
+  Defs,
+  ClipPath,
+  LinearGradient,
+  RadialGradient,
+  Stop,
+  /// `title`, `desc`, `metadata` and anything else that draws nothing.
+  Other,
+}
+
+/// The tag a live svg draws for an element named `name`.
+pub fn tagOf(name: &[u8]) -> Tag {
+  return if name == b"svg" {
+    Tag.Svg
+  } else if name == b"g" {
+    Tag.G
+  } else if name == b"path" {
+    Tag.Path
+  } else if name == b"rect" {
+    Tag.Rect
+  } else if name == b"circle" {
+    Tag.Circle
+  } else if name == b"ellipse" {
+    Tag.Ellipse
+  } else if name == b"line" {
+    Tag.Line
+  } else if name == b"polyline" {
+    Tag.Polyline
+  } else if name == b"polygon" {
+    Tag.Polygon
+  } else if name == b"defs" {
+    Tag.Defs
+  } else if name == b"clipPath" {
+    Tag.ClipPath
+  } else if name == b"linearGradient" {
+    Tag.LinearGradient
+  } else if name == b"radialGradient" {
+    Tag.RadialGradient
+  } else if name == b"stop" {
+    Tag.Stop
+  } else {
+    Tag.Other
+  }
+}
+
+/// The lowercase tag name of `tag` as CSS selectors match it.
+pub fn tagName(tag: Tag) -> &'static [u8] {
+  return match tag {
+    Tag.Svg => b"svg"
+    Tag.G => b"g"
+    Tag.Path => b"path"
+    Tag.Rect => b"rect"
+    Tag.Circle => b"circle"
+    Tag.Ellipse => b"ellipse"
+    Tag.Line => b"line"
+    Tag.Polyline => b"polyline"
+    Tag.Polygon => b"polygon"
+    Tag.Defs => b"defs"
+    Tag.ClipPath => b"clipPath"
+    Tag.LinearGradient => b"linearGradient"
+    Tag.RadialGradient => b"radialGradient"
+    Tag.Stop => b"stop"
+    Tag.Other => b""
+  }
+}
+
+/// One attribute kept on an element for CSS selector matching (such as `data-*`).
+pub struct Attr {
+  pub name: Bytes,
+  pub value: Bytes,
+}
+
+fn isShape(tag: Tag) -> bool {
+  return tag == Tag.Path || tag == Tag.Rect || tag == Tag.Circle || tag == Tag.Ellipse
+    || tag == Tag.Line || tag == Tag.Polyline || tag == Tag.Polygon
+}
+
+/// A fill or stroke paint as written.
+pub union Paint {
+  None,
+  Current,
+  Color { pub color: Rgba<f32> },
+  /// `url(#id)`, by the hash of the id ([`idHash`]).
+  Url { pub ref: u64 },
+}
+
+impl Copy for Paint {}
+
+/// Which properties a [`Props`] sets.
+const P_FILL: u32 = 1
+const P_STROKE: u32 = 2
+const P_FILL_OPACITY: u32 = 4
+const P_STROKE_OPACITY: u32 = 8
+const P_STROKE_WIDTH: u32 = 16
+const P_CAP: u32 = 32
+const P_JOIN: u32 = 64
+const P_MITER: u32 = 128
+const P_DASHES: u32 = 256
+const P_DASH_OFFSET: u32 = 512
+const P_FILL_RULE: u32 = 1024
+const P_OPACITY: u32 = 2048
+const P_DISPLAY: u32 = 4096
+const P_VISIBILITY: u32 = 8192
+const P_COLOR: u32 = 16384
+const P_STOP_COLOR: u32 = 32768
+const P_STOP_OPACITY: u32 = 65536
+const P_CLIP: u32 = 131072
+const P_POINTER: u32 = 262144
+
+// `pointer-events` as flags: which parts hit, and whether they must be painted or visible.
+const HIT_FILL: u8 = 1
+const HIT_STROKE: u8 = 2
+const HIT_PAINTED: u8 = 4
+const HIT_VISIBLE: u8 = 8
+const HIT_DEFAULT: u8 = 15
+
+/// The SVG properties an element sets, from its presentation attributes or its `style`.
+pub struct Props {
+  pub set: u32,
+  pub fill: Paint,
+  pub stroke: Paint,
+  pub fillOpacity: f32,
+  pub strokeOpacity: f32,
+  pub strokeWidth: f32,
+  pub cap: u8,
+  pub join: u8,
+  pub miter: f32,
+  pub dashes: List<f64>,
+  pub dashOffset: f32,
+  pub evenOdd: bool,
+  pub opacity: f32,
+  pub hidden: bool,
+  pub invisible: bool,
+  pub color: Rgba<f32>,
+  pub stopColor: Paint,
+  pub stopOpacity: f32,
+  /// `clip-path: url(#id)` by id hash, 0 for none.
+  pub clip: u64,
+  /// `pointer-events` as `HIT_*` flags.
+  pub pointer: u8,
+}
+
+impl Props {
+  pub fn make() -> Props {
+    return Props {
+      set: 0,
+      fill: Paint.None,
+      stroke: Paint.None,
+      fillOpacity: 1.0,
+      strokeOpacity: 1.0,
+      strokeWidth: 1.0,
+      cap: CAP_BUTT,
+      join: JOIN_MITER,
+      miter: 4.0,
+      dashes: List<f64>.make(),
+      dashOffset: 0.0,
+      evenOdd: false,
+      opacity: 1.0,
+      hidden: false,
+      invisible: false,
+      color: black(),
+      stopColor: Paint.Color { color: black() },
+      stopOpacity: 1.0,
+      clip: 0,
+      pointer: HIT_DEFAULT,
+    }
+  }
+}
+
+fn black() -> Rgba<f32> {
+  return Rgba<f32> { r: 0.0, g: 0.0, b: 0.0, a: 1.0 }
+}
+
+/// One element of a live svg.
+pub struct Element {
+  pub tag: Tag,
+  pub parent: u32,
+  pub first: u32,
+  pub last: u32,
+  pub next: u32,
+  pub previous: u32,
+  /// Whether the client created this element (numbers can have gaps).
+  pub used: bool,
+  /// The hash of the `id` attribute, 0 for none.
+  pub id: u64,
+  /// Raw `id`, `class`, and non-geometry attributes (e.g. `data-*`) for page CSS matching.
+  pub idText: Bytes,
+  pub classes: Bytes,
+  pub attrs: List<Attr>,
+  /// Bumped when the element's own geometry or stroke changes: part of its path cache ids.
+  pub generation: u64,
+  pub attributes: Props,
+  /// Page CSS stylesheet properties resolved for this element (between `attributes` and `styles`).
+  pub sheetStyles: Props,
+  pub styles: Props,
+  pub transform: Affine,
+  /// Transform set by page CSS (`transform`, `translate`, `scale`, `rotate`), overriding `transform`.
+  pub sheetTransform: Option<Affine>,
+  /// Geometry attributes, by [`Geometry`] index.
+  pub numbers: [f64; 14],
+  /// Which `numbers` were written.
+  pub written: u32,
+  /// `d` or `points` as written.
+  pub data: Bytes,
+  /// The shape in user space, for bounds and paint; rebuilt when geometry changes.
+  pub shape: Option<ShapePath>,
+  pub path: Option<VectorPath>,
+  /// Gradients: `gradientUnits="userSpaceOnUse"`, `gradientTransform`, `spreadMethod`, `href`.
+  pub userSpace: bool,
+  pub gradientTransform: Affine,
+  pub href: u64,
+  /// Roots: `viewBox` (empty when absent) and `preserveAspectRatio` as written.
+  pub viewBox: Option<ShapeRect>,
+  pub aspect: Bytes,
+}
+
+/// Indices of [`Element.numbers`].
+const N_X: usize = 0
+const N_Y: usize = 1
+const N_WIDTH: usize = 2
+const N_HEIGHT: usize = 3
+const N_RX: usize = 4
+const N_RY: usize = 5
+const N_CX: usize = 6
+const N_CY: usize = 7
+const N_R: usize = 8
+const N_X1: usize = 9
+const N_Y1: usize = 10
+const N_X2: usize = 11
+const N_Y2: usize = 12
+const N_OFFSET: usize = 13
+
+impl Element {
+  fn make(tag: Tag) -> Element {
+    return Element {
+      tag: tag,
+      parent: NO_ELEMENT,
+      first: NO_ELEMENT,
+      last: NO_ELEMENT,
+      next: NO_ELEMENT,
+      previous: NO_ELEMENT,
+      used: true,
+      id: 0,
+      idText: Bytes.make(),
+      classes: Bytes.make(),
+      attrs: List<Attr>.make(),
+      generation: 0,
+      attributes: Props.make(),
+      sheetStyles: Props.make(),
+      styles: Props.make(),
+      transform: Affine.identity(),
+      sheetTransform: Option<Affine>.None,
+      numbers: [0.0; 14],
+      written: 0,
+      data: Bytes.make(),
+      shape: Option<ShapePath>.None,
+      path: Option<VectorPath>.None,
+      userSpace: false,
+      gradientTransform: Affine.identity(),
+      href: 0,
+      viewBox: Option<ShapeRect>.None,
+      aspect: Bytes.make(),
+    }
+  }
+
+  fn number(self: &Self, index: usize, fallback: f64) -> f64 {
+    return if self.written & u32.shiftLeft(1, usize.toU32(index)) != 0 {
+      self.numbers[index]
+    } else {
+      fallback
+    }
+  }
+}
+
+/// The hash of an element id, as `url(#id)` and `href="#id"` refer to it. Never 0.
+pub fn idHash(id: &[u8]) -> u64 {
+  let mut h = Hash.mix(&Hash.seed(0x73766769), usize.toU64(id.length))
+  let mut i: usize = 0
+  while i < id.length {
+    h = Hash.combine(h, u8.toU64(id[i]))
+    i = i + 1
+  }
+  return if h == 0 { 1 } else { h }
+}
+
+/// The elements of one live svg. Element 0 is the root `svg`.
+pub struct LiveSvg {
+  pub elements: List<Element>,
+  /// The root's `width` and `height` in pixels, 0 when absent or relative.
+  pub width: f64,
+  pub height: f64,
+  /// Elements whose parsed attributes failed and were dropped since the last check, for tests.
+  pub rejected: u32,
+  /// Whether structure or selector-visible attributes changed since page CSS was last matched.
+  pub styleDirty: bool,
+  /// Revision of the last page CSS stylesheet pass that styled this svg.
+  pub styleRevision: u64,
+}
+
+impl LiveSvg {
+  pub effect fn make() -> LiveSvg
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut elements = List<Element>.make()
+    run elements.append(Element.make(Tag.Svg))
+    return LiveSvg { elements: move elements, width: 0.0, height: 0.0, rejected: 0, styleDirty: true, styleRevision: 0 }
+  }
+
+  pub fn length(self: &Self) -> usize {
+    return self.elements.length()
+  }
+
+  fn has(self: &Self, element: u32) -> bool {
+    let index = u32.toUsize(element)
+    return index < self.elements.length() && self.elements.asSlice()[index].used
+  }
+
+  pub fn at(self: &Self, element: u32) -> &Element {
+    return &self.elements.asSlice()[u32.toUsize(element)]
+  }
+
+  fn atMut(self: &mut Self, element: u32) -> &mut Element {
+    return &mut self.elements.asMutSlice()[u32.toUsize(element)]
+  }
+
+  /// Makes element `element` with tag `name` (or gives an existing one that tag) and places it
+  /// in `parent` before `before`, or last. Returns false when the parent is missing or the
+  /// move would put the element inside itself.
+  pub effect fn insert(self: &mut Self, element: u32, name: &[u8], parent: u32, before: u32) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if element == 0 || element == NO_ELEMENT || !self.has(parent) {
+      return false
+    }
+    if before != NO_ELEMENT && (!self.has(before) || self.at(before).parent != parent) {
+      return false
+    }
+    // A parent inside the element would make a cycle.
+    let mut up = parent
+    while up != NO_ELEMENT {
+      if up == element {
+        return false
+      }
+      up = self.at(up).parent
+    }
+    let index = u32.toUsize(element)
+    while self.elements.length() <= index {
+      let mut free = Element.make(Tag.Other)
+      free.used = false
+      run self.elements.append(move free)
+    }
+    let tag = tagOf(name)
+    if self.at(element).used {
+      self.detach(element)
+      if self.at(element).tag != tag {
+        let touched1 = self.atMut(element)
+        touched1.tag = tag
+        run self.reshape(element)
+      }
+    } else {
+      let slots = self.elements.asMutSlice()
+      slots[index] = Element.make(tag)
+    }
+    self.attach(element, parent, before)
+    self.styleDirty = true
+    return true
+  }
+
+  fn attach(self: &mut Self, element: u32, parent: u32, before: u32) -> () {
+    let previous = if before == NO_ELEMENT {
+      self.at(parent).last
+    } else {
+      self.at(before).previous
+    }
+    let e = self.atMut(element)
+    e.parent = parent
+    e.previous = previous
+    e.next = before
+    if previous == NO_ELEMENT {
+      let touched2 = self.atMut(parent)
+      touched2.first = element
+    } else {
+      let touched3 = self.atMut(previous)
+      touched3.next = element
+    }
+    if before == NO_ELEMENT {
+      let touched4 = self.atMut(parent)
+      touched4.last = element
+    } else {
+      let touched5 = self.atMut(before)
+      touched5.previous = element
+    }
+  }
+
+  fn detach(self: &mut Self, element: u32) -> () {
+    let e = self.at(element)
+    let parent = e.parent
+    let previous = e.previous
+    let next = e.next
+    if parent == NO_ELEMENT {
+      return ()
+    }
+    if previous == NO_ELEMENT {
+      let touched6 = self.atMut(parent)
+      touched6.first = next
+    } else {
+      let touched7 = self.atMut(previous)
+      touched7.next = next
+    }
+    if next == NO_ELEMENT {
+      let touched8 = self.atMut(parent)
+      touched8.last = previous
+    } else {
+      let touched9 = self.atMut(next)
+      touched9.previous = previous
+    }
+    let moved = self.atMut(element)
+    moved.parent = NO_ELEMENT
+    moved.previous = NO_ELEMENT
+    moved.next = NO_ELEMENT
+  }
+
+  /// Removes `element` and everything in it; their numbers can be used again.
+  pub fn remove(self: &mut Self, element: u32) -> bool {
+    if element == 0 || !self.has(element) {
+      return false
+    }
+    self.detach(element)
+    self.free(element)
+    self.styleDirty = true
+    return true
+  }
+
+  fn free(self: &mut Self, element: u32) -> () {
+    let mut child = self.at(element).first
+    while child != NO_ELEMENT {
+      let next = self.at(child).next
+      self.free(child)
+      child = next
+    }
+    let e = self.atMut(element)
+    e.used = false
+    e.first = NO_ELEMENT
+    e.last = NO_ELEMENT
+    e.parent = NO_ELEMENT
+    e.shape = Option<ShapePath>.None
+    e.path = Option<VectorPath>.None
+  }
+
+  /// Sets attribute `name` of `element` to `text`, or removes it when not `present`. Unknown
+  /// attributes and values that do not parse change nothing, as a browser ignores them.
+  pub effect fn set(self: &mut Self, element: u32, name: &[u8], text: &[u8], present: bool) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if !self.has(element) {
+      return false
+    }
+    if name == b"style" {
+      let mut styles = Props.make()
+      run declarations(&mut styles, text)
+      let e = self.atMut(element)
+      let geometric = strokeShape(&e.styles) != strokeShape(&styles)
+      e.styles = move styles
+      if geometric {
+        e.generation = e.generation + 1
+      }
+      return true
+    }
+    if name == b"id" {
+      let touched10 = self.atMut(element)
+      touched10.id = if present && text.length != 0 { idHash(text) } else { 0 }
+      touched10.idText = if present { run Bytes.copy(text) } else { Bytes.make() }
+      self.styleDirty = true
+      return true
+    }
+    if name == b"class" {
+      let touchedClass = self.atMut(element)
+      touchedClass.classes = if present { run Bytes.copy(text) } else { Bytes.make() }
+      self.styleDirty = true
+      return true
+    }
+    if name == b"transform" {
+      let e = self.atMut(element)
+      e.transform = if present {
+        match shapes.transform(text) {
+          Option<Affine>.Some { value: parsed } => parsed
+          _ => Affine.identity()
+        }
+      } else {
+        Affine.identity()
+      }
+      return true
+    }
+    if name == b"gradientTransform" {
+      let e = self.atMut(element)
+      e.gradientTransform = match shapes.transform(text) {
+        Option<Affine>.Some { value: parsed } => parsed
+        _ => Affine.identity()
+      }
+      return true
+    }
+    if name == b"gradientUnits" {
+      let touched11 = self.atMut(element)
+      touched11.userSpace = text == b"userSpaceOnUse"
+      return true
+    }
+    if name == b"href" || name == b"xlink:href" {
+      let touched12 = self.atMut(element)
+      touched12.href = if text.length > 1 && text[0] == 35 { idHash(cut(text, 1, text.length)) } else { 0 }
+      return true
+    }
+    if name == b"viewBox" {
+      let touched13 = self.atMut(element)
+      touched13.viewBox = if present { shapes.viewBox(text) } else { Option<ShapeRect>.None }
+      return true
+    }
+    if name == b"preserveAspectRatio" {
+      let touched14 = self.atMut(element)
+      touched14.aspect = run Bytes.copy(text)
+      return true
+    }
+    if name == b"d" || name == b"points" {
+      let tag = self.at(element).tag
+      let wanted = (name == b"d" && tag == Tag.Path)
+        || (name == b"points" && (tag == Tag.Polyline || tag == Tag.Polygon))
+      if !wanted {
+        return true
+      }
+      let e = self.atMut(element)
+      e.data = run Bytes.copy(text)
+      run self.reshape(element)
+      return true
+    }
+    let slot = numberSlot(name)
+    if slot < 14 {
+      let e = self.atMut(element)
+      let bit: u32 = u32.shiftLeft(1, usize.toU32(slot))
+      if present {
+        if let Option<f64>.Some { value: number } = length(text) {
+          e.numbers[slot] = number
+          e.written = e.written | bit
+        } else {
+          e.written = e.written & ~bit
+        }
+      } else {
+        e.written = e.written & ~bit
+      }
+      if element == 0 && (slot == N_WIDTH || slot == N_HEIGHT) {
+        self.width = self.at(0).number(N_WIDTH, 0.0)
+        self.height = self.at(0).number(N_HEIGHT, 0.0)
+      }
+      if isShape(self.at(element).tag) {
+        run self.reshape(element)
+      }
+      return true
+    }
+    let e = self.atMut(element)
+    let before = strokeShape(&e.attributes)
+    if present {
+      run property(&mut e.attributes, name, text)
+    } else {
+      clearProperty(&mut e.attributes, name)
+    }
+    if strokeShape(&e.attributes) != before {
+      e.generation = e.generation + 1
+    }
+    // Keep generic attributes (such as `data-*`) for page CSS selector matching.
+    let mut foundAttr = false
+    let mut ai: usize = 0
+    while ai < e.attrs.length() {
+      if e.attrs.asSlice()[ai].name.asSlice() == name {
+        foundAttr = true
+        if present {
+          let copy = run Bytes.copy(text)
+          let attrSlice = e.attrs.asMutSlice()
+          attrSlice[ai].value = move copy
+        } else {
+          drop e.attrs.remove(ai)
+        }
+        break
+      }
+      ai = ai + 1
+    }
+    if !foundAttr && present {
+      run e.attrs.append(Attr { name: run Bytes.copy(name), value: run Bytes.copy(text) })
+    }
+    self.styleDirty = true
+    return true
+  }
+
+  /// Replaces the page CSS stylesheet properties of `element` with `next` and `cssTransform`.
+  /// Returns true when the element's rendered state changed.
+  pub fn setSheetResult(self: &mut Self, element: u32, next: Props, cssTransform: Option<Affine>) -> bool {
+    if !self.has(element) {
+      return false
+    }
+    let e = self.atMut(element)
+    let beforeShape = strokeShape(&e.sheetStyles)
+    let afterShape = strokeShape(&next)
+    let changed = e.sheetStyles.set != next.set || beforeShape != afterShape
+      || e.sheetStyles.fillOpacity != next.fillOpacity
+      || e.sheetStyles.strokeOpacity != next.strokeOpacity
+      || e.sheetStyles.opacity != next.opacity
+      || e.sheetStyles.evenOdd != next.evenOdd
+      || e.sheetStyles.hidden != next.hidden
+      || e.sheetStyles.invisible != next.invisible
+      || e.sheetStyles.clip != next.clip
+      || e.sheetStyles.pointer != next.pointer
+      || !samePaint(e.sheetStyles.fill, next.fill)
+      || !samePaint(e.sheetStyles.stroke, next.stroke)
+      || !sameRgba(e.sheetStyles.color, next.color)
+      || !sameOptionalAffine(e.sheetTransform, cssTransform)
+    e.sheetStyles = move next
+    e.sheetTransform = cssTransform
+    if beforeShape != afterShape {
+      e.generation = e.generation + 1
+    }
+    return changed
+  }
+
+  /// Applies one CSS property (`name: text`) to `props` using the live svg parser.
+  pub effect fn applyCssProperty(props: &mut Props, name: &[u8], text: &[u8]) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run property(&mut props.*, name, text)
+  }
+
+  /// Sets a resolved sRGB color property (`fill`, `stroke`, `color`, `stop-color`) on `props`.
+  pub fn applyCssColor(props: &mut Props, name: &[u8], color: Rgba<f32>) -> () {
+    if name == b"fill" {
+      props.fill = Paint.Color { color: color }
+      props.set = props.set | P_FILL
+    } else if name == b"stroke" {
+      props.stroke = Paint.Color { color: color }
+      props.set = props.set | P_STROKE
+    } else if name == b"color" {
+      props.color = color
+      props.set = props.set | P_COLOR
+    } else if name == b"stop-color" {
+      props.stopColor = Paint.Color { color: color }
+      props.set = props.set | P_STOP_COLOR
+    }
+  }
+
+  /// Builds the element's path from its geometry again.
+  effect fn reshape(self: &mut Self, element: u32) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let shape = run geometryOf(self.at(element))
+    let path = match &shape {
+      Option<ShapePath>.Some { value } => run Effect.catchAll(converted(&value), noPath)
+      _ => Option<VectorPath>.None
+    }
+    let e = self.atMut(element)
+    e.generation = e.generation + 1
+    e.shape = move shape
+    e.path = move path
+  }
+
+  /// The element whose `id` hashes to `ref`, or NO_ELEMENT.
+  pub fn find(self: &Self, ref: u64) -> u32 {
+    if ref == 0 {
+      return NO_ELEMENT
+    }
+    let elements = self.elements.asSlice()
+    let mut i: usize = 0
+    while i < elements.length {
+      if elements[i].used && elements[i].id == ref {
+        return usize.toU32(i)
+      }
+      i = i + 1
+    }
+    return NO_ELEMENT
+  }
+}
+
+effect fn noPath<E>(error: E) -> Option<VectorPath> {
+  drop error
+  return Option<VectorPath>.None
+}
+
+effect fn converted(shape: &ShapePath) -> Option<VectorPath>
+  ! RenderError | OutOfMemoryError
+  ? &mut Allocator {
+  return Option<VectorPath>.some(run vector_path.convert(shape))
+}
+
+/// The element's shape in user space, or none for no shape (a rect without size, a group).
+effect fn geometryOf(e: &Element) -> Option<ShapePath>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if e.tag == Tag.Path {
+    let parsed = run shapes.parsePath(e.data.asSlice())
+    return if parsed.path.isEmpty() { Option<ShapePath>.None } else { Option<ShapePath>.some(move parsed.path) }
+  }
+  if e.tag == Tag.Polyline || e.tag == Tag.Polygon {
+    let path = run shapes.points(e.data.asSlice(), e.tag == Tag.Polygon)
+    return if path.isEmpty() { Option<ShapePath>.None } else { Option<ShapePath>.some(move path) }
+  }
+  if e.tag == Tag.Rect {
+    let width = e.number(N_WIDTH, 0.0)
+    let height = e.number(N_HEIGHT, 0.0)
+    if !(width > 0.0 && height > 0.0) {
+      return Option<ShapePath>.None
+    }
+    // An absent rx or ry takes the other's value (SVG 2 auto).
+    let rxWritten = e.written & u32.shiftLeft(1, usize.toU32(N_RX)) != 0
+    let ryWritten = e.written & u32.shiftLeft(1, usize.toU32(N_RY)) != 0
+    let mut rx = if rxWritten { e.numbers[N_RX] } else if ryWritten { e.numbers[N_RY] } else { 0.0 }
+    let mut ry = if ryWritten { e.numbers[N_RY] } else { rx }
+    rx = f64.max(0.0, f64.min(rx, width / 2.0))
+    ry = f64.max(0.0, f64.min(ry, height / 2.0))
+    return Option<ShapePath>.some(run shapes.rectangle(e.number(N_X, 0.0), e.number(N_Y, 0.0), width, height, rx, ry))
+  }
+  if e.tag == Tag.Circle {
+    let r = e.number(N_R, 0.0)
+    if !(r > 0.0) {
+      return Option<ShapePath>.None
+    }
+    return Option<ShapePath>.some(run shapes.ellipse(e.number(N_CX, 0.0), e.number(N_CY, 0.0), r, r))
+  }
+  if e.tag == Tag.Ellipse {
+    let rx = e.number(N_RX, 0.0)
+    let ry = e.number(N_RY, 0.0)
+    if !(rx > 0.0 && ry > 0.0) {
+      return Option<ShapePath>.None
+    }
+    return Option<ShapePath>.some(run shapes.ellipse(e.number(N_CX, 0.0), e.number(N_CY, 0.0), rx, ry))
+  }
+  if e.tag == Tag.Line {
+    let mut path = ShapePath.make()
+    let data = run lineData(e.number(N_X1, 0.0), e.number(N_Y1, 0.0), e.number(N_X2, 0.0), e.number(N_Y2, 0.0))
+    let parsed = run shapes.parsePath(data.asSlice())
+    path = move parsed.path
+    return if path.isEmpty() { Option<ShapePath>.None } else { Option<ShapePath>.some(move path) }
+  }
+  return Option<ShapePath>.None
+}
+
+effect fn lineData(x1: f64, y1: f64, x2: f64, y2: f64) -> List<u8>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut data = List<u8>.make()
+  run data.append(77)
+  run appendNumber(&mut data, x1)
+  run data.append(32)
+  run appendNumber(&mut data, y1)
+  run data.append(76)
+  run appendNumber(&mut data, x2)
+  run data.append(32)
+  run appendNumber(&mut data, y2)
+  return move data
+}
+
+/// Writes `value` in a form the path parser reads back exactly enough for a line: nine
+/// fraction digits.
+effect fn appendNumber(data: &mut List<u8>, value: f64) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut v = value
+  if !f64.isFinite(v) {
+    v = 0.0
+  }
+  if v < 0.0 {
+    run data.append(45)
+    v = -v
+  }
+  let whole = f64.floor(v)
+  let mut fraction = f64.floor((v - whole) * 1000000000.0 + 0.5)
+  let mut integer = f64.toU64(whole)
+  if fraction >= 1000000000.0 {
+    fraction = 0.0
+    integer = integer + 1
+  }
+  let mut digits: [u8; 24] = [0; 24]
+  let mut count: usize = 0
+  if integer == 0 {
+    digits[0] = 48
+    count = 1
+  }
+  while integer > 0 && count < 24 {
+    digits[count] = u64.toU8(integer % 10) + 48
+    integer = integer / 10
+    count = count + 1
+  }
+  while count > 0 {
+    count = count - 1
+    run data.append(digits[count])
+  }
+  run data.append(46)
+  let mut f = f64.toU64(fraction)
+  let mut place: u64 = 100000000
+  while place > 0 {
+    run data.append(u64.toU8(f / place) + 48)
+    f = f % place
+    place = place / 10
+  }
+}
+
+fn numberSlot(name: &[u8]) -> usize {
+  return if name == b"x" {
+    N_X
+  } else if name == b"y" {
+    N_Y
+  } else if name == b"width" {
+    N_WIDTH
+  } else if name == b"height" {
+    N_HEIGHT
+  } else if name == b"rx" {
+    N_RX
+  } else if name == b"ry" {
+    N_RY
+  } else if name == b"cx" {
+    N_CX
+  } else if name == b"cy" {
+    N_CY
+  } else if name == b"r" {
+    N_R
+  } else if name == b"x1" {
+    N_X1
+  } else if name == b"y1" {
+    N_Y1
+  } else if name == b"x2" {
+    N_X2
+  } else if name == b"y2" {
+    N_Y2
+  } else if name == b"offset" {
+    N_OFFSET
+  } else {
+    14
+  }
+}
+
+/// A length or number in user units: a plain number or one in `px`. A percentage is kept as
+/// a fraction for gradient coordinates and stop offsets (`50%` is 0.5).
+fn length(text: &[u8]) -> Option<f64> {
+  let trimmed = trim(text)
+  if trimmed.length > 2 && trimmed[trimmed.length - 2] == 112 && trimmed[trimmed.length - 1] == 120 {
+    return shapes.number(cut(trimmed, 0, trimmed.length - 2))
+  }
+  if trimmed.length > 1 && trimmed[trimmed.length - 1] == 37 {
+    return match shapes.number(cut(trimmed, 0, trimmed.length - 1)) {
+      Option<f64>.Some { value } => Option<f64>.some(value / 100.0)
+      _ => Option<f64>.None
+    }
+  }
+  return shapes.number(trimmed)
+}
+
+fn cut(data: &[u8], start: usize, end: usize) -> &[u8] {
+  return Slice.view<u8>(data, start, end - start)
+}
+
+fn space(byte: u8) -> bool {
+  return byte == 32 || byte == 9 || byte == 10 || byte == 13 || byte == 12
+}
+
+fn trim(text: &[u8]) -> &[u8] {
+  let mut start: usize = 0
+  let mut end = text.length
+  while start < end && space(text[start]) {
+    start = start + 1
+  }
+  while end > start && space(text[end - 1]) {
+    end = end - 1
+  }
+  return cut(text, start, end)
+}
+
+fn lower(byte: u8) -> u8 {
+  return if byte >= 65 && byte <= 90 { byte + 32 } else { byte }
+}
+
+fn same(text: &[u8], keyword: &[u8]) -> bool {
+  if text.length != keyword.length {
+    return false
+  }
+  let mut i: usize = 0
+  while i < text.length {
+    if lower(text[i]) != keyword[i] {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+/// What a stroke's coverage depends on, so a change to it bumps the generation.
+fn strokeShape(props: &Props) -> u64 {
+  let mut h = Hash.mix(&Hash.seed(0x7374726b), u32.toU64(props.set & (P_STROKE_WIDTH | P_CAP | P_JOIN | P_MITER | P_DASHES | P_DASH_OFFSET)))
+  h = Hash.combine(h, u32.toU64(f32.toBits(props.strokeWidth)))
+  h = Hash.combine(h, u8.toU64(props.cap) * 16 + u8.toU64(props.join))
+  h = Hash.combine(h, u32.toU64(f32.toBits(props.miter)))
+  h = Hash.combine(h, u32.toU64(f32.toBits(props.dashOffset)))
+  let dashes = props.dashes.asSlice()
+  let mut i: usize = 0
+  while i < dashes.length {
+    h = Hash.combine(h, f64.toBits(dashes[i]))
+    i = i + 1
+  }
+  return h
+}
+
+/// Applies the declarations of a `style` attribute that name SVG properties.
+effect fn declarations(props: &mut Props, text: &[u8]) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut start: usize = 0
+  while start < text.length {
+    let mut end = start
+    while end < text.length && text[end] != 59 {
+      end = end + 1
+    }
+    let declaration = cut(text, start, end)
+    let mut colon: usize = 0
+    while colon < declaration.length && declaration[colon] != 58 {
+      colon = colon + 1
+    }
+    if colon < declaration.length {
+      let name = trim(cut(declaration, 0, colon))
+      let mut value = trim(cut(declaration, colon + 1, declaration.length))
+      // `!important` makes no difference between a style attribute and attributes.
+      if value.length > 10 && same(trim(cut(value, value.length - 10, value.length)), b"!important") {
+        value = trim(cut(value, 0, value.length - 10))
+      }
+      run property(&mut props.*, name, value)
+    }
+    start = end + 1
+  }
+}
+
+/// Sets the SVG property `name` of `props` from `text`. Unknown names and invalid values do
+/// nothing.
+effect fn property(props: &mut Props, name: &[u8], text: &[u8]) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let value = trim(text)
+  if name == b"fill" {
+    if let Option<Paint>.Some { value: paint } = run paintOf(value) {
+      props.fill = paint
+      props.set = props.set | P_FILL
+    }
+  } else if name == b"stroke" {
+    if let Option<Paint>.Some { value: paint } = run paintOf(value) {
+      props.stroke = paint
+      props.set = props.set | P_STROKE
+    }
+  } else if name == b"fill-opacity" {
+    if let Option<f64>.Some { value: number } = length(value) {
+      props.fillOpacity = unit(number)
+      props.set = props.set | P_FILL_OPACITY
+    }
+  } else if name == b"stroke-opacity" {
+    if let Option<f64>.Some { value: number } = length(value) {
+      props.strokeOpacity = unit(number)
+      props.set = props.set | P_STROKE_OPACITY
+    }
+  } else if name == b"opacity" {
+    if let Option<f64>.Some { value: number } = length(value) {
+      props.opacity = unit(number)
+      props.set = props.set | P_OPACITY
+    }
+  } else if name == b"stop-opacity" {
+    if let Option<f64>.Some { value: number } = length(value) {
+      props.stopOpacity = unit(number)
+      props.set = props.set | P_STOP_OPACITY
+    }
+  } else if name == b"stroke-width" {
+    if let Option<f64>.Some { value: number } = length(value) {
+      if number >= 0.0 {
+        props.strokeWidth = f64.toF32(number)
+        props.set = props.set | P_STROKE_WIDTH
+      }
+    }
+  } else if name == b"stroke-miterlimit" {
+    if let Option<f64>.Some { value: number } = length(value) {
+      if number >= 1.0 {
+        props.miter = f64.toF32(number)
+        props.set = props.set | P_MITER
+      }
+    }
+  } else if name == b"stroke-dashoffset" {
+    if let Option<f64>.Some { value: number } = length(value) {
+      props.dashOffset = f64.toF32(number)
+      props.set = props.set | P_DASH_OFFSET
+    }
+  } else if name == b"stroke-linecap" {
+    let cap = if same(value, b"round") { CAP_ROUND } else if same(value, b"square") { CAP_SQUARE } else if same(value, b"butt") { CAP_BUTT } else { 255 }
+    if cap != 255 {
+      props.cap = cap
+      props.set = props.set | P_CAP
+    }
+  } else if name == b"stroke-linejoin" {
+    let join = if same(value, b"round") { JOIN_ROUND } else if same(value, b"bevel") { JOIN_BEVEL } else if same(value, b"miter") { JOIN_MITER } else { 255 }
+    if join != 255 {
+      props.join = join
+      props.set = props.set | P_JOIN
+    }
+  } else if name == b"stroke-dasharray" {
+    props.dashes.clear()
+    if !same(value, b"none") {
+      run dashList(&mut props.dashes, value)
+    }
+    props.set = props.set | P_DASHES
+  } else if name == b"fill-rule" {
+    props.evenOdd = same(value, b"evenodd")
+    props.set = props.set | P_FILL_RULE
+  } else if name == b"display" {
+    props.hidden = same(value, b"none")
+    props.set = props.set | P_DISPLAY
+  } else if name == b"visibility" {
+    props.invisible = same(value, b"hidden") || same(value, b"collapse")
+    props.set = props.set | P_VISIBILITY
+  } else if name == b"color" {
+    if let Option<Paint>.Some { value: paint } = run paintOf(value) {
+      if let Paint.Color { color } = paint {
+        props.color = color
+        props.set = props.set | P_COLOR
+      }
+    }
+  } else if name == b"stop-color" {
+    if let Option<Paint>.Some { value: paint } = run paintOf(value) {
+      props.stopColor = paint
+      props.set = props.set | P_STOP_COLOR
+    }
+  } else if name == b"clip-path" {
+    props.clip = urlRef(value)
+    props.set = props.set | P_CLIP
+  } else if name == b"pointer-events" {
+    let flags: u8 = if same(value, b"none") {
+      0
+    } else if same(value, b"visiblepainted") || same(value, b"auto") {
+      HIT_DEFAULT
+    } else if same(value, b"visiblefill") {
+      HIT_FILL | HIT_VISIBLE
+    } else if same(value, b"visiblestroke") {
+      HIT_STROKE | HIT_VISIBLE
+    } else if same(value, b"visible") {
+      HIT_FILL | HIT_STROKE | HIT_VISIBLE
+    } else if same(value, b"painted") {
+      HIT_FILL | HIT_STROKE | HIT_PAINTED
+    } else if same(value, b"fill") {
+      HIT_FILL
+    } else if same(value, b"stroke") {
+      HIT_STROKE
+    } else if same(value, b"all") {
+      HIT_FILL | HIT_STROKE
+    } else {
+      255
+    }
+    if flags != 255 {
+      props.pointer = flags
+      props.set = props.set | P_POINTER
+    }
+  }
+}
+
+fn clearProperty(props: &mut Props, name: &[u8]) -> () {
+  let bit = if name == b"fill" {
+    P_FILL
+  } else if name == b"stroke" {
+    P_STROKE
+  } else if name == b"fill-opacity" {
+    P_FILL_OPACITY
+  } else if name == b"stroke-opacity" {
+    P_STROKE_OPACITY
+  } else if name == b"opacity" {
+    P_OPACITY
+  } else if name == b"stop-opacity" {
+    P_STOP_OPACITY
+  } else if name == b"stroke-width" {
+    P_STROKE_WIDTH
+  } else if name == b"stroke-miterlimit" {
+    P_MITER
+  } else if name == b"stroke-dashoffset" {
+    P_DASH_OFFSET
+  } else if name == b"stroke-linecap" {
+    P_CAP
+  } else if name == b"stroke-linejoin" {
+    P_JOIN
+  } else if name == b"stroke-dasharray" {
+    P_DASHES
+  } else if name == b"fill-rule" {
+    P_FILL_RULE
+  } else if name == b"display" {
+    P_DISPLAY
+  } else if name == b"visibility" {
+    P_VISIBILITY
+  } else if name == b"color" {
+    P_COLOR
+  } else if name == b"stop-color" {
+    P_STOP_COLOR
+  } else if name == b"clip-path" {
+    P_CLIP
+  } else if name == b"pointer-events" {
+    P_POINTER
+  } else {
+    0
+  }
+  props.set = props.set & ~bit
+}
+
+fn unit(value: f64) -> f32 {
+  return f64.toF32(f64.max(0.0, f64.min(1.0, value)))
+}
+
+effect fn dashList(dashes: &mut List<f64>, text: &[u8]) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut start: usize = 0
+  while start < text.length {
+    while start < text.length && (space(text[start]) || text[start] == 44) {
+      start = start + 1
+    }
+    let mut end = start
+    while end < text.length && !space(text[end]) && text[end] != 44 {
+      end = end + 1
+    }
+    if end > start {
+      match length(cut(text, start, end)) {
+        Option<f64>.Some { value } => {
+          if value < 0.0 {
+            dashes.clear()
+            return ()
+          }
+          run dashes.append(value)
+        }
+        _ => {
+          dashes.clear()
+          return ()
+        }
+      }
+    }
+    start = end
+  }
+}
+
+/// The id hash of `url(#id)` (quoted or not), or 0.
+fn urlRef(text: &[u8]) -> u64 {
+  let value = trim(text)
+  if value.length < 6 || !same(cut(value, 0, 4), b"url(") {
+    return 0
+  }
+  let mut close: usize = 4
+  while close < value.length && value[close] != 41 {
+    close = close + 1
+  }
+  if close >= value.length {
+    return 0
+  }
+  let mut inner = trim(cut(value, 4, close))
+  if inner.length >= 2 && (inner[0] == 34 || inner[0] == 39) && inner[inner.length - 1] == inner[0] {
+    inner = cut(inner, 1, inner.length - 1)
+  }
+  if inner.length < 2 || inner[0] != 35 {
+    return 0
+  }
+  return idHash(cut(inner, 1, inner.length))
+}
+
+fn hexValue(byte: u8) -> u32 {
+  return if byte >= 48 && byte <= 57 {
+    u8.toU32(byte - 48)
+  } else if byte >= 97 && byte <= 102 {
+    u8.toU32(byte - 87)
+  } else if byte >= 65 && byte <= 70 {
+    u8.toU32(byte - 55)
+  } else {
+    16
+  }
+}
+
+/// `#rgb` and `#rrggbb`, the forms most generated SVG writes, without the CSS tokenizer.
+fn hexColor(text: &[u8]) -> Option<Rgba<f32>> {
+  if text.length != 4 && text.length != 7 {
+    return Option<Rgba<f32>>.None
+  }
+  let mut values: [u32; 6] = [0; 6]
+  let mut i: usize = 1
+  while i < text.length {
+    let v = hexValue(text[i])
+    if v == 16 {
+      return Option<Rgba<f32>>.None
+    }
+    values[i - 1] = v
+    i = i + 1
+  }
+  let channel = if text.length == 4 {
+    [values[0] * 17, values[1] * 17, values[2] * 17]
+  } else {
+    [values[0] * 16 + values[1], values[2] * 16 + values[3], values[4] * 16 + values[5]]
+  }
+  return Option<Rgba<f32>>.some(
+    Rgba<f32> {
+      r: u32.toF32(channel[0]) / 255.0,
+      g: u32.toF32(channel[1]) / 255.0,
+      b: u32.toF32(channel[2]) / 255.0,
+      a: 1.0,
+    },
+  )
+}
+
+/// A paint as SVG writes it: `none`, `currentColor`, a CSS color or `url(#id)` (its fallback
+/// is not kept).
+effect fn paintOf(text: &[u8]) -> Option<Paint>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if text.length == 0 {
+    return Option<Paint>.None
+  }
+  if same(text, b"none") || same(text, b"transparent") {
+    return Option<Paint>.some(if same(text, b"none") { Paint.None } else { Paint.Color { color: Rgba<f32> { r: 0.0, g: 0.0, b: 0.0, a: 0.0 } } })
+  }
+  if same(text, b"currentcolor") {
+    return Option<Paint>.some(Paint.Current)
+  }
+  if text.length > 4 && same(cut(text, 0, 4), b"url(") {
+    let ref = urlRef(text)
+    return if ref == 0 { Option<Paint>.None } else { Option<Paint>.some(Paint.Url { ref: ref }) }
+  }
+  if text[0] == 35 {
+    if let Option<Rgba<f32>>.Some { value } = hexColor(text) {
+      return Option<Paint>.some(Paint.Color { color: value })
+    }
+  }
+  let parsed = run Effect.catch<CssError>(cssColor(text), noColor)
+  return match parsed {
+    Option<Rgba<f32>>.Some { value } => Option<Paint>.some(Paint.Color { color: value })
+    _ => Option<Paint>.None
+  }
+}
+
+effect fn noColor(error: CssError) -> Option<Rgba<f32>> {
+  drop error
+  return Option<Rgba<f32>>.None
+}
+
+effect fn cssColor(text: &[u8]) -> Option<Rgba<f32>>
+  ! CssError | OutOfMemoryError
+  ? &mut Allocator {
+  let buffer = run lexer.tokenize(text, &Limits.make())
+  let input = Input.Contiguous { buffer: &buffer, range: buffer.all() }
+  let mut cursor = Cursor.make(&input)
+  let parsed = run colors.parseProgram(&input, &mut cursor)
+  if !cursor.done(&input) {
+    return Option<Rgba<f32>>.None
+  }
+  return match move parsed {
+    Option<colors.ColorProgram>.Some { value: program } => {
+      let context = ColorContext.make(Color.srgb(0.0, 0.0, 0.0, 1.0), [Color.srgb(0.0, 0.0, 0.0, 1.0); 19])
+      match program.evaluate(&context) {
+        Option<Color>.Some { value } => {
+          let c = colors.toSrgb(value)
+          Option<Rgba<f32>>.some(Rgba<f32> { r: f64.toF32(c.r), g: f64.toF32(c.g), b: f64.toF32(c.b), a: f64.toF32(c.a) })
+        }
+        _ => Option<Rgba<f32>>.None
+      }
+    }
+    _ => Option<Rgba<f32>>.None
+  }
+}
+
+// Paint.
+
+/// The inherited properties in effect while paint walks the elements.
+struct Inherited {
+  fill: Paint,
+  stroke: Paint,
+  fillOpacity: f32,
+  strokeOpacity: f32,
+  strokeWidth: f32,
+  cap: u8,
+  join: u8,
+  miter: f32,
+  dashes: u32,
+  dashOffset: f32,
+  evenOdd: bool,
+  invisible: bool,
+  color: Rgba<f32>,
+  pointer: u8,
+}
+
+impl Copy for Inherited {}
+
+/// Where paint draws: the scene, the path cache and what a frame paints with.
+pub struct Canvas<'c> {
+  pub scene: &'c mut Scene,
+  pub paths: &'c mut PathCache,
+  /// Seeds the path cache ids of this node.
+  pub seed: u64,
+  /// The text color, which `currentColor` paints with.
+  pub color: Rgba<f32>,
+  /// Page CSS on the root, over its presentation attributes.
+  pub root: RootPaint,
+}
+
+/// `fill`, `stroke` and `stroke-width` that page CSS gives the root; None and negative leave
+/// the root's own.
+pub struct RootPaint {
+  pub fill: Option<Paint>,
+  pub stroke: Option<Paint>,
+  pub strokeWidth: f32,
+}
+
+impl Copy for RootPaint {}
+
+/// The transform from the root's user space to device pixels, for content box `box` (in
+/// device pixels) at device pixel ratio `scale`.
+pub fn rootTransform(svg: &LiveSvg, box: Rect<f32>, scale: f32) -> Affine {
+  let root = svg.at(0)
+  let width = f32.toF64(box.xMax - box.xMin)
+  let height = f32.toF64(box.yMax - box.yMin)
+  let place = Affine.new(1.0, 0.0, 0.0, 1.0, f32.toF64(box.xMin), f32.toF64(box.yMin))
+  if let Option<ShapeRect>.Some { value: view } = root.viewBox {
+    if let Option<Affine>.Some { value: fitted } = shapes.viewport(view, width, height, root.aspect.asSlice()) {
+      return place * fitted
+    }
+  }
+  // Without a viewBox, user units are CSS pixels; when the root also gives no pixel width/height
+  // attributes, `scale` maps CSS pixels to device pixels.
+  let s = f32.toF64(scale)
+  let natural = if svg.width > 0.0 { width / svg.width } else { s }
+  let naturalY = if svg.height > 0.0 { height / svg.height } else if svg.width > 0.0 { natural } else { s }
+  return place * Affine.scale(natural, naturalY)
+}
+
+/// Paints `svg` into content box `box` (device pixels), clipped to `mask` (and to `box` when
+/// `clipToViewport` is true, i.e. `overflow` is not `visible`). `scale` maps CSS pixels to device
+/// pixels.
+pub effect fn paint(
+  svg: &LiveSvg,
+  canvas: &mut Canvas<'_>,
+  box: Rect<f32>,
+  scale: f32,
+  clipToViewport: bool,
+  mask: ContentMask,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let root = svg.at(0)
+  let mut inherited = inherit(
+    svg,
+    Inherited {
+      fill: Paint.Color { color: black() },
+      stroke: Paint.None,
+      fillOpacity: 1.0,
+      strokeOpacity: 1.0,
+      strokeWidth: 1.0,
+      cap: CAP_BUTT,
+      join: JOIN_MITER,
+      miter: 4.0,
+      dashes: NO_ELEMENT,
+      dashOffset: 0.0,
+      evenOdd: false,
+      invisible: false,
+      color: canvas.color,
+      pointer: HIT_DEFAULT,
+    },
+    0,
+  )
+  if let Option<Paint>.Some { value } = canvas.root.fill { inherited.fill = value }
+  if let Option<Paint>.Some { value } = canvas.root.stroke { inherited.stroke = value }
+  if canvas.root.strokeWidth >= 0.0 { inherited.strokeWidth = canvas.root.strokeWidth }
+  if hiddenOf(root) {
+    return ()
+  }
+  let clipped = if clipToViewport { mask.intersect(ContentMask.new(box)) } else { mask }
+  let transform = rootTransform(svg, box, scale)
+  run paintGroup(svg, &mut canvas.*, 0, &transform, inherited, clipped, 0)
+}
+
+fn hiddenOf(e: &Element) -> bool {
+  return if e.styles.set & P_DISPLAY != 0 {
+    e.styles.hidden
+  } else if e.sheetStyles.set & P_DISPLAY != 0 {
+    e.sheetStyles.hidden
+  } else if e.attributes.set & P_DISPLAY != 0 {
+    e.attributes.hidden
+  } else {
+    false
+  }
+}
+
+fn opacityOf(e: &Element) -> f32 {
+  return if e.styles.set & P_OPACITY != 0 {
+    e.styles.opacity
+  } else if e.sheetStyles.set & P_OPACITY != 0 {
+    e.sheetStyles.opacity
+  } else if e.attributes.set & P_OPACITY != 0 {
+    e.attributes.opacity
+  } else {
+    1.0
+  }
+}
+
+fn clipOf(e: &Element) -> u64 {
+  return if e.styles.set & P_CLIP != 0 {
+    e.styles.clip
+  } else if e.sheetStyles.set & P_CLIP != 0 {
+    e.sheetStyles.clip
+  } else if e.attributes.set & P_CLIP != 0 {
+    e.attributes.clip
+  } else {
+    0
+  }
+}
+
+/// The props of `e` that set `bit`: inline style over page CSS over presentation attributes.
+fn propsFor(e: &Element, bit: u32) -> Option<&Props> {
+  return if e.styles.set & bit != 0 {
+    Option<&Props>.some(&e.styles)
+  } else if e.sheetStyles.set & bit != 0 {
+    Option<&Props>.some(&e.sheetStyles)
+  } else if e.attributes.set & bit != 0 {
+    Option<&Props>.some(&e.attributes)
+  } else {
+    Option<&Props>.None
+  }
+}
+
+fn elementTransform(e: &Element) -> Affine {
+  return match e.sheetTransform {
+    Option<Affine>.Some { value } => value
+    Option<Affine>.None => e.transform
+  }
+}
+
+fn sameRgba(a: Rgba<f32>, b: Rgba<f32>) -> bool {
+  return a.r == b.r && a.g == b.g && a.b == b.b && a.a == b.a
+}
+
+fn samePaint(a: Paint, b: Paint) -> bool {
+  return match a {
+    Paint.None => match b { Paint.None => true _ => false }
+    Paint.Current => match b { Paint.Current => true _ => false }
+    Paint.Color { color: ca } => match b { Paint.Color { color: cb } => sameRgba(ca, cb) _ => false }
+    Paint.Url { ref: ra } => match b { Paint.Url { ref: rb } => ra == rb _ => false }
+  }
+}
+
+fn sameOptionalAffine(a: Option<Affine>, b: Option<Affine>) -> bool {
+  return match a {
+    Option<Affine>.None => b.isNone()
+    Option<Affine>.Some { value: x } => match b {
+      Option<Affine>.Some { value: y } => x.xx == y.xx && x.yx == y.yx && x.xy == y.xy && x.yy == y.yy && x.dx == y.dx && x.dy == y.dy
+      Option<Affine>.None => false
+    }
+  }
+}
+
+/// `parent` with the inherited properties element `element` sets.
+fn inherit(svg: &LiveSvg, parent: Inherited, element: u32) -> Inherited {
+  let e = svg.at(element)
+  let mut out = parent
+  if let Option<&Props>.Some { value } = propsFor(e, P_COLOR) {
+    out.color = value.color
+  }
+  if let Option<&Props>.Some { value } = propsFor(e, P_FILL) {
+    out.fill = value.fill
+  }
+  if let Option<&Props>.Some { value } = propsFor(e, P_STROKE) {
+    out.stroke = value.stroke
+  }
+  if let Option<&Props>.Some { value } = propsFor(e, P_FILL_OPACITY) {
+    out.fillOpacity = value.fillOpacity
+  }
+  if let Option<&Props>.Some { value } = propsFor(e, P_STROKE_OPACITY) {
+    out.strokeOpacity = value.strokeOpacity
+  }
+  if let Option<&Props>.Some { value } = propsFor(e, P_STROKE_WIDTH) {
+    out.strokeWidth = value.strokeWidth
+  }
+  if let Option<&Props>.Some { value } = propsFor(e, P_CAP) {
+    out.cap = value.cap
+  }
+  if let Option<&Props>.Some { value } = propsFor(e, P_JOIN) {
+    out.join = value.join
+  }
+  if let Option<&Props>.Some { value } = propsFor(e, P_MITER) {
+    out.miter = value.miter
+  }
+  if e.styles.set & P_DASHES != 0 || e.sheetStyles.set & P_DASHES != 0 || e.attributes.set & P_DASHES != 0 {
+    out.dashes = element
+  }
+  if let Option<&Props>.Some { value } = propsFor(e, P_DASH_OFFSET) {
+    out.dashOffset = value.dashOffset
+  }
+  if let Option<&Props>.Some { value } = propsFor(e, P_FILL_RULE) {
+    out.evenOdd = value.evenOdd
+  }
+  if let Option<&Props>.Some { value } = propsFor(e, P_VISIBILITY) {
+    out.invisible = value.invisible
+  }
+  if let Option<&Props>.Some { value } = propsFor(e, P_POINTER) {
+    out.pointer = value.pointer
+  }
+  return out
+}
+
+/// The dash list in effect: that of element `from`, or none.
+fn dashesOf(svg: &LiveSvg, from: u32) -> &[f64] {
+  if from == NO_ELEMENT {
+    return Slice.view<f64>(svg.at(0).styles.dashes.asSlice(), 0, 0)
+  }
+  let e = svg.at(from)
+  return if e.styles.set & P_DASHES != 0 {
+    e.styles.dashes.asSlice()
+  } else if e.sheetStyles.set & P_DASHES != 0 {
+    e.sheetStyles.dashes.asSlice()
+  } else {
+    e.attributes.dashes.asSlice()
+  }
+}
+
+effect fn paintGroup(
+  svg: &LiveSvg,
+  canvas: &mut Canvas<'_>,
+  element: u32,
+  transform: &Affine,
+  inherited: Inherited,
+  mask: ContentMask,
+  depth: u32,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if depth > MAX_DEPTH {
+    return ()
+  }
+  let mut child = svg.at(element).first
+  while child != NO_ELEMENT {
+    run paintElement(svg, &mut canvas.*, child, transform, inherited, mask, depth + 1)
+    child = svg.at(child).next
+  }
+}
+
+fn empty(mask: ContentMask) -> bool {
+  return !(mask.bounds.xMax > mask.bounds.xMin && mask.bounds.yMax > mask.bounds.yMin)
+}
+
+effect fn paintElement(
+  svg: &LiveSvg,
+  canvas: &mut Canvas<'_>,
+  element: u32,
+  parentTransform: &Affine,
+  parentInherited: Inherited,
+  parentMask: ContentMask,
+  depth: u32,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let e = svg.at(element)
+  let tag = e.tag
+  if !(tag == Tag.G || tag == Tag.Svg || isShape(tag)) || hiddenOf(e) {
+    return ()
+  }
+  let opacity = opacityOf(e)
+  if opacity <= 0.0 {
+    return ()
+  }
+  let transform = parentTransform.* * elementTransform(e)
+  let inherited = inherit(svg, parentInherited, element)
+  let mut mask = parentMask
+  let mut layers: u32 = 0
+  let clip = clipOf(e)
+  if clip != 0 {
+    let target = svg.find(clip)
+    if target != NO_ELEMENT && svg.at(target).tag == Tag.ClipPath {
+      match clipRect(svg, target, &transform) {
+        Option<Rect<f32>>.Some { value } => {
+          mask = mask.intersect(ContentMask.new(value))
+        }
+        _ => {
+          drop run canvas.scene.pushIsolatedLayer(mask.bounds, mask, Isolation { opacity: 1.0, blend: 0 })
+          drop run canvas.scene.pushMaskLayer()
+          run paintClip(svg, &mut canvas.*, target, &transform, mask)
+          run canvas.scene.popLayer()
+          layers = layers + 1
+        }
+      }
+    }
+  }
+  if empty(mask) {
+    run closeLayers(&mut canvas.*, layers)
+    return ()
+  }
+  // Opacity on a lone shape folds into its paint unless it has both a fill and a stroke,
+  // which must composite as one group.
+  let shape = isShape(tag)
+  let fold = shape && opacity < 1.0 && !(painted(inherited.fill) && painted(inherited.stroke))
+  if opacity < 1.0 && !fold {
+    drop run canvas.scene.pushIsolatedLayer(mask.bounds, mask, Isolation { opacity: opacity, blend: 0 })
+    layers = layers + 1
+  }
+  if shape {
+    if !inherited.invisible {
+      run paintShape(svg, &mut canvas.*, element, &transform, inherited, mask, if fold { opacity } else { 1.0 })
+    }
+  } else {
+    run paintGroup(svg, &mut canvas.*, element, &transform, inherited, mask, depth)
+  }
+  run closeLayers(&mut canvas.*, layers)
+}
+
+effect fn closeLayers(canvas: &mut Canvas<'_>, count: u32) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut i: u32 = 0
+  while i < count {
+    run canvas.scene.popLayer()
+    i = i + 1
+  }
+}
+
+fn painted(paint: Paint) -> bool {
+  return match paint {
+    Paint.None => false
+    _ => true
+  }
+}
+
+/// The device rectangle of a clip path that is one axis-aligned rect, or none.
+fn clipRect(svg: &LiveSvg, clip: u32, transform: &Affine) -> Option<Rect<f32>> {
+  let c = svg.at(clip)
+  let only = c.first
+  if only == NO_ELEMENT || svg.at(only).next != NO_ELEMENT {
+    return Option<Rect<f32>>.None
+  }
+  let r = svg.at(only)
+  if r.tag != Tag.Rect || hiddenOf(r) || r.number(N_RX, 0.0) != 0.0 || r.number(N_RY, 0.0) != 0.0 {
+    return Option<Rect<f32>>.None
+  }
+  let m = transform.* * c.transform * r.transform
+  if m.xy != 0.0 || m.yx != 0.0 {
+    return Option<Rect<f32>>.None
+  }
+  let x = r.number(N_X, 0.0)
+  let y = r.number(N_Y, 0.0)
+  let w = r.number(N_WIDTH, 0.0)
+  let h = r.number(N_HEIGHT, 0.0)
+  let x0 = m.xx * x + m.dx
+  let x1 = m.xx * (x + w) + m.dx
+  let y0 = m.yy * y + m.dy
+  let y1 = m.yy * (y + h) + m.dy
+  return Option<Rect<f32>>.some(
+    Rect<f32>.new(f64.toF32(f64.min(x0, x1)), f64.toF32(f64.min(y0, y1)), f64.toF32(f64.max(x0, x1)), f64.toF32(f64.max(y0, y1))),
+  )
+}
+
+/// Fills the shapes of clip path `clip` opaque, into the mask layer open.
+effect fn paintClip(svg: &LiveSvg, canvas: &mut Canvas<'_>, clip: u32, transform: &Affine, mask: ContentMask) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let c = svg.at(clip)
+  let base = transform.* * c.transform
+  let white = Background.solid(Rgba<f32> { r: 1.0, g: 1.0, b: 1.0, a: 1.0 })
+  let mut child = c.first
+  while child != NO_ELEMENT {
+    let e = svg.at(child)
+    if isShape(e.tag) && !hiddenOf(e) {
+      if let Option<VectorPath>.Some { value: path } = &e.path {
+        let m = base * e.transform
+        let rule = if e.attributes.evenOdd || e.styles.evenOdd { EVENODD } else { NONZERO }
+        drop run Effect.catchAll(
+          canvas.paths.fill(&mut canvas.scene, pathId(canvas.seed, child, e.generation, 3), &path, &m, rule, white, mask),
+          noDraw,
+        )
+      }
+    }
+    child = e.next
+  }
+}
+
+effect fn noDraw<E>(error: E) -> u32 {
+  drop error
+  return 0
+}
+
+fn pathId(seed: u64, element: u32, generation: u64, part: u64) -> u64 {
+  let mut h = Hash.combine(seed, u32.toU64(element))
+  h = Hash.combine(h, generation)
+  h = Hash.combine(h, part)
+  return if h == 0 { 1 } else { h }
+}
+
+effect fn paintShape(
+  svg: &LiveSvg,
+  canvas: &mut Canvas<'_>,
+  element: u32,
+  transform: &Affine,
+  inherited: Inherited,
+  mask: ContentMask,
+  opacity: f32,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let e = svg.at(element)
+  let path = match &e.path {
+    Option<VectorPath>.Some { value } => &value
+    _ => {
+      return ()
+    }
+  }
+  if painted(inherited.fill) {
+    let rule = if inherited.evenOdd { EVENODD } else { NONZERO }
+    if let Option<Background>.Some { value: paint } = run paintFor(svg, &mut canvas.*, element, inherited.fill, inherited.fillOpacity * opacity, transform, inherited, 0.0) {
+      drop run Effect.catchAll(
+        canvas.paths.fill(&mut canvas.scene, pathId(canvas.seed, element, e.generation, if inherited.evenOdd { 2 } else { 1 }), path, transform, rule, paint, mask),
+        noDraw,
+      )
+    }
+  }
+  if painted(inherited.stroke) && inherited.strokeWidth > 0.0 {
+    if let Option<Background>.Some { value: paint } = run paintFor(svg, &mut canvas.*, element, inherited.stroke, inherited.strokeOpacity * opacity, transform, inherited, f32.toF64(inherited.strokeWidth) / 2.0) {
+      let mut stroke = Stroke.make(f32.toF64(inherited.strokeWidth))
+      stroke.cap = inherited.cap
+      stroke.join = inherited.join
+      stroke.miterLimit = f32.toF64(inherited.miter)
+      stroke.dashOffset = f32.toF64(inherited.dashOffset)
+      let dashes = dashesOf(svg, inherited.dashes)
+      if dashes.length != 0 {
+        run stroke.setDashes(dashes)
+      }
+      // Inherited stroke properties change coverage too, so they are part of the id.
+      let id = Hash.combine(pathId(canvas.seed, element, e.generation, 4), strokeOf(&stroke))
+      drop run Effect.catchAll(
+        canvas.paths.stroke(&mut canvas.scene, id, path, &stroke, transform, paint, mask),
+        noDraw,
+      )
+    }
+  }
+}
+
+fn strokeOf(stroke: &Stroke) -> u64 {
+  let mut h = Hash.mix(&Hash.seed(0x6964), f64.toBits(stroke.width))
+  h = Hash.combine(h, u8.toU64(stroke.cap) * 16 + u8.toU64(stroke.join))
+  h = Hash.combine(h, f64.toBits(stroke.miterLimit))
+  h = Hash.combine(h, f64.toBits(stroke.dashOffset))
+  let dashes = stroke.dashArray()
+  let mut i: usize = 0
+  while i < dashes.length {
+    h = Hash.combine(h, f64.toBits(dashes[i]))
+    i = i + 1
+  }
+  return h
+}
+
+/// SVG paint servers mix stops with straight alpha, the scene's gradients premultiplied: between
+/// two stops whose alphas differ, samples of the straight mix make the two agree.
+effect fn straightAlpha(stops: &[ColorStop]) -> List<ColorStop> ! OutOfMemoryError ? &mut Allocator {
+  let mut out = List<ColorStop>.make()
+  let mut i: usize = 0
+  while i < stops.length {
+    let s = stops[i]
+    if i > 0 {
+      let p = stops[i - 1]
+      if p.color.a != s.color.a && s.offset > p.offset {
+        let mut k: u32 = 1
+        while k < STRAIGHT_SAMPLES {
+          let t = u32.toF32(k) / u32.toF32(STRAIGHT_SAMPLES)
+          let color = Rgba<f32> {
+            r: p.color.r + (s.color.r - p.color.r) * t,
+            g: p.color.g + (s.color.g - p.color.g) * t,
+            b: p.color.b + (s.color.b - p.color.b) * t,
+            a: p.color.a + (s.color.a - p.color.a) * t,
+          }
+          run out.append(ColorStop { color, offset: p.offset + (s.offset - p.offset) * t })
+          k = k + 1
+        }
+      }
+    }
+    run out.append(s)
+    i = i + 1
+  }
+  return move out
+}
+
+const STRAIGHT_SAMPLES: u32 = 8
+
+fn withAlpha(color: Rgba<f32>, alpha: f32) -> Rgba<f32> {
+  return Rgba<f32> { r: color.r, g: color.g, b: color.b, a: color.a * alpha }
+}
+
+/// What `paint` fills with on element `element`, or none when it paints nothing (a missing
+/// gradient, an invalid reference). `grow` widens the shape's box for a stroke.
+effect fn paintFor(
+  svg: &LiveSvg,
+  canvas: &mut Canvas<'_>,
+  element: u32,
+  paint: Paint,
+  alpha: f32,
+  transform: &Affine,
+  inherited: Inherited,
+  grow: f64,
+) -> Option<Background>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  return match paint {
+    Paint.None => Option<Background>.None
+    Paint.Current => Option<Background>.some(Background.solid(withAlpha(inherited.color, alpha)))
+    Paint.Color { color } => Option<Background>.some(Background.solid(withAlpha(color, alpha)))
+    Paint.Url { ref } => run gradientFor(svg, &mut canvas.*, element, svg.find(ref), alpha, transform, inherited, grow)
+  }
+}
+
+/// The element that holds the stops of gradient `gradient`: itself, or the one its `href`
+/// names when it has none.
+fn stopsOwner(svg: &LiveSvg, gradient: u32) -> u32 {
+  let mut current = gradient
+  let mut hops: u32 = 0
+  while current != NO_ELEMENT && hops < 16 {
+    if svg.at(current).first != NO_ELEMENT {
+      return current
+    }
+    current = svg.find(svg.at(current).href)
+    hops = hops + 1
+  }
+  return gradient
+}
+
+effect fn gradientFor(
+  svg: &LiveSvg,
+  canvas: &mut Canvas<'_>,
+  element: u32,
+  gradient: u32,
+  alpha: f32,
+  transform: &Affine,
+  inherited: Inherited,
+  grow: f64,
+) -> Option<Background>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if gradient == NO_ELEMENT {
+    return Option<Background>.None
+  }
+  let g = svg.at(gradient)
+  let linear = g.tag == Tag.LinearGradient
+  if !linear && g.tag != Tag.RadialGradient {
+    return Option<Background>.None
+  }
+  let e = svg.at(element)
+  let shape = match &e.shape {
+    Option<ShapePath>.Some { value } => &value
+    _ => {
+      return Option<Background>.None
+    }
+  }
+  // The device box the scene spans the gradient over: the shape's bounds.
+  let device = match bounds.pathTransformed(shape, transform.*) {
+    BoundsResult.Finite { rect } => rect
+    _ => {
+      return Option<Background>.None
+    }
+  }
+  let scale = f64.sqrt(f64.abs(transform.determinant()))
+  let box = Rect<f64>.new(device.xMin - grow * scale, device.yMin - grow * scale, device.xMax + grow * scale, device.yMax + grow * scale)
+  // Gradient space to device: objectBoundingBox maps the unit square onto the user bounds.
+  let space = if g.userSpace {
+    transform.* * g.gradientTransform
+  } else {
+    let user = match bounds.path(shape) {
+      BoundsResult.Finite { rect } => rect
+      _ => {
+        return Option<Background>.None
+      }
+    }
+    let w = user.xMax - user.xMin
+    let h = user.yMax - user.yMin
+    if !(w > 0.0 && h > 0.0) {
+      return Option<Background>.None
+    }
+    transform.* * Affine.new(w, 0.0, 0.0, h, user.xMin, user.yMin) * g.gradientTransform
+  }
+  // Stops, with offsets made monotonic as SVG requires.
+  let owner = stopsOwner(svg, gradient)
+  let mut stops = List<ColorStop>.make()
+  let mut child = svg.at(owner).first
+  let mut last: f32 = 0.0
+  while child != NO_ELEMENT {
+    let s = svg.at(child)
+    if s.tag == Tag.Stop {
+      let offset = f64.toF32(f64.max(0.0, f64.min(1.0, s.number(N_OFFSET, 0.0))))
+      let at = f32.max(offset, last)
+      last = at
+      let colorPaint = match propsFor(s, P_STOP_COLOR) {
+        Option<&Props>.Some { value } => value.stopColor
+        _ => Paint.Color { color: black() }
+      }
+      let stopOpacity: f32 = match propsFor(s, P_STOP_OPACITY) {
+        Option<&Props>.Some { value } => value.stopOpacity
+        _ => 1.0
+      }
+      let base = match colorPaint {
+        Paint.Color { color } => color
+        Paint.Current => inherited.color
+        _ => black()
+      }
+      run stops.append(ColorStop { color: withAlpha(base, stopOpacity * alpha), offset: at })
+    }
+    child = s.next
+  }
+  if stops.length() == 0 {
+    return Option<Background>.None
+  }
+  stops = run straightAlpha(stops.asSlice())
+  if stops.length() == 1 {
+    return Option<Background>.some(Background.solid(stops.asSlice()[0].color))
+  }
+  let cx = (box.xMin + box.xMax) / 2.0
+  let cy = (box.yMin + box.yMax) / 2.0
+  if linear {
+    let x1 = g.number(N_X1, 0.0)
+    let y1 = g.number(N_Y1, 0.0)
+    let x2 = g.number(N_X2, 1.0)
+    let y2 = g.number(N_Y2, 0.0)
+    let px = space.xx * x1 + space.xy * y1 + space.dx
+    let py = space.yx * x1 + space.yy * y1 + space.dy
+    let qx = space.xx * x2 + space.xy * y2 + space.dx
+    let qy = space.yx * x2 + space.yy * y2 + space.dy
+    let vx = qx - px
+    let vy = qy - py
+    let span = f64.sqrt(vx * vx + vy * vy)
+    if !(span > 0.0) {
+      return Option<Background>.some(Background.solid(stops.asSlice()[stops.length() - 1].color))
+    }
+    let dx = vx / span
+    let dy = vy / span
+    // The CSS line runs through the box center at the angle of (dx, dy) and spans the box:
+    // t_css = ((p - c) . d) / L + 1/2. The SVG one is t = ((p - p1) . d) / span. So
+    // t = a t_css + b with a = L / span, b = ((c - p1) . d - L / 2) / span.
+    let line = f64.abs((box.xMax - box.xMin) * dx) + f64.abs((box.yMax - box.yMin) * dy)
+    if !(line > 0.0) {
+      return Option<Background>.some(Background.solid(stops.asSlice()[0].color))
+    }
+    let a = line / span
+    let b = ((cx - px) * dx + (cy - py) * dy - line / 2.0) / span
+    let moved = stops.asMutSlice()
+    let mut i: usize = 0
+    while i < moved.length {
+      moved[i].offset = f64.toF32((f32.toF64(moved[i].offset) - b) / a)
+      i = i + 1
+    }
+    // CSS angles turn clockwise from up; (dx, dy) points down the screen for positive dy.
+    let angle = f64.atan2(dx, -dy) * 180.0 / 3.141592653589793
+    let range = run canvas.scene.colorStops(stops.asSlice())
+    return Option<Background>.some(
+      Background.Stops {
+        gradient: StopsGradient {
+          shape: GradientShape.Linear,
+          angle: f64.toF32(angle),
+          centerX: 0.0,
+          centerY: 0.0,
+          radiusX: 0.0,
+          radiusY: 0.0,
+          repeating: false,
+          stops: range,
+          interpolation: Interpolation.new(ColorSpace.Srgb),
+        },
+      },
+    )
+  }
+  // Radial: the center and radius in gradient space; the focal point is not drawn apart.
+  let gx = g.number(N_CX, 0.5)
+  let gy = g.number(N_CY, 0.5)
+  let r = g.number(N_R, 0.5)
+  if !(r > 0.0) {
+    return Option<Background>.some(Background.solid(stops.asSlice()[stops.length() - 1].color))
+  }
+  let centerX = space.xx * gx + space.xy * gy + space.dx
+  let centerY = space.yx * gx + space.yy * gy + space.dy
+  let radiusX = r * f64.sqrt(space.xx * space.xx + space.yx * space.yx)
+  let radiusY = r * f64.sqrt(space.xy * space.xy + space.yy * space.yy)
+  let range = run canvas.scene.colorStops(stops.asSlice())
+  return Option<Background>.some(
+    Background.Stops {
+      gradient: StopsGradient {
+        shape: GradientShape.Radial,
+        angle: 0.0,
+        centerX: f64.toF32(centerX - box.xMin),
+        centerY: f64.toF32(centerY - box.yMin),
+        radiusX: f64.toF32(radiusX),
+        radiusY: f64.toF32(radiusY),
+        repeating: false,
+        stops: range,
+        interpolation: Interpolation.new(ColorSpace.Srgb),
+      },
+    },
+  )
+}
+
+// Geometry reads: the element under a point, bounding boxes and path lengths.
+
+pub struct FlatPoint {
+  pub x: f64,
+  pub y: f64,
+}
+
+impl Copy for FlatPoint {}
+
+/// A path as polylines: `starts` indexes each subpath's first point in `points`.
+struct Flat {
+  points: List<FlatPoint>,
+  starts: List<usize>,
+  closed: List<bool>,
+}
+
+const CURVE_STEPS: u32 = 16
+
+impl Flat {
+  fn end(self: &Self, subpath: usize) -> usize {
+    return if subpath + 1 < self.starts.length() { self.starts.get(subpath + 1) } else { self.points.length() }
+  }
+}
+
+effect fn flatten(path: &VectorPath) -> Flat ! OutOfMemoryError ? &mut Allocator {
+  let mut flat = Flat { points: List<FlatPoint>.make(), starts: List<usize>.make(), closed: List<bool>.make() }
+  let verbs = path.verbList()
+  let points = path.pointList()
+  let mut at: usize = 0
+  let mut cx: f64 = 0.0
+  let mut cy: f64 = 0.0
+  let mut i: usize = 0
+  while i < verbs.length {
+    let verb = verbs[i]
+    if verb == vector_path_verbs.MOVE {
+      cx = points[at].x
+      cy = points[at].y
+      at = at + 1
+      run flat.starts.append(flat.points.length())
+      run flat.closed.append(false)
+      run flat.points.append(FlatPoint { x: cx, y: cy })
+    } else if verb == vector_path_verbs.LINE {
+      cx = points[at].x
+      cy = points[at].y
+      at = at + 1
+      run flat.points.append(FlatPoint { x: cx, y: cy })
+    } else if verb == vector_path_verbs.QUAD {
+      let c = points[at]
+      let p = points[at + 1]
+      at = at + 2
+      let mut k: u32 = 1
+      while k <= CURVE_STEPS {
+        let t = u32.toF64(k) / u32.toF64(CURVE_STEPS)
+        let u = 1.0 - t
+        run flat.points.append(FlatPoint {
+          x: u * u * cx + 2.0 * u * t * c.x + t * t * p.x,
+          y: u * u * cy + 2.0 * u * t * c.y + t * t * p.y,
+        })
+        k = k + 1
+      }
+      cx = p.x
+      cy = p.y
+    } else if verb == vector_path_verbs.CUBIC {
+      let c1 = points[at]
+      let c2 = points[at + 1]
+      let p = points[at + 2]
+      at = at + 3
+      let mut k: u32 = 1
+      while k <= CURVE_STEPS {
+        let t = u32.toF64(k) / u32.toF64(CURVE_STEPS)
+        let u = 1.0 - t
+        let a = u * u * u
+        let b = 3.0 * u * u * t
+        let c = 3.0 * u * t * t
+        let d = t * t * t
+        run flat.points.append(FlatPoint {
+          x: a * cx + b * c1.x + c * c2.x + d * p.x,
+          y: a * cy + b * c1.y + c * c2.y + d * p.y,
+        })
+        k = k + 1
+      }
+      cx = p.x
+      cy = p.y
+    } else if verb == vector_path_verbs.ARC {
+      let center = points[at]
+      let ax = points[at + 1]
+      let ay = points[at + 2]
+      let angles = points[at + 3]
+      let p = points[at + 4]
+      at = at + 5
+      let steps = f64.max(4.0, f64.ceil(f64.abs(angles.y) / (3.141592653589793 / 16.0)))
+      let n = f64.toU32(f64.min(steps, 256.0))
+      let mut k: u32 = 1
+      while k < n {
+        let angle = angles.x + angles.y * u32.toF64(k) / u32.toF64(n)
+        let cos = f64.cos(angle)
+        let sin = f64.sin(angle)
+        run flat.points.append(FlatPoint { x: center.x + ax.x * cos + ay.x * sin, y: center.y + ax.y * cos + ay.y * sin })
+        k = k + 1
+      }
+      run flat.points.append(FlatPoint { x: p.x, y: p.y })
+      cx = p.x
+      cy = p.y
+    } else if verb == vector_path_verbs.CLOSE {
+      let last = flat.closed.length()
+      if last > 0 {
+        let slots = flat.closed.asMutSlice()
+        slots[last - 1] = true
+        let first = flat.points.get(flat.starts.get(last - 1))
+        cx = first.x
+        cy = first.y
+      }
+    }
+    i = i + 1
+  }
+  return move flat
+}
+
+/// Whether (`x`, `y`) is inside the fill of `flat`, every subpath closed.
+fn insideFill(flat: &Flat, x: f64, y: f64, evenOdd: bool) -> bool {
+  let points = flat.points.asSlice()
+  let mut winding: i32 = 0
+  let mut crossings: u32 = 0
+  let mut s: usize = 0
+  while s < flat.starts.length() {
+    let start = flat.starts.get(s)
+    let end = flat.end(s)
+    let mut i = start
+    while i < end {
+      let a = points[i]
+      let b = if i + 1 < end { points[i + 1] } else { points[start] }
+      if (a.y <= y && b.y > y) || (a.y > y && b.y <= y) {
+        let cross = (b.x - a.x) * (y - a.y) - (x - a.x) * (b.y - a.y)
+        if a.y <= y {
+          if cross > 0.0 {
+            winding = winding + 1
+            crossings = crossings + 1
+          }
+        } else if cross < 0.0 {
+          winding = winding - 1
+          crossings = crossings + 1
+        }
+      }
+      i = i + 1
+    }
+    s = s + 1
+  }
+  return if evenOdd { crossings % 2 == 1 } else { winding != 0 }
+}
+
+fn segmentDistance(a: FlatPoint, b: FlatPoint, x: f64, y: f64) -> f64 {
+  let dx = b.x - a.x
+  let dy = b.y - a.y
+  let squared = dx * dx + dy * dy
+  let t = if squared > 0.0 { f64.max(0.0, f64.min(1.0, ((x - a.x) * dx + (y - a.y) * dy) / squared)) } else { 0.0 }
+  let px = a.x + t * dx - x
+  let py = a.y + t * dy - y
+  return f64.sqrt(px * px + py * py)
+}
+
+/// Whether (`x`, `y`) is within `half` of the outline of `flat`.
+fn nearStroke(flat: &Flat, x: f64, y: f64, half: f64) -> bool {
+  let points = flat.points.asSlice()
+  let mut s: usize = 0
+  while s < flat.starts.length() {
+    let start = flat.starts.get(s)
+    let end = flat.end(s)
+    let mut i = start
+    while i < end {
+      let last = i + 1 >= end
+      if !last || flat.closed.get(s) {
+        let b = if last { points[start] } else { points[i + 1] }
+        if segmentDistance(points[i], b, x, y) <= half {
+          return true
+        }
+      } else if end - start == 1 && segmentDistance(points[i], points[i], x, y) <= half {
+        return true
+      }
+      i = i + 1
+    }
+    s = s + 1
+  }
+  return false
+}
+
+fn mapPoint(m: &Affine, x: f64, y: f64) -> FlatPoint {
+  return FlatPoint { x: m.xx * x + m.xy * y + m.dx, y: m.yx * x + m.yy * y + m.dy }
+}
+
+/// The element of `svg` drawn topmost at (`x`, `y`), for a content box `box` in the same space,
+/// or 0 when the point is over none. `pointer-events`, `display`, `visibility` and clip paths
+/// decide as they do on the web.
+pub effect fn hit(svg: &LiveSvg, box: Rect<f32>, x: f32, y: f32, color: Rgba<f32>, clipToViewport: bool) -> u32
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let root = svg.at(0)
+  if hiddenOf(root) {
+    return 0
+  }
+  let fx = f32.toF64(x)
+  let fy = f32.toF64(y)
+  if clipToViewport && (fx < f32.toF64(box.xMin) || fx > f32.toF64(box.xMax) || fy < f32.toF64(box.yMin) || fy > f32.toF64(box.yMax)) {
+    return 0
+  }
+  let inherited = inherit(
+    svg,
+    Inherited {
+      fill: Paint.Color { color: black() },
+      stroke: Paint.None,
+      fillOpacity: 1.0,
+      strokeOpacity: 1.0,
+      strokeWidth: 1.0,
+      cap: CAP_BUTT,
+      join: JOIN_MITER,
+      miter: 4.0,
+      dashes: NO_ELEMENT,
+      dashOffset: 0.0,
+      evenOdd: false,
+      invisible: false,
+      color: color,
+      pointer: HIT_DEFAULT,
+    },
+    0,
+  )
+  let transform = rootTransform(svg, box, 1.0)
+  return run hitGroup(svg, 0, &transform, inherited, fx, fy, 0)
+}
+
+effect fn hitGroup(svg: &LiveSvg, element: u32, transform: &Affine, inherited: Inherited, x: f64, y: f64, depth: u32) -> u32
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if depth > MAX_DEPTH {
+    return 0
+  }
+  let mut child = svg.at(element).last
+  while child != NO_ELEMENT {
+    let found = run hitElement(svg, child, transform, inherited, x, y, depth + 1)
+    if found != 0 {
+      return found
+    }
+    child = svg.at(child).previous
+  }
+  return 0
+}
+
+effect fn hitElement(svg: &LiveSvg, element: u32, parentTransform: &Affine, parentInherited: Inherited, x: f64, y: f64, depth: u32) -> u32
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let e = svg.at(element)
+  let tag = e.tag
+  if !(tag == Tag.G || tag == Tag.Svg || isShape(tag)) || hiddenOf(e) {
+    return 0
+  }
+  let transform = parentTransform.* * elementTransform(e)
+  let inherited = inherit(svg, parentInherited, element)
+  let clip = clipOf(e)
+  if clip != 0 {
+    let target = svg.find(clip)
+    if target != NO_ELEMENT && svg.at(target).tag == Tag.ClipPath && !(run insideClip(svg, target, &transform, x, y)) {
+      return 0
+    }
+  }
+  if !isShape(tag) {
+    return run hitGroup(svg, element, &transform, inherited, x, y, depth)
+  }
+  let flags = inherited.pointer
+  if flags == 0 || (flags & HIT_VISIBLE != 0 && inherited.invisible) {
+    return 0
+  }
+  let path = match &e.path {
+    Option<VectorPath>.Some { value } => &value
+    _ => {
+      return 0
+    }
+  }
+  let inverse = match transform.inverse() {
+    Option<Affine>.Some { value } => value
+    _ => {
+      return 0
+    }
+  }
+  let local = mapPoint(&inverse, x, y)
+  let flat = run flatten(path)
+  let needsPaint = flags & HIT_PAINTED != 0
+  if flags & HIT_FILL != 0 && (!needsPaint || painted(inherited.fill)) && insideFill(&flat, local.x, local.y, inherited.evenOdd) {
+    return element
+  }
+  if flags & HIT_STROKE != 0 && (!needsPaint || painted(inherited.stroke)) && inherited.strokeWidth > 0.0 {
+    if nearStroke(&flat, local.x, local.y, f32.toF64(inherited.strokeWidth) / 2.0) {
+      return element
+    }
+  }
+  return 0
+}
+
+/// Whether (`x`, `y`) is inside the union of the shapes of clip path `clip`.
+effect fn insideClip(svg: &LiveSvg, clip: u32, transform: &Affine, x: f64, y: f64) -> bool
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let c = svg.at(clip)
+  let base = transform.* * c.transform
+  let mut child = c.first
+  while child != NO_ELEMENT {
+    let e = svg.at(child)
+    if isShape(e.tag) && !hiddenOf(e) {
+      if let Option<VectorPath>.Some { value: path } = &e.path {
+        if let Option<Affine>.Some { value: inverse } = (base * e.transform).inverse() {
+          let local = mapPoint(&inverse, x, y)
+          let flat = run flatten(&path)
+          if insideFill(&flat, local.x, local.y, e.attributes.evenOdd || e.styles.evenOdd) {
+            return true
+          }
+        }
+      }
+    }
+    child = e.next
+  }
+  return false
+}
+
+/// The bounding box of element `element` in its own user space, as `getBBox()` gives it:
+/// a shape's fill geometry, a group's children under their transforms. `None` when it has
+/// no geometry.
+pub fn boundingBox(svg: &LiveSvg, element: u32) -> Option<ShapeRect> {
+  if !svg.has(element) {
+    return Option<ShapeRect>.None
+  }
+  return boxUnder(svg, element, Affine.identity(), 0)
+}
+
+fn joinBoxes(a: Option<ShapeRect>, b: Option<ShapeRect>) -> Option<ShapeRect> {
+  return match a {
+    Option<ShapeRect>.Some { value: x } => match b {
+      Option<ShapeRect>.Some { value: y } => Option<ShapeRect>.some(ShapeRect {
+        xMin: f64.min(x.xMin, y.xMin),
+        yMin: f64.min(x.yMin, y.yMin),
+        xMax: f64.max(x.xMax, y.xMax),
+        yMax: f64.max(x.yMax, y.yMax),
+      })
+      _ => a
+    }
+    _ => b
+  }
+}
+
+fn boxUnder(svg: &LiveSvg, element: u32, transform: Affine, depth: u32) -> Option<ShapeRect> {
+  if depth > MAX_DEPTH {
+    return Option<ShapeRect>.None
+  }
+  let e = svg.at(element)
+  if isShape(e.tag) {
+    if let Option<ShapePath>.Some { value: shape } = &e.shape {
+      return match bounds.pathTransformed(&shape, transform) {
+        BoundsResult.Finite { rect } => Option<ShapeRect>.some(rect)
+        _ => Option<ShapeRect>.None
+      }
+    }
+    return Option<ShapeRect>.None
+  }
+  if !(e.tag == Tag.G || e.tag == Tag.Svg) {
+    return Option<ShapeRect>.None
+  }
+  let mut out = Option<ShapeRect>.None
+  let mut child = e.first
+  while child != NO_ELEMENT {
+    let c = svg.at(child)
+    if !hiddenOf(c) {
+      out = joinBoxes(out, boxUnder(svg, child, transform * c.transform, depth + 1))
+    }
+    child = c.next
+  }
+  return out
+}
+
+/// The length of shape `element`'s outline in its user units, as `getTotalLength()` gives it.
+pub effect fn totalLength(svg: &LiveSvg, element: u32) -> f64 ! OutOfMemoryError ? &mut Allocator {
+  if !svg.has(element) {
+    return 0.0
+  }
+  let path = match &svg.at(element).path {
+    Option<VectorPath>.Some { value } => &value
+    _ => {
+      return 0.0
+    }
+  }
+  let flat = run flatten(path)
+  let walked = walk(&flat, -1.0)
+  return walked.length
+}
+
+/// The point at `distance` along shape `element`'s outline, as `getPointAtLength()` gives
+/// it: clamped to the ends, (0, 0) for an element with no outline.
+pub effect fn pointAtLength(svg: &LiveSvg, element: u32, distance: f64) -> FlatPoint ! OutOfMemoryError ? &mut Allocator {
+  if !svg.has(element) {
+    return FlatPoint { x: 0.0, y: 0.0 }
+  }
+  let path = match &svg.at(element).path {
+    Option<VectorPath>.Some { value } => &value
+    _ => {
+      return FlatPoint { x: 0.0, y: 0.0 }
+    }
+  }
+  let flat = run flatten(path)
+  let walked = walk(&flat, f64.max(0.0, distance))
+  return walked.point
+}
+
+struct Walked {
+  length: f64,
+  point: FlatPoint,
+}
+
+/// Walks the outline of `flat`: its whole length, and the point `distance` along it (the end
+/// when it is shorter; a negative `distance` never stops).
+fn walk(flat: &Flat, distance: f64) -> Walked {
+  let points = flat.points.asSlice()
+  let mut total: f64 = 0.0
+  let mut last = FlatPoint { x: 0.0, y: 0.0 }
+  if points.length > 0 {
+    last = points[0]
+  }
+  let mut s: usize = 0
+  while s < flat.starts.length() {
+    let start = flat.starts.get(s)
+    let end = flat.end(s)
+    let mut i = start
+    while i < end {
+      let closing = i + 1 >= end
+      if !closing || flat.closed.get(s) {
+        let a = points[i]
+        let b = if closing { points[start] } else { points[i + 1] }
+        let dx = b.x - a.x
+        let dy = b.y - a.y
+        let step = f64.sqrt(dx * dx + dy * dy)
+        if distance >= 0.0 && total + step >= distance {
+          let t = if step > 0.0 { (distance - total) / step } else { 0.0 }
+          return Walked { length: distance, point: FlatPoint { x: a.x + dx * t, y: a.y + dy * t } }
+        }
+        total = total + step
+        last = b
+      }
+      i = i + 1
+    }
+    s = s + 1
+  }
+  return Walked { length: total, point: last }
+}
+
+/// `value` with at most 9 decimals and no trailing zeros.
+effect fn appendShort(data: &mut List<u8>, value: f64) -> () ! OutOfMemoryError ? &mut Allocator {
+  run appendNumber(&mut data.*, value)
+  while data.length() > 0 && data.get(data.length() - 1) == 48 {
+    drop data.pop()
+  }
+  if data.length() > 0 && data.get(data.length() - 1) == 46 {
+    drop data.pop()
+  }
+}
+
+/// What `measure` reads.
+pub const MEASURE_BOX: u32 = 0
+pub const MEASURE_LENGTH: u32 = 1
+pub const MEASURE_POINT: u32 = 2
+
+fn fieldEnd(bytes: &[u8], from: usize, separator: u8) -> usize {
+  let mut i = from
+  while i < bytes.length && bytes[i] != separator && bytes[i] != 30 {
+    i = i + 1
+  }
+  return i
+}
+
+fn decimal(text: &[u8]) -> u32 {
+  let mut value: u32 = 0
+  let mut i: usize = 0
+  while i < text.length && text[i] >= 48 && text[i] <= 57 && value < 100000000 {
+    value = value * 10 + u8.toU32(text[i] - 48)
+    i = i + 1
+  }
+  return value
+}
+
+/// Measures an element from its markup alone, for `getBBox()`, `getTotalLength()` and
+/// `getPointAtLength()` before the tree has seen it. `packed` holds the element and what is
+/// inside it as records split by U+001E, each `parent` U+001F `tag` then `name` U+001F `value`
+/// pairs; record 1 is the element (its parent 0), later records name earlier ones as their
+/// parent. Writes the box as `x y width height`, the length, or the point as `x y` to `out`.
+pub effect fn measure(packed: &[u8], op: u32, distance: f64, out: &mut List<u8>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut svg = run LiveSvg.make()
+  let mut record: u32 = 0
+  let mut at: usize = 0
+  while at < packed.length {
+    record = record + 1
+    let parentEnd = fieldEnd(packed, at, 31)
+    let parent = decimal(cut(packed, at, parentEnd))
+    let mut i = parentEnd + 1
+    if parentEnd >= packed.length || packed[parentEnd] == 30 {
+      i = parentEnd
+    }
+    let tagEnd = fieldEnd(packed, i, 31)
+    drop run svg.insert(record, cut(packed, i, tagEnd), if parent < record { parent } else { 0 }, NO_ELEMENT)
+    i = tagEnd
+    while i < packed.length && packed[i] == 31 {
+      let nameEnd = fieldEnd(packed, i + 1, 31)
+      let name = cut(packed, i + 1, nameEnd)
+      if nameEnd >= packed.length || packed[nameEnd] == 30 {
+        i = nameEnd
+        break
+      }
+      let valueEnd = fieldEnd(packed, nameEnd + 1, 31)
+      drop run svg.set(record, name, cut(packed, nameEnd + 1, valueEnd), true)
+      i = valueEnd
+    }
+    at = i + 1
+  }
+  if op == MEASURE_BOX {
+    let rect = match boundingBox(&svg, 1) {
+      Option<ShapeRect>.Some { value } => value
+      _ => ShapeRect { xMin: 0.0, yMin: 0.0, xMax: 0.0, yMax: 0.0 }
+    }
+    run appendShort(&mut out.*, rect.xMin)
+    run out.append(32)
+    run appendShort(&mut out.*, rect.yMin)
+    run out.append(32)
+    run appendShort(&mut out.*, rect.xMax - rect.xMin)
+    run out.append(32)
+    run appendShort(&mut out.*, rect.yMax - rect.yMin)
+  } else if op == MEASURE_LENGTH {
+    run appendShort(&mut out.*, run totalLength(&svg, 1))
+  } else {
+    let point = run pointAtLength(&svg, 1, distance)
+    run appendShort(&mut out.*, point.x)
+    run out.append(32)
+    run appendShort(&mut out.*, point.y)
+  }
+}

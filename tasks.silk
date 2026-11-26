@@ -1,0 +1,426 @@
+import silk.cli.command { Command, CommandLine, Opt }
+import silk.cli.task { Task, TaskError, TaskSet }
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.io.writer { WriterError }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.mem.box { Box }
+import silk.num.usize
+import silk.system.child_process { ChildProcess, ProcessError }
+import silk.system.filesystem { FileError, FileSystem, Path }
+import silk.system.host_input { HostInput, HostInputError }
+import silk.text.string { InvalidUtf8, Split, String }
+import silk.toml.scanner { TomlError }
+import silk.toml.value { Toml, TomlChild, Value as TomlValue }
+
+union Tasks {
+  Check,
+  Format { pub check: bool },
+  CiPlan { pub base: String, pub githubOutput: String },
+}
+
+impl CommandLine for Tasks {
+  static fn command() -> Command<Tasks> {
+    return Command<Tasks>.make("modules", "Monorepo orchestration tasks for silk-lang/modules")
+      |> Command.variant("Check", "Check all default workspace packages")
+      |> Command.variant("Format", "Format (or check formatting of) the workspace")
+      |> Command.variant(
+        "CiPlan",
+        "Compute affected CI jobs from git diff and the silk.toml dependency graph",
+      )
+      |> Command.option("check", Opt.about("Check formatting without writing files"))
+      |> Command.option(
+        "base",
+        Opt.about("Base git revision to diff against (empty runs all jobs)"),
+      )
+      |> Command.option(
+        "githubOutput",
+        Opt.about("File to append GitHub Actions key=value outputs to"),
+      )
+  }
+}
+
+struct MemberNode {
+  dir: String,
+  revDeps: List<usize>,
+}
+
+struct JobFlags {
+  core: bool,
+  gpu: bool,
+  browser: bool,
+  macos: bool,
+  windows: bool,
+  silkjs: bool,
+  ghostty: bool,
+  silkUiJs: bool,
+  docs: bool,
+}
+
+fn allJobs(enabled: bool) -> JobFlags {
+  return JobFlags {
+    core: enabled,
+    gpu: enabled,
+    browser: enabled,
+    macos: enabled,
+    windows: enabled,
+    silkjs: enabled,
+    ghostty: enabled,
+    silkUiJs: enabled,
+    docs: enabled,
+  }
+}
+
+fn boolWord(value: bool) -> string<'static> {
+  if value {
+    return "true"
+  }
+  return "false"
+}
+
+fn dirPrefixMatches(path: string, dir: string) -> bool {
+  if path == dir {
+    return true
+  }
+  let pBytes = String.utf8Bytes(path)
+  let dBytes = String.utf8Bytes(dir)
+  if pBytes.length <= dBytes.length {
+    return false
+  }
+  if !String.startsWith(path, dir) {
+    return false
+  }
+  return pBytes[dBytes.length] == 47
+}
+
+effect fn normalizeRelPath(baseDir: string, rel: string) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut parts = List<String>.make()
+  let mut baseSplit = String.split(baseDir, "/")
+  while let Option<string>.Some { value } = Split.next(&mut baseSplit) {
+    if value != "" && value != "." {
+      run parts.append(run String.copy(value))
+    }
+  }
+  let mut relSplit = String.split(rel, "/")
+  while let Option<string>.Some { value } = Split.next(&mut relSplit) {
+    if value == "" || value == "." {
+      // skip
+    } else if value == ".." {
+      if parts.length() > usize.ZERO {
+        let last = parts.length() - usize.ONE
+        drop List<String>.remove(&mut parts, last)
+      }
+    } else {
+      run parts.append(run String.copy(value))
+    }
+  }
+  let mut out = String.make()
+  let slice = parts.asSlice()
+  let mut i = usize.ZERO
+  while i < slice.length {
+    if i > usize.ZERO {
+      run String.append(&mut out, "/")
+    }
+    run String.append(&mut out, slice[i].view())
+    i = i + usize.ONE
+  }
+  return move out
+}
+
+effect fn parseTomlFile(path: &Path) -> Option<TomlValue>
+  ! FileError | OutOfMemoryError
+  ? &mut Allocator | &mut FileSystem {
+  if !run FileSystem.exists(path) {
+    return Option<TomlValue>.none()
+  }
+  let bytes = run FileSystem.readFile(path)
+  return match move run Effect.result(Toml.parse(Bytes.asSlice(&bytes))) {
+    Result<TomlValue, TomlError | OutOfMemoryError>.Success { value } => Option<TomlValue>.some(
+      move value,
+    )
+    Result<TomlValue, TomlError | OutOfMemoryError>.Failure { error } => match move error {
+      TomlError _ => Option<TomlValue>.none()
+      OutOfMemoryError exhausted => {
+        fail move exhausted
+      }
+    }
+  }
+}
+
+fn findMemberIndex(nodes: &[MemberNode], dir: string) -> Option<usize> {
+  let mut i = usize.ZERO
+  while i < nodes.length {
+    if nodes[i].dir.view() == dir {
+      return Option<usize>.some(i)
+    }
+    i = i + usize.ONE
+  }
+  return Option<usize>.none()
+}
+
+effect fn collectPathDeps(
+  table: &TomlValue,
+  memberDir: string,
+  memberIdx: usize,
+  nodes: &mut List<MemberNode>,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let children = match &table.* {
+    TomlValue.Table { entries, kind: _ } => List<TomlChild>.asSlice(
+      &Box<List<TomlChild>>.get(&entries)[0],
+    )
+    _ => {
+      return ()
+    }
+  }
+  let mut i = usize.ZERO
+  while i < children.length {
+    if let TomlChild.Member { entry } = &children[i] {
+      if let Option<string>.Some { value: depRel } = Toml.asString(
+        Toml.field(&entry.value, "path"),
+      ) {
+        let resolved = run normalizeRelPath(memberDir, depRel)
+        if let Option<usize>.Some { value: depIdx } = findMemberIndex(
+          nodes.asSlice(),
+          resolved.view(),
+        ) {
+          let mutSlice = nodes.asMutSlice()
+          run mutSlice[depIdx].revDeps.append(memberIdx)
+        }
+      }
+    }
+    i = i + usize.ONE
+  }
+}
+
+effect fn buildGraph(root: &Path) -> List<MemberNode>
+  ! TaskError | FileError | OutOfMemoryError
+  ? &mut Allocator | &mut FileSystem {
+  let manifestPath = run Path.join(root, "silk.toml")
+  let rootDoc = match move run parseTomlFile(&manifestPath) {
+    Option<TomlValue>.Some { value } => move value
+    Option<TomlValue>.None => run Task.abort("Failed to parse root silk.toml")
+  }
+  let mut nodes = List<MemberNode>.make()
+  if let Option<&TomlValue>.Some { value: members } = Toml.fieldAt(
+    Toml.field(&rootDoc, "workspace"),
+    "members",
+  ) {
+    let mut at = usize.ZERO
+    while let Option<string>.Some { value: mem } = Toml.asString(Toml.item(members, at)) {
+      run nodes.append(MemberNode { dir: run String.copy(mem), revDeps: List<usize>.make() })
+      at = at + usize.ONE
+    }
+  }
+  let count = nodes.length()
+  let mut i = usize.ZERO
+  while i < count {
+    let dirCopy = run String.copy(nodes.asSlice()[i].dir.view())
+    let memberDir = run Path.join(root, dirCopy.view())
+    let memberManifest = run Path.join(&memberDir, "silk.toml")
+    if let Option<TomlValue>.Some { value: doc } = move run parseTomlFile(&memberManifest) {
+      if let Option<&TomlValue>.Some { value: deps } = Toml.field(&doc, "dependencies") {
+        run collectPathDeps(deps, dirCopy.view(), i, &mut nodes)
+      }
+      if let Option<&TomlValue>.Some { value: devDeps } = Toml.field(&doc, "dev-dependencies") {
+        run collectPathDeps(devDeps, dirCopy.view(), i, &mut nodes)
+      }
+    }
+    i = i + usize.ONE
+  }
+  return move nodes
+}
+
+fn markJobForDir(dir: string, flags: &mut JobFlags) -> () {
+  flags.core = true
+  if dirPrefixMatches(dir, "lib/crdt") {
+    flags.macos = true
+  } else if dirPrefixMatches(dir, "lib/sqlite") {
+    flags.macos = true
+    flags.windows = true
+  } else if dirPrefixMatches(dir, "lib/css") {
+    flags.macos = true
+  } else if dirPrefixMatches(dir, "lib/fonts") {
+    flags.macos = true
+  } else if dirPrefixMatches(dir, "lib/native") {
+    flags.gpu = true
+    flags.browser = true
+    flags.macos = true
+    flags.windows = true
+  } else if dirPrefixMatches(dir, "lib/graphics") {
+    flags.gpu = true
+    flags.browser = true
+  } else if dirPrefixMatches(dir, "lib/svg") {
+    flags.gpu = true
+  } else if dirPrefixMatches(dir, "lib/silkjs") {
+    flags.silkjs = true
+  } else if dirPrefixMatches(dir, "loom/modules/ghostty") {
+    flags.ghostty = true
+    flags.macos = true
+    flags.windows = true
+  } else if dirPrefixMatches(dir, "loom") {
+    flags.gpu = true
+    flags.macos = true
+    flags.windows = true
+  } else if dirPrefixMatches(dir, "silk-ui/docs") {
+    flags.docs = true
+  } else if dirPrefixMatches(dir, "silk-ui/modules/js") {
+    flags.silkUiJs = true
+    flags.gpu = true
+    flags.browser = true
+    flags.macos = true
+    flags.windows = true
+  } else if dirPrefixMatches(dir, "silk-ui") {
+    flags.gpu = true
+    flags.browser = true
+    flags.macos = true
+    flags.windows = true
+    flags.docs = true
+    flags.silkUiJs = true
+  }
+}
+
+effect fn runCiPlan(base: string, githubOutput: string) -> ()
+  ! TaskError | ProcessError | FileError | HostInputError | OutOfMemoryError | WriterError
+  ? &mut HostInput | &mut Allocator | &mut ChildProcess | &mut FileSystem {
+  let root = run Task.root()
+  let mut flags = allJobs(false)
+  if base == "" {
+    flags = allJobs(true)
+  } else {
+    let mut range = run String.copy(base)
+    run String.append(&mut range, "...HEAD")
+    let diffBytes = run Task.capture("git", &["diff", "--name-only", range.view()])
+    let diffText = match String.fromUtf8(Bytes.asSlice(&diffBytes)) {
+      Result<string, InvalidUtf8>.Success { value } => value
+      Result<string, InvalidUtf8>.Failure { .. } => run Task.abort("git diff output was not UTF-8")
+    }
+    let nodes = run buildGraph(&root)
+    let nodeSlice = nodes.asSlice()
+    let mut visited = List<bool>.make()
+    let mut v = usize.ZERO
+    while v < nodeSlice.length {
+      run visited.append(false)
+      v = v + usize.ONE
+    }
+    let mut queue = List<usize>.make()
+    let mut runAll = false
+    let mut lines = String.split(diffText, "\n")
+    while let Option<string>.Some { value: raw } = Split.next(&mut lines) {
+      let file = String.trim(raw)
+      if file == "" {
+        // skip
+      } else if file == "silk.toml" || file == "tasks.silk" || file == ".github/workflows/ci.yml" {
+        runAll = true
+      } else {
+        // Find the longest matching workspace member directory.
+        let mut bestIdx = Option<usize>.none()
+        let mut bestLen = usize.ZERO
+        let mut idx = usize.ZERO
+        while idx < nodeSlice.length {
+          let d = nodeSlice[idx].dir.view()
+          if dirPrefixMatches(file, d) {
+            let dLen = String.utf8Bytes(d).length
+            if dLen >= bestLen {
+              bestLen = dLen
+              bestIdx = Option<usize>.some(idx)
+            }
+          }
+          idx = idx + usize.ONE
+        }
+        if let Option<usize>.Some { value: found } = bestIdx {
+          if !visited.asSlice()[found] {
+            let mutSlice = visited.asMutSlice()
+            mutSlice[found] = true
+            run queue.append(found)
+          }
+        } else {
+          // Non-member file inside one of the sub-projects (e.g. JS packages, docs assets).
+          markJobForDir(file, &mut flags)
+        }
+      }
+    }
+    if runAll {
+      flags = allJobs(true)
+    } else {
+      // BFS over reverse dependencies so transitive dependents are also marked affected.
+      let mut head = usize.ZERO
+      while head < queue.length() {
+        let cur = queue.asSlice()[head]
+        head = head + usize.ONE
+        markJobForDir(nodeSlice[cur].dir.view(), &mut flags)
+        let rdeps = nodeSlice[cur].revDeps.asSlice()
+        let mut r = usize.ZERO
+        while r < rdeps.length {
+          let next = rdeps[r]
+          if !visited.asSlice()[next] {
+            let mutSlice = visited.asMutSlice()
+            mutSlice[next] = true
+            run queue.append(next)
+          }
+          r = r + usize.ONE
+        }
+      }
+    }
+  }
+
+  let mut out = String.make()
+  run String.append(&mut out, "core=")
+  run String.append(&mut out, boolWord(flags.core))
+  run String.append(&mut out, "\ngpu=")
+  run String.append(&mut out, boolWord(flags.gpu))
+  run String.append(&mut out, "\nbrowser=")
+  run String.append(&mut out, boolWord(flags.browser))
+  run String.append(&mut out, "\nmacos=")
+  run String.append(&mut out, boolWord(flags.macos))
+  run String.append(&mut out, "\nwindows=")
+  run String.append(&mut out, boolWord(flags.windows))
+  run String.append(&mut out, "\nsilkjs=")
+  run String.append(&mut out, boolWord(flags.silkjs))
+  run String.append(&mut out, "\nghostty=")
+  run String.append(&mut out, boolWord(flags.ghostty))
+  run String.append(&mut out, "\nsilk_ui_js=")
+  run String.append(&mut out, boolWord(flags.silkUiJs))
+  run String.append(&mut out, "\ndocs=")
+  run String.append(&mut out, boolWord(flags.docs))
+  run String.append(&mut out, "\n")
+
+  if githubOutput != "" {
+    let outPath = run Path.make(githubOutput)
+    let mut existing = Bytes.make()
+    if run FileSystem.exists(&outPath) {
+      existing = run FileSystem.readFile(&outPath)
+    }
+    run Bytes.append(&mut existing, String.ownedUtf8Bytes(&out))
+    run FileSystem.writeFile(&outPath, Bytes.asSlice(&existing))
+  }
+}
+
+impl TaskSet for Tasks {
+  effect fn perform(self: Tasks) -> ()
+    ! TaskError | ProcessError | FileError | HostInputError | OutOfMemoryError | WriterError
+    ? &mut HostInput | &mut Allocator | &mut ChildProcess | &mut FileSystem {
+    match move self {
+      Tasks.Check => run Task.silk(&["check", "--workspace"])
+      Tasks.Format { check } => {
+        if check {
+          run Task.silk(&["format", "--check"])
+        } else {
+          run Task.silk(&["format"])
+        }
+      }
+      Tasks.CiPlan { base, githubOutput } => run runCiPlan(base.view(), githubOutput.view())
+    }
+  }
+}
+
+pub effect fn main() -> i32
+  ? &mut HostInput {
+  return run Task.main<Tasks>()
+}

@@ -1,0 +1,753 @@
+//! Touch input as a browser handles it: each finger is a pointer of type touch, the first one
+//! down the primary pointer, which presses, focuses and clicks like a mouse button. What the
+//! fingers do natively follows `touch-action`, intersected from the touched node up to the
+//! nearest scroll container (Pointer Events 3 §10):
+//!
+//! - Once the first finger moves past [`SLOP`] in a direction the touch action allows, the
+//!   tree takes the gesture: every finger's pointer is cancelled (`pointercancel`), and the
+//!   fingers pan the scroll containers under them, then a flick keeps scrolling ([`FLING`]).
+//! - A second finger down where `pinch-zoom` is allowed takes the gesture the same way. There
+//!   is no page zoom, so a native pinch only pans with the middle of the fingers.
+//! - Otherwise the fingers' pointer records go on to the client, which handles the gesture.
+import engine { UiTree }
+import input { Input, MOD_CONTROL, BUTTON_PRIMARY, POINTER_TOUCH, POINTER_MOUSE, MOUSE_POINTER_ID }
+import interact
+import mutation { LISTEN_POINTER_DOWN, LISTEN_POINTER_UP, LISTEN_POINTER_MOVE, LISTEN_POINTER_CANCEL, LISTEN_WHEEL, LISTEN_TOUCH }
+import node { NONE, Event, EventKind }
+import scrollbar { scrolls, usedOverflow }
+import style { TOUCH_AUTO, TOUCH_PINCH, TOUCH_PAN_LEFT, TOUCH_PAN_RIGHT, TOUCH_PAN_UP, TOUCH_PAN_DOWN, TOUCH_PAN_X, TOUCH_PAN_Y }
+import silk.collections.list { List }
+import silk.core.ownership { Copy }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f32
+import silk.num.f64
+import silk.num.u8
+import silk.num.u32
+import silk.num.usize
+
+/// CSS pixels a finger moves before the tree decides whether the gesture is a pan.
+pub const SLOP: f32 = 10.0
+
+/// The rate a flick slows at, per second: its speed falls to `e^-FLING` each second, so it
+/// travels its starting speed divided by `FLING` pixels.
+pub const FLING: f32 = 2.0
+
+/// Pixels per second below which a flick stops (and at release, below which none starts).
+pub const FLING_STOP: f32 = 30.0
+
+/// Seconds of finger movement the release speed is measured over.
+const VELOCITY_WINDOW: f64 = 0.1
+
+/// What the fingers down now are doing.
+pub const GESTURE_IDLE: u8 = 0
+/// Down, not moved past the slop yet.
+pub const GESTURE_UNDECIDED: u8 = 1
+/// The client has the gesture: pointer records go on.
+pub const GESTURE_CLIENT: u8 = 2
+/// The tree pans: the pointers were cancelled.
+pub const GESTURE_PAN: u8 = 3
+
+/// One finger on the screen.
+pub struct Touch {
+  /// The host's number for the touch.
+  pub host: u32,
+  /// Its DOM `pointerId`.
+  pub pointer: u32,
+  /// The node it went down on, which keeps its pointer records (implicit capture).
+  pub slot: u32,
+  pub id: u32,
+  pub x: f32,
+  pub y: f32,
+  pub primary: bool,
+  /// The tree took it: no more records go out for it.
+  pub cancelled: bool,
+}
+
+impl Copy for Touch {}
+
+/// A position of the gesture at a host time, for the release speed.
+struct Sample {
+  time: f64,
+  x: f32,
+  y: f32,
+}
+
+impl Copy for Sample {}
+
+/// The touch state of a tree.
+pub struct TouchState {
+  pub touches: List<Touch>,
+  nextPointer: u32,
+  pub gesture: u8,
+  /// The `TOUCH_*` gestures the first finger's node allows.
+  pub allowed: u8,
+  /// Where the first finger went down, and the node panning starts from.
+  startX: f32,
+  startY: f32,
+  scroller: u32,
+  scrollerId: u32,
+  /// The middle of the fingers when the pan last moved.
+  lastX: f32,
+  lastY: f32,
+  samples: List<Sample>,
+  /// A flick under way: the node it scrolls from, its speed in pixels per second (positive
+  /// scrolls down and right) and the frame time it last moved at (negative before its first
+  /// frame).
+  pub flingSlot: u32,
+  flingId: u32,
+  flingX: f32,
+  flingY: f32,
+  flingTime: f64,
+  /// A handler prevented a touch record the gesture could still stop on: no pan, no pinch and
+  /// no click until every finger lifts, as preventing `touchstart` or `touchmove` on the web.
+  pub blocked: bool,
+  /// The input `begin` handled sent a touch record a handler may prevent.
+  sent: bool,
+}
+
+impl TouchState {
+  pub fn make() -> TouchState {
+    return TouchState {
+      touches: List<Touch>.make(),
+      nextPointer: 2,
+      gesture: GESTURE_IDLE,
+      allowed: TOUCH_AUTO,
+      startX: 0.0,
+      startY: 0.0,
+      scroller: NONE,
+      scrollerId: NONE,
+      lastX: 0.0,
+      lastY: 0.0,
+      samples: List<Sample>.make(),
+      flingSlot: NONE,
+      flingId: NONE,
+      flingX: 0.0,
+      flingY: 0.0,
+      flingTime: -1.0,
+      blocked: false,
+      sent: false,
+    }
+  }
+}
+
+fn find(tree: &UiTree<'_>, host: u32) -> usize {
+  let list = tree.touch.touches.asSlice()
+  let mut i: usize = 0
+  while i < list.length {
+    if list[i].host == host {
+      return i
+    }
+    i = i + 1
+  }
+  return usize.MAX
+}
+
+/// The live node a touch keeps, or NONE.
+fn holder(tree: &UiTree<'_>, touch: &Touch) -> u32 {
+  if touch.slot == NONE || u32.toUsize(touch.slot) >= tree.nodes.length() {
+    return NONE
+  }
+  let node = tree.node(touch.slot)
+  if !node.live || node.id != touch.id {
+    return NONE
+  }
+  return touch.slot
+}
+
+/// Makes the records that follow come from touch `touch`.
+fn speakAs(tree: &mut UiTree<'_>, touch: &Touch) -> () {
+  tree.pointerId = touch.pointer
+  tree.pointerType = POINTER_TOUCH
+  tree.pointerPrimary = touch.primary
+}
+
+/// Makes the records that follow come from the mouse.
+pub fn speakAsMouse(tree: &mut UiTree<'_>) -> () {
+  tree.pointerId = MOUSE_POINTER_ID
+  tree.pointerType = POINTER_MOUSE
+  tree.pointerPrimary = true
+}
+
+/// A pointer record for a finger that is not the primary one: it goes to the node the finger
+/// went down on, and has no default action.
+effect fn secondaryRecord(tree: &mut UiTree<'_>, kind: EventKind, flag: u32, touch: &Touch, modifiers: u32) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let slot = holder(&tree.*, touch)
+  if slot == NONE || !interact.listensOnPath(&tree.*, slot, flag) {
+    return ()
+  }
+  let mut path = List<u32>.make()
+  run tree.pathTo(slot, &mut path)
+  let mut event = Event.make(kind, tree.node(slot).id, move path)
+  event.x = touch.x
+  event.y = touch.y
+  event.modifiers = modifiers
+  event.button = if kind == EventKind.PointerMove { 0 } else { BUTTON_PRIMARY }
+  event.pointerId = touch.pointer
+  event.pointerType = POINTER_TOUCH
+  event.primary = false
+  run tree.queueEvent(move event)
+}
+
+/// A touch record for `touch`, at the node it went down on, after its pointer records as in
+/// Chromium. `cancelable` records a handler may prevent, which `finish` then reads.
+effect fn touchRecord(tree: &mut UiTree<'_>, kind: EventKind, touch: &Touch, modifiers: u32, cancelable: bool) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let slot = holder(&tree.*, touch)
+  if slot == NONE || !interact.listensOnPath(&tree.*, slot, LISTEN_TOUCH) {
+    return ()
+  }
+  let mut path = List<u32>.make()
+  run tree.pathTo(slot, &mut path)
+  let mut event = Event.make(kind, tree.node(slot).id, move path)
+  event.x = touch.x
+  event.y = touch.y
+  event.modifiers = modifiers
+  event.detail = if cancelable { 1 } else { 0 }
+  event.pointerId = touch.pointer
+  event.pointerType = POINTER_TOUCH
+  event.primary = touch.primary
+  run tree.queueEvent(move event)
+  if cancelable {
+    tree.touch.sent = true
+  }
+}
+
+/// The `touch-action` gestures a touch on `slot` may start: the intersection over `slot` and
+/// the nodes above it, up to and including the nearest scroll container.
+pub fn allowedAt(tree: &UiTree<'_>, slot: u32) -> u8 {
+  let mut bits = TOUCH_AUTO
+  let mut at = slot
+  while at != NONE {
+    let c = &tree.node(at).computed().*
+    bits = u8.bitAnd(bits, c.scroll.touch)
+    if scrolls(usedOverflow(c, true)) || scrolls(usedOverflow(c, false)) {
+      return bits
+    }
+    at = tree.node(at).parent
+  }
+  return bits
+}
+
+/// The middle of the fingers that are down.
+fn middle(tree: &UiTree<'_>) -> [f32; 2] {
+  let list = tree.touch.touches.asSlice()
+  if list.length == 0 {
+    return [tree.touch.lastX, tree.touch.lastY]
+  }
+  let mut x: f32 = 0.0
+  let mut y: f32 = 0.0
+  let mut i: usize = 0
+  while i < list.length {
+    x = x + list[i].x
+    y = y + list[i].y
+    i = i + 1
+  }
+  let n = usize.toF32(list.length)
+  return [x / n, y / n]
+}
+
+effect fn sample(tree: &mut UiTree<'_>, time: f64) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let at = middle(&tree.*)
+  let samples = &mut tree.touch.samples
+  // Old samples are no use for the speed at release.
+  while samples.length() != 0 && samples.get(0).time < time - VELOCITY_WINDOW * 2.0 {
+    drop samples.remove(0)
+  }
+  run samples.append(Sample { time: time, x: at[0], y: at[1] })
+}
+
+/// Whether the first finger's movement (`dx`, `dy`) from where it went down starts a pan that
+/// `allowed` lets the tree take. With both axes allowed any direction pans; with one, the
+/// movement has to be mostly along it, and a direction word (`pan-up`) names the scroll
+/// direction, which is against the finger.
+fn pans(allowed: u8, dx: f32, dy: f32) -> bool {
+  let horizontal = f32.abs(dx) >= f32.abs(dy)
+  let wantX: u8 = if dx > 0.0 { TOUCH_PAN_LEFT } else { TOUCH_PAN_RIGHT }
+  let wantY: u8 = if dy > 0.0 { TOUCH_PAN_UP } else { TOUCH_PAN_DOWN }
+  let x = u8.bitAnd(allowed, wantX) != 0
+  let y = u8.bitAnd(allowed, wantY) != 0
+  if u8.bitAnd(allowed, TOUCH_PAN_X) != 0 && u8.bitAnd(allowed, TOUCH_PAN_Y) != 0 {
+    return (horizontal && x) || (!horizontal && y) || (x && y)
+  }
+  return if horizontal { x } else { y }
+}
+
+/// Cancels every finger's pointer: the tree has the gesture now.
+effect fn takeGesture(tree: &mut UiTree<'_>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut i: usize = 0
+  while i < tree.touch.touches.length() {
+    let touch = tree.touch.touches.get(i)
+    if !touch.cancelled {
+      speakAs(&mut tree, &touch)
+      if touch.primary {
+        // The press ends as a host cancel would end it: no click, capture lost.
+        run interact.beginInput(&mut tree, &Input.PointerCancel)
+        run interact.finishInput(&mut tree, Input.PointerCancel, false)
+      } else {
+        run secondaryRecord(&mut tree, EventKind.PointerCancel, LISTEN_POINTER_CANCEL, &touch, 0)
+      }
+      let mut done = touch
+      done.cancelled = true
+      tree.touch.touches.set(i, done)
+    }
+    i = i + 1
+  }
+  tree.touch.gesture = GESTURE_PAN
+  let at = middle(&tree.*)
+  tree.touch.lastX = at[0]
+  tree.touch.lastY = at[1]
+}
+
+/// Scrolls by how far the middle of the fingers moved since the last pan step, on the axes
+/// the touch action allows.
+effect fn panStep(tree: &mut UiTree<'_>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let at = middle(&tree.*)
+  let mut dx = tree.touch.lastX - at[0]
+  let mut dy = tree.touch.lastY - at[1]
+  tree.touch.lastX = at[0]
+  tree.touch.lastY = at[1]
+  let allowed = tree.touch.allowed
+  if u8.bitAnd(allowed, TOUCH_PAN_X) == 0 { dx = 0.0 }
+  if u8.bitAnd(allowed, TOUCH_PAN_Y) == 0 { dy = 0.0 }
+  let from = scroller(&tree.*)
+  if from != NONE && (dx != 0.0 || dy != 0.0) {
+    drop run interact.panChain(&mut tree, from, dx, dy)
+  }
+}
+
+fn scroller(tree: &UiTree<'_>) -> u32 {
+  let slot = tree.touch.scroller
+  if slot == NONE || u32.toUsize(slot) >= tree.nodes.length() {
+    return NONE
+  }
+  let node = tree.node(slot)
+  return if node.live && node.id == tree.touch.scrollerId { slot } else { NONE }
+}
+
+/// Stops a flick under way.
+pub fn stopFling(tree: &mut UiTree<'_>) -> () {
+  tree.touch.flingSlot = NONE
+  tree.touch.flingId = NONE
+}
+
+/// Whether the fingers or a flick hold a scroll, so scroll snapping waits.
+pub fn holding(tree: &UiTree<'_>) -> bool {
+  return tree.touch.gesture == GESTURE_PAN || tree.touch.flingSlot != NONE
+}
+
+/// Whether a flick is under way: the host keeps drawing frames.
+pub fn animating(tree: &UiTree<'_>) -> bool {
+  return tree.touch.flingSlot != NONE
+}
+
+/// Starts a flick from the release speed of the pan.
+fn startFling(tree: &mut UiTree<'_>) -> () {
+  let samples = tree.touch.samples.asSlice()
+  if samples.length < 2 {
+    return ()
+  }
+  let last = samples[samples.length - 1]
+  let mut first = samples[0]
+  let mut i: usize = 0
+  while i < samples.length {
+    if samples[i].time >= last.time - VELOCITY_WINDOW {
+      first = samples[i]
+      break
+    }
+    i = i + 1
+  }
+  let dt = f64.toF32(last.time - first.time)
+  if dt <= 0.0 {
+    return ()
+  }
+  let allowed = tree.touch.allowed
+  let mut vx = (first.x - last.x) / dt
+  let mut vy = (first.y - last.y) / dt
+  if u8.bitAnd(allowed, TOUCH_PAN_X) == 0 { vx = 0.0 }
+  if u8.bitAnd(allowed, TOUCH_PAN_Y) == 0 { vy = 0.0 }
+  if f32.hypot(vx, vy) < FLING_STOP {
+    return ()
+  }
+  let from = scroller(&tree.*)
+  if from == NONE {
+    return ()
+  }
+  tree.touch.flingSlot = from
+  tree.touch.flingId = tree.node(from).id
+  tree.touch.flingX = vx
+  tree.touch.flingY = vy
+  tree.touch.flingTime = -1.0
+}
+
+/// Moves a flick to the frame time: called once a frame, before layout settles scrolls.
+pub effect fn advance(tree: &mut UiTree<'_>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let slot = tree.touch.flingSlot
+  if slot == NONE {
+    return ()
+  }
+  if u32.toUsize(slot) >= tree.nodes.length() || !tree.node(slot).live || tree.node(slot).id != tree.touch.flingId {
+    stopFling(&mut tree)
+    return ()
+  }
+  let now = tree.input.time
+  if tree.touch.flingTime < 0.0 {
+    // The release frame: the flick moves from the next one.
+    tree.touch.flingTime = now
+    return ()
+  }
+  let dt = f64.toF32(now - tree.touch.flingTime)
+  if dt <= 0.0 {
+    return ()
+  }
+  tree.touch.flingTime = now
+  // Exact under exponential decay, so the distance does not depend on the frame rate.
+  let keep = f32.exp(-FLING * dt)
+  let travel = (1.0 - keep) / FLING
+  let vx = tree.touch.flingX
+  let vy = tree.touch.flingY
+  let moved = run interact.panChain(&mut tree, slot, vx * travel, vy * travel)
+  tree.touch.flingX = vx * keep
+  tree.touch.flingY = vy * keep
+  if !moved || f32.hypot(tree.touch.flingX, tree.touch.flingY) < FLING_STOP {
+    stopFling(&mut tree)
+  }
+}
+
+/// The first half of a touch or pinch input: pointer records, and the tree taking the gesture.
+pub effect fn begin(tree: &mut UiTree<'_>, input: &Input) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  tree.touchPending = TOUCH_NOTHING
+  tree.touch.sent = false
+  match &input.* {
+    Input.TouchStart { id, x, y, modifiers, time } => {
+      stopFling(&mut tree)
+      if find(&tree.*, id) != usize.MAX {
+        return ()
+      }
+      let first = tree.touch.touches.length() == 0
+      let touch = Touch {
+        host: id,
+        pointer: tree.touch.nextPointer,
+        slot: interact.hitSlot(&tree.*, x, y),
+        id: NONE,
+        x: x,
+        y: y,
+        primary: first,
+        cancelled: tree.touch.gesture == GESTURE_PAN,
+      }
+      tree.touch.nextPointer = if tree.touch.nextPointer == u32.MAX { 2 } else { tree.touch.nextPointer + 1 }
+      let mut kept = touch
+      kept.id = if touch.slot == NONE { NONE } else { tree.node(touch.slot).id }
+      run tree.touch.touches.append(kept)
+      if first {
+        tree.touch.samples.clear()
+        tree.touch.startX = x
+        tree.touch.startY = y
+        let layoutHit = interact.layoutHit(&tree.*, x, y)
+        tree.touch.scroller = layoutHit
+        tree.touch.scrollerId = if layoutHit == NONE { NONE } else { tree.node(layoutHit).id }
+        tree.touch.allowed = allowedAt(&tree.*, layoutHit)
+        tree.touch.gesture = if u8.bitAnd(tree.touch.allowed, TOUCH_PAN_X + TOUCH_PAN_Y) == 0
+          && u8.bitAnd(tree.touch.allowed, TOUCH_PINCH) == 0 {
+          GESTURE_CLIENT
+        } else {
+          GESTURE_UNDECIDED
+        }
+        speakAs(&mut tree, &kept)
+        run interact.beginInput(
+          &mut tree,
+          &Input.PointerDown { x: x, y: y, button: BUTTON_PRIMARY, modifiers: modifiers, clickCount: 1 },
+        )
+        tree.touchPending = TOUCH_PRESS
+        run touchRecord(&mut tree, EventKind.TouchStart, &kept, modifiers, true)
+      } else if !kept.cancelled {
+        speakAs(&mut tree, &kept)
+        run secondaryRecord(&mut tree, EventKind.PointerDown, LISTEN_POINTER_DOWN, &kept, modifiers)
+        run touchRecord(&mut tree, EventKind.TouchStart, &kept, modifiers, true)
+        // Two fingers where pinch-zoom is allowed are a pinch, which the tree takes unless a
+        // handler prevents the second `touchstart`.
+        if tree.touch.gesture == GESTURE_UNDECIDED && u8.bitAnd(tree.touch.allowed, TOUCH_PINCH) != 0
+          && !tree.touch.blocked {
+          if tree.touch.sent {
+            tree.touchPending = TOUCH_PINCH_START
+          } else {
+            run takeGesture(&mut tree)
+          }
+        }
+      } else {
+        run touchRecord(&mut tree, EventKind.TouchStart, &kept, modifiers, false)
+      }
+      run sample(&mut tree, time)
+      if tree.touch.gesture == GESTURE_PAN {
+        let at = middle(&tree.*)
+        tree.touch.lastX = at[0]
+        tree.touch.lastY = at[1]
+      }
+    }
+    Input.TouchMove { id, x, y, modifiers, time } => {
+      let index = find(&tree.*, id)
+      if index == usize.MAX {
+        return ()
+      }
+      let mut touch = tree.touch.touches.get(index)
+      if touch.x == x && touch.y == y {
+        return ()
+      }
+      touch.x = x
+      touch.y = y
+      tree.touch.touches.set(index, touch)
+      run sample(&mut tree, time)
+      if tree.touch.gesture == GESTURE_UNDECIDED && touch.primary {
+        let dx = x - tree.touch.startX
+        let dy = y - tree.touch.startY
+        let distance = f32.hypot(dx, dy)
+        if distance >= SLOP {
+          if pans(tree.touch.allowed, dx, dy) && !tree.touch.blocked {
+            // As in browsers, the `touchmove` goes first: preventing it keeps the gesture.
+            run touchRecord(&mut tree, EventKind.TouchMove, &touch, modifiers, true)
+            if tree.touch.sent {
+              tree.touchPending = TOUCH_DECIDE
+              return ()
+            }
+            run startPan(&mut tree, x, y)
+            tree.touchPending = TOUCH_PAN
+            return ()
+          }
+          tree.touch.gesture = GESTURE_CLIENT
+        }
+      }
+      if tree.touch.gesture == GESTURE_PAN {
+        run touchRecord(&mut tree, EventKind.TouchMove, &touch, modifiers, false)
+        tree.touchPending = TOUCH_PAN
+        return ()
+      }
+      run drag(&mut tree, &touch, modifiers)
+      run touchRecord(&mut tree, EventKind.TouchMove, &touch, modifiers, true)
+    }
+    Input.TouchEnd { id, x, y, modifiers, time } => {
+      let index = find(&tree.*, id)
+      if index == usize.MAX {
+        return ()
+      }
+      let mut touch = tree.touch.touches.get(index)
+      touch.x = x
+      touch.y = y
+      tree.touch.touches.set(index, touch)
+      if tree.touch.gesture == GESTURE_PAN {
+        run sample(&mut tree, time)
+        tree.touchPending = TOUCH_PAN
+      }
+      if !touch.cancelled {
+        speakAs(&mut tree, &touch)
+        if touch.primary {
+          run interact.beginInput(
+            &mut tree,
+            &Input.PointerUp { x: x, y: y, button: BUTTON_PRIMARY, modifiers: modifiers },
+          )
+          tree.touchPending = TOUCH_RELEASE
+        } else {
+          run secondaryRecord(&mut tree, EventKind.PointerUp, LISTEN_POINTER_UP, &touch, modifiers)
+        }
+      }
+      let endCancelable = tree.touch.gesture != GESTURE_PAN
+      run touchRecord(&mut tree, EventKind.TouchEnd, &touch, modifiers, endCancelable)
+      tree.touchEnded = index
+    }
+    Input.TouchCancel { id } => {
+      let index = find(&tree.*, id)
+      if index == usize.MAX {
+        return ()
+      }
+      let touch = tree.touch.touches.get(index)
+      if !touch.cancelled {
+        speakAs(&mut tree, &touch)
+        if touch.primary {
+          run interact.beginInput(&mut tree, &Input.PointerCancel)
+          tree.touchPending = TOUCH_CANCEL
+        } else {
+          run secondaryRecord(&mut tree, EventKind.PointerCancel, LISTEN_POINTER_CANCEL, &touch, 0)
+        }
+      }
+      run touchRecord(&mut tree, EventKind.TouchCancel, &touch, 0, false)
+      tree.touchEnded = index
+    }
+    Input.Pinch { x, y, delta, modifiers } => {
+      // As Chromium reports a trackpad pinch: a wheel with control held, `deltaY` the
+      // logarithm of the scale, which zooms nothing by default.
+      speakAsMouse(&mut tree)
+      let hit = interact.hitSlot(&tree.*, x, y)
+      if hit != NONE && interact.listensOnPath(&tree.*, hit, LISTEN_WHEEL) {
+        let mut path = List<u32>.make()
+        run tree.pathTo(hit, &mut path)
+        let mut event = Event.make(EventKind.Wheel, tree.node(hit).id, move path)
+        event.x = x
+        event.y = y
+        event.modifiers = u32.bitOr(modifiers, MOD_CONTROL)
+        event.deltaY = -100.0 * f32.log(f32.max(0.01, 1.0 + delta))
+        run tree.queueEvent(move event)
+      }
+    }
+    _ => {}
+  }
+}
+
+/// What `begin` left for `finish` (`UiTree.touchPending`).
+pub const TOUCH_NOTHING: u8 = 0
+pub const TOUCH_PRESS: u8 = 1
+pub const TOUCH_DRAG: u8 = 2
+pub const TOUCH_RELEASE: u8 = 3
+pub const TOUCH_CANCEL: u8 = 4
+pub const TOUCH_PAN: u8 = 5
+/// A finger left the slop in a direction the tree pans, and a handler may prevent its
+/// `touchmove`.
+pub const TOUCH_DECIDE: u8 = 6
+/// A second finger may start a pinch, unless a handler prevents its `touchstart`.
+pub const TOUCH_PINCH_START: u8 = 7
+
+/// The second half: the primary finger's defaults (focus, caret, click) and the tree's pan.
+/// Handlers cannot prevent a pan; `touch-action` decides it before they run, as in browsers.
+pub effect fn finish(tree: &mut UiTree<'_>, input: Input, prevented: bool) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let pending = tree.touchPending
+  tree.touchPending = TOUCH_NOTHING
+  // A prevented touch record keeps the gesture from the tree.
+  if prevented && tree.touch.sent {
+    tree.touch.blocked = true
+    if tree.touch.gesture == GESTURE_UNDECIDED {
+      tree.touch.gesture = GESTURE_CLIENT
+    }
+  }
+  tree.touch.sent = false
+  match move input {
+    Input.TouchStart { x, y, modifiers, .. } => {
+      if pending == TOUCH_PRESS {
+        run interact.finishInput(
+          &mut tree,
+          Input.PointerDown { x: x, y: y, button: BUTTON_PRIMARY, modifiers: modifiers, clickCount: 1 },
+          prevented,
+        )
+      } else if pending == TOUCH_PINCH_START && !tree.touch.blocked {
+        run takeGesture(&mut tree)
+      }
+    }
+    Input.TouchMove { id, x, y, modifiers, .. } => {
+      if pending == TOUCH_DECIDE {
+        if tree.touch.blocked {
+          let index = find(&tree.*, id)
+          if index != usize.MAX {
+            let touch = tree.touch.touches.get(index)
+            run drag(&mut tree, &touch, modifiers)
+            if tree.touchPending == TOUCH_DRAG {
+              tree.touchPending = TOUCH_NOTHING
+              run interact.finishInput(&mut tree, Input.PointerMove { x: x, y: y, modifiers: modifiers }, false)
+            }
+          }
+        } else {
+          run startPan(&mut tree, x, y)
+          run panStep(&mut tree)
+        }
+      } else if pending == TOUCH_PAN {
+        run panStep(&mut tree)
+      } else if pending == TOUCH_DRAG {
+        run interact.finishInput(&mut tree, Input.PointerMove { x: x, y: y, modifiers: modifiers }, prevented)
+      }
+    }
+    Input.TouchEnd { x, y, modifiers, .. } => {
+      if pending == TOUCH_PAN {
+        run panStep(&mut tree)
+      } else if pending == TOUCH_RELEASE && tree.touch.blocked {
+        // A prevented `touchstart` or `touchend` taps nothing: the press ends without a click.
+        run interact.finishInput(&mut tree, Input.PointerCancel, false)
+      } else if pending == TOUCH_RELEASE {
+        run interact.finishInput(
+          &mut tree,
+          Input.PointerUp { x: x, y: y, button: BUTTON_PRIMARY, modifiers: modifiers },
+          prevented,
+        )
+      }
+      run lift(&mut tree, false)
+    }
+    Input.TouchCancel { .. } => {
+      if pending == TOUCH_CANCEL {
+        run interact.finishInput(&mut tree, Input.PointerCancel, false)
+      }
+      run lift(&mut tree, true)
+    }
+    _ => {}
+  }
+}
+
+/// Takes the finger `begin` saw end off the list; the last one ends the gesture, with a flick
+/// when the tree was panning and the fingers came off moving.
+effect fn lift(tree: &mut UiTree<'_>, cancelled: bool) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let index = tree.touchEnded
+  tree.touchEnded = usize.MAX
+  if index == usize.MAX || index >= tree.touch.touches.length() {
+    return ()
+  }
+  drop tree.touch.touches.remove(index)
+  if tree.touch.touches.length() != 0 {
+    // The middle jumps when a finger comes off: the pan goes on from the new one.
+    let at = middle(&tree.*)
+    tree.touch.lastX = at[0]
+    tree.touch.lastY = at[1]
+    return ()
+  }
+  if tree.touch.gesture == GESTURE_PAN && !cancelled {
+    startFling(&mut tree)
+  }
+  tree.touch.gesture = GESTURE_IDLE
+  tree.touch.blocked = false
+  tree.touch.samples.clear()
+}
+
+/// The pointer records of a finger the client has: a move to the node holding it.
+effect fn drag(tree: &mut UiTree<'_>, touch: &Touch, modifiers: u32) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  speakAs(&mut tree, touch)
+  if touch.primary {
+    tree.pointerX = touch.x
+    tree.pointerY = touch.y
+    let mut to = interact.captureHolder(&tree.*)
+    if to == NONE {
+      to = interact.hitSlot(&tree.*, touch.x, touch.y)
+    }
+    if to != NONE && interact.listensOnPath(&tree.*, to, LISTEN_POINTER_MOVE) {
+      run interact.queuePointer(&mut tree, EventKind.PointerMove, to, modifiers, 0, 0)
+    }
+    tree.touchPending = TOUCH_DRAG
+  } else {
+    run secondaryRecord(&mut tree, EventKind.PointerMove, LISTEN_POINTER_MOVE, touch, modifiers)
+  }
+}
+
+/// The tree takes the gesture for a pan that starts at the edge of the slop, so the content
+/// does not jump; the first finger is at (`x`, `y`).
+effect fn startPan(tree: &mut UiTree<'_>, x: f32, y: f32) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let dx = x - tree.touch.startX
+  let dy = y - tree.touch.startY
+  let distance = f32.hypot(dx, dy)
+  run takeGesture(&mut tree)
+  if distance > 0.0 {
+    tree.touch.lastX = tree.touch.lastX - dx + dx * SLOP / distance
+    tree.touch.lastY = tree.touch.lastY - dy + dy * SLOP / distance
+  }
+}

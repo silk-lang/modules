@@ -1,0 +1,241 @@
+//! Prototype operations, quickjs.c:7995-8165,9015-9059. Arguments are borrowed
+//! except takePrototype's consumed input; every successful ValueBits result owns.
+//! Runtime/context must outlive calls. No payload borrow crosses host dispatch.
+import js_realm { Realm }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.mem.pointer { Pointer }
+import silk.core.result { Result }
+import silk.num.u32
+import js_core_types { RuntimeState, ObjectData, ObjectPayload, ShapeData,
+  NativeFunctionId, ExoticCallbacks, EXOTIC_GET_PROTOTYPE, EXOTIC_SET_PROTOTYPE,
+  EXOTIC_IS_EXTENSIBLE, EXOTIC_PREVENT_EXTENSIONS }
+import js_heap { CellRef, HeapHeader }
+import js_value { ValueBits }
+import js_owned_value { Value, lendBits, ValueRef }
+import js_object_ref { ObjectRef }
+import js_gc { HeapHooks }
+import js_gc as gc
+import js_runtime as runtime
+import js_shapes as shapes
+import js_class_data as classes
+import js_exceptions { JsException }
+import js_prototype_host { PrototypeHooks }
+import js_invariant { invariant, present }
+
+/// NotExtensible holds the refusing object, borrowed: the error is reported
+/// before the call that raised it returns (js_value_describe.prototypeError).
+pub union PrototypeError {
+  NotObject,
+  BadPrototype,
+  Immutable,
+  NotExtensible { pub object: ValueBits },
+  Circular
+}
+impl PrototypeError {
+  pub fn message(self: &Self) -> &'static [u8] {
+    return match &self.* {
+      PrototypeError.NotObject => b"not an object"
+      PrototypeError.BadPrototype => b"'setPrototypeOf' on proxy: trap returned falsish for property 'undefined'"
+      PrototypeError.Immutable => b"prototype is immutable"
+      PrototypeError.NotExtensible { .. } => b"object is not extensible"
+      PrototypeError.Circular => b"Cyclic __proto__ value"
+    }
+  }
+}
+fn reference(value: ValueBits) -> *mut HeapHeader {
+  return match value { ValueBits.Object { reference } => reference _ => invariant() }
+}
+fn objectCell(node: *mut HeapHeader) -> CellRef<ObjectData> { return unsafe CellRef<ObjectData>.of(node) }
+fn runtimeCell(rt: *mut HeapHeader) -> CellRef<RuntimeState> { return unsafe CellRef<RuntimeState>.of(rt) }
+fn storedPrototype<A>(owner: &A, node: CellRef<ObjectData>) -> ?*mut HeapHeader {
+  let shape = unsafe CellRef<ShapeData>.of(node.get(owner).shape)
+  return shape.get(owner).prototype
+}
+fn method<A>(owner: &A, rt: CellRef<RuntimeState>, node: CellRef<ObjectData>, mask: u16) -> Option<NativeFunctionId> {
+  let object = node.get(owner)
+  if !object.isExotic() { return Option<NativeFunctionId>.none() }
+  let state = rt.get(owner)
+  match &state.classes.asSlice()[u32.toUsize(object.classId())].exotic {
+    Option<ExoticCallbacks>.Some { value } => {
+      if (value.methodMask & mask) != 0 { return Option<NativeFunctionId>.some(value.descriptor) }
+    }
+    Option<ExoticCallbacks>.None => ()
+  }
+  return Option<NativeFunctionId>.none()
+}
+pub fn setImmutablePrototype<'a>(object: ValueRef<'a>) -> () {
+  if !object.view().isObject() { return () }
+  let mut anchor = ()
+  let data = ObjectRef.of(object).dataMut(&mut anchor)
+  data.setHasImmutablePrototype(true)
+}
+/// Borrowed context class-prototype alias, not an owning public result.
+pub fn getPrototypePrimitive<'a, 'b>(realm: Realm<'a>, value: ValueRef<'b>) -> ValueBits { let _context = realm.context()
+  let classId = match value.view() {
+    ValueBits.ShortBigInt { .. } => classes.JS_CLASS_BIG_INT
+    ValueBits.BigInt { .. } => classes.JS_CLASS_BIG_INT
+    ValueBits.Int { .. } => classes.JS_CLASS_NUMBER
+    ValueBits.Float64 { .. } => classes.JS_CLASS_NUMBER
+    ValueBits.Bool { .. } => classes.JS_CLASS_BOOLEAN
+    ValueBits.String { .. } => classes.JS_CLASS_STRING
+    ValueBits.Rope { .. } => classes.JS_CLASS_STRING
+    ValueBits.Symbol { .. } => classes.JS_CLASS_SYMBOL
+    _ => { return ValueBits.Null }
+  }
+  let anchor = ()
+  let state = realm.state(&anchor)
+  return state.classPrototypes.get(u32.toUsize(classId))
+}
+pub effect fn getPrototype<'a, 'b, H: PrototypeHooks>(hooks: &mut H, realm: Realm<'a>,
+  object: ValueRef<'b>) -> Value ! OutOfMemoryError | JsException ? &mut Allocator {
+  if !object.view().isObject() { return unsafe Value.retain(getPrototypePrimitive(realm, object)) }
+  let rt = runtimeCell(realm.runtime())
+  let node = objectCell(reference(object.view()))
+  match method(&hooks.*, rt, node, EXOTIC_GET_PROTOTYPE) {
+    Option<NativeFunctionId>.Some { value: table } => { return unsafe Value.adoptBits(run hooks.getPrototype(realm, table, object.borrow())) }
+    Option<NativeFunctionId>.None => ()
+  }
+  let proto = storedPrototype(&hooks.*, node)
+  if Pointer.isNull<HeapHeader>(proto) { return Value.immediate(ValueBits.Null) }
+  return unsafe Value.retain(ValueBits.Object { reference: present(proto) })
+}
+/// Consumes `object` and returns an owner of its prototype; `object` is released on
+/// every outcome, including an exotic callback's failure.
+pub effect fn takePrototype<'a, H: PrototypeHooks>(hooks: &mut H, realm: Realm<'a>,
+  object: Value) -> Value ! OutOfMemoryError | JsException ? &mut Allocator {
+  return run prototypeOf(&mut hooks, realm, object.borrow())
+}
+/// Returns an owner of the prototype of the borrowed `object`.
+pub effect fn prototypeOf<'a, 'b, H: PrototypeHooks>(hooks: &mut H, realm: Realm<'a>,
+  object: ValueRef<'b>) -> Value ! OutOfMemoryError | JsException ? &mut Allocator {
+  return run getPrototype(&mut hooks, realm, object)
+}
+effect fn reject(throwFlag: bool, error: PrototypeError) -> bool ! PrototypeError {
+  if throwFlag { fail move error }
+  return false
+}
+/// throwFlag=true is Object/JS_SetPrototype semantics; false is Reflect semantics.
+pub unsafe effect fn setPrototypeInternal<'a, 'b, H: PrototypeHooks + HeapHooks>(hooks: &mut H,realm: Realm<'a>, object: ValueRef<'b>, prototype: ValueBits, throwFlag: bool) -> bool
+  ! OutOfMemoryError | JsException | PrototypeError ? &mut Allocator {
+  if throwFlag {
+    if match object.view() { ValueBits.Null => true ValueBits.Undefined => true _ => false } { fail PrototypeError.NotObject }
+  } else if !object.view().isObject() { fail PrototypeError.NotObject }
+  let proto: ?*mut HeapHeader = match prototype {
+    ValueBits.Object { reference: node } => node
+    ValueBits.Null => Pointer.null<HeapHeader>()
+    _ => { fail PrototypeError.NotObject }
+  }
+  if !object.view().isObject() { return true }
+  let rt = realm.runtime()
+  let node = objectCell(reference(object.view()))
+  match method(&hooks.*, runtimeCell(rt), node, EXOTIC_SET_PROTOTYPE) {
+    Option<NativeFunctionId>.Some { value: table } => {
+      let accepted = run hooks.setPrototype(realm, table, object.borrow(), unsafe lendBits(&prototype, prototype))
+      if !accepted { return run reject(throwFlag, PrototypeError.BadPrototype) }
+      return true
+    }
+    Option<NativeFunctionId>.None => ()
+  }
+  if Pointer.address<HeapHeader>(storedPrototype(&hooks.*, node)) == Pointer.address<HeapHeader>(proto) { return true }
+  let data = node.get(&hooks.*)
+  let immutable = data.hasImmutablePrototype()
+  let extensible = data.extensible()
+  drop data
+  if immutable { return run reject(throwFlag, PrototypeError.Immutable) }
+  if !extensible { return run reject(throwFlag, PrototypeError.NotExtensible { object: ValueBits.Object { reference: node.header() } }) }
+  let mut cursor = proto
+  while !Pointer.isNull<HeapHeader>(cursor) {
+    if Pointer.address<HeapHeader>(cursor) == Pointer.address<HeapHeader>(node.header()) {
+      return run reject(throwFlag, PrototypeError.Circular)
+    }
+    // Deliberately reads stored shape edges, never invokes exotic getPrototype.
+    cursor = storedPrototype(&hooks.*, objectCell(present(cursor)))
+  }
+  // A shared shape moves to the shared shape with the same records under the
+  // new prototype, so the object keeps sharing shapes (and caches) with others.
+  let current = node.get(&hooks.*).shape
+  let shared = run unsafe shapes.withPrototype(rt, current, proto)
+  match Pointer.nonNullMut<HeapHeader>(shared) {
+    Option<*mut HeapHeader>.Some { value } => {
+      let moved = node.getMut(&mut hooks.*)
+      moved.shape = value
+      unsafe shapes.noteShapeChange(rt, &moved)
+      moved.setIsStandardArrayPrototype(false)
+      drop moved
+      unsafe gc.releaseOptional(&mut hooks, rt, current)
+      return true
+    }
+    Option<*mut HeapHeader>.None => ()
+  }
+  let ownedPrototype = unsafe prototype.retained()
+  let target = node.getMut(&mut hooks.*)
+  let prepared = run Effect.result(unsafe shapes.prepareUpdate(rt, &mut target))
+  let shapeNode = target.shape
+  drop target
+  match move prepared {
+    Result<(), OutOfMemoryError>.Failure { error } => {
+      // Upstream 8084-8088 leaks this speculative retain on shape OOM. Native
+      // ownership is transactional: retain before prepare, release on failure.
+      unsafe gc.release(&mut hooks, rt, ownedPrototype)
+      fail move error
+    }
+    Result<(), OutOfMemoryError>.Success { .. } => ()
+  }
+  let old = storedPrototype(&hooks.*, node)
+  // Source ordering is observable to native finalizers: old edge and std-array
+  // flag remain visible until after release. replacePrototype publishes too soon.
+  if !Pointer.isNull<HeapHeader>(old) { unsafe gc.release(&mut hooks, rt, ValueBits.Object { reference: present(old) }) }
+  let shapeCell = unsafe CellRef<ShapeData>.of(shapeNode)
+  let shape = shapeCell.getMut(&mut hooks.*)
+  shape.prototype = proto
+  drop shape
+  unsafe shapes.markPrototype(proto)
+  let changed = node.getMut(&mut hooks.*)
+  changed.setIsStandardArrayPrototype(false)
+  return true
+}
+pub effect fn setPrototype<'a, 'b, H: PrototypeHooks + HeapHooks>(hooks: &mut H,realm: Realm<'a>, object: ValueRef<'b>, prototype: ValueRef<'b>) -> bool
+  ! OutOfMemoryError | JsException | PrototypeError ? &mut Allocator {
+  return run unsafe setPrototypeInternal(&mut hooks, realm, object, prototype.view(), true)
+}
+pub effect fn isExtensible<'a, 'b, H: PrototypeHooks>(hooks: &mut H, realm: Realm<'a>,
+  object: ValueRef<'b>) -> bool ! OutOfMemoryError | JsException ? &mut Allocator {
+  if !object.view().isObject() { return false }
+  let rt = runtimeCell(realm.runtime())
+  let node = objectCell(reference(object.view()))
+  match method(&hooks.*, rt, node, EXOTIC_IS_EXTENSIBLE) {
+    Option<NativeFunctionId>.Some { value: table } => { return run hooks.isExtensible(realm, table, object.borrow()) }
+    Option<NativeFunctionId>.None => ()
+  }
+  return node.get(&hooks.*).extensible()
+}
+pub effect fn preventExtensions<'a, 'b, H: PrototypeHooks>(hooks: &mut H, realm: Realm<'a>,
+  object: ValueRef<'b>) -> bool ! OutOfMemoryError | JsException ? &mut Allocator {
+  if !object.view().isObject() { return false }
+  let rt = runtimeCell(realm.runtime())
+  let node = objectCell(reference(object.view()))
+  let data = node.get(&hooks.*)
+  let exotic = data.isExotic()
+  let typed = data.classId() >= classes.JS_CLASS_UINT8C_ARRAY && data.classId() <= classes.JS_CLASS_FLOAT64_ARRAY
+  let mut requiresExtensible = false
+  if exotic && typed {
+    requiresExtensible = match &data.payload {
+      ObjectPayload.TypedArray { array } => array.requiresExtensible
+      _ => invariant()
+    }
+  }
+  drop data
+  if exotic && typed {
+    if requiresExtensible { return false }
+  } else {
+    match method(&hooks.*, rt, node, EXOTIC_PREVENT_EXTENSIONS) {
+      Option<NativeFunctionId>.Some { value: table } => { return run hooks.preventExtensions(realm, table, object.borrow()) }
+      Option<NativeFunctionId>.None => ()
+    }
+  }
+  let changed = node.getMut(&mut hooks.*)
+  changed.setExtensible(false)
+  return true
+}

@@ -1,0 +1,781 @@
+//! SVG icons rasterized by svg_render into atlas tiles at the size they are drawn.
+//!
+//! [`IconCache.register`] parses an icon once. [`IconCache.icon`] returns its tile for a device
+//! pixel size and style, rendering it on a miss and queueing the pixels in
+//! [`IconCache.uploads`] for the renderer to copy into its texture, as the glyph cache does. The
+//! atlas is borrowed per call, so glyphs, icons and images share it.
+//!
+//! An animated icon (SMIL elements, or a `@keyframes` rule for CSS Animations) is cached per
+//! frame: the time is rounded to [`IconOptions.framesPerSecond`], each frame number gets its own
+//! tile, and the atlas evicts frames that stop being drawn. This suits small animated icons such
+//! as spinners. Large animated SVGs should go through the display list lowering into gpu_scene
+//! instead, which does not keep a texture per frame.
+import uploads { Upload, Uploads }
+import atlas.atlas { Atlas, AtlasTile, AtlasError, Kind }
+import svg_render.lib { Animated, RenderOptions, RenderError, Pixmap, Environment }
+import svg_render.lib as renderer
+import svg_core.resources { Resolver }
+import svg_css.colors { Color }
+import silk.collections.hash { Hash, HashKey, HashSeed }
+import silk.collections.hash_map { HashMap }
+import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f32
+import silk.num.f64
+import silk.num.u32
+import silk.num.u8
+import silk.num.u64
+import silk.num.usize
+
+/// A registered icon.
+pub struct IconId {
+  pub index: u32,
+}
+
+impl Copy for IconId {}
+
+/// How an icon's pixels are kept.
+pub union IconStyle {
+  /// Coverage only, one byte per pixel (the rendering's alpha), in a monochrome texture. Draw it
+  /// as a `GlyphSprite`, tinted with the sprite's color, as GPUI draws its icons.
+  Mask,
+  /// Premultiplied RGBA in a polychrome texture, the icon's own colors. Draw it as an
+  /// `ImageSprite`.
+  Color,
+}
+
+impl Copy for IconStyle {}
+
+impl IconStyle {
+  /// The atlas texture kind tiles of this style live in.
+  pub fn kind(self: &Self) -> Kind {
+    return match &self.* {
+      IconStyle.Mask => Kind.Monochrome
+      IconStyle.Color => Kind.Polychrome
+    }
+  }
+
+  fn color(self: &Self) -> bool {
+    return match &self.* {
+      IconStyle.Mask => false
+      IconStyle.Color => true
+    }
+  }
+}
+
+pub struct IconOptions {
+  /// Animation frames per second: an animated icon's time is rounded to a multiple of
+  /// `1 / framesPerSecond` and each multiple is its own tile. Must be positive.
+  pub framesPerSecond: f64,
+}
+
+impl Copy for IconOptions {}
+
+impl IconOptions {
+  pub fn default() -> IconOptions {
+    return IconOptions { framesPerSecond: 60.0 }
+  }
+}
+
+/// How many lookups hit, missed, or found their tile evicted, since the cache was made.
+pub struct IconStats {
+  pub hits: u64,
+  pub misses: u64,
+  pub rerendered: u64,
+}
+
+impl Copy for IconStats {}
+
+/// Maximum distinct viewport-sized tiles retained per (icon, frame, color, tint) so resizing an
+/// inline SVG does not accumulate stale atlas tiles.
+const MAX_VIEWPORT_SIZES: usize = 4
+
+struct IconKey {
+  icon: u32,
+  width: u32,
+  height: u32,
+  /// Bit-encoded CSS viewport width/height overrides (f32.toBits), or 0 when using intrinsic size.
+  viewportWidth: u32,
+  viewportHeight: u32,
+  frame: u32,
+  color: bool,
+  /// The host's `currentColor` as RGBA8 for a color tile; zero for a mask.
+  tint: u32,
+}
+
+impl Copy for IconKey {}
+
+impl HashKey for IconKey {
+  fn equals(left: &Self, right: &Self) -> bool {
+    return left.icon == right.icon && left.width == right.width && left.height == right.height
+      && left.viewportWidth == right.viewportWidth
+      && left.viewportHeight == right.viewportHeight
+      && left.frame == right.frame
+      && left.color == right.color
+      && left.tint == right.tint
+  }
+
+  fn hash(value: &Self, seed: &HashSeed) -> u64 {
+    let mut hashed = Hash.mix(seed, u32.toU64(value.icon))
+    hashed = Hash.combine(hashed, u32.toU64(value.width))
+    hashed = Hash.combine(hashed, u32.toU64(value.height))
+    hashed = Hash.combine(hashed, u32.toU64(value.viewportWidth))
+    hashed = Hash.combine(hashed, u32.toU64(value.viewportHeight))
+    hashed = Hash.combine(hashed, u32.toU64(value.frame))
+    hashed = Hash.combine(hashed, u32.toU64(value.tint))
+    return Hash.combine(
+      hashed,
+      if value.color {
+        1
+      } else {
+        0
+      },
+    )
+  }
+}
+
+struct Source {
+  document: Animated,
+  moves: bool,
+  /// Whether every painted pixel is `currentColor`, once [`IconCache.classify`] has looked.
+  tinted: bool,
+  /// Width over height of the document's viewport (its size, else its viewBox).
+  ratio: f64,
+  /// The root's `width` and `height` in pixels, 0 where the markup gives no absolute one.
+  width: f64,
+  height: f64,
+  /// Whether the root `<svg>` uses a `viewBox` with `preserveAspectRatio="xMin* slice"` and no
+  /// viewport-dependent CSS queries/units, so narrower widths are exact left-anchored crops of a
+  /// wider cached tile.
+  xMinSlice: bool,
+}
+
+pub struct IconCache {
+  options: IconOptions,
+  sources: List<Option<Source>>,
+  entries: HashMap<IconKey, AtlasTile>,
+  pending: Uploads,
+  mask: List<u8>,
+  counters: IconStats,
+  scratchKeys: List<IconKey>,
+}
+
+fn contains(data: &[u8], needle: &[u8]) -> bool {
+  if needle.length == 0 || data.length < needle.length {
+    return needle.length == 0
+  }
+  let mut i: usize = 0
+  while i + needle.length <= data.length {
+    let mut j: usize = 0
+    while j < needle.length && data[i + j] == needle[j] {
+      j = j + 1
+    }
+    if j == needle.length {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+fn containsIn(data: &[u8], start: usize, end: usize, needle: &[u8]) -> bool {
+  if needle.length == 0 {
+    return true
+  }
+  if end < start || end - start < needle.length {
+    return false
+  }
+  let mut i = start
+  while i + needle.length <= end {
+    let mut j: usize = 0
+    while j < needle.length && data[i + j] == needle[j] {
+      j = j + 1
+    }
+    if j == needle.length {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+/// Whether the root `<svg>` tag has a `viewBox` and `preserveAspectRatio` starting with `xMin` and
+/// using `slice`, with no viewport-width-dependent CSS (`@media`, `vw`, `cqw`, `vmin`, `vmax`).
+fn isXMinSlice(data: &[u8]) -> bool {
+  if contains(data, b"@media") || contains(data, b"vw") || contains(data, b"cqw")
+    || contains(data, b"vmin") || contains(data, b"vmax") {
+    return false
+  }
+  let mut i: usize = 0
+  while i + 4 <= data.length && !(data[i] == 60 && data[i + 1] == 115 && data[i + 2] == 118 && data[i + 3] == 103) {
+    i = i + 1
+  }
+  let start = i
+  while i < data.length && data[i] != 62 {
+    i = i + 1
+  }
+  if start >= i {
+    return false
+  }
+  if !containsIn(data, start, i, b"viewBox=") {
+    return false
+  }
+  return containsIn(data, start, i, b"preserveAspectRatio=\"xMinYMin slice\"")
+    || containsIn(data, start, i, b"preserveAspectRatio=\"xMinYMid slice\"")
+    || containsIn(data, start, i, b"preserveAspectRatio=\"xMinYMax slice\"")
+    || containsIn(data, start, i, b"preserveAspectRatio='xMinYMin slice'")
+    || containsIn(data, start, i, b"preserveAspectRatio='xMinYMid slice'")
+    || containsIn(data, start, i, b"preserveAspectRatio='xMinYMax slice'")
+}
+
+/// Attribute `name` of the first `<svg` tag in `data` as pixels: a plain number or one in
+/// `px`. 0 when it is missing, relative (`%`, `em`) or not a number.
+pub fn rootLength(data: &[u8], name: &[u8]) -> f64 {
+  let mut i: usize = 0
+  while i + 4 <= data.length && !(data[i] == 60 && data[i + 1] == 115 && data[i + 2] == 118 && data[i + 3] == 103) {
+    i = i + 1
+  }
+  i = i + 4
+  while i < data.length && data[i] != 62 {
+    // An attribute name starts after white space.
+    let spaced = data[i - 1] == 32 || data[i - 1] == 9 || data[i - 1] == 10 || data[i - 1] == 13
+    if spaced && i + name.length + 1 < data.length {
+      let mut j: usize = 0
+      while j < name.length && data[i + j] == name[j] {
+        j = j + 1
+      }
+      if j == name.length && data[i + j] == 61 {
+        let quote = data[i + j + 1]
+        if quote == 34 || quote == 39 {
+          return pixels(data, i + j + 2, quote)
+        }
+      }
+    }
+    i = i + 1
+  }
+  return 0.0
+}
+
+/// The number at `from` up to `quote`, in pixels, or 0.
+fn pixels(data: &[u8], from: usize, quote: u8) -> f64 {
+  let mut value: f64 = 0.0
+  let mut scale: f64 = 0.0
+  let mut digits: usize = 0
+  let mut i = from
+  while i < data.length && data[i] == 32 {
+    i = i + 1
+  }
+  while i < data.length {
+    let c = data[i]
+    if c >= 48 && c <= 57 {
+      let digit = u32.toF64(u8.toU32(c - 48))
+      if scale == 0.0 {
+        value = value * 10.0 + digit
+      } else {
+        value = value + digit * scale
+        scale = scale / 10.0
+      }
+      digits = digits + 1
+    } else if c == 46 && scale == 0.0 {
+      scale = 0.1
+    } else {
+      break
+    }
+    i = i + 1
+  }
+  if digits == 0 {
+    return 0.0
+  }
+  if i + 1 < data.length && data[i] == 112 && data[i + 1] == 120 {
+    i = i + 2
+  }
+  while i < data.length && data[i] == 32 {
+    i = i + 1
+  }
+  if i < data.length && data[i] == quote {
+    return value
+  }
+  return 0.0
+}
+
+fn near(a: u8, b: u8) -> bool {
+  return if a > b {
+    a - b <= 1
+  } else {
+    b - a <= 1
+  }
+}
+
+fn channel(value: f64) -> u32 {
+  if !(value > 0.0) {
+    return 0
+  }
+  if value >= 1.0 {
+    return 255
+  }
+  return f64.toU32(value * 255.0 + 0.5)
+}
+
+/// `color` as RGBA8 with a set low bit, so that no color keys like a mask.
+fn tintOf(color: &Color) -> u32 {
+  return channel(color.channels[0]) * 16777216 + channel(color.channels[1]) * 65536
+    + channel(color.channels[2]) * 256
+    + (channel(color.alpha) & 254)
+    + 1
+}
+
+impl IconCache {
+  pub fn make(options: IconOptions) -> IconCache {
+    return IconCache {
+      options: options,
+      sources: List<Option<Source>>.make(),
+      entries: HashMap<IconKey, AtlasTile>.make(Hash.seed(0x69636f6e)),
+      pending: Uploads.make(),
+      mask: List<u8>.make(),
+      counters: IconStats { hits: 0, misses: 0, rerendered: 0 },
+      scratchKeys: List<IconKey>.make(),
+    }
+  }
+
+  /// Parses an SVG icon once. Every later [`IconCache.icon`] call for it must pass the same
+  /// `host`, which also decides whether the document animates (an animated processing mode).
+  pub effect fn register(self: &mut Self, data: &[u8], host: &Environment<'_, '_>) -> IconId
+    ! RenderError | OutOfMemoryError
+    ? &mut Resolver | &mut Allocator {
+    let mut document = run renderer.parseAnimated(data, host)
+    let moves = document.animated() || contains(data, b"@keyframes")
+    // Only the width is forced, so the display list height carries the document's aspect.
+    let mut options = RenderOptions.make()
+    options.width = 4096
+    options.maxPixels = usize.MAX
+    let list = run document.frame(&options, host)
+    let ratio = u32.toF64(list.width) / u32.toF64(list.height)
+    drop list
+    let id = IconId { index: u64.toU32(usize.toU64(self.sources.length())) }
+    run self.sources.append(
+      Option<Source>.some(
+        Source {
+          document: move document,
+          moves: moves,
+          tinted: true,
+          ratio: ratio,
+          width: rootLength(data, b"width"),
+          height: rootLength(data, b"height"),
+          xMinSlice: isXMinSlice(data),
+        },
+      ),
+    )
+    return id
+  }
+
+  /// Decides whether `icon` paints only with `currentColor`, by rendering it at `size` pixels
+  /// under two hosts that differ only in `currentColor`: `black` and `white`. Such an icon is
+  /// [`IconCache.tinted`] and draws as a mask in the text color; any other is drawn in color.
+  /// Icons are taken as tinted until classified.
+  pub effect fn classify(
+    self: &mut Self,
+    icon: IconId,
+    size: u32,
+    black: &Environment<'_, '_>,
+    white: &Environment<'_, '_>,
+  ) -> bool
+    ! RenderError | OutOfMemoryError
+    ? &mut Resolver | &mut Allocator {
+    if u32.toUsize(icon.index) >= self.sources.length()
+      || self.sources.asSlice()[u32.toUsize(icon.index)].isNone() {
+      return true
+    }
+    let key = IconKey { icon: icon.index, width: size, height: size, viewportWidth: 0, viewportHeight: 0, frame: 0, color: true, tint: 0 }
+    let dark = run self.render(black, key)
+    let light = run self.render(white, key)
+    let a = dark.data()
+    let b = light.data()
+    let mut tinted = a.length == b.length
+    let mut i: usize = 0
+    while tinted && i + 3 < a.length {
+      // Premultiplied: black paint has no color, white paint has as much color as coverage.
+      tinted = a[i] <= 1 && a[i + 1] <= 1 && a[i + 2] <= 1 && near(b[i], b[i + 3])
+        && near(b[i + 1], b[i + 3])
+        && near(b[i + 2], b[i + 3])
+        && near(a[i + 3], b[i + 3])
+      i = i + 4
+    }
+    let source = &mut self.sources.asMutSlice()[u32.toUsize(icon.index)]
+    match &mut source.* {
+      Option<Source>.Some { value } => {
+        value.tinted = tinted
+      }
+      Option<Source>.None => {}
+    }
+    return tinted
+  }
+
+  /// Sets whether `icon` paints only with `currentColor` without rasterizing it twice.
+  pub fn setTinted(self: &mut Self, icon: IconId, tinted: bool) -> () {
+    if u32.toUsize(icon.index) >= self.sources.length() {
+      return ()
+    }
+    let source = &mut self.sources.asMutSlice()[u32.toUsize(icon.index)]
+    match &mut source.* {
+      Option<Source>.Some { value } => {
+        value.tinted = tinted
+      }
+      Option<Source>.None => {}
+    }
+  }
+
+  /// Whether `icon` paints only with `currentColor` (see [`IconCache.classify`]).
+  pub fn tinted(self: &Self, icon: IconId) -> bool {
+    if u32.toUsize(icon.index) >= self.sources.length() {
+      return true
+    }
+    return match &self.sources.asSlice()[u32.toUsize(icon.index)] {
+      Option<Source>.Some { value } => value.tinted
+      Option<Source>.None => true
+    }
+  }
+
+  /// Whether `icon` has `viewBox` + `preserveAspectRatio="xMin* slice"` with no viewport-width
+  /// CSS dependencies, so narrower boxes are exact left-aligned crops of a wider cached tile.
+  pub fn xMinSlice(self: &Self, icon: IconId) -> bool {
+    if u32.toUsize(icon.index) >= self.sources.length() {
+      return false
+    }
+    return match &self.sources.asSlice()[u32.toUsize(icon.index)] {
+      Option<Source>.Some { value } => value.xMinSlice
+      Option<Source>.None => false
+    }
+  }
+
+  /// Width over height of `icon`'s own viewport, or 0 when it is unknown. A box of another
+  /// shape draws it at this ratio, centered, as `preserveAspectRatio="xMidYMid meet"` does.
+  pub fn ratio(self: &Self, icon: IconId) -> f64 {
+    if u32.toUsize(icon.index) >= self.sources.length() {
+      return 0.0
+    }
+    return match &self.sources.asSlice()[u32.toUsize(icon.index)] {
+      Option<Source>.Some { value } => value.ratio
+      Option<Source>.None => 0.0
+    }
+  }
+
+  /// The `width` the root `<svg>` gives in pixels, as an inline `<svg>` sizes itself when
+  /// CSS does not; 0 for one it leaves out or gives in relative units.
+  pub fn width(self: &Self, icon: IconId) -> f64 {
+    if u32.toUsize(icon.index) >= self.sources.length() {
+      return 0.0
+    }
+    return match &self.sources.asSlice()[u32.toUsize(icon.index)] {
+      Option<Source>.Some { value } => value.width
+      Option<Source>.None => 0.0
+    }
+  }
+
+  /// The `height` the root `<svg>` gives in pixels, as [`IconCache.width`].
+  pub fn height(self: &Self, icon: IconId) -> f64 {
+    if u32.toUsize(icon.index) >= self.sources.length() {
+      return 0.0
+    }
+    return match &self.sources.asSlice()[u32.toUsize(icon.index)] {
+      Option<Source>.Some { value } => value.height
+      Option<Source>.None => 0.0
+    }
+  }
+
+  /// The number of registered icons.
+  pub fn iconCount(self: &Self) -> usize {
+    let mut count: usize = 0
+    let mut i: usize = 0
+    while i < self.sources.length() {
+      if self.sources.asSlice()[i].isSome() {
+        count = count + 1
+      }
+      i = i + 1
+    }
+    return count
+  }
+
+  /// Whether any icon known here changes over time.
+  pub fn anyAnimated(self: &Self) -> bool {
+    let sources = self.sources.asSlice()
+    let mut i: usize = 0
+    while i < sources.length {
+      match &sources[i] {
+        Option<Source>.Some { value } => {
+          if value.moves {
+            return true
+          }
+        }
+        Option<Source>.None => ()
+      }
+      i = i + 1
+    }
+    return false
+  }
+
+  /// Whether `icon` changes over time, so that [`IconCache.icon`] keys it by frame.
+  pub fn animated(self: &Self, icon: IconId) -> bool {
+    if u32.toUsize(icon.index) >= self.sources.length() {
+      return false
+    }
+    return match &self.sources.asSlice()[u32.toUsize(icon.index)] {
+      Option<Source>.Some { value } => value.moves
+      Option<Source>.None => false
+    }
+  }
+
+  /// The frame number `time` (seconds) rounds to for `icon`: zero for a still icon.
+  pub fn frameOf(self: &Self, icon: IconId, time: f64) -> u32 {
+    if !self.animated(icon) || !(time > 0.0) {
+      return 0
+    }
+    let frame = f64.floor(time * self.options.framesPerSecond + 0.5)
+    return if frame >= 4294967295.0 {
+      4294967295
+    } else {
+      f64.toU32(frame)
+    }
+  }
+
+  /// The number of cached tiles.
+  pub fn length(self: &Self) -> usize {
+    return self.entries.length()
+  }
+
+  pub fn stats(self: &Self) -> IconStats {
+    return self.counters
+  }
+
+  /// The tile of `icon` rendered at `width` x `height` device pixels in `style`, at `time`
+  /// seconds for an animated icon. A color tile is kept per `currentColor` of `host`. A hit touches the tile so the atlas keeps it; a miss
+  /// renders the icon with svg_render (the same pixels as `svg_render.lib.render` at that size
+  /// and the rounded time) and queues them in [`IconCache.uploads`].
+  ///
+  /// Fails with `AtlasError.EmptyTile` for a zero size, and with `AtlasError.Full` when the
+  /// atlas has no room after evicting what earlier frames used; nothing is cached then.
+  pub effect fn icon(
+    self: &mut Self,
+    atlas: &mut Atlas,
+    host: &Environment<'_, '_>,
+    icon: IconId,
+    width: u32,
+    height: u32,
+    style: IconStyle,
+    time: f64,
+  ) -> AtlasTile
+    ! RenderError | AtlasError | OutOfMemoryError
+    ? &mut Resolver | &mut Allocator {
+    return run self.iconInViewport(&mut atlas, host, icon, width, height, 0.0, 0.0, style, time)
+  }
+
+  /// Like [`IconCache.icon`], with positive `viewportWidth`/`viewportHeight` (CSS pixels)
+  /// overriding the root `<svg>`'s CSS viewport without re-parsing its markup.
+  pub effect fn iconInViewport(
+    self: &mut Self,
+    atlas: &mut Atlas,
+    host: &Environment<'_, '_>,
+    icon: IconId,
+    width: u32,
+    height: u32,
+    viewportWidth: f64,
+    viewportHeight: f64,
+    style: IconStyle,
+    time: f64,
+  ) -> AtlasTile
+    ! RenderError | AtlasError | OutOfMemoryError
+    ? &mut Resolver | &mut Allocator {
+    if width == 0 || height == 0 || u32.toUsize(icon.index) >= self.sources.length()
+      || self.sources.asSlice()[u32.toUsize(icon.index)].isNone() {
+      fail AtlasError.EmptyTile
+    }
+    let vwBits = if viewportWidth > 0.0 { f32.toBits(f64.toF32(viewportWidth)) } else { 0 }
+    let vhBits = if viewportHeight > 0.0 { f32.toBits(f64.toF32(viewportHeight)) } else { 0 }
+    let key = IconKey {
+      icon: icon.index,
+      width: width,
+      height: height,
+      viewportWidth: vwBits,
+      viewportHeight: vhBits,
+      frame: self.frameOf(icon, time),
+      color: style.color(),
+      tint: if style.color() {
+        tintOf(&host.colors.currentColor)
+      } else {
+        0
+      },
+    }
+    if let Option<AtlasTile>.Some { value } = self.entries.get(key) {
+      if atlas.touch(value.id) {
+        self.counters.hits = self.counters.hits + 1
+        return value
+      }
+      self.counters.rerendered = self.counters.rerendered + 1
+    } else {
+      self.counters.misses = self.counters.misses + 1
+    }
+    if vwBits != 0 || vhBits != 0 {
+      self.scratchKeys.clear()
+      let mut b: usize = 0
+      while b < self.entries.bucketCount() {
+        if self.entries.occupiedAt(b) {
+          let existing = self.entries.keyAt(b)
+          if existing.icon == key.icon && existing.frame == key.frame
+            && existing.color == key.color && existing.tint == key.tint
+            && (existing.viewportWidth != 0 || existing.viewportHeight != 0) {
+            run self.scratchKeys.append(existing)
+          }
+        }
+        b = b + 1
+      }
+      let extra = self.scratchKeys.asSlice()
+      if extra.length >= MAX_VIEWPORT_SIZES {
+        let mut dropCount = extra.length - MAX_VIEWPORT_SIZES + 1
+        let mut k: usize = 0
+        while k < extra.length && dropCount > 0 {
+          if let Option<AtlasTile>.Some { value } = self.entries.remove(extra[k]) {
+            drop atlas.free(value.id)
+          }
+          dropCount = dropCount - 1
+          k = k + 1
+        }
+      }
+    }
+    let pixmap = run self.render(host, key)
+    let tile = run atlas.allocate(style.kind(), pixmap.width(), pixmap.height())
+    let rgba = pixmap.data()
+    match &style {
+      IconStyle.Color => {
+        run self.pending.push(tile, rgba, pixmap.width() * 4)
+      }
+      IconStyle.Mask => {
+        self.mask.clear()
+        let mut i: usize = 3
+        while i < rgba.length {
+          run self.mask.append(rgba[i])
+          i = i + 4
+        }
+        run self.pending.push(tile, self.mask.asSlice(), pixmap.width())
+      }
+    }
+    drop run self.entries.insert(key, tile)
+    return tile
+  }
+
+  /// `icon`'s first frame at `width` x `height` pixels, premultiplied RGBA, outside the atlas
+  /// (for a cursor). None for an unregistered icon or a zero size.
+  pub effect fn rendered(
+    self: &mut Self,
+    host: &Environment<'_, '_>,
+    icon: IconId,
+    width: u32,
+    height: u32,
+  ) -> Option<Pixmap>
+    ! RenderError | OutOfMemoryError
+    ? &mut Resolver | &mut Allocator {
+    if width == 0 || height == 0 || u32.toUsize(icon.index) >= self.sources.length()
+      || self.sources.asSlice()[u32.toUsize(icon.index)].isNone() {
+      return Option<Pixmap>.None
+    }
+    let key = IconKey { icon: icon.index, width: width, height: height, viewportWidth: 0, viewportHeight: 0, frame: 0, color: true, tint: 0 }
+    return Option<Pixmap>.Some { value: run self.render(host, key) }
+  }
+
+  /// The rendering of `key`: `svg_render.lib.render` of the icon at its size and frame time.
+  effect fn render(self: &mut Self, host: &Environment<'_, '_>, key: IconKey) -> Pixmap
+    ! RenderError | OutOfMemoryError
+    ? &mut Resolver | &mut Allocator {
+    let mut options = RenderOptions.make()
+    options.width = key.width
+    options.height = key.height
+    if key.viewportWidth != 0 {
+      options.viewportWidth = f32.toF64(f32.fromBits(key.viewportWidth))
+    }
+    if key.viewportHeight != 0 {
+      options.viewportHeight = f32.toF64(f32.fromBits(key.viewportHeight))
+    }
+    options.time = u32.toF64(key.frame) / self.options.framesPerSecond
+    let source = &mut self.sources.asMutSlice()[u32.toUsize(key.icon)]
+    return match &mut source.* {
+      Option<Source>.Some { value } => {
+        let list = run value.document.frame(&options, host)
+        run renderer.renderDisplayList(&list)
+      }
+      Option<Source>.None => Intrinsic.trap("render of unregistered icon")
+    }
+  }
+
+  /// Tiles rendered since the last [`IconCache.clearUploads`], in allocation order. Mask tiles
+  /// hold one byte per pixel, color tiles four (premultiplied RGBA).
+  pub fn uploads(self: &Self) -> &[Upload] {
+    return self.pending.list()
+  }
+
+  /// The pixel bytes [`Upload.offset`] points into.
+  pub fn uploadBytes(self: &Self) -> &[u8] {
+    return self.pending.bytes()
+  }
+
+  /// Forgets the queued uploads once the renderer has copied them.
+  pub fn clearUploads(self: &mut Self) -> () {
+    self.pending.clear()
+  }
+
+  /// Releases an icon's document and cached tiles. Its id is never reused.
+  pub effect fn unregister(self: &mut Self, atlas: &mut Atlas, icon: IconId) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if u32.toUsize(icon.index) >= self.sources.length() {
+      return ()
+    }
+    self.scratchKeys.clear()
+    let mut i: usize = 0
+    while i < self.entries.bucketCount() {
+      if self.entries.occupiedAt(i) && self.entries.keyAt(i).icon == icon.index {
+        run self.scratchKeys.append(self.entries.keyAt(i))
+      }
+      i = i + 1
+    }
+    let keys = self.scratchKeys.asSlice()
+    i = 0
+    while i < keys.length {
+      if let Option<AtlasTile>.Some { value } = self.entries.remove(keys[i]) {
+        drop atlas.free(value.id)
+      }
+      i = i + 1
+    }
+    let sources = self.sources.asMutSlice()
+    sources[u32.toUsize(icon.index)] = Option<Source>.None
+  }
+
+  /// Drops every entry whose tile `atlas` no longer holds (evicted frames of an animation, for
+  /// example), and returns how many were dropped.
+  pub effect fn prune(self: &mut Self, atlas: &Atlas) -> usize
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    self.scratchKeys.clear()
+    let mut i: usize = 0
+    while i < self.entries.bucketCount() {
+      if self.entries.occupiedAt(i) {
+        if let Option<AtlasTile>.None = atlas.get(self.entries.valueAt(i).id) {
+          run self.scratchKeys.append(self.entries.keyAt(i))
+        }
+      }
+      i = i + 1
+    }
+    let stale = self.scratchKeys.asSlice()
+    let mut j: usize = 0
+    while j < stale.length {
+      drop self.entries.remove(stale[j])
+      j = j + 1
+    }
+    return stale.length
+  }
+
+  /// Drops every cached tile entry, for example when the scale factor changes. Registered
+  /// icons stay; tiles stay allocated until the atlas evicts them.
+  pub fn clear(self: &mut Self) -> () {
+    self.entries.clear()
+  }
+}

@@ -1,0 +1,1053 @@
+// Native QuickJS source positions and PC2LINE format (quickjs.c).
+// Fabrice Bellard and Charlie Gordon; see LICENSE.quickjs.
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.collections.list { List }
+import silk.core.ownership { Copy }
+import silk.mem.pointer { Pointer }
+import silk.collections.slice { Slice }
+import silk.num.u8
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+import silk.num.i32
+import silk.num.i64
+import silk.simd.u8x16
+import silk.simd.mask16
+import byte_buffer { ByteBuffer }
+
+pub const NO_SOURCE_POSITION: u32 = 0xffffffff
+pub const FUNCTION_DEFINITION_PC: u32 = 0xffffffff
+pub const PC2LINE_BASE: i32 = -1
+pub const PC2LINE_RANGE: u32 = 5
+pub const PC2LINE_OP_FIRST: u32 = 1
+pub const PC2LINE_DIFF_PC_MAX: u32 = 50
+
+pub struct SourceLocation { pub line: i32, pub column: i32 }
+impl Copy for SourceLocation {}
+/// One offset in both coordinate systems (SourcePositionCache.locateBoth).
+pub struct SourcePair { pub legacy: SourceLocation, pub ecma: SourceLocation }
+impl Copy for SourcePair {}
+pub struct PcSourcePosition { pub pc: u32, pub sourcePosition: u32 }
+impl Copy for PcSourcePosition {}
+
+// Cached source coordinates are zero-based; decoded debug coordinates are
+// one-based. Keep using the same immutable source with a given cache. Offsets
+// must be within that source, whose line/column counts must fit signed 32 bits.
+// Deliberately matches upstream byte counting, including cursors inside UTF8:
+// only LF starts a new line, CR/U+2028/U+2029 count as columns, continuation
+// bytes do not count, and each leading byte counts one (not two UTF16 units).
+//
+// Besides the last located offset, the cache keeps the furthest offset it has reached (the mark).
+// A function's positions jump back to its start after its nested functions moved the cursor past
+// it, and then forward again; resuming from the mark makes the forward jump cost the distance past
+// the mark instead of a rescan. A jump back to near the start of the source scans from the start.
+//
+// A prepared cache also keeps checkpoints: the coordinates of every CHECKPOINT_BYTES-th
+// offset, recorded the first time a scan passes it. Nested functions are compiled before
+// their parent, so a parent's positions jump back over every nested body it contains; with
+// checkpoints a jump costs at most CHECKPOINT_BYTES of scanning instead of the distance, and
+// the whole source is scanned about once however deep its functions nest.
+pub struct SourcePositionCache {
+  cursor: usize, line: i32, column: i32,
+  markCursor: usize, markLine: i32, markColumn: i32,
+  ecmaCursor: usize, ecmaLine: i32, ecmaColumn: i32,
+  checkpoints: List<SourceLocation>, covered: usize,
+  ecmaCheckpoints: List<SourceLocation>, ecmaCovered: usize,
+  // The offset of checkpoint 0: 0, or where an `at` cache starts.
+  base: usize,
+  // shareCoordinates: up to this offset locateEcma answers with locate (0: never).
+  sharedEnd: usize,
+  // shareCoordinates found, or was told, that the whole source is plain (see
+  // js_core_types.SourceText): a parse through this cache passes that on.
+  pub plainText: bool,
+  // The line index (shareCoordinates): when indexed, the two coordinate systems
+  // agree over source[base, sharedEnd), feeds holds the offset of each LF there
+  // and trails that of each UTF8 continuation byte, both in order, so locate
+  // there takes a search instead of a scan. The line is the coordinates at base
+  // (feedLine, feedColumn) plus the LFs before the offset; the column counts the
+  // bytes since the last of them, less the continuation bytes among them.
+  // feedHint is the count of LFs before the last offset located that way.
+  feeds: List<u32>, indexed: bool, feedHint: usize, feedLine: i32, feedColumn: i32,
+  trails: List<u32>
+}
+const CHECKPOINT_BYTES: usize = 256
+impl SourcePositionCache {
+  pub fn make() -> SourcePositionCache {
+    return SourcePositionCache { cursor: 0, line: 0, column: 0, markCursor: 0, markLine: 0, markColumn: 0,
+      ecmaCursor: 0, ecmaLine: 0, ecmaColumn: 0,
+      checkpoints: List<SourceLocation>.make(), covered: 0,
+      ecmaCheckpoints: List<SourceLocation>.make(), ecmaCovered: 0, base: 0, sharedEnd: 0, plainText: false,
+      feeds: List<u32>.make(), indexed: false, feedHint: 0, feedLine: 0, feedColumn: 0,
+      trails: List<u32>.make() }
+  }
+  /// A cache whose cursors already stand at offset, at (line, column) and
+  /// (ecmaLine, ecmaColumn) in ECMAScript coordinates: later offsets are counted
+  /// from there.
+  pub fn at(offset: usize, line: i32, column: i32, ecmaLine: i32, ecmaColumn: i32) -> SourcePositionCache {
+    return SourcePositionCache { cursor: offset, line: line, column: column, markCursor: 0, markLine: 0, markColumn: 0,
+      ecmaCursor: offset, ecmaLine: ecmaLine, ecmaColumn: ecmaColumn,
+      checkpoints: List<SourceLocation>.make(), covered: 0,
+      ecmaCheckpoints: List<SourceLocation>.make(), ecmaCovered: 0, base: offset, sharedEnd: 0, plainText: false,
+      feeds: List<u32>.make(), indexed: false, feedHint: 0, feedLine: 0, feedColumn: 0,
+      trails: List<u32>.make() }
+  }
+  /// Reserves checkpoints for a source of `length` bytes. Without it the cache works
+  /// from its cursor and mark alone.
+  pub effect fn prepare(self: &mut Self, length: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.prepareSpan(length)
+  }
+  /// prepare for a cache made by `at`: checkpoints for its offset up to
+  /// offset + length, starting from its coordinates there.
+  pub effect fn prepareSpan(self: &mut Self, length: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+    let count = length / CHECKPOINT_BYTES + 1
+    self.checkpoints = run List<SourceLocation>.makeWithCapacity(count)
+    run self.checkpoints.appendRepeated(SourceLocation { line: 0, column: 0 }, count)
+    self.checkpoints.set(0, SourceLocation { line: self.line, column: self.column })
+    self.covered = 1
+    self.ecmaCheckpoints = run List<SourceLocation>.makeWithCapacity(count)
+    run self.ecmaCheckpoints.appendRepeated(SourceLocation { line: 0, column: 0 }, count)
+    self.ecmaCheckpoints.set(0, SourceLocation { line: self.ecmaLine, column: self.ecmaColumn })
+    self.ecmaCovered = 1
+  }
+  /// After prepare or prepareSpan: if source[base, base + length) is ASCII without CR
+  /// and both coordinate systems agree at base, they agree throughout that span (LF is
+  /// its only terminator and every byte one column), so locateEcma answers there with
+  /// locate and the source is scanned once instead of twice. plain says the whole
+  /// source is already known to be plain (js_core_types.SourceText). A span that is
+  /// gets a line index too (see feeds), found in that pass; a known-plain one does not.
+  pub effect fn shareCoordinates(self: &mut Self, source: &[u8], length: usize, plain: bool) -> ()
+    ! OutOfMemoryError ? &mut Allocator {
+    if plain { self.plainText = true }
+    if self.covered == 0 || self.ecmaCovered == 0 || self.cursor != self.base || self.ecmaCursor != self.base
+      || self.line != self.ecmaLine || self.column != self.ecmaColumn { return () }
+    if self.base > source.length || length > source.length - self.base { return () }
+    let end = self.base + length
+    let bytes = Pointer.fromSlice<u8>(source)
+    // Offsets in the index are u32, as source positions are.
+    let mut clean = self.base
+    // Known plain needs no pass; the index is only worth one where a pass runs anyway.
+    if !plain && end <= u32.toUsize(u32.MAX) { clean = run unsafe indexFeeds(bytes, self.base, end, &mut self.feeds, &mut self.trails) }
+    if clean == end {
+      self.indexed = true
+      self.feedLine = self.line
+      self.feedColumn = self.column
+      self.sharedEnd = end
+      if self.base == 0 && end == source.length { self.plainText = true }
+      return ()
+    }
+    self.feeds.clear()
+    self.trails.clear()
+    // The two systems agree over [base, clean).
+    if plain || unsafe sameCoordinates(bytes, clean, end) {
+      self.sharedEnd = end
+      if self.base == 0 && end == source.length { self.plainText = true }
+    }
+  }
+  // locate within an indexed span: the LFs before offset give its line, the last
+  // of them its column.
+  fn locateIndexed(self: &mut Self, offset: usize) -> SourceLocation {
+    let feeds = self.feeds.asSlice()
+    let count = feeds.length
+    let target = usize.toU32(offset)
+    let mut before = self.feedHint
+    // Most lookups land on the line of the one before.
+    if !((before == 0 || feeds[before - 1] < target) && (before == count || feeds[before] >= target)) {
+      let mut low: usize = 0
+      let mut high = count
+      while low < high {
+        let middle = low + (high - low) / 2
+        if feeds[middle] < target { low = middle + 1 } else { high = middle }
+      }
+      before = low
+    }
+    self.feedHint = before
+    let lineStart = if before == 0 { usize.toU32(self.base) } else { feeds[before - 1] + 1 }
+    let mut bytes = target - lineStart
+    if self.trails.length() != 0 { bytes = bytes - (rankBelow(self.trails.asSlice(), target) - rankBelow(self.trails.asSlice(), lineStart)) }
+    if before == 0 { return SourceLocation { line: self.feedLine, column: i32.wrappingAdd(self.feedColumn, u32.toI32(bytes)) } }
+    return SourceLocation { line: i32.wrappingAdd(self.feedLine, usize.toI32(before)), column: u32.toI32(bytes) }
+  }
+  @inlineAlways
+  pub fn locate(self: &mut Self, source: &[u8], offset: usize) -> SourceLocation {
+    if self.indexed && offset <= self.sharedEnd && offset >= self.base {
+      if offset > source.length { Intrinsic.trap("SourcePositionCache.locate: offset past source") }
+      return self.locateIndexed(offset)
+    }
+    if self.covered != 0 { return self.locateFromCheckpoint(source, offset) }
+    if offset >= self.cursor {
+      // Checking the end once lets the scan read without per-byte index checks.
+      if offset > source.length { Intrinsic.trap("SourcePositionCache.locate: offset past source") }
+      if offset >= self.markCursor && self.markCursor > self.cursor {
+        self.cursor = self.markCursor
+        self.line = self.markLine
+        self.column = self.markColumn
+      }
+      let moved = unsafe scan(Pointer.fromSlice<u8>(source), source.length, self.cursor, offset, self.line, self.column)
+      self.line = moved.line
+      self.column = moved.column
+    } else {
+      if self.cursor > self.markCursor {
+        self.markCursor = self.cursor
+        self.markLine = self.line
+        self.markColumn = self.column
+      }
+      if offset <= self.cursor - offset {
+        let start = unsafe scan(Pointer.fromSlice<u8>(source), source.length, 0, offset, 0, 0)
+        self.line = start.line
+        self.column = start.column
+      } else {
+        let between = unsafe scan(Pointer.fromSlice<u8>(source), source.length, offset, self.cursor, 0, 0)
+        if between.line == 0 { self.column = self.column - between.column }
+        else {
+          self.line = self.line - between.line
+          self.column = unsafe columnBefore(Pointer.fromSlice<u8>(source), offset)
+        }
+      }
+    }
+    self.cursor = offset
+    return SourceLocation { line: self.line, column: self.column }
+  }
+  // Same checkpoint scheme as locateFromCheckpoint: a step back or a long step forward
+  // restarts from the checkpoint at or below `offset`, so no lookup scans more than
+  // CHECKPOINT_BYTES past what the checkpoints already cover.
+  fn locateEcmaFromCheckpoint(self: &mut Self, source: &[u8], offset: usize) -> SourceLocation {
+    let mut from = self.ecmaCursor
+    let mut at = SourceLocation { line: self.ecmaLine, column: self.ecmaColumn }
+    if offset < self.ecmaCursor || offset - self.ecmaCursor > CHECKPOINT_BYTES {
+      let mut index = (offset - self.base) / CHECKPOINT_BYTES
+      if index >= self.ecmaCovered { index = self.ecmaCovered - 1 }
+      let start = self.base + index * CHECKPOINT_BYTES
+      if self.ecmaCursor > offset || self.ecmaCursor < start {
+        from = start
+        at = self.ecmaCheckpoints.get(index)
+      }
+    }
+    while self.ecmaCovered < self.ecmaCheckpoints.length() {
+      let boundary = self.base + self.ecmaCovered * CHECKPOINT_BYTES
+      if boundary > offset || boundary < from { break }
+      at = scanEcma(source, from, boundary, at)
+      self.ecmaCheckpoints.set(self.ecmaCovered, at)
+      self.ecmaCovered = self.ecmaCovered + 1
+      from = boundary
+    }
+    at = scanEcma(source, from, offset, at)
+    self.ecmaCursor = offset self.ecmaLine = at.line self.ecmaColumn = at.column
+    return at
+  }
+  /// locate and locateEcma at one offset. Where the two systems share
+  /// coordinates (shareCoordinates), one lookup answers both.
+  pub fn locateBoth(self: &mut Self, source: &[u8], offset: usize) -> SourcePair {
+    let at = self.locate(source, offset)
+    if offset <= self.sharedEnd && offset >= self.base { return SourcePair { legacy: at, ecma: at } }
+    return SourcePair { legacy: at, ecma: self.locateEcma(source, offset) }
+  }
+  /// ECMAScript stack coordinates: UTF-16 columns and all line terminators.
+  /// Kept separate from QuickJS's legacy scalar/LF coordinate policy.
+  pub fn locateEcma(self: &mut Self, source: &[u8], offset: usize) -> SourceLocation {
+    if offset > source.length { Intrinsic.trap("SourcePositionCache.locateEcma: offset past source") }
+    if offset <= self.sharedEnd && offset >= self.base { return self.locate(source, offset) }
+    if self.ecmaCovered != 0 {
+      if offset < self.base { Intrinsic.trap("SourcePositionCache.locateEcma: offset before its start") }
+      return self.locateEcmaFromCheckpoint(source, offset)
+    }
+    if offset >= self.ecmaCursor {
+      let mut i = self.ecmaCursor
+      while i < offset {
+        let c = source[i]
+        if ecmaTerminator(source, i) {
+          if c != 10 || i == 0 || source[i - 1] != 13 { self.ecmaLine = self.ecmaLine + 1 }
+          self.ecmaColumn = 0
+        } else { self.ecmaColumn = self.ecmaColumn + utf16Width(c) }
+        i = i + 1
+      }
+    } else {
+      // Reverse only the traversed delta, never the whole source prefix.
+      let mut lines: i32 = 0 let mut columns: i32 = 0
+      let mut i = offset
+      while i < self.ecmaCursor {
+        let c = source[i]
+        if ecmaTerminator(source, i) {
+          if c != 10 || i == 0 || source[i - 1] != 13 { lines = lines + 1 }
+          columns = 0
+        } else { columns = columns + utf16Width(c) }
+        i = i + 1
+      }
+      if lines == 0 { self.ecmaColumn = self.ecmaColumn - columns }
+      else {
+        self.ecmaLine = self.ecmaLine - lines self.ecmaColumn = 0 i = offset
+        while i > 0 {
+          i = i - 1
+          if ecmaTerminator(source, i) { break }
+          self.ecmaColumn = self.ecmaColumn + utf16Width(source[i])
+        }
+      }
+    }
+    self.ecmaCursor = offset
+    return SourceLocation { line: self.ecmaLine, column: self.ecmaColumn }
+  }
+  @inlineAlways
+  fn locateFromCheckpoint(self: &mut Self, source: &[u8], offset: usize) -> SourceLocation {
+    if offset > source.length || offset < self.base { Intrinsic.trap("SourcePositionCache.locate: offset outside source") }
+    if offset < self.cursor && self.cursor - offset <= CHECKPOINT_BYTES {
+      // A short step back: count what lies between instead of rescanning from a checkpoint.
+      let between = unsafe scan(Pointer.fromSlice<u8>(source), source.length, offset, self.cursor, 0, 0)
+      if between.line == 0 { self.column = self.column - between.column }
+      else {
+        self.line = self.line - between.line
+        self.column = unsafe columnBefore(Pointer.fromSlice<u8>(source), offset)
+      }
+      self.cursor = offset
+      return SourceLocation { line: self.line, column: self.column }
+    }
+    let mut from = self.cursor
+    let mut at = SourceLocation { line: self.line, column: self.column }
+    if offset < self.cursor || offset - self.cursor > CHECKPOINT_BYTES {
+      let mut index = (offset - self.base) / CHECKPOINT_BYTES
+      if index >= self.covered { index = self.covered - 1 }
+      let start = self.base + index * CHECKPOINT_BYTES
+      if self.cursor > offset || self.cursor < start {
+        from = start
+        at = self.checkpoints.get(index)
+      }
+    }
+    // Record the checkpoints this scan passes for the first time.
+    while self.covered < self.checkpoints.length() {
+      let boundary = self.base + self.covered * CHECKPOINT_BYTES
+      if boundary > offset || boundary < from { break }
+      at = unsafe scan(Pointer.fromSlice<u8>(source), source.length, from, boundary, at.line, at.column)
+      self.checkpoints.set(self.covered, at)
+      self.covered = self.covered + 1
+      from = boundary
+    }
+    at = unsafe scan(Pointer.fromSlice<u8>(source), source.length, from, offset, at.line, at.column)
+    self.cursor = offset self.line = at.line self.column = at.column
+    return at
+  }
+}
+
+const ONES: u64 = 0x0101010101010101
+const HIGH: u64 = 0x8080808080808080
+const LOW: u64 = 0x7f7f7f7f7f7f7f7f
+const NEWLINES: u64 = 0x0a0a0a0a0a0a0a0a
+unsafe fn wordAt(bytes: ?[*]const u8, index: usize) -> u64 {
+  let base = unsafe Intrinsic.pointerRequalify<?[*]const u8, [*]const u8>(bytes)
+  let at = unsafe Intrinsic.pointerReinterpret<*const u8, *const align(1) u64>(unsafe Pointer.at<u8>(base, index))
+  return unsafe Pointer.readUnaligned<u64>(at)
+}
+// The high bit of each byte of `word` that is LF.
+@inlineAlways
+fn newlinesIn(word: u64) -> u64 {
+  let other = u64.bitXor(word, NEWLINES)
+  return u64.bitAnd(u64.bitNot(u64.bitOr(u64.wrappingAdd(u64.bitAnd(other, LOW), LOW), other)), HIGH)
+}
+// The high bit of each byte of `word` that counts as a column: every byte except UTF8
+// continuation bytes, which have bit 7 set and bit 6 clear.
+@inlineAlways
+fn leadsIn(word: u64) -> u64 {
+  return u64.bitAnd(u64.bitNot(u64.bitAnd(word, u64.bitNot(u64.shiftLeft(word, 1)))), HIGH)
+}
+// The number of bytes marked in `marks`, which holds only high bits.
+@inlineAlways
+fn marked(marks: u64) -> i32 {
+  return u64.toI32(u64.shiftRight(u64.wrappingMultiply(u64.shiftRight(marks, 7), ONES), 56))
+}
+// The high bits of every byte at or below the highest byte marked in `newlines`.
+@inlineAlways
+fn throughLast(newlines: u64) -> u64 {
+  let mut smeared = u64.bitOr(newlines, u64.shiftRight(newlines, 8))
+  smeared = u64.bitOr(smeared, u64.shiftRight(smeared, 16))
+  return u64.bitOr(smeared, u64.shiftRight(smeared, 32))
+}
+// Advances line/column over bytes [from, to), which must be within the source of `length` bytes.
+// Each step reads one word: an LF adds its count to the line, and the column restarts with the
+// bytes after the last LF. A word that reaches past `to` masks those bytes off; only the last
+// few bytes of the source, where a whole word would read past the end, go byte by byte.
+@inlineAlways
+unsafe fn scan(bytes: ?[*]const u8, length: usize, from: usize, to: usize, startLine: i32, startColumn: i32) -> SourceLocation {
+  let mut line = startLine
+  let mut column = startColumn
+  let mut i = from
+  while i < to {
+    let remaining = to - i
+    if remaining < 8 && length - i < 8 {
+      while i < to {
+        let c = unsafe byteAt(bytes, i)
+        if c == 10 {
+          line = line + 1
+          column = 0
+        } else if c < 128 || c >= 192 { column = i32.wrappingAdd(column, 1) }
+        i = i + 1
+      }
+      break
+    }
+    // Sixty-four ASCII bytes at once, one line feed bit per byte (minified
+    // code has long lines, so most of a scan is this step).
+    if remaining >= 64 {
+      let base = unsafe Intrinsic.pointerRequalify<?[*]const u8, [*]const u8>(bytes)
+      let a = unsafe lanesAt(base, i)
+      let b = unsafe lanesAt(base, i + 16)
+      let c = unsafe lanesAt(base, i + 32)
+      let d = unsafe lanesAt(base, i + 48)
+      if !mask16.any(u8x16.lanesGreaterOrEqual((a | b) | (c | d), u8x16.splat(128))) {
+        let feed = u8x16.splat(10)
+        let feeds = mask16.toBits(u8x16.lanesEqual(a, feed)) | u64.shiftLeft(mask16.toBits(u8x16.lanesEqual(b, feed)), 16)
+          | u64.shiftLeft(mask16.toBits(u8x16.lanesEqual(c, feed)), 32) | u64.shiftLeft(mask16.toBits(u8x16.lanesEqual(d, feed)), 48)
+        if feeds == 0 { column = i32.wrappingAdd(column, 64) }
+        else {
+          line = line + u32.toI32(u64.countOnes(feeds))
+          column = u32.toI32(u64.leadingZeros(feeds))
+        }
+        i = i + 64
+        continue
+      }
+    }
+    // Sixteen ASCII bytes at once: count their line feeds, and the column restarts
+    // after the last one.
+    if remaining >= 16 {
+      let lanes = unsafe lanesAt(unsafe Intrinsic.pointerRequalify<?[*]const u8, [*]const u8>(bytes), i)
+      if !mask16.any(u8x16.lanesGreaterOrEqual(lanes, u8x16.splat(128))) {
+        let feeds = mask16.toBits(u8x16.lanesEqual(lanes, u8x16.splat(10)))
+        if feeds == 0 { column = i32.wrappingAdd(column, 16) }
+        else {
+          if u64.bitAnd(feeds, feeds - 1) == 0 { line = line + 1 } else { line = line + u32.toI32(u64.countOnes(feeds)) }
+          column = u32.toI32(u64.leadingZeros(feeds)) - 48
+        }
+        i = i + 16
+        continue
+      }
+    }
+    let word = unsafe wordAt(bytes, i)
+    let found = newlinesIn(word)
+    // Most words are eight ASCII columns without a line feed.
+    if found == 0 && u64.bitAnd(word, HIGH) == 0 && remaining >= 8 {
+      column = i32.wrappingAdd(column, 8)
+      i = i + 8
+      continue
+    }
+    let mut valid = HIGH
+    if remaining < 8 { valid = u64.bitAnd(HIGH, u64.wrappingSubtract(u64.shiftLeft(1, usize.toU64(remaining * 8)), 1)) }
+    let newlines = u64.bitAnd(found, valid)
+    let leads = u64.bitAnd(leadsIn(word), valid)
+    if newlines == 0 {
+      column = i32.wrappingAdd(column, marked(leads))
+    } else {
+      line = line + marked(newlines)
+      column = marked(u64.bitAnd(leads, u64.bitNot(throughLast(newlines))))
+    }
+    i = i + 8
+  }
+  return SourceLocation { line: line, column: column }
+}
+// The column of `offset`: the bytes that count as columns between the LF before it (or the start
+// of the source) and `offset`, read a word at a time from `offset` down.
+unsafe fn columnBefore(bytes: ?[*]const u8, offset: usize) -> i32 {
+  let mut column: i32 = 0
+  let mut i = offset
+  while i >= 8 {
+    let word = unsafe wordAt(bytes, i - 8)
+    let newlines = newlinesIn(word)
+    let leads = leadsIn(word)
+    if newlines != 0 { return column + marked(u64.bitAnd(leads, u64.bitNot(throughLast(newlines)))) }
+    column = column + marked(leads)
+    i = i - 8
+  }
+  while i > 0 {
+    i = i - 1
+    let c = unsafe byteAt(bytes, i)
+    if c == 10 { break }
+    if c < 128 || c >= 192 { column = column + 1 }
+  }
+  return column
+}
+
+@inlineAlways
+unsafe fn lanesAt(base: [*]const u8, index: usize) -> simd<u8, 16> {
+  return unsafe Pointer.readUnaligned<simd<u8, 16>>(unsafe Intrinsic.pointerReinterpret<*const u8, *const align(1) simd<u8, 16>>(unsafe Pointer.at<u8>(base, index)))
+}
+// How many of the ascending values are below target.
+fn rankBelow(values: &[u32], target: u32) -> u32 {
+  let mut low: usize = 0
+  let mut high = values.length
+  while low < high {
+    let middle = low + (high - low) / 2
+    if values[middle] < target { low = middle + 1 } else { high = middle }
+  }
+  return usize.toU32(low)
+}
+// At most one continuation byte per this many source bytes is indexed; a span
+// with more (mostly non-Latin text) keeps scanning instead.
+const TRAIL_RATIO: usize = 16
+// Appends the offset of every LF in bytes [from, to) to feeds and of every UTF8
+// continuation byte to trails while the two coordinate systems agree over those
+// bytes (no CR, LS, PS or four-byte sequence; see sameCoordinates). Returns to when
+// they agree throughout, else an offset at or before the first byte where they may
+// not: they agree before it, and the lists are then partial.
+unsafe effect fn indexFeeds(bytes: ?[*]const u8, from: usize, to: usize, feeds: &mut List<u32>, trails: &mut List<u32>) -> usize
+  ! OutOfMemoryError ? &mut Allocator {
+  let mut i = from
+  let base = unsafe Intrinsic.pointerRequalify<?[*]const u8, [*]const u8>(bytes)
+  let returns = u8x16.splat(13)
+  let high = u8x16.splat(128)
+  let feed = u8x16.splat(10)
+  let limit = (to - from) / TRAIL_RATIO
+  while to - i >= 64 {
+    let a = unsafe lanesAt(base, i)
+    let b = unsafe lanesAt(base, i + 16)
+    let c = unsafe lanesAt(base, i + 32)
+    let d = unsafe lanesAt(base, i + 48)
+    let fewest = u8x16.minimum(u8x16.minimum(a ^ returns, b ^ returns), u8x16.minimum(c ^ returns, d ^ returns))
+    let nearest = u8x16.minimum(u8x16.minimum(a ^ feed, b ^ feed), u8x16.minimum(c ^ feed, d ^ feed))
+    // Most blocks hold no CR, LF or non-ASCII byte: one test passes them.
+    if !mask16.any(u8x16.lanesGreaterOrEqual((a | b) | (c | d), high))
+      && !mask16.any(u8x16.lanesEqual(u8x16.minimum(fewest, nearest), u8x16.splat(0))) {
+      i = i + 64
+      continue
+    }
+    if mask16.any(u8x16.lanesEqual(fewest, u8x16.splat(0))) { return i }
+    if mask16.any(u8x16.lanesGreaterOrEqual((a | b) | (c | d), high)) {
+      // Non-ASCII: this block byte by byte.
+      let stop = i + 64
+      while i < stop {
+        let at = run unsafe indexByte(bytes, i, to, &mut feeds, &mut trails)
+        if !at || trails.length() > limit { return stop - 64 }
+        i = i + 1
+      }
+      continue
+    }
+    let mut found = mask16.toBits(u8x16.lanesEqual(a, feed)) | u64.shiftLeft(mask16.toBits(u8x16.lanesEqual(b, feed)), 16)
+      | u64.shiftLeft(mask16.toBits(u8x16.lanesEqual(c, feed)), 32) | u64.shiftLeft(mask16.toBits(u8x16.lanesEqual(d, feed)), 48)
+    while found != 0 {
+      run feeds.append(usize.toU32(i + u32.toUsize(u64.trailingZeros(found))))
+      found = u64.bitAnd(found, found - 1)
+    }
+    i = i + 64
+  }
+  let start = i
+  while i < to {
+    if !(run unsafe indexByte(bytes, i, to, &mut feeds, &mut trails)) || trails.length() > limit { return start }
+    i = i + 1
+  }
+  return to
+}
+// indexFeeds for the byte at i: false where the coordinate systems may part.
+@inlineAlways
+unsafe effect fn indexByte(bytes: ?[*]const u8, i: usize, to: usize, feeds: &mut List<u32>, trails: &mut List<u32>) -> bool
+  ! OutOfMemoryError ? &mut Allocator {
+  let c = unsafe byteAt(bytes, i)
+  if c < 128 {
+    if c == 13 { return false }
+    if c == 10 { run feeds.append(usize.toU32(i)) }
+    return true
+  }
+  if c >= 240 { return false }
+  if c == 226 && to - i >= 3 && unsafe byteAt(bytes, i + 1) == 128 {
+    let last = unsafe byteAt(bytes, i + 2)
+    if last == 168 || last == 169 { return false }
+  }
+  if c < 192 { run trails.append(usize.toU32(i)) }
+  return true
+}
+const CARRIAGE_RETURNS: u64 = 0x0d0d0d0d0d0d0d0d
+// Whether QuickJS and ECMAScript coordinates agree over bytes [from, to): no CR,
+// no LS or PS, and no four-byte sequence (one column there, two UTF-16 units
+// here). Other UTF-8 counts one column per character in both.
+unsafe fn sameCoordinates(bytes: ?[*]const u8, from: usize, to: usize) -> bool {
+  let mut i = from
+  let base = unsafe Intrinsic.pointerRequalify<?[*]const u8, [*]const u8>(bytes)
+  let returns = u8x16.splat(13)
+  let high = u8x16.splat(128)
+  // 64 bytes at a time: any CR lane XORs to zero, any non-ASCII lane has bit 7.
+  while to - i >= 64 {
+    let a = unsafe lanesAt(base, i)
+    let b = unsafe lanesAt(base, i + 16)
+    let c = unsafe lanesAt(base, i + 32)
+    let d = unsafe lanesAt(base, i + 48)
+    let fewest = u8x16.minimum(u8x16.minimum(a ^ returns, b ^ returns), u8x16.minimum(c ^ returns, d ^ returns))
+    let either = (a | b) | (c | d)
+    if mask16.any(u8x16.lanesEqual(fewest, u8x16.splat(0))) || mask16.any(u8x16.lanesGreaterOrEqual(either, high)) {
+      if !unsafe sameCoordinatesBytes(bytes, i, i + 64, to) { return false }
+    }
+    i = i + 64
+  }
+  while to - i >= 8 {
+    let word = unsafe wordAt(bytes, i)
+    let other = u64.bitXor(word, CARRIAGE_RETURNS)
+    let returns = u64.bitAnd(u64.bitNot(u64.bitOr(u64.wrappingAdd(u64.bitAnd(other, LOW), LOW), other)), HIGH)
+    if u64.bitOr(u64.bitAnd(word, HIGH), returns) != 0 {
+      // Only a word with a CR or a non-ASCII byte goes byte by byte.
+      if !unsafe sameCoordinatesBytes(bytes, i, i + 8, to) { return false }
+    }
+    i = i + 8
+  }
+  return unsafe sameCoordinatesBytes(bytes, i, to, to)
+}
+// sameCoordinates over bytes [from, until); a sequence may run on up to `to`.
+unsafe fn sameCoordinatesBytes(bytes: ?[*]const u8, from: usize, until: usize, to: usize) -> bool {
+  let mut i = from
+  while i < until {
+    let c = unsafe byteAt(bytes, i)
+    if c == 13 || c >= 240 { return false }
+    if c == 226 && to - i >= 3 && unsafe byteAt(bytes, i + 1) == 128 {
+      let last = unsafe byteAt(bytes, i + 2)
+      if last == 168 || last == 169 { return false }
+    }
+    i = i + 1
+  }
+  return true
+}
+// Advances ECMAScript coordinates over bytes [from, to). A word of ASCII with no CR or LF
+// adds eight columns at once; any other word goes byte by byte.
+fn scanEcma(source: &[u8], from: usize, to: usize, start: SourceLocation) -> SourceLocation {
+  let mut line = start.line
+  let mut column = start.column
+  let mut i = from
+  let bytes = Pointer.fromSlice<u8>(source)
+  while i < to {
+    if to - i >= 8 {
+      let word = unsafe wordAt(bytes, i)
+      let other = u64.bitXor(word, CARRIAGE_RETURNS)
+      let returns = u64.bitAnd(u64.bitNot(u64.bitOr(u64.wrappingAdd(u64.bitAnd(other, LOW), LOW), other)), HIGH)
+      if u64.bitOr(u64.bitOr(u64.bitAnd(word, HIGH), newlinesIn(word)), returns) == 0 {
+        column = column + 8
+        i = i + 8
+        continue
+      }
+    }
+    let c = source[i]
+    if ecmaTerminator(source, i) {
+      if c != 10 || i == 0 || source[i - 1] != 13 { line = line + 1 }
+      column = 0
+    } else { column = column + utf16Width(c) }
+    i = i + 1
+  }
+  return SourceLocation { line: line, column: column }
+}
+fn utf16Width(byte: u8) -> i32 {
+  if byte >= 240 { return 2 }
+  if byte < 128 || byte >= 192 { return 1 }
+  return 0
+}
+fn ecmaTerminator(source: &[u8], offset: usize) -> bool {
+  let c = source[offset]
+  return c == 13 || c == 10 || (c == 226 && offset + 2 < source.length
+    && source[offset + 1] == 128 && (source[offset + 2] == 168 || source[offset + 2] == 169))
+}
+
+// Mirrors add_pc2line_info's bounded collector. A zero capacity disables it;
+// full collectors, descending PCs and duplicate source positions are ignored.
+pub struct PcSourcePositions {
+  entries: List<PcSourcePosition>, capacity: usize, lastPc: u32, lastSource: u32
+}
+impl PcSourcePositions {
+  pub effect fn make(capacity: usize, functionSourcePosition: u32) -> PcSourcePositions
+    ! OutOfMemoryError ? &mut Allocator {
+    let mut entries = List<PcSourcePosition>.make()
+    run entries.reserve(capacity)
+    return PcSourcePositions { entries: move entries, capacity: capacity,
+      lastPc: 0, lastSource: functionSourcePosition }
+  }
+  pub fn asSlice(self: &Self) -> &[PcSourcePosition] { return self.entries.asSlice() }
+  pub effect fn add(self: &mut Self, pc: u32, sourcePosition: u32) -> bool
+    ! OutOfMemoryError ? &mut Allocator {
+    if self.entries.length() >= self.capacity || pc < self.lastPc || sourcePosition == self.lastSource { return false }
+    run self.entries.append(PcSourcePosition { pc: pc, sourcePosition: sourcePosition })
+    self.lastPc = pc
+    self.lastSource = sourcePosition
+    return true
+  }
+}
+
+pub struct Leb128Read { pub value: u32, pub next: usize, pub valid: bool }
+impl Copy for Leb128Read {}
+pub struct SignedLeb128Read { pub value: i32, pub next: usize, pub valid: bool }
+impl Copy for SignedLeb128Read {}
+
+// Upstream accepts noncanonical encodings and discards the high bits of a fifth
+// terminating byte. Five continuation bytes or truncation fail without advancing
+// the caller's cursor. QuickJS's signed LEB is ZigZag, NOT DWARF SLEB128.
+pub fn readLeb128(bytes: &[u8], start: usize) -> Leb128Read {
+  return unsafe readLeb128Raw(Pointer.fromSlice<u8>(bytes), bytes.length, start)
+}
+unsafe fn byteAt(bytes: ?[*]const u8, index: usize) -> u8 {
+  let base = unsafe Intrinsic.pointerRequalify<?[*]const u8, [*]const u8>(bytes)
+  return unsafe Pointer.read<u8>(unsafe Pointer.at<u8>(base, index))
+}
+unsafe fn readLeb128Raw(bytes: ?[*]const u8, length: usize, start: usize) -> Leb128Read {
+  let mut cursor = start
+  let mut value: u32 = 0
+  let mut shift: u32 = 0
+  while shift < 35 && cursor < length {
+    let byte = unsafe byteAt(bytes, cursor)
+    cursor = cursor + 1
+    value = value | u32.shiftLeft(u8.toU32(byte & 127), shift)
+    if (byte & 128) == 0 { return Leb128Read { value: value, next: cursor, valid: true } }
+    shift = shift + 7
+  }
+  return Leb128Read { value: 0, next: start, valid: false }
+}
+pub fn readSignedLeb128(bytes: &[u8], start: usize) -> SignedLeb128Read {
+  return unsafe readSignedLeb128Raw(Pointer.fromSlice<u8>(bytes), bytes.length, start)
+}
+unsafe fn readSignedLeb128Raw(bytes: ?[*]const u8, length: usize, start: usize) -> SignedLeb128Read {
+  let decoded = unsafe readLeb128Raw(bytes, length, start)
+  let mut value = u32.toI32(u32.shiftRight(decoded.value, 1))
+  if (decoded.value & 1) != 0 { value = -1 - value }
+  return SignedLeb128Read { value: value, next: decoded.next, valid: decoded.valid }
+}
+pub effect fn writeLeb128(out: &mut ByteBuffer, value: u32) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut remaining = value
+  // Reserve the exact maximum for this operand before making any writes.
+  let mut size: usize = 1
+  let mut count = u32.shiftRight(value, 7)
+  while count != 0 {
+    size = size + 1
+    count = u32.shiftRight(count, 7)
+  }
+  run out.reserve(size)
+  while true {
+    let mut byte = u32.toU8(remaining & 127)
+    remaining = u32.shiftRight(remaining, 7)
+    if remaining != 0 { byte = byte | 128 }
+    run out.append(byte)
+    if remaining == 0 { break }
+  }
+}
+pub effect fn writeSignedLeb128(out: &mut ByteBuffer, value: i32) -> () ! OutOfMemoryError ? &mut Allocator {
+  run writeLeb128(&mut out, zigzag(value))
+}
+@inlineAlways
+fn zigzag(value: i32) -> u32 {
+  if value < 0 { return i64.toU32(-i32.toI64(value) * 2 - 1) }
+  return i64.toU32(i32.toI64(value) * 2)
+}
+// Writes value as LEB128 into buffer from at; returns the end. Five bytes fit any u32.
+@inlineAlways
+fn putLeb128(buffer: &mut [u8; 16], at: usize, value: u32) -> usize {
+  let mut remaining = value
+  let mut index = at
+  while remaining >= 128 {
+    buffer[index] = u32.toU8(remaining & 127) | 128
+    remaining = u32.shiftRight(remaining, 7)
+    index = index + 1
+  }
+  buffer[index] = u32.toU8(remaining)
+  return index + 1
+}
+
+// Source offsets must be in bounds except NO_SOURCE_POSITION entries, which are
+// skipped. The returned buffer is owned and can be moved into FunctionBytecode.
+// A stripped function omits this call and has an empty table.
+pub effect fn encodePc2Line(source: &[u8], functionSourcePosition: u32, positions: &[PcSourcePosition],
+  cache: &mut SourcePositionCache) -> ByteBuffer ! OutOfMemoryError ? &mut Allocator {
+  return run encodePositions(source, functionSourcePosition, positions, &mut cache, false)
+}
+// Entries are final call-instruction PCs, not legacy statement source markers.
+// The caller shares an ECMAScript-only cache across the compilation tree.
+pub effect fn encodeCallSitePc2Line(source: &[u8], functionSourcePosition: u32,
+  positions: &[PcSourcePosition], cache: &mut SourcePositionCache) -> ByteBuffer
+  ! OutOfMemoryError ? &mut Allocator {
+  return run encodePositions(source, functionSourcePosition, positions, &mut cache, true)
+}
+effect fn encodePositions(source: &[u8], functionSourcePosition: u32,
+  positions: &[PcSourcePosition], cache: &mut SourcePositionCache, ecma: bool) -> ByteBuffer
+  ! OutOfMemoryError ? &mut Allocator {
+  let mut out = ByteBuffer.make()
+  // Keep the upstream encoder's reserved-buffer append fast path.
+  run out.reserve(positions.length * 2 + 10)
+  let mut last = if ecma { cache.locateEcma(source, u32.toUsize(functionSourcePosition)) }
+    else { cache.locate(source, u32.toUsize(functionSourcePosition)) }
+  let mut lastPc: u32 = 0
+  let mut header: [u8; 16] = [0; 16]
+  let mut written = putLeb128(&mut header, 0, i32.toU32(last.line))
+  written = putLeb128(&mut header, written, i32.toU32(last.column))
+  run appendBytes(&mut out, Slice.view(&header, 0, written))
+  let mut index: usize = 0
+  while index < positions.length {
+    let entry = positions[index]
+    index = index + 1
+    if entry.sourcePosition == NO_SOURCE_POSITION { continue }
+    let diffPc = u32.wrappingSubtract(entry.pc, lastPc)
+    // The original subtracts unsigned PCs and then interprets the delta as int.
+    if diffPc >= 0x80000000 { continue }
+    let offset = u32.toUsize(entry.sourcePosition)
+    let current = if ecma { cache.locateEcma(source, offset) } else { cache.locate(source, offset) }
+    let diffLine = current.line - last.line
+    let diffColumn = current.column - last.column
+    if diffLine == 0 && diffColumn == 0 { continue }
+    // An entry is at most 1 + 5 + 5 + 5 bytes: gather it locally, append once.
+    let mut scratch: [u8; 16] = [0; 16]
+    let mut used: usize = 1
+    if diffLine >= -1 && diffLine < 4 && diffPc <= 50 {
+      scratch[0] = u32.toU8(i32.toU32(diffLine + 1) + diffPc * 5 + 1)
+    } else {
+      // scratch[0] stays 0, the long form's marker.
+      used = putLeb128(&mut scratch, used, diffPc)
+      used = putLeb128(&mut scratch, used, zigzag(diffLine))
+    }
+    used = putLeb128(&mut scratch, used, zigzag(diffColumn))
+    run appendBytes(&mut out, Slice.view(&scratch, 0, used))
+    lastPc = entry.pc
+    last = current
+  }
+  return move out
+}
+
+// Appends within the reserved storage when it fits, growing only when it does not.
+@inlineAlways
+effect fn appendBytes(out: &mut ByteBuffer, bytes: &[u8]) -> () ! OutOfMemoryError ? &mut Allocator {
+  if !out.appendSliceWithin(bytes) { run out.appendSlice(bytes) }
+}
+
+fn signedBits(value: u32) -> i32 {
+  if value >= 0x80000000 { return -1 - u32.toI32(value ^ 0xffffffff) }
+  return u32.toI32(value)
+}
+
+// Returns (0,0) for stripped/malformed tables, as find_line_num does. The entry
+// beginning exactly at pcValue applies; malformed future entries are inspected
+// only as far as the first PC greater than the requested one. Definition lookup
+// reads just the two header fields, even if the following table is malformed.
+pub fn decodePc2Line(table: &[u8], pcValue: u32) -> SourceLocation {
+  return unsafe decodePc2LineRaw(Pointer.fromSlice<u8>(table), table.length, pcValue)
+}
+
+/// Reads an immutable native/ROM debug table without copying it into owned storage.
+/// The pointer may be null only when length is zero; all length bytes must remain
+/// initialized and readable for this call. Malformed contents still return (0,0).
+pub unsafe fn decodePc2LineRaw(table: ?[*]const u8, length: usize, pcValue: u32) -> SourceLocation {
+  let missing = SourceLocation { line: 0, column: 0 }
+  let initialLine = unsafe readLeb128Raw(table, length, 0)
+  if !initialLine.valid { return missing }
+  let initialColumn = unsafe readLeb128Raw(table, length, initialLine.next)
+  if !initialColumn.valid { return missing }
+  let mut location = SourceLocation {
+    line: signedBits(u32.wrappingAdd(initialLine.value, 1)),
+    column: signedBits(u32.wrappingAdd(initialColumn.value, 1)) }
+  if pcValue == FUNCTION_DEFINITION_PC { return location }
+  let mut pc: u32 = 0
+  let mut cursor = initialColumn.next
+  while cursor < length {
+    let opcode = unsafe byteAt(table, cursor)
+    cursor = cursor + 1
+    let mut line: i32 = 0
+    if opcode == 0 {
+      let deltaPc = unsafe readLeb128Raw(table, length, cursor)
+      if !deltaPc.valid { return missing }
+      pc = u32.wrappingAdd(pc, deltaPc.value)
+      let deltaLine = unsafe readSignedLeb128Raw(table, length, deltaPc.next)
+      if !deltaLine.valid { return missing }
+      cursor = deltaLine.next
+      line = i32.wrappingAdd(location.line, deltaLine.value)
+    } else {
+      let packed = u8.toU32(opcode) - 1
+      pc = u32.wrappingAdd(pc, packed / 5)
+      line = i32.wrappingAdd(location.line, u32.toI32(packed % 5) - 1)
+    }
+    let deltaColumn = unsafe readSignedLeb128Raw(table, length, cursor)
+    if !deltaColumn.valid { return missing }
+    cursor = deltaColumn.next
+    let column = i32.wrappingAdd(location.column, deltaColumn.value)
+    if pcValue < pc { return location }
+    location = SourceLocation { line: line, column: column }
+  }
+  return location
+}
+
+/// A stopping point of a pc2line decode: the table offset of the next entry, the
+/// pc and location in force before it. cursor 0 is none (entries start after the
+/// header).
+pub struct Pc2LineResume { pub cursor: usize, pub pc: u32, pub line: i32, pub column: i32 }
+impl Copy for Pc2LineResume {}
+impl Pc2LineResume {
+  pub fn none() -> Pc2LineResume { return Pc2LineResume { cursor: 0, pc: 0, line: 0, column: 0 } }
+}
+/// decodePc2LineRaw, resuming from resume when pcValue is at or past its pc, and
+/// leaving resume where this lookup stopped. Stacks repeat the same few frames,
+/// and a script's top-level table can run to megabytes (Octane bundles every
+/// benchmark into one script), so this keeps each capture's cost independent of
+/// how far into a big function the frame is. Short tables resume too: Error
+/// captures in a loop decode the same frames each time.
+pub unsafe fn decodePc2LineResuming(table: ?[*]const u8, length: usize, pcValue: u32, resume: &mut Pc2LineResume) -> SourceLocation {
+  if pcValue == FUNCTION_DEFINITION_PC { return unsafe decodePc2LineRaw(table, length, pcValue) }
+  let missing = SourceLocation { line: 0, column: 0 }
+  let mut pc: u32 = 0
+  let mut cursor: usize = 0
+  let mut location = missing
+  if resume.cursor != 0 && resume.cursor <= length && pcValue >= resume.pc {
+    cursor = resume.cursor
+    pc = resume.pc
+    location = SourceLocation { line: resume.line, column: resume.column }
+  } else {
+    let initialLine = unsafe readLeb128Raw(table, length, 0)
+    if !initialLine.valid { return missing }
+    let initialColumn = unsafe readLeb128Raw(table, length, initialLine.next)
+    if !initialColumn.valid { return missing }
+    location = SourceLocation {
+      line: signedBits(u32.wrappingAdd(initialLine.value, 1)),
+      column: signedBits(u32.wrappingAdd(initialColumn.value, 1)) }
+    cursor = initialColumn.next
+  }
+  while cursor < length {
+    let entry = cursor
+    let before = pc
+    let opcode = unsafe byteAt(table, cursor)
+    cursor = cursor + 1
+    let mut line: i32 = 0
+    if opcode == 0 {
+      let deltaPc = unsafe readLeb128Raw(table, length, cursor)
+      if !deltaPc.valid { return missing }
+      pc = u32.wrappingAdd(pc, deltaPc.value)
+      let deltaLine = unsafe readSignedLeb128Raw(table, length, deltaPc.next)
+      if !deltaLine.valid { return missing }
+      cursor = deltaLine.next
+      line = i32.wrappingAdd(location.line, deltaLine.value)
+    } else {
+      let packed = u8.toU32(opcode) - 1
+      pc = u32.wrappingAdd(pc, packed / 5)
+      line = i32.wrappingAdd(location.line, u32.toI32(packed % 5) - 1)
+    }
+    let deltaColumn = unsafe readSignedLeb128Raw(table, length, cursor)
+    if !deltaColumn.valid { return missing }
+    cursor = deltaColumn.next
+    let column = i32.wrappingAdd(location.column, deltaColumn.value)
+    if pcValue < pc {
+      resume.* = Pc2LineResume { cursor: entry, pc: before, line: location.line, column: location.column }
+      return location
+    }
+    location = SourceLocation { line: line, column: column }
+  }
+  resume.* = Pc2LineResume { cursor: cursor, pc: pc, line: location.line, column: location.column }
+  return location
+}
+
+/// Line tables not yet encoded. A compile keeps a function's raw (pc, source
+/// offset) lists instead of encoding them, and lookups replay the encoder over
+/// the function's own text: most functions never need a location, so compiling
+/// them pays nothing for one. `text` is the function's source span, which starts
+/// at whole-source offset `base`; every entry offset lies in it.
+pub struct PendingLines {
+  pub base: usize,
+  pub functionSourcePosition: u32,
+  pub start: SourceLocation,
+  pub ecmaStart: SourceLocation,
+  pub lines: List<PcSourcePosition>,
+  pub calls: List<PcSourcePosition>,
+  /// Backtraces that have located a frame of this function from the pending lists.
+  pub lookups: u32
+}
+/// Scan checkpoints pendingLocation keeps: an entry before the scan position
+/// rescans from the nearest one instead of from the function's start.
+const PENDING_MARKS: usize = 32
+const PENDING_MIN_MARK_STEP: usize = 1024
+impl PendingLines {
+  /// Bytes the raw lists hold.
+  pub fn bytes(self: &Self) -> usize { return (self.lines.capacity() + self.calls.capacity()) * 8 }
+}
+
+/// Whether p's entries reach their source offsets in order, so that one lookup
+/// scans its span at most once: an entry behind the scan rescans from a mark,
+/// and in a function megabytes long (a bundle's module body) hundreds of those
+/// cost more than encoding the tables.
+pub fn pendingForward(p: &PendingLines) -> bool {
+  return forward(p.lines.asSlice()) && forward(p.calls.asSlice())
+}
+fn forward(entries: &[PcSourcePosition]) -> bool {
+  let mut last: u32 = 0
+  let mut i: usize = 0
+  while i < entries.length {
+    let offset = entries[i].sourcePosition
+    if offset != NO_SOURCE_POSITION {
+      if offset < last { return false }
+      last = offset
+    }
+    i = i + 1
+  }
+  return true
+}
+/// Whether every entry of `entries` can be located from the span [functionStart,
+/// end) by scanning forward from functionStart.
+pub fn pendingFits(entries: &[PcSourcePosition], functionStart: u32, end: usize) -> bool {
+  let mut i: usize = 0
+  while i < entries.length {
+    let offset = entries[i].sourcePosition
+    if offset != NO_SOURCE_POSITION && (offset < functionStart || u32.toUsize(offset) > end) { return false }
+    i = i + 1
+  }
+  return true
+}
+
+/// The location decodePc2Line would give for pc in the table that encodePc2Line
+/// (calls false) or encodeCallSitePc2Line (calls true) would build from p.
+/// text is the span p.base starts.
+pub fn pendingLocation(p: &PendingLines, text: &[u8], pc: u32, calls: bool) -> SourceLocation {
+  let start = if calls { p.ecmaStart } else { p.start }
+  let mut location = SourceLocation { line: i32.wrappingAdd(start.line, 1), column: i32.wrappingAdd(start.column, 1) }
+  if pc == FUNCTION_DEFINITION_PC { return location }
+  let entries = if calls { p.calls.asSlice() } else { p.lines.asSlice() }
+  let first = u32.toUsize(p.functionSourcePosition) - p.base
+  let mut last = start
+  let mut lastPc: u32 = 0
+  // Scan state: coordinates at text offset `cursor`.
+  let mut cursor = first
+  let mut at = start
+  // Coordinates at increasing offsets the scan has reached, so an entry behind
+  // the cursor costs at most `step` bytes of rescanning, however long the span.
+  let mut marks: [usize; 32] = [0; 32]
+  let mut markLines: [i32; 32] = [0; 32]
+  let mut markColumns: [i32; 32] = [0; 32]
+  let mut markCount: usize = 0
+  let span = text.length - first
+  let step = if span / PENDING_MARKS > PENDING_MIN_MARK_STEP { span / PENDING_MARKS } else { PENDING_MIN_MARK_STEP }
+  let mut nextMark = first + step
+  let bytes = Pointer.fromSlice<u8>(text)
+  let mut index: usize = 0
+  while index < entries.length {
+    let entry = entries[index]
+    index = index + 1
+    if entry.sourcePosition == NO_SOURCE_POSITION { continue }
+    let diffPc = u32.wrappingSubtract(entry.pc, lastPc)
+    if diffPc >= 0x80000000 { continue }
+    let offset = u32.toUsize(entry.sourcePosition) - p.base
+    if offset < cursor {
+      cursor = first at = start
+      let mut m = markCount
+      while m > 0 {
+        m = m - 1
+        if marks[m] <= offset { cursor = marks[m] at = SourceLocation { line: markLines[m], column: markColumns[m] } break }
+      }
+    }
+    at = if calls { scanEcma(text, cursor, offset, at) }
+      else { unsafe scan(bytes, text.length, cursor, offset, at.line, at.column) }
+    cursor = offset
+    if cursor >= nextMark && markCount < PENDING_MARKS {
+      marks[markCount] = cursor markLines[markCount] = at.line markColumns[markCount] = at.column
+      markCount = markCount + 1 nextMark = cursor + step
+    }
+    if at.line == last.line && at.column == last.column { continue }
+    if pc < entry.pc { return location }
+    location = SourceLocation { line: i32.wrappingAdd(at.line, 1), column: i32.wrappingAdd(at.column, 1) }
+    lastPc = entry.pc
+    last = at
+  }
+  return location
+}
+
+/// The encoded table for p, as compile would have built it.
+pub effect fn encodePending(p: &PendingLines, text: &[u8], calls: bool) -> ByteBuffer ! OutOfMemoryError ? &mut Allocator {
+  let first = u32.toUsize(p.functionSourcePosition) - p.base
+  let mut cache = SourcePositionCache.at(first, p.start.line, p.start.column, p.ecmaStart.line, p.ecmaStart.column)
+  run cache.prepareSpan(text.length - first)
+  run cache.shareCoordinates(text, text.length - first, false)
+  let entries = if calls { p.calls.asSlice() } else { p.lines.asSlice() }
+  let mut shifted = List<PcSourcePosition>.make()
+  run shifted.reserveExact(entries.length)
+  let mut i: usize = 0
+  while i < entries.length {
+    let mut entry = entries[i]
+    if entry.sourcePosition != NO_SOURCE_POSITION { entry.sourcePosition = entry.sourcePosition - usize.toU32(p.base) }
+    run shifted.append(entry)
+    i = i + 1
+  }
+  let position = p.functionSourcePosition - usize.toU32(p.base)
+  return run encodePositions(text, position, shifted.asSlice(), &mut cache, calls)
+}

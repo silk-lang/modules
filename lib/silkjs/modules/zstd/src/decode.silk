@@ -1,0 +1,874 @@
+//! The Zstandard decoder: frames and the streaming interface (`zstd_decompress.c` of the
+//! reference).
+//!
+//! [`decompressStream`] is `ZSTD_decompressStream`: it takes any amount of input and any amount
+//! of output room, returns 0 when a frame is complete and flushed, a hint of the input it expects
+//! next otherwise, or an error (see `errors.silk`). It decodes every block type, skippable frames,
+//! frames one after another, the content checksum and dictionaries.
+import mem
+import errors
+import xxh64
+import decode_block
+import decode_block { Dctx }
+import huf_decode
+import silk.mem.pointer { Pointer }
+import silk.mem.layout { Layout }
+import silk.num.u8
+import silk.num.u16
+import silk.num.u32
+import silk.num.u64
+import silk.num.i32
+import silk.num.usize
+
+const MAGIC: u32 = 0xFD2FB528
+const MAGIC_SKIPPABLE_START: u32 = 0x184D2A50
+const MAGIC_SKIPPABLE_MASK: u32 = 0xFFFFFFF0
+const MAGIC_DICTIONARY: u32 = 0xEC30A437
+const CONTENTSIZE_UNKNOWN: u64 = 0xFFFFFFFFFFFFFFFF
+const WINDOWLOG_MAX: u32 = 31
+const WINDOWLOG_ABSOLUTEMIN: u32 = 10
+const BLOCK_HEADER_SIZE: usize = 3
+const SKIPPABLE_HEADER_SIZE: usize = 8
+const FRAME_HEADER_MIN: usize = 5
+const MAX_WINDOW_DEFAULT: u64 = 134217729
+const NO_FORWARD_PROGRESS_MAX: u32 = 16
+const WORKSPACE_TOO_LARGE_FACTOR: usize = 3
+const WORKSPACE_TOO_LARGE_MAX_DURATION: u32 = 128
+
+// ZSTD_dStage
+const DS_GET_FRAME_HEADER_SIZE: u32 = 0
+const DS_DECODE_BLOCK_HEADER: u32 = 2
+const DS_DECOMPRESS_BLOCK: u32 = 3
+const DS_DECOMPRESS_LAST_BLOCK: u32 = 4
+const DS_CHECK_CHECKSUM: u32 = 5
+const DS_SKIP_FRAME: u32 = 7
+
+// ZSTD_dStreamStage
+const ZDSS_INIT: u32 = 0
+const ZDSS_LOAD_HEADER: u32 = 1
+const ZDSS_READ: u32 = 2
+const ZDSS_LOAD: u32 = 3
+const ZDSS_FLUSH: u32 = 4
+
+const BT_RAW: u32 = 0
+const BT_RLE: u32 = 1
+const BT_COMPRESSED: u32 = 2
+const BT_RESERVED: u32 = 3
+
+const FRAME_REGULAR: u32 = 0
+const FRAME_SKIPPABLE: u32 = 1
+
+/// `ZSTD_d_windowLogMax`.
+pub const D_WINDOW_LOG_MAX: i32 = 100
+const D_FORMAT: i32 = 1000
+const D_STABLE_OUT_BUFFER: i32 = 1001
+const D_FORCE_IGNORE_CHECKSUM: i32 = 1002
+const D_REF_MULTIPLE_DDICTS: i32 = 1003
+const D_DISABLE_HUFFMAN_ASSEMBLY: i32 = 1004
+const D_MAX_BLOCK_SIZE: i32 = 1005
+
+unsafe fn nonNull(p: ?[*]mut u8) -> [*]mut u8 { return unsafe Intrinsic.pointerRequalify<?[*]mut u8, [*]mut u8>(p) }
+unsafe fn asWords(p: ?[*]mut u8) -> [*]mut u8 { return unsafe nonNull(p) }
+unsafe fn asWordsOptional(p: ?[*]mut u8) -> ?[*]mut u8 { return p }
+unsafe fn wordsBytes(p: ?[*]mut u8) -> ?[*]mut u8 { return p }
+unsafe fn wordsRo(p: ?[*]mut u8) -> [*]const u8 { return unsafe mem.ro(unsafe nonNull(p)) }
+unsafe fn state(p: ?[*]mut u8) -> *mut Dctx { return unsafe Intrinsic.pointerReinterpret<*mut u8, *mut Dctx>(unsafe Intrinsic.pointerRequalify<?[*]mut u8, *mut u8>(p)) }
+@inlineAlways
+fn address(p: [*]const u8) -> usize { return Pointer.addressMany<u8>(p) }
+fn nullBytes() -> ?[*]mut u8 { return unsafe Intrinsic.pointerRequalify<?*mut u8, ?[*]mut u8>(Pointer.null<u8>()) }
+fn isNull(p: ?[*]mut u8) -> bool { return Pointer.isNullMany<u8>(p) }
+
+/// Returns a new decoder (`ZSTD_createDStream`), or null if memory is exhausted. Release it with
+/// [`freeDStream`].
+pub unsafe fn createDStream() -> ?[*]mut u8 {
+  let raw = unsafe mem.calloc(1, Layout.of<Dctx>().bytes)
+  if isNull(raw) { return raw }
+  let ll = unsafe mem.calloc(decode_block.LONG_TABLE_CELLS, 8)
+  let of = unsafe mem.calloc(decode_block.OFFSET_TABLE_CELLS, 8)
+  let ml = unsafe mem.calloc(decode_block.LONG_TABLE_CELLS, 8)
+  let llDefault = unsafe mem.calloc(65, 8)
+  let ofDefault = unsafe mem.calloc(33, 8)
+  let mlDefault = unsafe mem.calloc(65, 8)
+  let huf = unsafe mem.calloc(1, huf_decode.TABLE_BYTES)
+  let lit = unsafe mem.calloc(1, decode_block.BLOCK_MAX + decode_block.WILDCOPY)
+  let header = unsafe mem.calloc(1, 32)
+  if isNull(ll) || isNull(of) || isNull(ml) || isNull(llDefault) || isNull(ofDefault) || isNull(mlDefault) || isNull(huf) || isNull(lit) || isNull(header) {
+    unsafe mem.free(ll) unsafe mem.free(of) unsafe mem.free(ml) unsafe mem.free(llDefault) unsafe mem.free(ofDefault)
+    unsafe mem.free(mlDefault) unsafe mem.free(huf) unsafe mem.free(lit) unsafe mem.free(header) unsafe mem.free(raw)
+    return nullBytes()
+  }
+  let litRo = unsafe mem.ro(unsafe nonNull(lit))
+  unsafe Pointer.put<Dctx>(unsafe state(raw), Dctx {
+    llSpace: unsafe asWords(ll), ofSpace: unsafe asWords(of), mlSpace: unsafe asWords(ml),
+    llDefault: unsafe asWords(llDefault), ofDefault: unsafe asWords(ofDefault), mlDefault: unsafe asWords(mlDefault),
+    hufSpace: unsafe nonNull(huf),
+    llPtr: unsafe wordsRo(unsafe asWordsOptional(ll)), ofPtr: unsafe wordsRo(unsafe asWordsOptional(of)), mlPtr: unsafe wordsRo(unsafe asWordsOptional(ml)),
+    hufPtr: unsafe mem.ro(unsafe nonNull(huf)),
+    rep: [1, 4, 8], litEntropy: false, fseEntropy: false,
+    litBuffer: unsafe nonNull(lit), litBase: litRo, litStart: 0, litSize: 0, sequenceRoom: 0,
+    prefixBase: litRo, prefixStart: 0, previousDstEnd: 0, extBase: litRo, extLen: 0,
+    stage: DS_GET_FRAME_HEADER_SIZE, expected: 0, blockType: BT_RESERVED, rleSize: 0, headerSize: 0,
+    headerBuffer: unsafe nonNull(header),
+    frameType: FRAME_REGULAR, frameContentSize: 0, windowSize: 0, blockSizeMax: decode_block.BLOCK_MAX, frameDictId: 0,
+    checksumFlag: false, validateChecksum: false, decodedSize: 0, hash: xxh64.make(), dictId: 0,
+    streamStage: ZDSS_INIT, lhSize: 0, inBuff: nullBytes(), inBuffSize: 0, inPos: 0,
+    outBuff: nullBytes(), outBuffSize: 0, outStart: 0, outEnd: 0, hostageByte: false, noForwardProgress: 0, oversizedDuration: 0,
+    maxWindowSize: MAX_WINDOW_DEFAULT, forceIgnoreChecksum: false, maxBlockSizeParam: 0,
+    dict: nullBytes(), dictSize: 0, dictEntropy: false, dictDictId: 0,
+    dictLl: unsafe asWordsOptional(nullBytes()), dictOf: unsafe asWordsOptional(nullBytes()), dictMl: unsafe asWordsOptional(nullBytes()),
+    dictHuf: nullBytes(), dictRep: [1, 4, 8],
+  })
+  let mut anchor = ()
+  let dctx = unsafe Pointer.borrowMut<(), Dctx>(&mut anchor, unsafe state(raw))
+  unsafe decode_block.buildDefaultTables(&mut dctx)
+  return raw
+}
+
+unsafe fn clearDict(dctx: &mut Dctx) -> () {
+  unsafe mem.free(dctx.dict)
+  unsafe mem.free(unsafe wordsBytes(dctx.dictLl))
+  unsafe mem.free(unsafe wordsBytes(dctx.dictOf))
+  unsafe mem.free(unsafe wordsBytes(dctx.dictMl))
+  unsafe mem.free(dctx.dictHuf)
+  dctx.dict = nullBytes()
+  dctx.dictSize = 0
+  dctx.dictEntropy = false
+  dctx.dictDictId = 0
+  dctx.dictLl = unsafe asWordsOptional(nullBytes())
+  dctx.dictOf = unsafe asWordsOptional(nullBytes())
+  dctx.dictMl = unsafe asWordsOptional(nullBytes())
+  dctx.dictHuf = nullBytes()
+}
+
+/// Releases a decoder made by [`createDStream`] (`ZSTD_freeDStream`). A null pointer is allowed.
+pub unsafe fn freeDStream(raw: ?[*]mut u8) -> usize {
+  if isNull(raw) { return 0 }
+  let mut anchor = ()
+  let dctx = unsafe Pointer.borrowMut<(), Dctx>(&mut anchor, unsafe state(raw))
+  unsafe clearDict(&mut dctx)
+  unsafe mem.free(dctx.llSpace)
+  unsafe mem.free(dctx.ofSpace)
+  unsafe mem.free(dctx.mlSpace)
+  unsafe mem.free(dctx.llDefault)
+  unsafe mem.free(dctx.ofDefault)
+  unsafe mem.free(dctx.mlDefault)
+  unsafe mem.free(dctx.hufSpace)
+  unsafe mem.free(dctx.litBuffer)
+  unsafe mem.free(dctx.headerBuffer)
+  unsafe mem.free(dctx.inBuff)
+  drop dctx
+  unsafe mem.free(raw)
+  return 0
+}
+
+/// Sets a decoding parameter (`ZSTD_DCtx_setParameter`). `ZSTD_d_windowLogMax` (100) is
+/// supported; 0 selects the default of 27. Returns 0 or an error.
+pub unsafe fn dctxSetParameter(raw: ?[*]mut u8, parameter: i32, value: i32) -> usize {
+  let mut anchor = ()
+  let dctx = unsafe Pointer.borrowMut<(), Dctx>(&mut anchor, unsafe state(raw))
+  if dctx.streamStage != ZDSS_INIT { return errors.err(errors.E_STAGE_WRONG) }
+  if parameter == D_WINDOW_LOG_MAX {
+    let mut log = value
+    if log == 0 { log = 27 }
+    if log < 10 || log > 31 { return errors.err(errors.E_PARAMETER_OUTOFBOUND) }
+    dctx.maxWindowSize = u64.shiftLeft(1, i32.toU64(log))
+    return 0
+  }
+  if parameter == D_FORCE_IGNORE_CHECKSUM {
+    if value < 0 || value > 1 { return errors.err(errors.E_PARAMETER_OUTOFBOUND) }
+    dctx.forceIgnoreChecksum = value == 1
+    return 0
+  }
+  if parameter == D_MAX_BLOCK_SIZE {
+    if value != 0 && (value < 1024 || value > 131072) { return errors.err(errors.E_PARAMETER_OUTOFBOUND) }
+    dctx.maxBlockSizeParam = i32.toUsize(value)
+    return 0
+  }
+  if parameter == D_DISABLE_HUFFMAN_ASSEMBLY {
+    if value < 0 || value > 1 { return errors.err(errors.E_PARAMETER_OUTOFBOUND) }
+    return 0
+  }
+  if parameter == D_FORMAT || parameter == D_STABLE_OUT_BUFFER || parameter == D_REF_MULTIPLE_DDICTS {
+    // The reference has these experimental modes; the port implements only their defaults.
+    if value < 0 || value > 1 { return errors.err(errors.E_PARAMETER_OUTOFBOUND) }
+    if value == 1 { return errors.err(errors.E_PARAMETER_UNSUPPORTED) }
+    return 0
+  }
+  return errors.err(errors.E_PARAMETER_UNSUPPORTED)
+}
+
+/// Resets the session, the parameters, or both (`ZSTD_DCtx_reset`; 1, 2 and 3). Resetting the
+/// parameters also drops the dictionary.
+pub unsafe fn dctxReset(raw: ?[*]mut u8, directive: i32) -> usize {
+  let mut anchor = ()
+  let dctx = unsafe Pointer.borrowMut<(), Dctx>(&mut anchor, unsafe state(raw))
+  if directive == 1 || directive == 3 {
+    dctx.streamStage = ZDSS_INIT
+    dctx.noForwardProgress = 0
+  }
+  if directive == 2 || directive == 3 {
+    if dctx.streamStage != ZDSS_INIT { return errors.err(errors.E_STAGE_WRONG) }
+    unsafe clearDict(&mut dctx)
+    dctx.maxWindowSize = MAX_WINDOW_DEFAULT
+    dctx.forceIgnoreChecksum = false
+    dctx.maxBlockSizeParam = 0
+  }
+  return 0
+}
+
+// ZSTD_loadDEntropy into the dictionary tables. Returns the size of the entropy header, or
+// `dictionary_corrupted`.
+unsafe fn loadDictEntropy(dctx: &mut Dctx, dict: [*]const u8, size: usize) -> usize {
+  if size <= 8 { return errors.err(errors.E_DICTIONARY_CORRUPTED) }
+  let mut at: usize = 8
+  let hufSize = unsafe huf_decode.readTableX2(unsafe nonNull(dctx.dictHuf), dict, at, size - at)
+  if errors.isError(hufSize) { return errors.err(errors.E_DICTIONARY_CORRUPTED) }
+  at = at + hufSize
+  let ofSize = unsafe decode_block.loadDictTable(unsafe asWords(unsafe wordsBytes(dctx.dictOf)), decode_block.DICT_KIND_OF, dict, at, size)
+  if errors.isError(ofSize) { return ofSize }
+  at = at + ofSize
+  let mlSize = unsafe decode_block.loadDictTable(unsafe asWords(unsafe wordsBytes(dctx.dictMl)), decode_block.DICT_KIND_ML, dict, at, size)
+  if errors.isError(mlSize) { return mlSize }
+  at = at + mlSize
+  let llSize = unsafe decode_block.loadDictTable(unsafe asWords(unsafe wordsBytes(dctx.dictLl)), decode_block.DICT_KIND_LL, dict, at, size)
+  if errors.isError(llSize) { return llSize }
+  at = at + llSize
+  if at + 12 > size { return errors.err(errors.E_DICTIONARY_CORRUPTED) }
+  let contentSize = size - (at + 12)
+  let mut index: usize = 0
+  while index < 3 {
+    let rep = unsafe mem.r32(dict, at)
+    at = at + 4
+    if rep == 0 || u32.toUsize(rep) > contentSize { return errors.err(errors.E_DICTIONARY_CORRUPTED) }
+    dctx.dictRep[index] = rep
+    index = index + 1
+  }
+  return at
+}
+
+/// Loads a dictionary for the frames that follow (`ZSTD_DCtx_loadDictionary`): a raw content
+/// dictionary, or a full dictionary with its entropy tables and identifier. The bytes are copied.
+/// A size of 0 removes the dictionary. Returns 0 or an error.
+pub unsafe fn dctxLoadDictionary(raw: ?[*]mut u8, dict: ?[*]const u8, size: usize) -> usize {
+  let mut anchor = ()
+  let dctx = unsafe Pointer.borrowMut<(), Dctx>(&mut anchor, unsafe state(raw))
+  if dctx.streamStage != ZDSS_INIT { return errors.err(errors.E_STAGE_WRONG) }
+  unsafe clearDict(&mut dctx)
+  if Pointer.isNullMany<u8>(dict) || size == 0 { return 0 }
+  let source = unsafe Intrinsic.pointerRequalify<?[*]const u8, [*]const u8>(dict)
+  let copy = unsafe mem.malloc(size)
+  if isNull(copy) { return errors.err(errors.E_MEMORY_ALLOCATION) }
+  let _c = unsafe mem.memcpy(unsafe nonNull(copy), source, size)
+  dctx.dict = copy
+  dctx.dictSize = size
+  if size < 8 { return 0 }
+  if unsafe mem.r32(source, 0) != MAGIC_DICTIONARY { return 0 }
+  dctx.dictDictId = unsafe mem.r32(source, 4)
+  dctx.dictLl = unsafe asWordsOptional(unsafe mem.calloc(decode_block.LONG_TABLE_CELLS, 8))
+  dctx.dictOf = unsafe asWordsOptional(unsafe mem.calloc(decode_block.OFFSET_TABLE_CELLS, 8))
+  dctx.dictMl = unsafe asWordsOptional(unsafe mem.calloc(decode_block.LONG_TABLE_CELLS, 8))
+  dctx.dictHuf = unsafe mem.calloc(1, huf_decode.TABLE_BYTES)
+  let mut loaded = errors.err(errors.E_MEMORY_ALLOCATION)
+  if !isNull(unsafe wordsBytes(dctx.dictLl)) && !isNull(unsafe wordsBytes(dctx.dictOf)) && !isNull(unsafe wordsBytes(dctx.dictMl)) && !isNull(dctx.dictHuf) {
+    loaded = unsafe loadDictEntropy(&mut dctx, unsafe mem.ro(unsafe nonNull(copy)), size)
+  }
+  if errors.isError(loaded) {
+    // The reference fails to create its dictionary object and reports it as an allocation error.
+    unsafe clearDict(&mut dctx)
+    return errors.err(errors.E_MEMORY_ALLOCATION)
+  }
+  dctx.dictEntropy = true
+  return 0
+}
+
+// ZSTD_frameHeaderSize_internal, for at least 5 bytes.
+unsafe fn frameHeaderSize(src: [*]const u8, size: usize) -> usize {
+  if size < FRAME_HEADER_MIN { return errors.err(errors.E_SRCSIZE_WRONG) }
+  let descriptor = u8.toU32(unsafe mem.r8(src, 4))
+  let dictIdCode = descriptor & 3
+  let singleSegment = u32.shiftRight(descriptor, 5) & 1
+  let fcsId = u32.shiftRight(descriptor, 6)
+  let mut total: usize = FRAME_HEADER_MIN
+  if singleSegment == 0 { total = total + 1 }
+  if dictIdCode == 1 { total = total + 1 } else if dictIdCode == 2 { total = total + 2 } else if dictIdCode == 3 { total = total + 4 }
+  if fcsId == 1 { total = total + 2 } else if fcsId == 2 { total = total + 4 } else if fcsId == 3 { total = total + 8 }
+  if singleSegment == 1 && fcsId == 0 { total = total + 1 }
+  return total
+}
+
+// ZSTD_getFrameHeader_advanced: reads the frame header at `src[0..size]` into the frame fields
+// of `dctx`. Returns 0 on success, the number of bytes it needs if `size` is too small, or an
+// error.
+unsafe fn getFrameHeader(dctx: &mut Dctx, src: [*]const u8, size: usize) -> usize {
+  if size < FRAME_HEADER_MIN {
+    if size > 0 {
+      // Reject a wrong magic number as soon as its first bytes are known.
+      let mut copied = size
+      if copied > 4 { copied = 4 }
+      let mut asFrame = MAGIC
+      let mut asSkippable = MAGIC_SKIPPABLE_START
+      let mut index: usize = 0
+      while index < copied {
+        let byte = u8.toU32(unsafe mem.r8(src, index))
+        let shift = usize.toU32(index * 8)
+        let mask = u32.bitNot(u32.shiftLeft(255, shift))
+        asFrame = (asFrame & mask) | u32.shiftLeft(byte, shift)
+        asSkippable = (asSkippable & mask) | u32.shiftLeft(byte, shift)
+        index = index + 1
+      }
+      if asFrame != MAGIC && (asSkippable & MAGIC_SKIPPABLE_MASK) != MAGIC_SKIPPABLE_START {
+        return errors.err(errors.E_PREFIX_UNKNOWN)
+      }
+    }
+    return FRAME_HEADER_MIN
+  }
+  let magic = unsafe mem.r32(src, 0)
+  if magic != MAGIC {
+    if (magic & MAGIC_SKIPPABLE_MASK) == MAGIC_SKIPPABLE_START {
+      if size < SKIPPABLE_HEADER_SIZE { return SKIPPABLE_HEADER_SIZE }
+      dctx.frameType = FRAME_SKIPPABLE
+      dctx.frameDictId = u32.wrappingSubtract(magic, MAGIC_SKIPPABLE_START)
+      dctx.headerSize = SKIPPABLE_HEADER_SIZE
+      dctx.frameContentSize = u32.toU64(unsafe mem.r32(src, 4))
+      dctx.windowSize = 0
+      dctx.blockSizeMax = 0
+      dctx.checksumFlag = false
+      return 0
+    }
+    return errors.err(errors.E_PREFIX_UNKNOWN)
+  }
+  let headerSize = unsafe frameHeaderSize(src, size)
+  if size < headerSize { return headerSize }
+  dctx.headerSize = headerSize
+  let descriptor = u8.toU32(unsafe mem.r8(src, 4))
+  let mut position: usize = FRAME_HEADER_MIN
+  let dictIdCode = descriptor & 3
+  let checksumFlag = (u32.shiftRight(descriptor, 2) & 1) == 1
+  let singleSegment = (u32.shiftRight(descriptor, 5) & 1) == 1
+  let fcsId = u32.shiftRight(descriptor, 6)
+  let mut windowSize: u64 = 0
+  let mut dictId: u32 = 0
+  let mut contentSize = CONTENTSIZE_UNKNOWN
+  if (descriptor & 8) != 0 { return errors.err(errors.E_FRAMEPARAMETER_UNSUPPORTED) }
+  if !singleSegment {
+    let windowByte = u8.toU32(unsafe mem.r8(src, position))
+    position = position + 1
+    let windowLog = u32.shiftRight(windowByte, 3) + WINDOWLOG_ABSOLUTEMIN
+    if windowLog > WINDOWLOG_MAX { return errors.err(errors.E_FRAMEPARAMETER_WINDOWTOOLARGE) }
+    windowSize = u64.shiftLeft(1, u32.toU64(windowLog))
+    windowSize = windowSize + u64.shiftRight(windowSize, 3) * u32.toU64(windowByte & 7)
+  }
+  if dictIdCode == 1 { dictId = u8.toU32(unsafe mem.r8(src, position)) position = position + 1 }
+  if dictIdCode == 2 { dictId = u16.toU32(unsafe mem.r16(src, position)) position = position + 2 }
+  if dictIdCode == 3 { dictId = unsafe mem.r32(src, position) position = position + 4 }
+  if fcsId == 0 { if singleSegment { contentSize = u8.toU64(unsafe mem.r8(src, position)) } }
+  if fcsId == 1 { contentSize = u16.toU64(unsafe mem.r16(src, position)) + 256 }
+  if fcsId == 2 { contentSize = u32.toU64(unsafe mem.r32(src, position)) }
+  if fcsId == 3 { contentSize = unsafe mem.r64(src, position) }
+  if singleSegment { windowSize = contentSize }
+  dctx.frameType = FRAME_REGULAR
+  dctx.frameContentSize = contentSize
+  dctx.windowSize = windowSize
+  dctx.blockSizeMax = decode_block.BLOCK_MAX
+  if windowSize < usize.toU64(decode_block.BLOCK_MAX) { dctx.blockSizeMax = u64.toUsize(windowSize) }
+  dctx.frameDictId = dictId
+  dctx.checksumFlag = checksumFlag
+  return 0
+}
+
+// ZSTD_decompressBegin_usingDDict: the state before the first block of a frame.
+unsafe fn beginFrame(dctx: &mut Dctx) -> () {
+  let litRo = unsafe mem.ro(dctx.litBuffer)
+  dctx.expected = FRAME_HEADER_MIN
+  dctx.stage = DS_GET_FRAME_HEADER_SIZE
+  dctx.decodedSize = 0
+  dctx.prefixBase = litRo
+  dctx.prefixStart = 0
+  dctx.previousDstEnd = 0
+  dctx.extBase = litRo
+  dctx.extLen = 0
+  dctx.litEntropy = false
+  dctx.fseEntropy = false
+  dctx.dictId = 0
+  dctx.blockType = BT_RESERVED
+  dctx.rep = [1, 4, 8]
+  dctx.llPtr = unsafe mem.ro(dctx.llSpace)
+  dctx.ofPtr = unsafe mem.ro(dctx.ofSpace)
+  dctx.mlPtr = unsafe mem.ro(dctx.mlSpace)
+  dctx.hufPtr = unsafe mem.ro(dctx.hufSpace)
+  if !isNull(dctx.dict) {
+    // ZSTD_copyDDictParameters: the whole dictionary is the prefix of the frame.
+    dctx.dictId = dctx.dictDictId
+    dctx.prefixBase = unsafe mem.ro(unsafe nonNull(dctx.dict))
+    dctx.prefixStart = 0
+    dctx.previousDstEnd = dctx.dictSize
+    if dctx.dictEntropy {
+      dctx.litEntropy = true
+      dctx.fseEntropy = true
+      dctx.llPtr = unsafe wordsRo(dctx.dictLl)
+      dctx.ofPtr = unsafe wordsRo(dctx.dictOf)
+      dctx.mlPtr = unsafe wordsRo(dctx.dictMl)
+      dctx.hufPtr = unsafe mem.ro(unsafe nonNull(dctx.dictHuf))
+      dctx.rep = dctx.dictRep
+    }
+  }
+}
+
+// ZSTD_decodeFrameHeader, after the header was read into the frame fields.
+unsafe fn acceptFrameHeader(dctx: &mut Dctx) -> usize {
+  if dctx.frameDictId != 0 && dctx.dictId != dctx.frameDictId { return errors.err(errors.E_DICTIONARY_WRONG) }
+  dctx.validateChecksum = dctx.checksumFlag && !dctx.forceIgnoreChecksum
+  if dctx.validateChecksum { xxh64.reset(&mut dctx.hash) }
+  return 0
+}
+
+// ZSTD_nextSrcSizeToDecompressWithInputSize.
+fn nextSrcSize(dctx: &Dctx, inputSize: usize) -> usize {
+  if !(dctx.stage == DS_DECOMPRESS_BLOCK || dctx.stage == DS_DECOMPRESS_LAST_BLOCK) { return dctx.expected }
+  if dctx.blockType != BT_RAW { return dctx.expected }
+  let mut size = inputSize
+  if size < 1 { size = 1 }
+  if size > dctx.expected { size = dctx.expected }
+  return size
+}
+
+// ZSTD_checkContinuity: when the output position is not the end of the prefix, the prefix
+// becomes the external segment.
+unsafe fn checkContinuity(dctx: &mut Dctx, out: [*]mut u8, start: usize) -> () {
+  let ro = unsafe mem.ro(out)
+  if address(ro) != address(dctx.prefixBase) || start != dctx.previousDstEnd {
+    dctx.extBase = unsafe mem.addc(dctx.prefixBase, dctx.prefixStart)
+    dctx.extLen = dctx.previousDstEnd - dctx.prefixStart
+    dctx.prefixBase = ro
+    dctx.prefixStart = start
+    dctx.previousDstEnd = start
+  }
+}
+
+// ZSTD_decompressContinue, for the stages the stream uses. Decodes `size` bytes at `src[at..]`
+// into `out[start..start+capacity]`. Returns the number of bytes written, or an error.
+unsafe fn continueFrame(dctx: &mut Dctx, out: [*]mut u8, start: usize, capacity: usize, src: [*]const u8, at: usize, size: usize) -> usize {
+  if size != nextSrcSize(&dctx, size) { return errors.err(errors.E_SRCSIZE_WRONG) }
+  if dctx.stage == DS_DECODE_BLOCK_HEADER {
+    let header = u16.toU32(unsafe mem.r16(src, at)) | u32.shiftLeft(u8.toU32(unsafe mem.r8(src, at + 2)), 16)
+    let lastBlock = (header & 1) == 1
+    let blockType = u32.shiftRight(header, 1) & 3
+    let mut blockSize = u32.toUsize(u32.shiftRight(header, 3))
+    let originalSize = blockSize
+    if blockType == BT_RLE { blockSize = 1 } else if blockType == BT_RESERVED { return errors.err(errors.E_CORRUPTION_DETECTED) }
+    if blockSize > dctx.blockSizeMax { return errors.err(errors.E_CORRUPTION_DETECTED) }
+    dctx.expected = blockSize
+    dctx.blockType = blockType
+    dctx.rleSize = originalSize
+    if blockSize != 0 {
+      if lastBlock { dctx.stage = DS_DECOMPRESS_LAST_BLOCK } else { dctx.stage = DS_DECOMPRESS_BLOCK }
+      return 0
+    }
+    if lastBlock {
+      if dctx.checksumFlag {
+        dctx.expected = 4
+        dctx.stage = DS_CHECK_CHECKSUM
+      } else {
+        dctx.expected = 0
+        dctx.stage = DS_GET_FRAME_HEADER_SIZE
+      }
+    } else {
+      dctx.expected = BLOCK_HEADER_SIZE
+      dctx.stage = DS_DECODE_BLOCK_HEADER
+    }
+    return 0
+  }
+  if dctx.stage == DS_DECOMPRESS_BLOCK || dctx.stage == DS_DECOMPRESS_LAST_BLOCK {
+    unsafe checkContinuity(&mut dctx, out, start)
+    let mut written: usize = 0
+    if dctx.blockType == BT_COMPRESSED {
+      written = unsafe decode_block.decompressBlock(&mut dctx, out, start, capacity, src, at, size, true)
+      dctx.expected = 0
+    } else if dctx.blockType == BT_RAW {
+      if size > capacity { return errors.err(errors.E_DSTSIZE_TOOSMALL) }
+      if size != 0 { let _m = unsafe mem.memmove(unsafe mem.add(out, start), unsafe mem.addc(src, at), size) }
+      written = size
+      dctx.expected = dctx.expected - written
+    } else if dctx.blockType == BT_RLE {
+      if dctx.rleSize > capacity { return errors.err(errors.E_DSTSIZE_TOOSMALL) }
+      if dctx.rleSize != 0 { let _s = unsafe mem.memset(unsafe mem.add(out, start), u8.toI32(unsafe mem.r8(src, at)), dctx.rleSize) }
+      written = dctx.rleSize
+      dctx.expected = 0
+    } else {
+      return errors.err(errors.E_CORRUPTION_DETECTED)
+    }
+    if errors.isError(written) { return written }
+    if written > dctx.blockSizeMax { return errors.err(errors.E_CORRUPTION_DETECTED) }
+    dctx.decodedSize = dctx.decodedSize + usize.toU64(written)
+    if dctx.validateChecksum { unsafe xxh64.update(&mut dctx.hash, unsafe mem.ro(out), start, written) }
+    dctx.previousDstEnd = start + written
+    if dctx.expected > 0 { return written }
+    if dctx.stage == DS_DECOMPRESS_LAST_BLOCK {
+      if dctx.frameContentSize != CONTENTSIZE_UNKNOWN && dctx.decodedSize != dctx.frameContentSize {
+        return errors.err(errors.E_CORRUPTION_DETECTED)
+      }
+      if dctx.checksumFlag {
+        dctx.expected = 4
+        dctx.stage = DS_CHECK_CHECKSUM
+      } else {
+        dctx.expected = 0
+        dctx.stage = DS_GET_FRAME_HEADER_SIZE
+      }
+    } else {
+      dctx.stage = DS_DECODE_BLOCK_HEADER
+      dctx.expected = BLOCK_HEADER_SIZE
+    }
+    return written
+  }
+  if dctx.stage == DS_CHECK_CHECKSUM {
+    if dctx.validateChecksum {
+      let computed = u64.wrappingToU32(xxh64.digest(&dctx.hash))
+      if unsafe mem.r32(src, at) != computed { return errors.err(errors.E_CHECKSUM_WRONG) }
+    }
+    dctx.expected = 0
+    dctx.stage = DS_GET_FRAME_HEADER_SIZE
+    return 0
+  }
+  if dctx.stage == DS_SKIP_FRAME {
+    dctx.expected = 0
+    dctx.stage = DS_GET_FRAME_HEADER_SIZE
+    return 0
+  }
+  return errors.err(errors.E_GENERIC)
+}
+
+// ZSTD_findFrameCompressedSize: the size of the frame at `src[at..at+size]`, or an error if it is
+// not complete or not valid.
+unsafe fn findFrameCompressedSize(dctx: &mut Dctx, src: [*]const u8, at: usize, size: usize) -> usize {
+  let start = unsafe mem.addc(src, at)
+  if size >= SKIPPABLE_HEADER_SIZE && (unsafe mem.r32(start, 0) & MAGIC_SKIPPABLE_MASK) == MAGIC_SKIPPABLE_START {
+    let payload = unsafe mem.r32(start, 4)
+    if u32.wrappingAdd(payload, 8) < payload { return errors.err(errors.E_FRAMEPARAMETER_UNSUPPORTED) }
+    let total = SKIPPABLE_HEADER_SIZE + u32.toUsize(payload)
+    if total > size { return errors.err(errors.E_SRCSIZE_WRONG) }
+    return total
+  }
+  // The header fields of `dctx` are read again by the caller's path, so parsing into them is
+  // harmless; they are restored from the same bytes.
+  let headerResult = unsafe getFrameHeader(&mut dctx, start, size)
+  if errors.isError(headerResult) { return headerResult }
+  if headerResult > 0 { return errors.err(errors.E_SRCSIZE_WRONG) }
+  let mut ip = dctx.headerSize
+  let mut remaining = size - dctx.headerSize
+  while true {
+    if remaining < BLOCK_HEADER_SIZE { return errors.err(errors.E_SRCSIZE_WRONG) }
+    let header = u16.toU32(unsafe mem.r16(start, ip)) | u32.shiftLeft(u8.toU32(unsafe mem.r8(start, ip + 2)), 16)
+    let blockType = u32.shiftRight(header, 1) & 3
+    let mut blockSize = u32.toUsize(u32.shiftRight(header, 3))
+    if blockType == BT_RLE { blockSize = 1 } else if blockType == BT_RESERVED { return errors.err(errors.E_CORRUPTION_DETECTED) }
+    if BLOCK_HEADER_SIZE + blockSize > remaining { return errors.err(errors.E_SRCSIZE_WRONG) }
+    ip = ip + BLOCK_HEADER_SIZE + blockSize
+    remaining = remaining - (BLOCK_HEADER_SIZE + blockSize)
+    if (header & 1) == 1 { break }
+  }
+  if dctx.checksumFlag {
+    if remaining < 4 { return errors.err(errors.E_SRCSIZE_WRONG) }
+    ip = ip + 4
+  }
+  return ip
+}
+
+// ZSTD_decompress_usingDDict for one regular frame: decodes the complete frame at
+// `src[at..at+size]` straight into `dst[start..start+capacity]`. Returns the decoded size, or an
+// error.
+unsafe fn decompressFrameDirect(dctx: &mut Dctx, dst: [*]mut u8, start: usize, capacity: usize, src: [*]const u8, at: usize, size: usize) -> usize {
+  // ZSTD_decompressMultiFrame skips a skippable frame; there is then nothing else in `size`.
+  if size >= SKIPPABLE_HEADER_SIZE && (unsafe mem.r32(src, at) & MAGIC_SKIPPABLE_MASK) == MAGIC_SKIPPABLE_START { return 0 }
+  unsafe beginFrame(&mut dctx)
+  unsafe checkContinuity(&mut dctx, dst, start)
+  let mut ip = at
+  let mut remaining = size
+  let oend = start + capacity
+  let mut op = start
+  if remaining < 6 + BLOCK_HEADER_SIZE { return errors.err(errors.E_SRCSIZE_WRONG) }
+  let headerSize = unsafe frameHeaderSize(unsafe mem.addc(src, ip), FRAME_HEADER_MIN)
+  if errors.isError(headerSize) { return headerSize }
+  if remaining < headerSize + BLOCK_HEADER_SIZE { return errors.err(errors.E_SRCSIZE_WRONG) }
+  let parsed = unsafe getFrameHeader(&mut dctx, unsafe mem.addc(src, ip), headerSize)
+  if errors.isError(parsed) { return parsed }
+  if parsed > 0 { return errors.err(errors.E_SRCSIZE_WRONG) }
+  let accepted = unsafe acceptFrameHeader(&mut dctx)
+  if errors.isError(accepted) { return accepted }
+  ip = ip + headerSize
+  remaining = remaining - headerSize
+  if dctx.maxBlockSizeParam != 0 && dctx.maxBlockSizeParam < dctx.blockSizeMax { dctx.blockSizeMax = dctx.maxBlockSizeParam }
+  while true {
+    if remaining < BLOCK_HEADER_SIZE { return errors.err(errors.E_SRCSIZE_WRONG) }
+    let header = u16.toU32(unsafe mem.r16(src, ip)) | u32.shiftLeft(u8.toU32(unsafe mem.r8(src, ip + 2)), 16)
+    let lastBlock = (header & 1) == 1
+    let blockType = u32.shiftRight(header, 1) & 3
+    let mut blockSize = u32.toUsize(u32.shiftRight(header, 3))
+    let originalSize = blockSize
+    if blockType == BT_RLE { blockSize = 1 } else if blockType == BT_RESERVED { return errors.err(errors.E_CORRUPTION_DETECTED) }
+    ip = ip + BLOCK_HEADER_SIZE
+    remaining = remaining - BLOCK_HEADER_SIZE
+    if blockSize > remaining { return errors.err(errors.E_SRCSIZE_WRONG) }
+    let mut decoded: usize = 0
+    if blockType == BT_COMPRESSED {
+      decoded = unsafe decode_block.decompressBlock(&mut dctx, dst, op, oend - op, src, ip, blockSize, false)
+    } else if blockType == BT_RAW {
+      if blockSize > oend - op { return errors.err(errors.E_DSTSIZE_TOOSMALL) }
+      if blockSize != 0 { let _m = unsafe mem.memmove(unsafe mem.add(dst, op), unsafe mem.addc(src, ip), blockSize) }
+      decoded = blockSize
+    } else {
+      if originalSize > oend - op { return errors.err(errors.E_DSTSIZE_TOOSMALL) }
+      if originalSize != 0 { let _s = unsafe mem.memset(unsafe mem.add(dst, op), u8.toI32(unsafe mem.r8(src, ip)), originalSize) }
+      decoded = originalSize
+    }
+    if errors.isError(decoded) { return decoded }
+    if dctx.validateChecksum { unsafe xxh64.update(&mut dctx.hash, unsafe mem.ro(dst), op, decoded) }
+    op = op + decoded
+    dctx.previousDstEnd = op
+    ip = ip + blockSize
+    remaining = remaining - blockSize
+    if lastBlock { break }
+  }
+  if dctx.frameContentSize != CONTENTSIZE_UNKNOWN && usize.toU64(op - start) != dctx.frameContentSize {
+    return errors.err(errors.E_CORRUPTION_DETECTED)
+  }
+  if dctx.checksumFlag {
+    if remaining < 4 { return errors.err(errors.E_CHECKSUM_WRONG) }
+    if !dctx.forceIgnoreChecksum {
+      let computed = u64.wrappingToU32(xxh64.digest(&dctx.hash))
+      if unsafe mem.r32(src, ip) != computed { return errors.err(errors.E_CHECKSUM_WRONG) }
+    }
+    remaining = remaining - 4
+  }
+  if remaining != 0 { return errors.err(errors.E_SRCSIZE_WRONG) }
+  return op - start
+}
+
+// ZSTD_decompressContinueStream: decodes into the stream's own buffer and moves to the stage
+// that flushes it.
+unsafe fn continueStream(dctx: &mut Dctx, src: [*]const u8, at: usize, size: usize) -> usize {
+  let isSkipFrame = dctx.stage == DS_SKIP_FRAME
+  let mut capacity: usize = 0
+  if !isSkipFrame { capacity = dctx.outBuffSize - dctx.outStart }
+  let mut out = dctx.litBuffer
+  if !isNull(dctx.outBuff) { out = unsafe nonNull(dctx.outBuff) }
+  let outStart = dctx.outStart
+  let decoded = unsafe continueFrame(&mut dctx, out, outStart, capacity, src, at, size)
+  if errors.isError(decoded) { return decoded }
+  if decoded == 0 && !isSkipFrame {
+    dctx.streamStage = ZDSS_READ
+  } else {
+    dctx.outEnd = dctx.outStart + decoded
+    dctx.streamStage = ZDSS_FLUSH
+  }
+  return 0
+}
+
+// ZSTD_decodingBufferSize_internal.
+fn decodingBufferSize(windowSize: u64, frameContentSize: u64, blockSizeMax: usize) -> u64 {
+  let mut blockSize: u64 = usize.toU64(decode_block.BLOCK_MAX)
+  if windowSize < blockSize { blockSize = windowSize }
+  if usize.toU64(blockSizeMax) < blockSize { blockSize = usize.toU64(blockSizeMax) }
+  let needed = windowSize + blockSize * 2 + usize.toU64(decode_block.WILDCOPY) * 2
+  if frameContentSize < needed { return frameContentSize }
+  return needed
+}
+
+/// Decodes from `src[srcPos..srcSize]` into `dst[dstPos..dstSize]` and moves both positions
+/// (`ZSTD_decompressStream`).
+///
+/// Returns 0 when a frame is completely decoded and flushed, an error (`errors.isError`), or a
+/// hint of how many bytes of input the next call wants.
+pub unsafe fn decompressStream(raw: ?[*]mut u8, dst: [*]mut u8, dstSize: usize, dstPos: &mut usize, src: [*]const u8, srcSize: usize, srcPos: &mut usize) -> usize {
+  let mut anchor = ()
+  let dctx = unsafe Pointer.borrowMut<(), Dctx>(&mut anchor, unsafe state(raw))
+  if srcPos.* > srcSize { return errors.err(errors.E_SRCSIZE_WRONG) }
+  if dstPos.* > dstSize { return errors.err(errors.E_DSTSIZE_TOOSMALL) }
+  let istart = srcPos.*
+  let iend = srcSize
+  let mut ip = istart
+  let ostart = dstPos.*
+  let oend = dstSize
+  let mut op = ostart
+  let header = dctx.headerBuffer
+  let mut someMoreWork = true
+  while someMoreWork {
+    if dctx.streamStage == ZDSS_INIT {
+      dctx.streamStage = ZDSS_LOAD_HEADER
+      dctx.lhSize = 0
+      dctx.inPos = 0
+      dctx.outStart = 0
+      dctx.outEnd = 0
+      dctx.hostageByte = false
+    }
+    if dctx.streamStage == ZDSS_LOAD_HEADER {
+      let loadedHeader = dctx.lhSize
+      let hSize = unsafe getFrameHeader(&mut dctx, unsafe mem.ro(header), loadedHeader)
+      if errors.isError(hSize) { return hSize }
+      if hSize != 0 {
+        let toLoad = hSize - dctx.lhSize
+        let remainingInput = iend - ip
+        if toLoad > remainingInput {
+          if remainingInput > 0 {
+            let _c = unsafe mem.memcpy(unsafe mem.add(header, dctx.lhSize), unsafe mem.addc(src, ip), remainingInput)
+            dctx.lhSize = dctx.lhSize + remainingInput
+          }
+          srcPos.* = srcSize
+          let partial = dctx.lhSize
+          let early = unsafe getFrameHeader(&mut dctx, unsafe mem.ro(header), partial)
+          if errors.isError(early) { return early }
+          // ZSTD_FRAMEHEADERSIZE_MIN is 6: the 5 bytes read first and one more.
+          let mut wanted = hSize
+          if wanted < 6 { wanted = 6 }
+          return wanted - dctx.lhSize + BLOCK_HEADER_SIZE
+        }
+        let _c = unsafe mem.memcpy(unsafe mem.add(header, dctx.lhSize), unsafe mem.addc(src, ip), toLoad)
+        dctx.lhSize = hSize
+        ip = ip + toLoad
+        continue
+      }
+      // The header is complete. When the whole frame is in the input and the output has room for
+      // its content, decode it in one pass straight into the output.
+      if dctx.frameContentSize != CONTENTSIZE_UNKNOWN && dctx.frameType != FRAME_SKIPPABLE && usize.toU64(oend - op) >= dctx.frameContentSize {
+        let cSize = unsafe findFrameCompressedSize(&mut dctx, src, istart, iend - istart)
+        // The header buffer is the source of the frame fields; read them again from it.
+        let complete = dctx.lhSize
+        let _again = unsafe getFrameHeader(&mut dctx, unsafe mem.ro(header), complete)
+        if cSize <= iend - istart {
+          let decompressed = unsafe decompressFrameDirect(&mut dctx, dst, op, oend - op, src, istart, cSize)
+          if errors.isError(decompressed) { return decompressed }
+          ip = istart + cSize
+          op = op + decompressed
+          dctx.expected = 0
+          dctx.stage = DS_GET_FRAME_HEADER_SIZE
+          dctx.streamStage = ZDSS_INIT
+          someMoreWork = false
+          continue
+        }
+      }
+      unsafe beginFrame(&mut dctx)
+      if (unsafe mem.r32(unsafe mem.ro(header), 0) & MAGIC_SKIPPABLE_MASK) == MAGIC_SKIPPABLE_START {
+        dctx.expected = u32.toUsize(unsafe mem.r32(unsafe mem.ro(header), 4))
+        dctx.stage = DS_SKIP_FRAME
+      } else {
+        let accepted = unsafe acceptFrameHeader(&mut dctx)
+        if errors.isError(accepted) { return accepted }
+        dctx.expected = BLOCK_HEADER_SIZE
+        dctx.stage = DS_DECODE_BLOCK_HEADER
+      }
+      if dctx.windowSize < 1024 { dctx.windowSize = 1024 }
+      if dctx.windowSize > dctx.maxWindowSize { return errors.err(errors.E_FRAMEPARAMETER_WINDOWTOOLARGE) }
+      if dctx.maxBlockSizeParam != 0 && dctx.maxBlockSizeParam < dctx.blockSizeMax { dctx.blockSizeMax = dctx.maxBlockSizeParam }
+      let mut neededIn = dctx.blockSizeMax
+      if neededIn < 4 { neededIn = 4 }
+      let neededOut64 = decodingBufferSize(dctx.windowSize, dctx.frameContentSize, dctx.blockSizeMax)
+      let neededOut = u64.toUsize(neededOut64)
+      if (dctx.inBuffSize + dctx.outBuffSize) >= (neededIn + neededOut) * WORKSPACE_TOO_LARGE_FACTOR {
+        dctx.oversizedDuration = dctx.oversizedDuration + 1
+      } else {
+        dctx.oversizedDuration = 0
+      }
+      let tooSmall = dctx.inBuffSize < neededIn || dctx.outBuffSize < neededOut
+      let tooLarge = dctx.oversizedDuration >= WORKSPACE_TOO_LARGE_MAX_DURATION
+      if tooSmall || tooLarge {
+        unsafe mem.free(dctx.inBuff)
+        dctx.inBuffSize = 0
+        dctx.outBuffSize = 0
+        dctx.outBuff = nullBytes()
+        dctx.inBuff = unsafe mem.malloc(neededIn + neededOut)
+        if isNull(dctx.inBuff) { return errors.err(errors.E_MEMORY_ALLOCATION) }
+        dctx.inBuffSize = neededIn
+        dctx.outBuff = unsafe Intrinsic.pointerRequalify<[*]mut u8, ?[*]mut u8>(unsafe mem.add(unsafe nonNull(dctx.inBuff), neededIn))
+        dctx.outBuffSize = neededOut
+      }
+      dctx.streamStage = ZDSS_READ
+    }
+    if dctx.streamStage == ZDSS_READ {
+      let neededInSize = nextSrcSize(&dctx, iend - ip)
+      if neededInSize == 0 {
+        dctx.streamStage = ZDSS_INIT
+        someMoreWork = false
+        continue
+      }
+      if iend - ip >= neededInSize {
+        let decoded = unsafe continueStream(&mut dctx, src, ip, neededInSize)
+        if errors.isError(decoded) { return decoded }
+        ip = ip + neededInSize
+        continue
+      }
+      if ip == iend { someMoreWork = false continue }
+      dctx.streamStage = ZDSS_LOAD
+    }
+    if dctx.streamStage == ZDSS_LOAD {
+      let neededInSize = dctx.expected
+      let toLoad = neededInSize - dctx.inPos
+      let isSkipFrame = dctx.stage == DS_SKIP_FRAME
+      let mut loadedSize = toLoad
+      if iend - ip < loadedSize { loadedSize = iend - ip }
+      if !isSkipFrame {
+        if toLoad > dctx.inBuffSize - dctx.inPos { return errors.err(errors.E_CORRUPTION_DETECTED) }
+        if loadedSize != 0 { let _c = unsafe mem.memcpy(unsafe mem.add(unsafe nonNull(dctx.inBuff), dctx.inPos), unsafe mem.addc(src, ip), loadedSize) }
+      }
+      if loadedSize != 0 {
+        ip = ip + loadedSize
+        dctx.inPos = dctx.inPos + loadedSize
+      }
+      if loadedSize < toLoad { someMoreWork = false continue }
+      dctx.inPos = 0
+      let staged = unsafe mem.ro(unsafe nonNull(dctx.inBuff))
+      let decoded = unsafe continueStream(&mut dctx, staged, 0, neededInSize)
+      if errors.isError(decoded) { return decoded }
+      continue
+    }
+    if dctx.streamStage == ZDSS_FLUSH {
+      let toFlush = dctx.outEnd - dctx.outStart
+      let mut flushed = toFlush
+      if oend - op < flushed { flushed = oend - op }
+      if flushed != 0 {
+        let _c = unsafe mem.memcpy(unsafe mem.add(dst, op), unsafe mem.addc(unsafe mem.ro(unsafe nonNull(dctx.outBuff)), dctx.outStart), flushed)
+      }
+      op = op + flushed
+      dctx.outStart = dctx.outStart + flushed
+      if flushed == toFlush {
+        dctx.streamStage = ZDSS_READ
+        if usize.toU64(dctx.outBuffSize) < dctx.frameContentSize && dctx.outStart + dctx.blockSizeMax > dctx.outBuffSize {
+          dctx.outStart = 0
+          dctx.outEnd = 0
+        }
+        continue
+      }
+      someMoreWork = false
+    }
+  }
+  srcPos.* = ip
+  dstPos.* = op
+  if ip == istart && op == ostart {
+    dctx.noForwardProgress = dctx.noForwardProgress + 1
+    if dctx.noForwardProgress >= NO_FORWARD_PROGRESS_MAX {
+      if op == oend { return errors.err(errors.E_NOFORWARDPROGRESS_DESTFULL) }
+      if ip == iend { return errors.err(errors.E_NOFORWARDPROGRESS_INPUTEMPTY) }
+    }
+  } else {
+    dctx.noForwardProgress = 0
+  }
+  let mut nextSrcSizeHint = dctx.expected
+  if nextSrcSizeHint == 0 {
+    if dctx.outEnd == dctx.outStart {
+      if dctx.hostageByte {
+        if srcPos.* >= srcSize {
+          dctx.streamStage = ZDSS_READ
+          return 1
+        }
+        srcPos.* = srcPos.* + 1
+      }
+      return 0
+    }
+    if !dctx.hostageByte {
+      srcPos.* = srcPos.* - 1
+      dctx.hostageByte = true
+    }
+    return 1
+  }
+  if dctx.stage == DS_DECOMPRESS_BLOCK { nextSrcSizeHint = nextSrcSizeHint + BLOCK_HEADER_SIZE }
+  nextSrcSizeHint = nextSrcSizeHint - dctx.inPos
+  return nextSrcSizeHint
+}

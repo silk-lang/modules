@@ -1,0 +1,419 @@
+# Loom
+
+Loom is a Silk UI framework in the Elm style: a model, messages, a pure
+`view`, an `update`, and commands and subscriptions as plain data. The view is a function the
+runtime calls again; it diffs the new description against the last one and sends the retained
+tree the fewest `Mutation`s it can. The `loom` package depends only on
+[ui-protocol](https://github.com/silk-lang/silkui/tree/main/modules/protocol): it sends `Mutation`s to a `Backend` and reads `Event` records back, so
+[ui-tree](https://github.com/silk-lang/silkui/tree/main/modules/tree) (through `loom-tree`), a browser document (`loom-dom`) or any other protocol
+client can show it.
+
+Components (buttons, fields, lists, tabs, menus, dialogs and more) are in
+[loom-components](../loom-components), built on this package, and [examples/notes](https://github.com/silk-lang/nonstd/tree/7d6c3693a9ad1fec24127985626ab4224f9f1995/examples/notes) is a complete
+example app. [modules/README.md](https://github.com/silk-lang/silkui/blob/main/modules/README.md) is the overview of the whole UI stack.
+
+Packages:
+
+- `modules/loom` (`loom`): the builder (`ui.silk`), the diff (`diff.silk`), the app contract
+  (`app.silk`), declared windows (`windows.silk`), the runtime (`runtime.silk`),
+  loop helpers (`seq.silk`), and commands on fibers (`tasks.silk`).
+- `modules/loom/tree` (`loom-tree`): Loom on ui-tree: `feed` (input the browser way), `frame`
+  and `frameRoot`, and headless driving for tests (`harness.silk`).
+- `modules/loom/window` (`loom-window`): `runWindow`, the loop that runs an app in a native window
+  through [modules/platform/window](https://github.com/silk-lang/lib-native/tree/main/modules/platform/window) and [ui_renderer](https://github.com/silk-lang/lib-graphics/tree/main/modules/ui_renderer).
+  `runWindowWith` also serves an [inspector](https://github.com/silk-lang/silkui/tree/main/modules/inspect/server) (debug builds with
+  `SILK_UI_INSPECT` set), so ui-inspect-cli, ui-inspect-mcp and the
+  [devtools window](../devtools) can look at the app.
+- `modules/loom/examples`: a counter and a todo list. `modules/loom/demo` runs the todo list in a window.
+- `modules/loom/notes` (`loom-notes`): the Notes example in a window: menus, dialogs, the clipboard,
+  a worker thread.
+- `modules/loom/mirror` (`loom-mirror`): the mirror example, one count in two native windows
+  (see [Windows](#windows)).
+- [`examples/scroll-demo`](https://github.com/silk-lang/nonstd/tree/7d6c3693a9ad1fec24127985626ab4224f9f1995/examples/scroll-demo): a fully mounted mixed-document scroll stress app,
+  with native controls and repeatable CPU benchmarks of the shared libraries.
+- `modules/loom/tests`: unit tests and the golden scenes.
+
+## An app
+
+```silk
+pub struct Counter { pub count: i64 }
+pub union Message { Increment, Decrement }
+
+impl App<Message, NoCommand> for Counter {
+  fn view(self: &Self, ui: &mut Ui<Message>) -> () {
+    ui.row(
+      |ui| {
+        ui.gap(8.0)
+        ui.button("-", || Message.Decrement)
+        ui.box(|ui| { ui.testId("count"); ui.number(self.count) })
+        ui.button("+", || Message.Increment)
+      },
+    )
+  }
+
+  fn update(self: &mut Self, message: Message, cx: &mut Context<NoCommand>) -> () {
+    match move message {
+      Message.Increment => { self.count = self.count + 1 }
+      Message.Decrement => { self.count = self.count - 1 }
+    }
+  }
+}
+
+let mut runtime = Runtime<Counter, Message, NoCommand>.make(Counter { count: 0 })
+run runtime.start(&mut tree, 0.0)            // creates the root and the first render
+run pump(&mut runtime, &mut tree)            // after each tree.dispatch: events to messages
+run tick(&mut runtime, &mut tree, now, true) // timers and frames due at `now`
+```
+
+`App<M, C>` has `view`, `update`, and `subscriptions` and `windows` (both empty by default). The command type
+implements `Perform<M, E, ? R>`: `perform` is the only effectful code in an app, and its
+failures `E` and requirements `R` (a store, the network, a clock) are provided once where the app
+runs, so a test swaps them. `examples/src/todo.silk` saves through a `Store` service this way,
+and the tests give it a memory store. `perform` takes the command by value, so a command can
+move what it carries into the work.
+
+## Commands on fibers
+
+By default a command runs synchronously, right after the update that made it, and its message
+is handled next. A loop that runs inside a scheduler (`LocalScheduler.execute`) can run them on
+fibers instead, so a slow command does not hold up input and frames:
+
+```silk
+runtime.deferCommands()                // drain keeps commands instead of performing them
+let mut tasks = Tasks<Message, E>.make()
+while running {
+  run pump(&mut runtime, &mut tree)
+  run tasks.launch(&mut runtime)       // each waiting command starts on its own fiber
+  run Fiber.yieldNow()
+  if (run tasks.collect(&mut runtime)) != 0 { // finished commands' messages, in finish order
+    run drain(&mut runtime, &mut tree)
+  }
+}
+```
+
+A fiber can only use the Scheduler and the clock, so these commands implement
+`Perform<M, E ? &mut Scheduler | &mut MonotonicClock>` and own what they need (a `Shared<Store>`,
+not a borrowed one). `tasks.collect` raises a command's error, or `Cancelled`.
+
+## Views
+
+The builder opens nodes with a body: `box`, `row`, `column`, `node(kind, body)`, `input`,
+`canvas`, `pressable`, and leaves with `text`, `number`, `image`, `icon` and `button`. Inside a
+body, calls apply to the open node: `style` (and `hover`, `active`, `focused`, `focusVisible`
+for the state variants), shorthands such as `padding`, `gap`, `background`, `color`, `fontSize`,
+`width`, `height` and `grow`, the attributes `accessRole`, `label`, `testId`, `tabIndex`,
+`cursor`, `disabled`, `focusTrap`, and handlers.
+
+**Handlers are never stored.** `onClick(|| Message.Increment)` records only that the node
+listens for clicks. When the tree reports an event, the runtime runs `view` again in dispatch
+mode: it enters only the nodes on the event's path and calls the handlers there, in bubbling
+order from the target up. `onInput(|text| ...)` hands the handler the input's new value as an owned `String`, and
+`onEnter(handler)` sends a message for Enter (an input's submit). `on(kind, handler)` takes a
+`fn(&Event) -> Reply<M>`, where `Reply`
+is `Emit`, `EmitAndStop`, `Stop`, `Pass`, `Prevent` or `Custom`. Enter, leave, focus, blur and scroll go to the
+target only. So a handler sees the model as it is when the event arrives, and nothing captured
+can go stale.
+
+Handlers run before the tree's default action, as in a browser, so they can prevent it.
+`Reply.Prevent` keeps a press from moving focus, a wheel from scrolling, or a key from doing
+what it does (Tab, Enter and Space clicks, editing, typed text). `Reply.Custom { message,
+stopPropagation, preventDefault }` spells out all three, as Elm's `custom`. When the view knows
+ahead of time, it declares it on the node instead: `ui.prevent(&[DefaultAction.Scroll])` for a
+canvas that pans itself, `ui.prevent(&[DefaultAction.Focus])` for a toolbar button that must
+not take focus from an editor. A tree host feeds input with `loom_tree.lib.feed(&mut app, &mut tree,
+input)`, which is `tree.begin`, the handlers, then `tree.finish` with their verdict.
+
+The state attributes `checked`, `selected` and `expanded`, and for inputs `placeholder`,
+`multiline` and `readOnly`, describe a node to the tree (and so to inspectors and tests).
+`decimal(value, places)` is a text node with a number.
+
+**Focus, anchors and overlays.** These are what popups and composite components need, still
+without stored closures:
+
+- `ui.takeFocus()` focuses the open node when this render asks and the last one did not (or the
+  node is new): a dialog's first field when it opens, a menu's button when the menu closes. A
+  view can keep asking while the condition holds; the last node asking wins. `ui.reveal()`
+  scrolls the node into view the same way.
+- `ui.anchor(key)` names the open node; before each render and dispatch the runtime reads the
+  layout boxes of the anchored nodes from the tree, and `ui.anchorRect(key)` returns one (and
+  `ui.anchorPressed(key)` whether a press on it is in progress). A popup places itself next to
+  its button with it, and a slider maps the pointer to a value.
+- `ui.overlay(key, body)` puts the nodes `body` opens in the overlay layer: a box under the root
+  after everything else, so they are drawn and hit above the rest, wherever the `overlay` call
+  is in the view. Their events bubble to the root. For an event in an overlay the dispatch pass
+  runs the whole view to find the call, and handlers outside it do not run.
+
+**Lists** use `ui.each(items, key, body)` (and `ui.enumerate` with the index): the first node
+the body opens for an item takes its key, so the diff keeps the node (and its focus, scroll and
+hover state) when the item moves. Without keys, children match by their order among unkeyed
+siblings and their kind. `ui.key(value)` keys the next node by hand.
+
+`seq` has the same loops for plain data: `forEach`, `enumerate`, `count`, and `map` and
+`filter`, which build a `List` and so need an allocator. These are functions over slices, not a
+`Stream` type: when std settles on one, `each` can take it without the views changing.
+
+**`lazy(hash, body)`** reuses the last render's region when `hash` (of everything `body` reads)
+is unchanged, as Elm's `Html.lazy`; the diff skips it.
+
+## The diff
+
+Nodes are matched while the view builds: same parent, then the same key (or unkeyed ordinal) and
+the same kind. A match keeps its tree id; anything else is created, and old nodes left over are
+destroyed. Within a parent, the nodes that keep their relative order are found with a longest
+increasing subsequence, and only the others are moved, so rotating a list of five is one
+`InsertBefore` and reversing it is four. Styles go out as the properties that changed
+(`ClearStyle` first when one was removed), and text, attributes, listeners, sources and canvas
+commands only when they differ. Tree ids grow and are never reused. Id 1 is the runtime's root,
+a column filling the viewport.
+
+`runtime.stats` counts renders, dispatches, messages, commands, mutations, nodes and reused
+nodes, for tests and for the inspection phases.
+
+## Subscriptions
+
+`subscriptions(subs)` returns what the model wants now, each with a key: `every(key, seconds,
+handler)`, `animationFrame`, `keyBinding(key, name, modifiers, handler)` (wherever focus is,
+unless a view handler stops the key first) and `resize`. The runtime asks after every update,
+starts the new keys and stops the missing ones. Handlers are delivered the way view handlers
+are: by asking again and calling the one that matches. `runtime.nextDeadline()` tells a loop how
+long it can wait.
+
+## Windows
+
+`windows(model, w)` (on `Program`, and `windows(self, w)` on `App`, both empty by default)
+declares the windows the model wants besides the first, in the spirit of `view` and
+`subscriptions`: each under a key, with a `WindowSpec` (title, size, resizable), its own view,
+and the message for a request to close it.
+
+```silk
+fn windows(model: &Mirror, w: &mut Windows<Message>) -> () {
+  if model.open {
+    w.window(
+      SECOND,
+      WindowSpec.titled("Second window").sized(320.0, 200.0),
+      |h| second(model, h),
+      || Message.CloseRequested,
+    )
+    w.listen(SECOND, |event| Message.SecondChanged { event: event })
+  }
+}
+```
+
+The runtime asks after every update and compares the answer with the windows it opened, by key,
+in the render's batch: a new key opens a root (`OpenRoot`) with a root box and the window's view
+in it, a key that is gone closes it (`CloseRoot`) and destroys its nodes, and a new title or size
+updates it (`UpdateRoot`). Every window's view renders again with the first one, from the one
+model, so windows share state with no wire between them. A record whose path starts at a window's
+root box dispatches through that window's view. A request to close a window is only a message:
+the window stays while the model declares it. `w.listen(key, handler)` hears the window's size,
+focus, and `Failed` from a backend that cannot show it; a failed window is not opened again until
+the model stops declaring it. `w.windowWith` takes a view written with `Ui`, as an `App`'s. A
+program that declares no windows renders and sends exactly what it did before.
+
+`harness.clickIn(runtime, tree, root, viewport, "Close")` clicks in a window's root.
+
+A runtime shows its app in the first root with root box `ROOT_ID` (1). `runtime.placeAt(root,
+node)`, before `start`, puts it in root `root` with root box `node` instead; its nodes take the
+ids after `node` and its windows the roots after `root`. That is how a second program shares a
+tree with the first: the devtools in the app's own process are placed at the top of the id
+space ([ui-inspect-devtools](../devtools/README.md#in-the-apps-own-process)).
+[examples/src/mirror.silk](examples/src/mirror.silk) is a counter in two windows,
+`modules/loom/mirror` runs it natively, and [tests/src/windows.silk](tests/src/windows.silk) tests
+it on the headless tree and on the server-side document.
+
+## Native apps
+
+`loom_window.program` runs a `Program` in a native window with nothing else to write:
+
+```silk
+effect fn app(platform: Option<Launched>) -> i32 ? &mut Allocator {
+  let mut window = run Window.make("Notes", 760.0, 520.0)
+  run window.font(SANS, "system-ui, sans-serif")
+  let fonts = run systemFonts()
+  let mut shell = window.shell()
+  return run show<Notes, Message, Command, &mut Shell | &mut Allocator>(move window, &fonts, move platform)
+    |> Effect.provideMut<Shell>(&mut shell)
+}
+
+fn main() -> i32 {
+  return launch(app)
+}
+```
+
+- `Window`: the title and size, `font`, `image`, `icon`, `lowLatency`, `uninspected`. `open` is
+  `show` with the failures typed instead of printed.
+- `Shell` (a service, so commands call `run Shell.copy(text)`): `setTitle`, `setSize`,
+  `minimize`, `toggleFullScreen`, `quit`, `copy`, `paste`, `dark`, `setMenu(Menu)`, `openFile`
+  and `saveFile`. `window.shell()` is the real one; `ShellLog` writes down what was asked, for
+  tests.
+- Subscriptions for what the window says: `menuAction`, `files` (a closed dialog),
+  `appearance`, `windowFocus` and `closeRequested`. A program that subscribes to
+  `closeRequested` keeps the window until a command calls `Shell.quit`.
+- `window.poster()` is a `Poster` any thread may post to; the text arrives through
+  `subs.port(key, name, handler)` on the UI thread.
+- Views: `onPointerUp/Move/Enter/Leave/Cancel`, `onDoubleClick`, `onKeyUp`, `onWheel`,
+  `onScroll`, `capturePointer()` (the node keeps the pointer while a button is held) and
+  `scrollTo(x, y)`.
+
+[examples/src/notes.silk](examples/src/notes.silk) uses all of it and `modules/loom/notes` runs
+it; [tests/src/native.silk](tests/src/native.silk) tests it with no window. The host posts to
+the `PORT_*` names in `loom.shell`, which is also how a test speaks for the window.
+
+## Testing and driving
+
+`harness` drives an app without a window through the tree's real input path: `click(runtime,
+tree, viewport, "Add")` finds a node by test id, label or text and clicks its center;
+`press(..., "n", MOD_CONTROL)` presses a key; `locateRole` and `clickRole` find a node by role and
+name ("the Save button"), `typeText` types into the focused input, and `clickAt`, `drag`,
+`hover`, `moveTo` and `wheel` drive the pointer; `snapshot` returns the `describe` text. The tests
+check counts and stats with these, and `modules/loom/tests` renders golden scenes (`describe` text and
+PNG) for the counter and the todo list. `silk task native demo modules/loom/demo -- check` runs the todo list in a
+real window on X11 and Wayland, clicks Add and compares a frame.
+
+## What the inspector sees
+
+A program keeps a `Journal`: every message with what sent it (`click #12`, `port shell:menu`,
+`command Save`, `timer`), the commands `update` returned and the model afterwards. Nothing is
+written by hand: `show.show` and `show.showTree` print any value by reflection (`pub` fields of
+structs and unions, list items, numbers, strings), and a type reflection cannot open says how
+with `impl Shown`. loom knows no inspector: the journal is read by silk-ui's inspector
+extension, `silk-ui`, in [loom-inspect](inspect), which the window host registers and serves
+the way any framework would its own. There it is the `silk-ui.program`, `silk-ui.messages` and
+`silk-ui.model` commands, the `silk-ui.message` topic and the Program panel the devtools show
+([ui-inspect-devtools](../devtools)), a view the app renders with its own `Document`
+builder. The journal keeps the last 200 steps and is only filled while an inspector is
+attached.
+
+A native app also shows those devtools in its own process, in a window or docked in its own
+(`SILK_UI_DEVTOOLS=window|dock|1`, or F12 in a debug build with `SILK_UI_INSPECT` set); see
+[ui-inspect-devtools](../devtools/README.md#in-the-apps-own-process).
+
+## What depends on the tree
+
+Views, the diff and the element model (`ui`, `diff`, `equal`, `virtual_list`) import only
+`ui-protocol`: they produce mutations and read event records, and never touch a tree. Only
+`runtime` and `harness` hold a `ui-tree`, so another host that speaks the protocol needs its
+own runtime and nothing else.
+
+## Backends
+
+The runtime drives a `Backend` (`backend.silk`): `mutate` takes a render's batch, `events` gives
+element records back, and `measure`, `range` and `navigate` answer the view and the shell. A
+backend says what roots it shows with `roots()` (a `RootSupport`: how many, and what a root past
+the first becomes), gives each root's viewport with `viewport(root)`, and hands out root events
+with `rootEvents`. `UiTree` shows any number of roots, one under the native window host; `Dom`
+and `Html` show the first only and answer an `OpenRoot` for another with a `Failed` root event.
+A program renders into the first root: `Runtime.start` opens it with the runtime's root box.
+The windows a program declares are the other roots (see [Windows](#windows)): their records and
+root events go to their views and handlers; the first root's root events are the host's (resize,
+the shell's ports), and records from a root nobody declared are dropped. On `Dom` and `Html` a
+declared window fails and the first one works as before.
+
+## Limits
+
+- `runWindow` performs commands synchronously. For native workers, use deferred commands and
+  `loom-window.commands.Commands`, or compose `Background` jobs in `WindowContent`. See the
+  [native primitives guide](window/README.md). There is no automatic cancellation by command key.
+- There is no `ui.map` for embedding a child app with its own message type, and no custom
+  subscription kind.
+- Style and attribute calls a `lazy` body makes on its parent are not kept when the region is
+  reused; open a node inside `lazy` instead.
+- A `lazy` region that opened an overlay is not reused.
+- Anchor boxes come from the tree's last frame, so a popup opened in the same pass that moved
+  its button sits where the button was.
+- Two items with the same key under one parent: the second gets a new node each render.
+- Running out of memory traps.
+- `UiTree` measures nodes in its current root only, so `ui.anchorRect` in a declared window is
+  empty unless that window's root is current while the runtime renders (as it is while its own
+  frame runs). Virtual lists in a declared window get no ranges.
+- `view` and `update` are plain functions that allocate through `ui.alloc` and `cx.alloc`, so
+  running out of memory traps instead of failing with a typed error. Effect builders would need
+  `run` on every call (`run ui.row(effect |ui| {...})`, with bodies typed
+  `for<'call> fn(&'call mut Ui<M>) -> mut Effect<'call; ...>`), so plain functions were kept.
+
+The [native primitives guide](window/README.md) covers the full layout bridge, styled and
+managed images, measured bounds, custom GPU content, shared text caches and OS accessibility.
+
+## Virtual lists
+
+A virtual list mounts only the rows the tree asks for. The tree requests sorted indices: the
+rows around the viewport, and any row that holds keyboard focus, the focused widget's active
+descendant or a screen reader's browse cursor, each kept until it leaves. Measurements,
+overscan, scroll anchoring and the layout spacers live in `ui-tree`, behind its plain-data
+[mutation/query protocol](https://github.com/silk-lang/silkui/blob/main/modules/tree/README.md#virtual-scrolling);
+Loom reads the request with `Backend.indices` and builds those rows. In a browser page
+`loom-dom` answers it, with spacers in the document ([loom-dom](dom/README.md#virtual-lists)).
+
+In a `Program` view, `h.virtualList` is the scroll column itself, a `list` by default:
+
+```silk
+h.virtualList(
+  FEED,
+  model.messages.length(),
+  VirtualOptions { estimatedHeight: 48.0, overscan: 128.0, gap: 0.0, revision: model.revision },
+  &[h.accessRole(Role.Feed), h.style(&[css.height(px(480.0))])],
+  |i| model.messages.get(i).id,
+  |i| messageRow(model.messages.get(i), h),
+)
+```
+
+`Ui.virtualItems(listKey, count, options, key, body)` does the same inside the open column of
+an `App` view. Each row is a `listitem` wrapper with its logical position and the count. Keys
+must be unique and stable: when items are inserted or removed, a retained row keeps its node,
+and so its focus, by key. Unmounted rows keep no state; keep it in the model. Bump
+`options.revision` after a reorder to discard measured heights.
+
+The [scroll demo](https://github.com/silk-lang/nonstd/tree/7d6c3693a9ad1fec24127985626ab4224f9f1995/examples/scroll-demo) is a complete example. This separation removes
+virtualization geometry from the app layer; the rest of `loom` talks to any
+`Backend`.
+
+`Ui.anchored(key, options)` attaches the open popup to a node named with `Ui.anchor`.
+The runtime resolves view keys to tree IDs and emits `SetAnchor`; placement then
+follows tree layout and scrolling without rendering the view again. Popup hierarchy
+and event handlers remain part of the view. The anchor key must exist in that view.
+
+### Selector identity
+
+`ui.class("flex gap-2")`, `ui.id("toolbar")`, and
+`ui.attribute("data-state", "open")` set selector identity on the open node.
+The document API has the same helpers: `h.class(...)`, `h.id(...)`, and
+`h.attribute(name, value)`.
+
+Class helpers add up in order, so a node can take its classes in pieces:
+
+```silk
+h.box(&[
+  h.class("rounded-xl border p-4"),
+  h.classWhen(model.busy, "opacity-50"),
+  h.classSelect(chosen, "border-teal-700 bg-teal-50", "border-gray-300 bg-white"),
+  h.classes(&[CARD, SPACING]),
+], children)
+```
+
+`classWhen` adds its classes while the condition holds, `classSelect` adds one of two
+strings, and `classes` adds every string of a list. `className` replaces whatever the
+node has so far, as assigning the HTML attribute does. `ui` has the same four.
+
+Named attributes support `data-*`, `aria-*`, `lang`, and `dir`. Empty strings
+remain present; omitting an attribute in the next view removes it. Repeated
+assignments to a name keep the last value. The tree, HTML renderer and browser
+wire preserve those distinctions. The native tree accepts compiled sheets through
+its batch protocol. `Batch.loadStyleSheet(root, id, source)` also accepts CSS text or a URL.
+Generated development hosts include the runtime compiler; release tree hosts opt in with
+`App.runtimeStylesheets()`. A custom `Window` can install `runtimeStylesheets()` with
+`withStylesheetCompiler`. DOM hosts use the browser's parser. Loads preserve adoption order,
+keep the previous sheet after failure, and ignore cancelled results.
+
+### Custom properties
+
+`ui.customProperty("--gap", "8px")` and `h.customProperty("--gap", "8px")`
+declare a custom property in the base look. Use `customPropertyFor(state, name,
+value, important)` for another look or an important declaration. Names preserve
+case; values are CSS tokens. An empty value is present, and omitting a property
+in a later view removes it.
+
+Custom properties inherit into both sheet declarations and style objects in the
+native tree. The DOM transport uses CSS custom properties directly, and the HTML
+renderer writes them into inline styles or state rules. Lazy regions keep their
+custom declarations when reused. Clearing an ordinary style restores any custom
+properties that the new view still declares in that look.

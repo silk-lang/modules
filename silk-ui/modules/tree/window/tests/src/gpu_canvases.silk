@@ -1,0 +1,275 @@
+//! GPU canvas presents without a window: an app's device draws a canvas, and a second device
+//! plays the render thread's part (render_thread.serveCanvases) and reads every frame back.
+//! Where both devices share images (macOS), frames cross as shared images with fences, the
+//! swap chain's images come back to the app, and the app never draws into an image the other
+//! device still holds; elsewhere they cross as pixels. A machine with no GPU adapter, or with
+//! only Dawn's null backend (which accepts every call and draws nothing), checks nothing. RGBA canvases always cross as pixels.
+import ui_tree_window.canvas_frames { CanvasFrame, CanvasPresenter, ReturnedImage, SharedPicture }
+import ui_tree_window.gpu_canvas { CanvasGpu, GpuCanvas, CANVAS_FORMAT, CANVAS_FORMAT_BGRA, sharingFeatures }
+import ui_renderer.readback { copyOut, readbackSize, unpack }
+import webgpu.runtime { Device, GpuError, Instance, RequestAdapterOptions }
+import webgpu.runtime as runtime
+import webgpu.resources as resources
+import webgpu.resources { Queue, Texture }
+import webgpu.descriptors { Color, DeviceDescriptor, RenderPassColorAttachment, RenderPassDescriptor, TextureViewDescriptor }
+import webgpu.shared_texture { BeginAccess, SharedFence, SharedImage, SharedTextureMemory }
+import webgpu_sys.generated_webgpu as flags
+import silk.collections.list { List }
+import silk.concurrency.sync { Parker }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.u8
+import silk.num.u32
+import silk.num.usize
+import silk.testing.testing { AssertionError, Testing }
+
+const WIDTH: u32 = 8
+
+const HEIGHT: u32 = 4
+
+/// The second device, as the render thread makes it.
+struct Renderer {
+  instance: Instance,
+  device: Device,
+  queue: Queue,
+}
+
+/// A shared image the second device imported.
+struct Imported {
+  chain: u32,
+  index: u32,
+  memory: SharedTextureMemory,
+  texture: Texture,
+}
+
+/// Frame `n`'s colour, in whole units of 1/255 (alpha is drawn as one half: the canvas is
+/// opaque, so it shows as 255).
+fn red(n: u32) -> u32 {
+  return 20 + n * 20
+}
+
+fn green(n: u32) -> u32 {
+  return 200 - n * 15
+}
+
+const BLUE: u32 = 90
+
+/// Draws frame `n` into the canvas and presents it.
+effect fn drawFrame(app: &CanvasGpu, canvas: &mut GpuCanvas, n: u32) -> ()
+  ! GpuError | OutOfMemoryError {
+  let view = run canvas.texture().createView(&TextureViewDescriptor.default())
+  let mut clear = Color.default()
+  clear.setR(u32.toF64(red(n)) / 255.0)
+  clear.setG(u32.toF64(green(n)) / 255.0)
+  clear.setB(u32.toF64(BLUE) / 255.0)
+  clear.setA(0.5)
+  let mut attachment = RenderPassColorAttachment.default().withView(&view)
+  attachment.setClearValue(clear)
+  attachment.setLoadOp(flags.WGPULoadOp_Clear)
+  attachment.setStoreOp(flags.WGPUStoreOp_Store)
+  let attachments = [attachment]
+  let descriptor = RenderPassDescriptor.default().withColorAttachments(&attachments)
+  let mut encoder = run resources.createCommandEncoder(&app.device, b"canvas test")
+  let mut pass = run encoder.beginRenderPass(&descriptor)
+  pass.end()
+  let commands = run encoder.finish(b"canvas test")
+  app.queue.submit(&[commands.reference()])
+  run canvas.present(app)
+}
+
+/// Whether `pixels` (RGBA rows) are all of frame `n`'s colour.
+fn showsFrame(pixels: &[u8], n: u32) -> bool {
+  if pixels.length != u32.toUsize(WIDTH * HEIGHT * 4) {
+    return false
+  }
+  let mut i: usize = 0
+  while i < pixels.length {
+    if !near(pixels[i], red(n)) || !near(pixels[i + 1], green(n)) || !near(pixels[i + 2], BLUE)
+      || pixels[i + 3] != 255 {
+      return false
+    }
+    i = i + 4
+  }
+  return true
+}
+
+fn near(value: u8, wanted: u32) -> bool {
+  let v = u8.toU32(value)
+  return v + 1 >= wanted && v <= wanted + 1
+}
+
+/// What the second device sees of `frame`: its pixels, read back from the shared image when it
+/// is one. A shared image is imported once, sampled after the app's fences, and the image it
+/// replaces (`shown`) goes back to the app with this device's fences.
+effect fn receive(
+  renderer: &Renderer,
+  presenter: &CanvasPresenter,
+  imports: &mut List<Imported>,
+  shown: &mut usize,
+  frame: &CanvasFrame,
+) -> List<u8>
+  ! GpuError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut pixels = List<u8>.make()
+  if let Option<SharedPicture>.Some { value } = &frame.shared {
+    let mut at: usize = 0
+    while at < imports.length()
+      && (imports.asSlice()[at].chain != value.chain || imports.asSlice()[at].index != value.index) {
+      at = at + 1
+    }
+    if at == imports.length() {
+      let memory = run SharedTextureMemory.importImage(&renderer.device, b"canvas test", &value.image.get().image)
+      let texture = run memory.createTexture(b"canvas test")
+      run imports.append(Imported { chain: value.chain, index: value.index, memory: move memory, texture: move texture })
+    }
+    let mut fences = List<SharedFence>.make()
+    let given = value.fences.asSlice()
+    let mut f: usize = 0
+    while f < given.length {
+      run fences.append(run SharedFence.importMtlSharedEvent(&renderer.device, given[f].exportInfo().handle))
+      f = f + 1
+    }
+    let image = &imports.asSlice()[at]
+    run image.memory.beginAccessAfter(&image.texture, BeginAccess.ready(), fences.asSlice(), value.values.asSlice())
+    let buffer = run copyOut(&renderer.device, &renderer.queue, &image.texture, WIDTH, HEIGHT)
+    let padded = run runtime.mapRead(&renderer.device, &buffer, 0, readbackSize(WIDTH, HEIGHT))
+    pixels = run unpack(padded.asSlice(), WIDTH, HEIGHT, true)
+    if shown.* != usize.MAX {
+      let old = &imports.asSlice()[shown.*]
+      let end = run old.memory.endAccess(&old.texture, false)
+      run presenter.giveBack(
+        ReturnedImage {
+          surface: frame.surface,
+          chain: old.chain,
+          index: old.index,
+          fences: move end.fences,
+          values: move end.signaledValues,
+        },
+      )
+    }
+    shown.* = at
+  } else {
+    run pixels.appendSlice(frame.pixels.asSlice())
+  }
+  return move pixels
+}
+
+effect fn rendererDevice() -> Renderer
+  ! GpuError | OutOfMemoryError {
+  let instance = run Instance.create()
+  let adapter = run instance.requestAdapter(&RequestAdapterOptions.default())
+  let device = run adapter.requestDevice(&DeviceDescriptor.default().withRequiredFeatures(sharingFeatures(&adapter)))
+  let queue = run resources.getQueue(&device)
+  return Renderer { instance: move instance, device: move device, queue: move queue }
+}
+
+/// Whether the default adapter draws: false with no adapter, and with any backend that is
+/// not a real GPU API. A machine without a GPU driver gets Dawn's null backend.
+effect fn adapterDraws() -> bool
+  ! GpuError | OutOfMemoryError {
+  let instance = run Instance.create()
+  let adapter = run instance.requestAdapter(&RequestAdapterOptions.default())
+  let info = run adapter.getInfo()
+  let backend = info.backendType()
+  return backend == flags.WGPUBackendType_Metal || backend == flags.WGPUBackendType_Vulkan
+    || backend == flags.WGPUBackendType_D3D12 || backend == flags.WGPUBackendType_D3D11
+}
+
+effect fn body(format: u32) -> ()
+  ! AssertionError<'static> | GpuError | OutOfMemoryError
+  ? &mut Allocator {
+  let draws = run Effect.result(adapterDraws())
+  match move draws {
+    Result<bool, GpuError | OutOfMemoryError>.Success { value } => {
+      if !value {
+        return ()
+      }
+    }
+    Result<bool, GpuError | OutOfMemoryError>.Failure { error } => {
+      drop error
+      return ()
+    }
+  }
+  let opened = run Effect.result(CanvasGpu.open())
+  let app = match move opened {
+    Result<CanvasGpu, GpuError | OutOfMemoryError>.Success { value } => move value
+    Result<CanvasGpu, GpuError | OutOfMemoryError>.Failure { error } => {
+      // No GPU adapter here: nothing to check.
+      drop error
+      return ()
+    }
+  }
+  let renderer = run rendererDevice()
+  let parker = run Parker.make()
+  let presenter = run CanvasPresenter.make(Option.some(parker.unparker()))
+  presenter.setSharing(SharedImage.supported(&renderer.device))
+  // Only BGRA canvases share their images; RGBA ones copy through the CPU everywhere.
+  let shares = format == CANVAS_FORMAT_BGRA && SharedImage.supported(&app.device) && SharedImage.supported(&renderer.device)
+  let mut canvas = run GpuCanvas.makeIn(&app, &presenter, WIDTH, HEIGHT, format)
+  canvas.opaque = true
+  run Testing.expect(canvas.zeroCopy() == shares, "a canvas shares its images exactly where it can")
+
+  let mut imports = List<Imported>.make()
+  let mut shown: usize = usize.MAX
+  // Seven frames, each taken before the next: every image of the chain is drawn, shown and
+  // given back twice.
+  let mut n: u32 = 0
+  while n < 7 {
+    run drawFrame(&app, &mut canvas, n)
+    let taken = presenter.take()
+    run Testing.expect(taken.frames.length() == 1, "one frame per present")
+    let frame = &taken.frames.asSlice()[0]
+    run Testing.expect(frame.shared.isSome() == shares, "the frame's kind follows the canvas")
+    let pixels = run receive(&renderer, &presenter, &mut imports, &mut shown, frame)
+    run Testing.expect(showsFrame(pixels.asSlice(), n), "the second device sees the frame just drawn, opaque")
+    n = n + 1
+  }
+  // Two presents before the second device takes: the first frame goes back to the app unseen,
+  // and only the newest is shown.
+  run drawFrame(&app, &mut canvas, 7)
+  run drawFrame(&app, &mut canvas, 8)
+  let taken = presenter.take()
+  run Testing.expect(taken.frames.length() == 1, "a newer frame replaces one not taken")
+  let pixels = run receive(&renderer, &presenter, &mut imports, &mut shown, &taken.frames.asSlice()[0])
+  run Testing.expect(showsFrame(pixels.asSlice(), 8), "the newest frame is the one shown")
+  if shares {
+    run Testing.expect(imports.length() == 3, "each image of the chain is imported once")
+  }
+  run drawFrame(&app, &mut canvas, 9)
+  let last = presenter.take()
+  let lastPixels = run receive(&renderer, &presenter, &mut imports, &mut shown, &last.frames.asSlice()[0])
+  run Testing.expect(showsFrame(lastPixels.asSlice(), 9), "frames keep coming after a replaced one")
+
+  if shown != usize.MAX {
+    let image = &imports.asSlice()[shown]
+    drop run image.memory.endAccess(&image.texture, false)
+  }
+  drop canvas
+  run app.device.checkErrors()
+  run renderer.device.checkErrors()
+}
+
+test effect fn bgraCanvasFramesReachASecondDevice() -> ()
+  ! AssertionError<'static> | GpuError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run body(CANVAS_FORMAT_BGRA) |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+test effect fn rgbaCanvasFramesReachASecondDevice() -> ()
+  ! AssertionError<'static> | GpuError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run body(CANVAS_FORMAT) |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+test effect fn shownCanvasFramesAreCounted() -> ()
+  ! AssertionError<'static> | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let presenter = run CanvasPresenter.detached() |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(presenter.shownFrames() == 0, "none shown at first")
+  presenter.noteShown(0)
+  presenter.noteShown(3)
+  presenter.noteShown(1)
+  run Testing.expect(presenter.shownFrames() == 4, "the renderer's counts add up")
+}

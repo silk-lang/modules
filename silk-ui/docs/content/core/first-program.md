@@ -1,0 +1,109 @@
+# Your first program
+
+This page reads one small program from top to bottom: a counter. It is the smallest thing that is still a whole Silk UI program, and every bigger program has the same parts.
+
+> **Note:** New here? [Silk UI at a glance](/core/) shows how all the parts fit before you read any code. This page then takes the smallest program apart, and the [tutorial](/core/tutorial/) builds a bigger one step by step.
+
+## The program
+
+Here it is, running. Click the buttons.
+
+::demo counter
+
+And here is all of its code. Nothing is left out.
+
+::source examples/src/core/counter.silk
+
+The rest of this page walks through it, one part at a time.
+
+## The model
+
+::source examples/src/core/counter.silk "pub struct Counter"
+
+The **model** is everything the program remembers. Here that is one number.
+
+There is no other state anywhere: no fields on components, no hooks, no stores. If the screen shows something, it is in the model or computed from it. That is what makes a Silk UI program easy to reason about. To know what the screen shows, you look at one value.
+
+## Messages
+
+::source examples/src/core/counter.silk "pub union Message"
+
+A **message** says that something happened. The counter has three, one for each button.
+
+Name messages as facts, in the past tense: `ClickedIncrement`, not `Increment`. A message does not say what to do. It says what the user did, and `update` decides what that means.
+
+## Update
+
+::source examples/src/core/counter.silk "effect fn update"
+
+`update` takes the model and one message, and returns the next model. It is the only code that changes the model, so when a value is wrong there is exactly one place to look.
+
+`Next.of(model)` means "this is the next model, and there is nothing else to do". Later pages return more than that: [commands](/core/commands/) to run, or a new [location](/core/routing/).
+
+> **Note:** `update` takes the model by value and gives it back. Silk moves it in and out, so nothing is copied, and no other code can be holding on to the old one.
+
+## Init
+
+::source examples/src/core/counter.silk "effect fn init"
+
+`init` makes the first model. It runs once, when the program starts.
+
+## View
+
+::source examples/src/core/counter.silk "fn view"
+
+`view` describes the screen for a model. It is a plain function: the same model always gives the same screen. It never changes anything, it only describes.
+
+`h` is the builder you describe the screen with. `h.row` is a box that lays its children out in a row, and `h.number` is a number as text. The count sits in a row of its own so that it can be centered in a fixed width, which keeps the buttons still while the number grows. Each takes a list of attributes and a list of children.
+
+The view is called again after every update. That sounds expensive and is not: Silk UI compares the new description with the last one and changes only what differs. Clicking `+` changes one text node.
+
+## A view function
+
+::source examples/src/core/counter.silk "fn button"
+
+There are no components to learn. When a piece of the screen repeats, write a function that returns a `Node`. This one takes a label and the message a click sends.
+
+`h.onClick(message)` is how the screen talks back: it says which message the program gets when this node is clicked. `h.style` is the node's look, and `h.hover` is its look while the pointer is over it.
+
+## The whole loop
+
+| Part | What it is | When it runs |
+| --- | --- | --- |
+| `init` | The first model | Once, at the start |
+| `view` | The screen, for a model | After every update |
+| `update` | The next model, after a message | For every message |
+
+The user clicks, a message goes to `update`, `update` returns a model, `view` shows it. Then the program waits for the next message. [How a program runs](/core/how-it-runs/) follows one click all the way around.
+
+## Run it yourself
+
+The program above knows nothing about where it runs. The quickest way to run one is the Loom template, whose `silk/app.silk` is this counter:
+
+```sh
+silk init my-app -t ui-loom
+cd my-app
+silk dev
+```
+
+The window restarts when you change `silk/app.silk`. [Get started](/start/) has the rest: building, and running the same app in a browser page.
+
+The template's tasks write the host for you: the few lines that open a window or mount the program in a page. To see what is in one, [your first window](/native/) writes it by hand, and [in the browser](/core/browser/) does the same for a web page.
+
+To use Loom in a package of your own, add it to `silk.toml`:
+
+```toml title="silk.toml"
+[dependencies]
+loom = { git = "https://github.com/silk-lang/loom.git", rev = "<a commit>", path = "modules/loom", package = "loom" }
+```
+
+Loom lives in its own repository, [silk-lang/loom](https://github.com/silk-lang/loom). The examples in these docs, under `docs/examples` of silkui, name it the same way.
+
+## Recap
+
+- A program is a **model** and three functions: `init`, `update`, `view`.
+- **Messages** are the only way the model changes, and `update` is the only place it does.
+- `view` describes the screen for a model. It never changes anything.
+- A piece of UI is a function that returns a `Node`.
+
+Next: [build something bigger](/core/tutorial/), or see [how the loop runs](/core/how-it-runs/).

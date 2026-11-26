@@ -1,0 +1,1969 @@
+//! [`Runtime`]: runs an [`App`] against a [`Backend`].
+//!
+//! The loop is one event at a time: a record from the tree is dispatched (the view runs again
+//! along the record's path and calls the handlers there), the messages update the model, their
+//! commands are performed and their messages handled too, and then the view renders and the
+//! diff goes to the tree as one mutation batch. Only then does the next record go, so a handler
+//! always sees the view the user saw.
+//!
+//! The runtime talks to the tree only through its public protocol: `Mutation` batches in
+//! (`apply`), `Event` records out (`takeEvents`).
+//!
+//! The windows the model declares besides the first (`App.windows`, see `windows`) render with
+//! the view, each into a root of its own, and the diff of their declarations against the
+//! windows open goes in the same batch: `OpenRoot`, `UpdateRoot` and `CloseRoot`. A record whose
+//! path starts at a window's root node dispatches through that window's view, and the root
+//! events of a window reach the model through the window's handlers.
+//!
+//! A runtime shows its app in the first root, with root box `ROOT_ID`, unless it is placed
+//! elsewhere (`placeAt`): a second program in the same tree, such as devtools drawn in the
+//! app's own process, takes a root and an id range of its own.
+import ui_protocol.css
+import app { App, Perform, Context, Subscriptions, SubscriptionKind, Delivery }
+import diff { DiffState, diffFrom, rootStyle }
+import windows { Windows, WindowEvent, WindowRecord }
+import journal { Journal, MODEL_LIMIT, eventName }
+import show { Printer, show, showTree }
+import keep { Restored, encode, restoreValue }
+import silk.json.value { Value }
+import font { Fonts }
+import ui { Ui, Identity, AnchorRect, NO_ENTRY, ROOT_ID, Sources }
+import ui_protocol.mutation {
+  Mutation,
+  FIRST_ROOT,
+  NodeKind,
+  StyleState,
+  LISTEN_KEY_DOWN
+}
+import ui_protocol.record { Event, EventKind }
+import ui_protocol.input { Input, MOD_ALT, MOD_CONTROL, MOD_META, MOD_SHIFT }
+import ui_protocol.options { VirtualItem, VirtualOptions, RootOptions }
+import ui_protocol.root { RootEvent, RootEventKind }
+import backend { Backend, Measured, TreeError }
+import silk.collections.list { List }
+import silk.collections.hash_map { HashMap }
+import silk.collections.hash { Hash }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.core.result { Result }
+import silk.collections.slice { Slice }
+import silk.geometry.size { Size2 }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.u32
+import silk.num.usize
+import silk.text.string { String, InvalidUtf8 }
+import silk.trace { Trace as Prof }
+
+fn sameVirtualOptions(a: VirtualOptions, b: VirtualOptions) -> bool {
+  return a.estimatedHeight == b.estimatedHeight && a.overscan == b.overscan
+    && a.gap == b.gap && a.revision == b.revision
+}
+
+fn sameVirtualItems(a: &[VirtualItem], b: &[VirtualItem]) -> bool {
+  if a.length != b.length {
+    return false
+  }
+  let mut i: usize = 0
+  while i < a.length {
+    if a[i].index != b[i].index || a[i].id != b[i].id {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+/// A running `Every` subscription.
+struct Timer {
+  key: u64,
+  interval: f64,
+  due: f64,
+  seen: bool,
+}
+
+impl Copy for Timer {}
+
+/// What the last render did, for tests and inspectors.
+pub struct RenderStats {
+  pub renders: u64,
+  pub dispatches: u64,
+  pub messages: u64,
+  pub commands: u64,
+  /// Mutations the last render sent.
+  pub mutations: usize,
+  /// Nodes in the last render.
+  pub nodes: usize,
+  /// Nodes the last render copied with `lazy`.
+  pub reused: u32,
+}
+
+impl Copy for RenderStats {}
+
+/// A window the model declared, and what the runtime opened for it.
+struct OpenWindow<M> {
+  key: u64,
+  root: u32,
+  /// Its root box, and its view's builder and diff state.
+  node: u32,
+  ui: Ui<M>,
+  diffState: DiffState,
+  /// What it was opened or last updated with.
+  title: List<u8>,
+  width: f32,
+  height: f32,
+  resizable: bool,
+  /// The backend could not show it: it stays closed until the model stops declaring it.
+  failed: bool,
+  seen: bool,
+}
+
+/// A command that waits for a host to run it (see `Runtime.deferCommands`), with what
+/// `Perform` says of it. Hand its message to `Runtime.finish` under `ticket`.
+pub struct Held<C> {
+  pub ticket: u64,
+  pub owner: u64,
+  pub slot: u64,
+  /// It must run on the UI thread (`Perform.onUiThread`).
+  pub ui: bool,
+  pub command: C,
+}
+
+/// A command a host took with `takeWork` and has not finished.
+struct Working {
+  ticket: u64,
+  owner: u64,
+  slot: u64,
+  cancelled: bool,
+}
+
+impl Copy for Working {}
+
+/// What a running command is, as text, for a host that asked for the journal.
+struct WorkLabel {
+  ticket: u64,
+  text: String,
+}
+
+/// Runs app model `A` with messages `M` and commands `C`. See the module documentation.
+pub struct Runtime<A, M, C> {
+  pub model: A,
+  pub ui: Ui<M>,
+  pub subscriptions: Subscriptions<M>,
+  pub context: Context<C>,
+  pub diffState: DiffState,
+  pub stats: RenderStats,
+  /// The time of the last `tick`, in seconds.
+  pub time: f64,
+  queue: List<M>,
+  head: usize,
+  batch: List<Mutation>,
+  /// Scratch for the indices a backend requests for a virtual list.
+  virtualWanted: List<usize>,
+  records: List<Event>,
+  prevented: bool,
+  path: List<Identity>,
+  timers: List<Timer>,
+  animating: bool,
+  keyBindings: bool,
+  resizes: bool,
+  /// A link was followed since the backend was last told.
+  went: bool,
+  width: f32,
+  height: f32,
+  started: bool,
+  deferring: bool,
+  held: List<Held<C>>,
+  working: List<Working>,
+  labels: List<WorkLabel>,
+  nextTicket: u64,
+  /// What the program did, once a host asks (`record`).
+  pub journal: Journal,
+  /// The windows the model declares besides the first, and the ones open, oldest first.
+  pub windows: Windows<M>,
+  opened: List<OpenWindow<M>>,
+  /// The root id the next window opens as.
+  nextRoot: u32,
+  /// While a window's view runs: its key. `self.ui` and `self.diffState` are that window's
+  /// then (see `enter`).
+  inWindow: bool,
+  windowKey: u64,
+  /// The root the app's view shows in, and its root box (see `placeAt`).
+  pub root: u32,
+  pub rootNode: u32,
+}
+
+impl<A: App<M, C>, M, C> Runtime<A, M, C> {
+  pub fn make(model: A) -> Runtime<A, M, C> {
+    return Runtime<A, M, C> {
+      model: move model,
+      ui: Ui<M>.make(),
+      subscriptions: Subscriptions<M>.make(),
+      context: Context<C>.make(),
+      diffState: DiffState.make(),
+      stats: RenderStats {
+        renders: 0,
+        dispatches: 0,
+        messages: 0,
+        commands: 0,
+        mutations: 0,
+        nodes: 0,
+        reused: 0,
+      },
+      time: 0.0,
+      queue: List<M>.make(),
+      head: 0,
+      batch: List<Mutation>.make(),
+      virtualWanted: List<usize>.make(),
+      records: List<Event>.make(),
+      prevented: false,
+      path: List<Identity>.make(),
+      timers: List<Timer>.make(),
+      animating: false,
+      keyBindings: false,
+      resizes: false,
+      went: false,
+      width: 0.0,
+      height: 0.0,
+      started: false,
+      deferring: false,
+      held: List<Held<C>>.make(),
+      working: List<Working>.make(),
+      labels: List<WorkLabel>.make(),
+      nextTicket: 1,
+      journal: Journal.make(),
+      windows: Windows<M>.make(),
+      opened: List<OpenWindow<M>>.make(),
+      nextRoot: FIRST_ROOT + 1,
+      inWindow: false,
+      windowKey: 0,
+      root: FIRST_ROOT,
+      rootNode: ROOT_ID,
+    }
+  }
+
+  /// Shows the app in root `root` with root box `node` instead of the first root and
+  /// `ROOT_ID`, for a program that shares its tree with another one. The nodes it makes take
+  /// the ids after `node`, and the windows it declares the roots after `root`, so pick both
+  /// past what the other program uses (devtools in the app's process count down from the top of
+  /// the id space). Call it before `start`.
+  pub fn placeAt(self: &mut Self, root: u32, node: u32) -> () {
+    self.root = root
+    self.rootNode = node
+    self.ui.rootId = node
+    self.diffState.nextId = node + 1
+    self.nextRoot = root + 1
+  }
+
+  /// From now on, every message is written down in `journal` with the model it led to. The
+  /// first step is the model as it is now. For a host that serves an inspector.
+  pub effect fn record(self: &mut Self) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if self.journal.on {
+      return ()
+    }
+    self.journal.on = true
+    let model = run self.shownModel()
+    let mut waiting = List<String>.make()
+    let commands = self.context.commands.asSlice()
+    let mut i: usize = 0
+    while i < commands.length {
+      run waiting.append(run show(&commands[i]))
+      i = i + 1
+    }
+    let saved = run self.savedModel()
+    run self.journal.add(
+      self.time,
+      run String.copy("start"),
+      run String.copy("init"),
+      move waiting,
+      move model,
+      move saved,
+    )
+  }
+
+  /// The model as `keep` writes it, for the journal; empty past [`MODEL_LIMIT`].
+  effect fn savedModel(self: &Self) -> String
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let text = run encode(&self.model)
+    if String.byteLength(String.view(&text)) > MODEL_LIMIT {
+      return String.make()
+    }
+    return move text
+  }
+
+  /// Puts a model `keep` wrote (a journal step's, or one saved to a file) onto the model and
+  /// renders it, as if a message had led there: the journal gets a step for it, said by
+  /// `cause` and `message`. The report names the fields that kept their value.
+  pub effect fn restoreModel<B: Backend>(
+    self: &mut Self,
+    tree: &mut B,
+    saved: &Value,
+    cause: string,
+    message: string,
+  ) -> Restored
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    let report = run restoreValue(&mut self.model, saved)
+    self.stats.messages = self.stats.messages + 1
+    if self.journal.on {
+      let model = run self.shownModel()
+      let kept = run self.savedModel()
+      run self.journal.add(
+        self.time,
+        run String.copy(cause),
+        run String.copy(message),
+        List<String>.make(),
+        move model,
+        move kept,
+      )
+    }
+    run self.render(&mut tree)
+    return move report
+  }
+
+  effect fn shownModel(self: &Self) -> String
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let text = run showTree(&self.model)
+    if String.byteLength(String.view(&text)) <= MODEL_LIMIT {
+      return move text
+    }
+    let bytes = String.utf8Bytes(String.view(&text))
+    let mut end = MODEL_LIMIT
+    while end > 0 && (bytes[end] & 0xC0) == 0x80 {
+      end = end - 1
+    }
+    let mut cut = run String.copy(String.slice(String.view(&text), 0, end))
+    run cut.append("\n…")
+    return move cut
+  }
+
+  /// Says where the messages queued from `from` on came from. The ones before it that nobody
+  /// spoke for were sent by a task (`send`).
+  effect fn caused(self: &mut Self, from: usize, cause: string) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if !self.journal.on {
+      return ()
+    }
+    while self.journal.causes.length() < from {
+      run self.journal.causes.append(run String.copy("task"))
+    }
+    while self.journal.causes.length() < self.queue.length() {
+      run self.journal.causes.append(run String.copy(cause))
+    }
+  }
+
+  /// Whether any command waits or runs.
+  pub fn busy(self: &Self) -> bool {
+    return self.held.length() != 0 || self.working.length() != 0
+  }
+
+  /// The commands that run and the ones that wait, one line each, oldest first:
+  /// `running Load for 1:6`, `waiting Save`. The owner is written as its two halves when the
+  /// upper one is set, which is how a child that owns commands for its own children names
+  /// them (a stack and a screen's key); a command of the app itself has no owner written.
+  pub effect fn workLines(self: &Self) -> List<String>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut lines = List<String>.make()
+    let working = self.working.asSlice()
+    let labels = self.labels.asSlice()
+    let mut i: usize = 0
+    while i < working.length {
+      let mut line = run String.copy(if working[i].cancelled { "cancelled " } else { "running " })
+      let mut named = false
+      let mut l: usize = 0
+      while l < labels.length {
+        if labels[l].ticket == working[i].ticket {
+          run line.append(String.view(&labels[l].text))
+          named = true
+        }
+        l = l + 1
+      }
+      if !named {
+        run line.append("a command")
+      }
+      run ownerText(&mut line, working[i].owner)
+      run lines.append(move line)
+      i = i + 1
+    }
+    let held = self.held.asSlice()
+    let mut j: usize = 0
+    while j < held.length {
+      let mut line = run String.copy("waiting ")
+      let text = run show(&held[j].command)
+      run line.append(String.view(&text))
+      run ownerText(&mut line, held[j].owner)
+      run lines.append(move line)
+      j = j + 1
+    }
+    return move lines
+  }
+
+  /// The subscriptions the model asks for now, one line each: `every 1s`, `port menu`.
+  pub effect fn subscriptionLines(self: &mut Self) -> List<String>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    self.subscriptions.beginCollect()
+    App<M, C>.subscriptions(&self.model, &mut self.subscriptions)
+    let mut lines = List<String>.make()
+    let list = self.subscriptions.list()
+    let mut i: usize = 0
+    while i < list.length {
+      let record = list[i]
+      let mut line = String.make()
+      if record.kind == SubscriptionKind.Every {
+        run line.append("every ")
+        let mut to = Printer.make(false)
+        run to.real(record.interval)
+        run line.append(String.view(&to.out))
+        run line.append("s")
+      } else if record.kind == SubscriptionKind.AnimationFrame {
+        run line.append("animationFrame")
+      } else if record.kind == SubscriptionKind.KeyBinding {
+        run line.append("keyBinding ")
+        if (record.modifiers & MOD_CONTROL) != 0 {
+          run line.append("Control+")
+        }
+        if (record.modifiers & MOD_ALT) != 0 {
+          run line.append("Alt+")
+        }
+        if (record.modifiers & MOD_SHIFT) != 0 {
+          run line.append("Shift+")
+        }
+        if (record.modifiers & MOD_META) != 0 {
+          run line.append("Meta+")
+        }
+        if let Result<string, InvalidUtf8>.Success { value: name } = String.fromUtf8(
+          self.subscriptions.keyName(record),
+        ) {
+          run line.append(name)
+        }
+      } else if record.kind == SubscriptionKind.Resize {
+        run line.append("resize")
+      } else if record.kind == SubscriptionKind.Location {
+        run line.append("location")
+      } else {
+        run line.append("port ")
+        if let Result<string, InvalidUtf8>.Success { value: name } = String.fromUtf8(
+          self.subscriptions.keyName(record),
+        ) {
+          run line.append(name)
+        }
+      }
+      run lines.append(move line)
+      i = i + 1
+    }
+    return move lines
+  }
+
+  /// From now on, `drain` keeps the commands `update` returns instead of performing them, for
+  /// the host to run after the frame that shows the update, on the UI thread or off it. The
+  /// host takes them with `takeWork` and gives each message back with `finish`.
+  pub fn deferCommands(self: &mut Self) -> () {
+    self.deferring = true
+  }
+
+  /// How many commands wait to be taken with `takeWork` (or `takeDeferred`).
+  pub fn deferred(self: &Self) -> usize {
+    return self.held.length()
+  }
+
+  /// Takes the oldest command that waits, with nothing kept of it: its message comes back
+  /// through `send`, and cancelling its owner no longer reaches it. Call it only while
+  /// `deferred()` is not 0. Hosts that honour cancellation use `takeWork`.
+  pub fn takeDeferred(self: &mut Self) -> C {
+    let held = self.held.remove(0)
+    return move held.command
+  }
+
+  /// How many waiting commands a host may run off the UI thread (`ui` false) or must run on
+  /// it (`ui` true).
+  pub fn deferredOn(self: &Self, ui: bool) -> usize {
+    let held = self.held.asSlice()
+    let mut count: usize = 0
+    let mut i: usize = 0
+    while i < held.length {
+      if held[i].ui == ui {
+        count = count + 1
+      }
+      i = i + 1
+    }
+    return count
+  }
+
+  /// Takes the oldest waiting command and remembers it as running until `finish` or
+  /// `abandon` names its ticket. Call it only while `deferred()` is not 0.
+  pub effect fn takeWork(self: &mut Self) -> Held<C>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return run self.takeAt(0)
+  }
+
+  /// `takeWork` for the oldest command with this `ui` (see `deferredOn`). Call it only while
+  /// `deferredOn(ui)` is not 0.
+  pub effect fn takeWorkOn(self: &mut Self, ui: bool) -> Held<C>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let held = self.held.asSlice()
+    let mut i: usize = 0
+    while i + 1 < held.length && held[i].ui != ui {
+      i = i + 1
+    }
+    return run self.takeAt(i)
+  }
+
+  effect fn takeAt(self: &mut Self, index: usize) -> Held<C>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let held = self.held.remove(index)
+    if self.journal.on {
+      run self.labels.append(WorkLabel { ticket: held.ticket, text: run show(&held.command) })
+    }
+    run self.working.append(
+      Working { ticket: held.ticket, owner: held.owner, slot: held.slot, cancelled: false },
+    )
+    return move held
+  }
+
+  /// How many commands were ever held: it grows by one for each, so a host that remembers it
+  /// sees when a new one came.
+  pub fn issued(self: &Self) -> u64 {
+    return self.nextTicket
+  }
+
+  /// How many commands hosts took with `takeWork` and have not finished.
+  pub fn inFlight(self: &Self) -> usize {
+    return self.working.length()
+  }
+
+  /// Whether the running command `ticket` was cancelled: its work can stop early.
+  pub fn cancelled(self: &Self, ticket: u64) -> bool {
+    let working = self.working.asSlice()
+    let mut i: usize = 0
+    while i < working.length {
+      if working[i].ticket == ticket {
+        return working[i].cancelled
+      }
+      i = i + 1
+    }
+    return true
+  }
+
+  /// The running command `ticket` ended with `message`. Queues it for `drain` and returns
+  /// true, or drops it and returns false when the command was cancelled meanwhile.
+  pub fn finish(self: &mut Self, ticket: u64, message: M) -> bool {
+    if self.abandon(ticket) {
+      self.send(move message)
+      return true
+    }
+    drop message
+    return false
+  }
+
+  /// The running command `ticket` ended with no message. Returns whether it was still wanted.
+  pub fn abandon(self: &mut Self, ticket: u64) -> bool {
+    let mut i: usize = 0
+    while i < self.working.length() {
+      let entry = self.working.get(i)
+      if entry.ticket == ticket {
+        drop self.working.remove(i)
+        let mut l: usize = 0
+        while l < self.labels.length() {
+          if self.labels.asSlice()[l].ticket == ticket {
+            drop self.labels.remove(l)
+            break
+          }
+          l = l + 1
+        }
+        return !entry.cancelled
+      }
+      i = i + 1
+    }
+    return false
+  }
+
+  /// Cancels the commands of `owner` that wait or run, as `cx.cancel(owner)` does.
+  pub fn cancel(self: &mut Self, owner: u64) -> () {
+    self.cancelWhere(owner, 0, false)
+  }
+
+  /// Drops the waiting commands of `owner` and marks its running ones cancelled; with
+  /// `slotted`, only those in `slot`.
+  fn cancelWhere(self: &mut Self, owner: u64, slot: u64, slotted: bool) -> () {
+    let mut i: usize = 0
+    while i < self.held.length() {
+      let matches = self.held.asSlice()[i].owner == owner
+        && (!slotted || self.held.asSlice()[i].slot == slot)
+      if matches {
+        drop self.held.remove(i)
+      } else {
+        i = i + 1
+      }
+    }
+    let mut w: usize = 0
+    while w < self.working.length() {
+      let mut entry = self.working.get(w)
+      if entry.owner == owner && (!slotted || entry.slot == slot) {
+        entry.cancelled = true
+        self.working.set(w, entry)
+      }
+      w = w + 1
+    }
+  }
+
+  /// Creates the root box, opens the first root (or the one `placeAt` named) with it, renders the first view into `tree`
+  /// and collects the first subscriptions. `time` is the clock the timers count from, in
+  /// seconds.
+  pub effect fn start<B: Backend>(self: &mut Self, tree: &mut B, time: f64) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    self.time = time
+    let mut batch = List<Mutation>.make()
+    let node = self.rootNode
+    run batch.append(Mutation.Create { id: node, kind: NodeKind.Box })
+    run batch.append(
+      Mutation.SetStyle { id: node, state: StyleState.Base, declarations: run rootStyle(false) },
+    )
+    run batch.append(
+      Mutation.OpenRoot { root: self.root, node: node, options: RootOptions.default() },
+    )
+    run Backend.mutate(&mut tree, move batch)
+    self.started = true
+    run self.render(&mut tree)
+  }
+
+  /// Whether `start` has run.
+  pub fn running(self: &Self) -> bool {
+    return self.started
+  }
+
+  /// Queues `message`, as if a handler sent it. `drain` handles it.
+  pub fn send(self: &mut Self, message: M) -> () {
+    self.ui.heap.alloc(self.queue.append(move message))
+  }
+
+  /// Whether messages wait in the queue.
+  pub fn pending(self: &Self) -> bool {
+    return self.head < self.queue.length()
+  }
+
+  /// Renders the view into `tree`: the diff against the last render goes in as one batch,
+  /// with the declared windows' (see the module documentation).
+  pub effect fn render<B: Backend>(self: &mut Self, tree: &mut B) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    let _renderSpan = Prof.span("loom.render")
+    run self.collectSubscriptions()
+    self.batch.clear()
+    self.diffState.taken = 0
+    let root = self.root
+    run self.renderView(&mut tree, root)
+    let nodes = self.ui.arena.entries.length()
+    let reused = self.ui.reused
+    run self.renderWindows(&mut tree)
+    self.stats.renders = self.stats.renders + 1
+    self.stats.mutations = self.batch.length() + self.diffState.taken
+    self.stats.nodes = nodes
+    self.stats.reused = reused
+    Prof.set("mutations", &self.stats.mutations)
+    Prof.set("nodes", &nodes)
+    Prof.set("reused", &reused)
+
+    // Transfer the batch in constant time. Removing its first mutation repeatedly
+    // shifts the remaining array and makes mounting a large view quadratic.
+    let batch = Intrinsic.replace(self.batch, List<Mutation>.make())
+    let _mutateSpan = Prof.span("loom.mutate")
+    run Backend.mutate(&mut tree, move batch)
+    drop _mutateSpan
+  }
+
+  /// Runs the view in `self.ui` (the first window's, or the one `enter` swapped in), whose
+  /// root is `root`, and appends its diff to the batch.
+  effect fn renderView<B: Backend>(self: &mut Self, tree: &mut B, root: u32) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    run self.readAnchorsIn(&mut tree, root)
+    run self.ui.beginRender()
+    let _viewSpan = Prof.span("loom.view")
+    self.runView()
+    drop _viewSpan
+    self.ui.endRender()
+    if self.keyBindings {
+      // Key records reach the root wherever focus is, but only when a node on the path
+      // listens: the root listens for the bindings.
+      let mut top = self.ui.arena.entry(0)
+      top.listeners = u32.bitOr(top.listeners, LISTEN_KEY_DOWN)
+      self.ui.arena.setEntry(0, top)
+    }
+    self.diffState.marked = self.ui.hasMarks()
+    self.diffState.transient = Backend.copiesBatches(&tree)
+    if !self.ui.fontsSent {
+      self.ui.fontsSent = true
+      run self.sendFonts()
+    }
+    run self.sendLoads()
+    let _diffSpan = Prof.span("loom.diff")
+    run diffFrom(
+      &mut self.ui.arena,
+      &self.ui.previous,
+      &mut self.diffState,
+      &mut self.batch,
+      &mut tree,
+      self.ui.rootId,
+    )
+    drop _diffSpan
+    // Anchored placement is rare: skip both passes when no entry, new or old, has it.
+    let mut placing = false
+    let mut scan: usize = if self.ui.hasMarks() {
+      0
+    } else {
+      self.ui.arena.entries.length()
+    }
+    while scan < self.ui.arena.entries.length() {
+      let here = &self.ui.arena.entries.asSlice()[scan]
+      let old = here.old
+      if (here.extra != 0 && self.ui.arena.extraCopy(here).hasPlacement)
+        || (old != NO_ENTRY && self.ui.previous.extraCopy(self.ui.previous.entryRef(old)).hasPlacement) {
+        placing = true
+        break
+      }
+      scan = scan + 1
+    }
+    let mut anchors = HashMap<u64, u32>.make(Hash.seed(0x616e6368))
+    let mut entryIndex: u32 = if placing {
+      0
+    } else {
+      self.ui.arena.length()
+    }
+    while entryIndex < self.ui.arena.length() {
+      let entry = self.ui.arena.entry(entryIndex)
+      let extra = self.ui.arena.extraCopy(&entry)
+      if extra.hasAnchor {
+        drop run anchors.insert(extra.anchor, entry.id)
+      }
+      entryIndex = entryIndex + 1
+    }
+    entryIndex = if placing {
+      0
+    } else {
+      self.ui.arena.length()
+    }
+    while entryIndex < self.ui.arena.length() {
+      let entry = self.ui.arena.entry(entryIndex)
+      let extra = self.ui.arena.extraCopy(&entry)
+      if extra.hasPlacement {
+        let target = anchors.get(extra.placementTarget).unwrapOr(0)
+        if target == 0 {
+          fail TreeError.UnknownNode { index: self.batch.length(), id: target }
+        }
+        run self.batch.append(
+          Mutation.SetAnchor { id: entry.id, target: target, options: extra.placementOptions },
+        )
+      } else if entry.old != NO_ENTRY
+        && self.ui.previous.extraCopy(self.ui.previous.entryRef(entry.old)).hasPlacement {
+        run self.batch.append(Mutation.ClearAnchor { id: entry.id })
+      }
+      entryIndex = entryIndex + 1
+    }
+    let mut removed: usize = 0
+    while removed < self.ui.removedVirtualPorts.length() {
+      run self.batch.append(
+        Mutation.ClearVirtualList { id: self.ui.removedVirtualPorts.get(removed) },
+      )
+      removed = removed + 1
+    }
+    self.ui.removedVirtualPorts.clear()
+    let mut v: usize = 0
+    while v < self.ui.virtualLists.length() {
+      let portEntry = self.ui.virtualLists.asSlice()[v].port
+      let id = self.ui.arena.entry(portEntry).id
+      let count = self.ui.virtualLists.asSlice()[v].count
+      let options = self.ui.virtualLists.asSlice()[v].options
+      let mut items = List<VirtualItem>.make()
+      let rowCount = self.ui.virtualLists.asSlice()[v].rows.length()
+      let mut r: usize = 0
+      while r < rowCount {
+        let row = self.ui.virtualLists.asSlice()[v].rows.get(r)
+        run items.append(VirtualItem { index: row.index, id: self.ui.arena.entry(row.entry).id })
+        r = r + 1
+      }
+      let list = &mut self.ui.virtualLists.asMutSlice()[v]
+      let configChanged = list.sentPort != id || list.sentCount != count
+        || !sameVirtualOptions(list.sentOptions, options)
+      let itemsChanged = list.sentPort != id
+        || !sameVirtualItems(list.sentItems.asSlice(), items.asSlice())
+      if configChanged {
+        run self.batch.append(
+          Mutation.SetVirtualList { id: id, count: count, options: options },
+        )
+        list.sentCount = count
+        list.sentOptions = options
+      }
+      if itemsChanged || configChanged {
+        list.sentItems.clear()
+        run list.sentItems.appendSlice(items.asSlice())
+        run self.batch.append(Mutation.SetVirtualItems { id: id, items: move items })
+      }
+      list.sentPort = id
+      v = v + 1
+    }
+  }
+
+  /// Sends the fonts the app declares (`App.fonts`) to the tree of the view in `self.ui`.
+  effect fn sendFonts(self: &mut Self) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut fonts = Fonts.make()
+    App<M, C>.fonts(&self.model, &mut fonts)
+    let families = fonts.families.asSlice()
+    let mut f: usize = 0
+    while f < families.length {
+      run self.batch.append(
+        Mutation.DefineFontFamily { family: families[f].family(), names: run String.copy(families[f].names) },
+      )
+      f = f + 1
+    }
+    let faces = fonts.faces.asSlice()
+    let mut i: usize = 0
+    while i < faces.length {
+      let face = faces[i].face
+      run self.batch.append(
+        Mutation.DeclareFontFace {
+          face: usize.toU32(i) + 1,
+          family: run String.copy(faces[i].font.first()),
+          url: run String.copy(String.view(&faces[i].url)),
+          weightMin: face.weightMin,
+          weightMax: face.weightMax,
+          widthMin: face.widthMin,
+          widthMax: face.widthMax,
+          style: face.style,
+          ranges: List<u32>.make(),
+        },
+      )
+      i = i + 1
+    }
+    let sheets = fonts.stylesheets.asSlice()
+    let mut s: usize = 0
+    while s < sheets.length {
+      run self.batch.append(Mutation.LoadFontStylesheet { url: run String.copy(String.view(&sheets[s])) })
+      s = s + 1
+    }
+  }
+
+  /// Asks the host to load the image and icon URLs the views named for the first time, before
+  /// the mutations that show them.
+  effect fn sendLoads(self: &mut Self) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let pending = Intrinsic.replace(self.ui.sources.pending, List<u32>.make())
+    let mut at: usize = 0
+    while at < pending.length() {
+      let resource = pending.asSlice()[at]
+      at = at + 1
+      let url = self.ui.sources.url(resource)
+      if self.ui.sources.isIcon(resource) {
+        run self.batch.append(Mutation.LoadIcon { resource: resource, url: run String.copy(url) })
+      } else {
+        run self.batch.append(Mutation.LoadImage { resource: resource, url: run String.copy(url) })
+      }
+    }
+  }
+
+  /// Runs the view whose builder `self.ui` is: the app's, or in a window, that window's.
+  fn runView(self: &mut Self) -> () {
+    if !self.inWindow {
+      App<M, C>.view(&self.model, &mut self.ui)
+      return ()
+    }
+    let ui = Intrinsic.replace(self.ui, Ui<M>.make())
+    self.windows.beginView(self.windowKey, move ui)
+    App<M, C>.windows(&self.model, &mut self.windows)
+    self.ui = self.windows.endView()
+  }
+
+  /// Makes window `at`'s view builder and diff state the runtime's, for `renderView` and
+  /// `dispatchView`, until `leave`. Tree ids stay one sequence.
+  fn enter(self: &mut Self, at: usize) -> () {
+    let nextId = self.diffState.nextId
+    let list = self.opened.asMutSlice()
+    let ui = Intrinsic.replace(list[at].ui, Ui<M>.make())
+    let state = Intrinsic.replace(list[at].diffState, DiffState.make())
+    let key = list[at].key
+    drop list
+    let mut mainUi = Intrinsic.replace(self.ui, move ui)
+    let mainState = Intrinsic.replace(self.diffState, move state)
+    self.diffState.nextId = nextId
+    // The windows share one URL table, so a resource id means one URL everywhere.
+    self.ui.sources = Intrinsic.replace(mainUi.sources, Sources.make())
+    let back = self.opened.asMutSlice()
+    back[at].ui = move mainUi
+    back[at].diffState = move mainState
+    self.inWindow = true
+    self.windowKey = key
+  }
+
+  /// Gives window `at` its view builder and diff state back.
+  fn leave(self: &mut Self, at: usize) -> () {
+    let nextId = self.diffState.nextId
+    let list = self.opened.asMutSlice()
+    let mainUi = Intrinsic.replace(list[at].ui, Ui<M>.make())
+    let mainState = Intrinsic.replace(list[at].diffState, DiffState.make())
+    drop list
+    let mut ui = Intrinsic.replace(self.ui, move mainUi)
+    let state = Intrinsic.replace(self.diffState, move mainState)
+    self.diffState.nextId = nextId
+    self.ui.sources = Intrinsic.replace(ui.sources, Sources.make())
+    let back = self.opened.asMutSlice()
+    back[at].ui = move ui
+    back[at].diffState = move state
+    self.inWindow = false
+  }
+
+  /// The declared window with key `key` (`what` 0), root `value` (1) or root node `value` (2),
+  /// or `usize.MAX`.
+  fn windowWhere(self: &Self, what: u32, key: u64, value: u32) -> usize {
+    let list = self.opened.asSlice()
+    let mut i: usize = 0
+    while i < list.length {
+      let found = if what == 0 {
+        list[i].key == key
+      } else if what == 1 {
+        list[i].root == value
+      } else {
+        list[i].node == value
+      }
+      if found {
+        return i
+      }
+      i = i + 1
+    }
+    return usize.MAX
+  }
+
+  /// Asks the model for its windows and appends what makes the open ones match to the
+  /// batch: new windows open with their view, gone ones close, changed ones update, and every
+  /// open one renders its view again.
+  effect fn renderWindows<B: Backend>(self: &mut Self, tree: &mut B) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    self.windows.beginCollect()
+    App<M, C>.windows(&self.model, &mut self.windows)
+    if self.windows.records.length() == 0 && self.opened.length() == 0 {
+      return ()
+    }
+    let mut records = List<WindowRecord>.make()
+    run records.appendSlice(self.windows.list())
+    let mut titles = List<u8>.make()
+    run titles.appendSlice(self.windows.bytes.asSlice())
+    let marks = self.opened.asMutSlice()
+    let mut m: usize = 0
+    while m < marks.length {
+      marks[m].seen = false
+      m = m + 1
+    }
+    let declared = records.asSlice()
+    let mut r: usize = 0
+    while r < declared.length {
+      let record = declared[r]
+      r = r + 1
+      let title = Slice.view(
+        titles.asSlice(),
+        u32.toUsize(record.titleStart),
+        u32.toUsize(record.titleLength),
+      )
+      let mut at = self.windowWhere(0, record.key, 0)
+      let opening = at == usize.MAX
+      if opening {
+        let node = self.diffState.nextId
+        self.diffState.nextId = self.diffState.nextId + 1
+        let root = self.nextRoot
+        self.nextRoot = self.nextRoot + 1
+        run self.batch.append(Mutation.Create { id: node, kind: NodeKind.Box })
+        run self.batch.append(
+          Mutation.SetStyle { id: node, state: StyleState.Base, declarations: run rootStyle(false) },
+        )
+        let mut ui = Ui<M>.make()
+        ui.rootId = node
+        let mut stored = List<u8>.make()
+        run stored.appendSlice(title)
+        run self.opened.append(
+          OpenWindow<M> {
+            key: record.key,
+            root: root,
+            node: node,
+            ui: move ui,
+            diffState: DiffState.make(),
+            title: move stored,
+            width: record.width,
+            height: record.height,
+            resizable: record.resizable,
+            failed: false,
+            seen: true,
+          },
+        )
+        at = self.opened.length() - 1
+      } else {
+        let list = self.opened.asMutSlice()
+        list[at].seen = true
+        if list[at].failed {
+          continue
+        }
+        let changed = !same(list[at].title.asSlice(), title) || list[at].width != record.width
+          || list[at].height != record.height
+          || list[at].resizable != record.resizable
+        if changed {
+          list[at].title.clear()
+          list[at].width = record.width
+          list[at].height = record.height
+          list[at].resizable = record.resizable
+          let root = list[at].root
+          drop list
+          let shown = self.opened.asMutSlice()
+          run shown[at].title.appendSlice(title)
+          run self.batch.append(
+            Mutation.UpdateRoot { root: root, options: run optionsOf(title, record) },
+          )
+        }
+      }
+      let root = self.opened.asSlice()[at].root
+      self.enter(at)
+      run self.renderView(&mut tree, root)
+      self.leave(at)
+      if opening {
+        let node = self.opened.asSlice()[at].node
+        run self.batch.append(
+          Mutation.OpenRoot { root: root, node: node, options: run optionsOf(title, record) },
+        )
+      }
+    }
+
+    // The windows the model no longer declares close, and their nodes go.
+    let mut i: usize = 0
+    while i < self.opened.length() {
+      if self.opened.asSlice()[i].seen {
+        i = i + 1
+      } else {
+        let gone = self.opened.remove(i)
+        if !gone.failed {
+          run self.batch.append(Mutation.CloseRoot { root: gone.root })
+          run self.batch.append(Mutation.Destroy { id: gone.node })
+        }
+      }
+    }
+  }
+
+  /// Hands the root events of the declared windows to their handlers; their messages join
+  /// the queue. A window the backend could not show is not opened again while the model
+  /// declares it, and its nodes go. The app's own root's events are the host's (resize, ports).
+  pub effect fn rootEvents<B: Backend>(
+    self: &mut Self,
+    tree: &mut B,
+    events: &List<RootEvent>,
+  ) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    let list = events.asSlice()
+    let mut i: usize = 0
+    while i < list.length {
+      let event = list[i]
+      i = i + 1
+      if event.root == self.root {
+        continue
+      }
+      let at = self.windowWhere(1, 0, event.root)
+      if at == usize.MAX {
+        continue
+      }
+      let key = self.opened.asSlice()[at].key
+      match event.kind {
+        RootEventKind.CloseRequested => run self.deliverWindow(key, true, WindowEvent.Failed)
+        RootEventKind.Resized { width, height } => run self.deliverWindow(
+          key,
+          false,
+          WindowEvent.Resized { width: width, height: height },
+        )
+        RootEventKind.Focused => run self.deliverWindow(key, false, WindowEvent.Focused)
+        RootEventKind.Blurred => run self.deliverWindow(key, false, WindowEvent.Blurred)
+        RootEventKind.Failed => {
+          let list = self.opened.asMutSlice()
+          if !list[at].failed {
+            list[at].failed = true
+            list[at].ui = Ui<M>.make()
+            list[at].diffState = DiffState.make()
+            let node = list[at].node
+            drop list
+            let mut batch = List<Mutation>.make()
+            run batch.append(Mutation.Destroy { id: node })
+            run Backend.mutate(&mut tree, move batch)
+            run self.deliverWindow(key, false, WindowEvent.Failed)
+          }
+        }
+        _ => {}
+      }
+    }
+  }
+
+  /// Delivers a close request (`closing`) or `event` to the handlers of window `key`.
+  effect fn deliverWindow(self: &mut Self, key: u64, closing: bool, event: WindowEvent) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    self.windows.beginDelivery(key, closing, event)
+    App<M, C>.windows(&self.model, &mut self.windows)
+    self.windows.beginCollect()
+    let first = self.queue.length()
+    while self.windows.messages.length() != 0 {
+      run self.queue.append(self.windows.messages.remove(0))
+    }
+    run self.caused(
+      first,
+      if closing {
+        "window close"
+      } else {
+        "window"
+      },
+    )
+  }
+
+  /// Reconciles the indices the backend requests with the virtual view. The tree owns geometry.
+  pub effect fn syncVirtual<B: Backend>(self: &mut Self, tree: &mut B) -> bool
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    let mut changed = false
+    let mut v: usize = 0
+    while v < self.ui.virtualLists.length() {
+      let id = self.ui.arena.entry(self.ui.virtualLists.asSlice()[v].port).id
+      if run Backend.indices(&tree, id, &mut self.virtualWanted) {
+        let list = &mut self.ui.virtualLists.asMutSlice()[v]
+        if !sameIndices(list.indices.asSlice(), self.virtualWanted.asSlice()) {
+          list.indices.clear()
+          run list.indices.appendSlice(self.virtualWanted.asSlice())
+          changed = true
+        }
+      }
+      v = v + 1
+    }
+    if changed {
+      run self.render(&mut tree)
+    }
+    return changed
+  }
+
+  /// Reads the layout boxes of the last render's anchored nodes (`ui.anchor`) from `tree`, for
+  /// `ui.anchorRect` in the next pass.
+  pub effect fn readAnchors<B: Backend>(self: &mut Self, tree: &mut B) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let root = self.root
+    run self.readAnchorsIn(&mut tree, root)
+  }
+
+  /// `readAnchors` for the view in `self.ui`, whose root is `root`.
+  effect fn readAnchorsIn<B: Backend>(self: &mut Self, tree: &mut B, root: u32) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    self.ui.viewportBounds = Backend.viewport(&tree, root)
+    self.ui.anchors.clear()
+    // The arena still holds the last render: without marks, none of its nodes has an anchor.
+    let count = if self.ui.marked {
+      self.ui.arena.length()
+    } else {
+      0
+    }
+    let mut i: u32 = 0
+    while i < count {
+      // Read in place: an entry is large, and almost none has an anchor.
+      let here = self.ui.arena.entryRef(i)
+      let hasAnchor = here.extra != 0 && self.ui.arena.extraCopy(here).hasAnchor
+      if !hasAnchor {
+        i = i + 1
+        continue
+      }
+      let entry = self.ui.arena.entry(i)
+      let extra = self.ui.arena.extraCopy(&entry)
+      if extra.hasAnchor && entry.id != 0 {
+        if let Option<Measured>.Some { value: node } = run Backend.measure(&tree, entry.id) {
+          let anchor = AnchorRect {
+            key: extra.anchor,
+            rect: node.bounds,
+            pressed: node.pressed,
+            hovered: node.hovered,
+            focused: node.focused,
+          }
+          run self.ui.anchors.append(anchor)
+        }
+      }
+      i = i + 1
+    }
+  }
+
+  /// Asks the model for its subscriptions and starts and stops timers to match.
+  effect fn collectSubscriptions(self: &mut Self) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    self.subscriptions.beginCollect()
+    App<M, C>.subscriptions(&self.model, &mut self.subscriptions)
+    self.animating = false
+    self.keyBindings = false
+    self.resizes = false
+    let mut t: usize = 0
+    while t < self.timers.length() {
+      let mut timer = self.timers.get(t)
+      timer.seen = false
+      self.timers.set(t, timer)
+      t = t + 1
+    }
+    let list = self.subscriptions.list()
+    let mut i: usize = 0
+    while i < list.length {
+      let record = list[i]
+      if record.kind == SubscriptionKind.Every {
+        let mut found = false
+        let mut j: usize = 0
+        while j < self.timers.length() {
+          let mut timer = self.timers.get(j)
+          if timer.key == record.key {
+            if timer.interval != record.interval {
+              timer.interval = record.interval
+              timer.due = self.time + record.interval
+            }
+            timer.seen = true
+            self.timers.set(j, timer)
+            found = true
+          }
+          j = j + 1
+        }
+        if !found {
+          run self.timers.append(
+            Timer {
+              key: record.key,
+              interval: record.interval,
+              due: self.time + record.interval,
+              seen: true,
+            },
+          )
+        }
+      } else if record.kind == SubscriptionKind.AnimationFrame {
+        self.animating = true
+      } else if record.kind == SubscriptionKind.KeyBinding {
+        self.keyBindings = true
+      } else if record.kind == SubscriptionKind.Resize {
+        self.resizes = true
+      }
+      i = i + 1
+    }
+    let mut k: usize = 0
+    while k < self.timers.length() {
+      if self.timers.get(k).seen {
+        k = k + 1
+      } else {
+        drop self.timers.remove(k)
+      }
+    }
+  }
+
+  /// The earliest time a timer is due, if any: a window loop waits at most until then.
+  pub fn nextDeadline(self: &Self) -> Option<f64> {
+    let mut best = Option<f64>.None
+    let mut i: usize = 0
+    while i < self.timers.length() {
+      let due = self.timers.get(i).due
+      best = match best {
+        Option<f64>.Some { value } => Option<f64>.Some {
+          value: if due < value {
+            due
+          } else {
+            value
+          },
+        }
+        Option<f64>.None => Option<f64>.Some { value: due }
+      }
+      i = i + 1
+    }
+    return best
+  }
+
+  /// Whether the model wants a message every display frame.
+  pub fn wantsFrames(self: &Self) -> bool {
+    return self.animating
+  }
+
+  /// Delivers `delivery` to the matching subscription handler; its messages join the queue.
+  effect fn deliver(self: &mut Self, delivery: Delivery) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    self.subscriptions.beginDelivery(delivery)
+    App<M, C>.subscriptions(&self.model, &mut self.subscriptions)
+    self.subscriptions.beginCollect()
+    let first = self.queue.length()
+    while self.subscriptions.messages.length() != 0 {
+      run self.queue.append(self.subscriptions.messages.remove(0))
+    }
+    if self.journal.on {
+      let mut cause = String.make()
+      if delivery.kind == SubscriptionKind.Every {
+        run cause.append("timer")
+      } else if delivery.kind == SubscriptionKind.AnimationFrame {
+        run cause.append("frame")
+      } else if delivery.kind == SubscriptionKind.KeyBinding {
+        run cause.append("key binding")
+      } else if delivery.kind == SubscriptionKind.Resize {
+        run cause.append("resize")
+      } else if delivery.kind == SubscriptionKind.Location {
+        run cause.append("location ")
+        run cause.append(String.view(&self.subscriptions.current))
+      } else {
+        run cause.append("port ")
+        run cause.append(String.view(&self.journal.port))
+      }
+      run self.caused(first, String.view(&cause))
+    }
+  }
+
+  /// Where the app is (see `Subscriptions.location`).
+  pub fn location(self: &Self) -> string {
+    if String.byteLength(String.view(&self.subscriptions.current)) == 0 {
+      return "/"
+    }
+    return String.view(&self.subscriptions.current)
+  }
+
+  /// Moves the location to `path` and tells the location subscriptions; their messages join
+  /// the queue. Before `start` it sets where the app starts: `settle` then handles the messages
+  /// so the first render is already there.
+  pub effect fn locate(self: &mut Self, path: string) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    self.subscriptions.current = run String.copy(path)
+    self.subscriptions.beginCollect()
+    App<M, C>.subscriptions(&self.model, &mut self.subscriptions)
+    let list = self.subscriptions.list()
+    let mut keys = List<u64>.make()
+    let mut j: usize = 0
+    while j < list.length {
+      if list[j].kind == SubscriptionKind.Location {
+        run keys.append(list[j].key)
+      }
+      j = j + 1
+    }
+    let mut k: usize = 0
+    while k < keys.length() {
+      let delivery = Delivery {
+        kind: SubscriptionKind.Location,
+        key: keys.get(k),
+        time: self.time,
+        width: 0.0,
+        height: 0.0,
+      }
+      run self.deliver(delivery)
+      k = k + 1
+    }
+  }
+
+  /// The host posts `text` to the port `name`: tells the port subscriptions of that name,
+  /// whose messages join the queue.
+  pub effect fn posted(self: &mut Self, name: string, text: string) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    self.subscriptions.posted = run String.copy(text)
+    if self.journal.on {
+      self.journal.port = run String.copy(name)
+    }
+    self.subscriptions.beginCollect()
+    App<M, C>.subscriptions(&self.model, &mut self.subscriptions)
+    let wanted = String.utf8Bytes(name)
+    let list = self.subscriptions.list()
+    let mut keys = List<u64>.make()
+    let mut j: usize = 0
+    while j < list.length {
+      if list[j].kind == SubscriptionKind.Port {
+        let named = self.subscriptions.keyName(list[j])
+        let mut same = named.length == wanted.length
+        let mut i: usize = 0
+        while same && i < named.length {
+          same = named[i] == wanted[i]
+          i = i + 1
+        }
+        if same {
+          run keys.append(list[j].key)
+        }
+      }
+      j = j + 1
+    }
+    let mut k: usize = 0
+    while k < keys.length() {
+      let delivery = Delivery {
+        kind: SubscriptionKind.Port,
+        key: keys.get(k),
+        time: self.time,
+        width: 0.0,
+        height: 0.0,
+      }
+      run self.deliver(delivery)
+      k = k + 1
+    }
+    self.subscriptions.posted = String.make()
+  }
+
+  /// Whether the model subscribes to the port `name` now.
+  pub fn listens(self: &mut Self, name: string) -> bool {
+    self.subscriptions.beginCollect()
+    App<M, C>.subscriptions(&self.model, &mut self.subscriptions)
+    let wanted = String.utf8Bytes(name)
+    let list = self.subscriptions.list()
+    let mut j: usize = 0
+    while j < list.length {
+      if list[j].kind == SubscriptionKind.Port {
+        let named = self.subscriptions.keyName(list[j])
+        let mut same = named.length == wanted.length
+        let mut i: usize = 0
+        while same && i < named.length {
+          same = named[i] == wanted[i]
+          i = i + 1
+        }
+        if same {
+          return true
+        }
+      }
+      j = j + 1
+    }
+    return false
+  }
+
+  /// The viewport is `width` by `height` CSS pixels: tells the resize subscriptions, whose
+  /// messages join the queue. For before `start`, as `locate` is; afterwards `resize` does it.
+  pub effect fn sized(self: &mut Self, width: f32, height: f32) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    self.width = width
+    self.height = height
+    self.subscriptions.beginCollect()
+    App<M, C>.subscriptions(&self.model, &mut self.subscriptions)
+    let list = self.subscriptions.list()
+    let mut keys = List<u64>.make()
+    let mut j: usize = 0
+    while j < list.length {
+      if list[j].kind == SubscriptionKind.Resize {
+        run keys.append(list[j].key)
+      }
+      j = j + 1
+    }
+    let mut k: usize = 0
+    while k < keys.length() {
+      let delivery = Delivery {
+        kind: SubscriptionKind.Resize,
+        key: keys.get(k),
+        time: self.time,
+        width: width,
+        height: height,
+      }
+      run self.deliver(delivery)
+      k = k + 1
+    }
+  }
+
+  /// Whether a link was followed since the last call: the location is where it went.
+  pub fn takeWent(self: &mut Self) -> bool {
+    let value = self.went
+    self.went = false
+    return value
+  }
+
+  /// Whether a handler prevented a default action since the last call. A host that feeds
+  /// input in two steps (`tree.begin`, `pump`, `tree.finish`) hands this to `finish`.
+  pub fn takePrevented(self: &mut Self) -> bool {
+    let value = self.prevented
+    self.prevented = false
+    return value
+  }
+
+  /// Dispatches `record` through the view, or the view of the declared window whose root
+  /// node its path starts at: the messages its handlers send join the queue. A record from
+  /// another root, or whose path names a node that is gone (a later record of a batch whose
+  /// earlier ones changed the view), is dropped.
+  pub effect fn dispatch(self: &mut Self, record: Event) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let _span = Prof.span("loom.dispatch")
+    self.path.clear()
+    let first = if record.path.length() == 0 {
+      0
+    } else {
+      record.path.get(0)
+    }
+    if first == self.rootNode {
+      run self.dispatchView(move record)
+      return ()
+    }
+    let at = self.windowWhere(2, 0, first)
+    if at == usize.MAX || self.opened.asSlice()[at].failed {
+      return ()
+    }
+    self.enter(at)
+    run self.dispatchView(move record)
+    self.leave(at)
+  }
+
+  /// `dispatch` through the view whose builder `self.ui` is.
+  effect fn dispatchView(self: &mut Self, record: Event) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let ids = record.path.asSlice()
+
+    // Whether the record's target is a text input: the keys it types are not key bindings.
+    let mut typing = false
+
+    // The link the record is in, if any: the innermost one.
+    let mut link = List<u8>.make()
+    // The entries on the path, root first, for `answerKept`.
+    let mut entries = run List<u32>.makeWithCapacity(ids.length)
+    run entries.append(0)
+    let mut i: usize = 1
+    while i < ids.length {
+      let entry = run self.diffState.entryOf(&self.ui.arena, ids[i])
+      if entry == NO_ENTRY {
+        return ()
+      }
+      run entries.append(entry)
+      let found = self.ui.arena.entry(entry)
+      run self.path.append(found.identity)
+      typing = isTextInput(found.kind)
+      let href = self.ui.arena.extraCopy(&found).href
+      if href.length != 0 {
+        link.clear()
+        run link.appendSlice(self.ui.arena.text(href))
+      }
+      i = i + 1
+    }
+
+    // Only a path inside the app is followed; any other address is the document's to load.
+    let follows = record.kind == EventKind.Click && link.length() != 0 && link.get(0) == 47
+      && record.modifiers == 0
+      && record.button == 0
+    let isKey = record.kind == EventKind.KeyDown
+    let mut name = List<u8>.make()
+    let modifiers = record.modifiers
+    if isKey && self.keyBindings {
+      run name.appendSlice(String.utf8Bytes(String.view(&record.key)))
+    }
+    let kind = record.kind
+    let target = record.target
+    run self.ui.beginDispatch(move record, self.path.asSlice())
+    // A record whose path only has handlers with fixed messages is answered from the replies
+    // the last render kept; any other runs the view to ask its handlers.
+    if !self.ui.answerKept(entries.asSlice()) {
+      self.runView()
+    }
+    let before = self.queue.length()
+    run self.ui.endDispatch(&mut self.queue)
+    if self.journal.on && self.queue.length() != before {
+      let mut to = Printer.make(false)
+      run to.out.append(eventName(kind))
+      run to.out.append(" #")
+      run to.unsigned(u32.toU64(target))
+      run self.caused(before, String.view(&to.out))
+    }
+    let prevented = self.ui.takePrevented()
+    if prevented {
+      self.prevented = true
+    }
+    self.stats.dispatches = self.stats.dispatches + 1
+    if follows && !prevented {
+      // The click is the runtime's now: a document must not load the page the link names.
+      self.prevented = true
+      self.went = true
+      if let Result<string, InvalidUtf8>.Success { value: path } = String.fromUtf8(link.asSlice()) {
+        run self.locate(path)
+      }
+    }
+    if isKey && self.keyBindings && self.queue.length() == before {
+      // No handler in the view took the key: try the key bindings.
+      let list = self.subscriptions.list()
+      let mut matched = List<u64>.make()
+      let mut j: usize = 0
+      while j < list.length {
+        let binding = list[j]
+        if binding.kind == SubscriptionKind.KeyBinding && binding.modifiers == modifiers
+          && (!typing || bindsWhileTyping(modifiers, name.asSlice()))
+          && same(self.subscriptions.keyName(binding), name.asSlice()) {
+          run matched.append(binding.key)
+        }
+        j = j + 1
+      }
+      let mut k: usize = 0
+      while k < matched.length() {
+        let delivery = Delivery {
+          kind: SubscriptionKind.KeyBinding,
+          key: matched.get(k),
+          time: self.time,
+          width: 0.0,
+          height: 0.0,
+        }
+        run self.deliver(delivery)
+        k = k + 1
+      }
+    }
+  }
+}
+
+/// Appends ` for <owner>` to a work line, nothing for owner 0.
+effect fn ownerText(line: &mut String, owner: u64) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if owner == 0 {
+    return ()
+  }
+  run line.append(" for ")
+  let mut to = Printer.make(false)
+  let upper = owner / 4294967296
+  if upper != 0 {
+    run to.unsigned(upper)
+    run to.out.append(":")
+  }
+  run to.unsigned(owner % 4294967296)
+  run line.append(String.view(&to.out))
+}
+
+fn isTextInput(kind: NodeKind) -> bool {
+  match kind {
+    NodeKind.Input => {
+      return true
+    }
+    _ => {
+      return false
+    }
+  }
+}
+
+/// Whether a key binding fires while a text input has focus: only a chord with Control, Alt
+/// or Meta, or Escape. Every other key belongs to the input.
+fn bindsWhileTyping(modifiers: u32, name: &[u8]) -> bool {
+  if u32.bitAnd(modifiers, MOD_CONTROL + MOD_ALT + MOD_META) != 0 {
+    return true
+  }
+  return same(name, b"Escape")
+}
+
+/// Handles every queued message: update, then each command's message in turn. Renders once
+/// the queue is empty, if anything was handled.
+pub effect fn drain<A: App<M, C>, M, C: Perform<M, E, R>, E, B: Backend, ? R>(
+  runtime: &mut Runtime<A, M, C>,
+  tree: &mut B,
+) -> ()
+  ! E | TreeError | OutOfMemoryError
+  ? R | &mut Allocator {
+  let handled = run settle(&mut runtime)
+  if runtime.takeWent() {
+    Backend.navigate(&mut tree, runtime.location())
+  }
+  if handled {
+    run runtime.render(&mut tree)
+  }
+}
+
+/// Handles every queued message as `drain` does, without rendering. Returns whether anything
+/// was handled. Before `start`, it brings the model to where the first render should be: past
+/// the commands `init` started with and the location the app starts at.
+pub effect fn settle<A: App<M, C>, M, C: Perform<M, E, R>, E, ? R>(
+  runtime: &mut Runtime<A, M, C>,
+) -> bool
+  ! E | OutOfMemoryError
+  ? R | &mut Allocator {
+  if !runtime.pending() && runtime.context.commands.length() == 0 {
+    return false
+  }
+  while true {
+    // Commands first: the ones a program starts with wait here before any message.
+    while runtime.context.commands.length() != 0 {
+      let command = runtime.context.commands.remove(0)
+      runtime.stats.commands = runtime.stats.commands + 1
+      if runtime.deferring {
+        let owner = Perform<M, E, R>.owner(&command)
+        let slot = Perform<M, E, R>.slot(&command)
+        let ui = Perform<M, E, R>.onUiThread(&command)
+        if slot != 0 {
+          // A newer command in a slot replaces what its owner had there.
+          runtime.cancelWhere(owner, slot, true)
+        }
+        let ticket = runtime.nextTicket
+        runtime.nextTicket = ticket + 1
+        run runtime.held.append(
+          Held<C> { ticket: ticket, owner: owner, slot: slot, ui: ui, command: move command },
+        )
+      } else if runtime.journal.on {
+        let mut cause = run String.copy("command ")
+        let shown = run show(&command)
+        run cause.append(String.view(&shown))
+        let result = run Perform<M, E, R>.perform(move command)
+        let first = runtime.queue.length()
+        run runtime.queue.append(move result)
+        run runtime.caused(first, String.view(&cause))
+      } else {
+        let result = run Perform<M, E, R>.perform(move command)
+        run runtime.queue.append(move result)
+      }
+    }
+    if runtime.head >= runtime.queue.length() {
+      break
+    }
+    let message = runtime.queue.remove(runtime.head)
+    runtime.stats.messages = runtime.stats.messages + 1
+    if runtime.journal.on {
+      let shown = run show(&message)
+      let cause = if runtime.head < runtime.journal.causes.length() {
+        runtime.journal.causes.remove(runtime.head)
+      } else {
+        run String.copy("task")
+      }
+      let before = runtime.context.commands.length()
+      App<M, C>.update(&mut runtime.model, move message, &mut runtime.context)
+      let mut asked = List<String>.make()
+      let commands = runtime.context.commands.asSlice()
+      let mut i = before
+      while i < commands.length {
+        run asked.append(run show(&commands[i]))
+        i = i + 1
+      }
+      let model = run runtime.shownModel()
+      let saved = run runtime.savedModel()
+      run runtime.journal.add(
+        runtime.time,
+        move cause,
+        move shown,
+        move asked,
+        move model,
+        move saved,
+      )
+    } else {
+      App<M, C>.update(&mut runtime.model, move message, &mut runtime.context)
+    }
+    if let Option<String>.Some { value: path } = Intrinsic.replace(
+      runtime.context.destination,
+      Option<String>.none(),
+    ) {
+      runtime.went = true
+      run runtime.locate(String.view(&path))
+    }
+
+    // Before this update's own commands are held, so a cancel never reaches them.
+    while runtime.context.cancels.length() != 0 {
+      let owner = runtime.context.cancels.remove(0)
+      runtime.cancelWhere(owner, 0, false)
+    }
+  }
+  runtime.queue.clear()
+  runtime.journal.causes.clear()
+  runtime.head = 0
+  return true
+}
+
+/// Moves the location to `path`, as a click on a link to it does, and handles the messages.
+pub effect fn navigate<A: App<M, C>, M, C: Perform<M, E, R>, E, B: Backend, ? R>(
+  runtime: &mut Runtime<A, M, C>,
+  tree: &mut B,
+  path: string,
+) -> ()
+  ! E | TreeError | OutOfMemoryError
+  ? R | &mut Allocator {
+  run runtime.locate(path)
+  run drain(&mut runtime, &mut tree)
+}
+
+/// Posts `text` to the port `name` (see `Subscriptions.port`) and handles the messages.
+pub effect fn post<A: App<M, C>, M, C: Perform<M, E, R>, E, B: Backend, ? R>(
+  runtime: &mut Runtime<A, M, C>,
+  tree: &mut B,
+  name: string,
+  text: string,
+) -> ()
+  ! E | TreeError | OutOfMemoryError
+  ? R | &mut Allocator {
+  run runtime.posted(name, text)
+  if runtime.running() {
+    run drain(&mut runtime, &mut tree)
+  }
+}
+
+/// Takes the tree's event records and handles them one at a time: dispatch, update, render.
+/// Returns whether any record was handled.
+pub effect fn pump<A: App<M, C>, M, C: Perform<M, E, R>, E, B: Backend, ? R>(
+  runtime: &mut Runtime<A, M, C>,
+  tree: &mut B,
+) -> bool
+  ! E | TreeError | OutOfMemoryError
+  ? R | &mut Allocator {
+  let _span = Prof.span("loom.pump")
+  runtime.records.clear()
+  run Backend.events(&mut tree, &mut runtime.records)
+
+  // A program hears what happens to its first window from the host (resize, ports), and to
+  // the windows it declared through their handlers.
+  let mut rootEvents = List<RootEvent>.make()
+  run Backend.rootEvents(&mut tree, &mut rootEvents)
+  let mut handled = runtime.records.length() != 0
+  if rootEvents.length() != 0 {
+    run runtime.rootEvents(&mut tree, &rootEvents)
+    if runtime.pending() {
+      handled = true
+      run drain(&mut runtime, &mut tree)
+    }
+  }
+  while runtime.records.length() != 0 {
+    let record = runtime.records.remove(0)
+    run runtime.readAnchors(&mut tree)
+    run runtime.dispatch(move record)
+    run drain(&mut runtime, &mut tree)
+  }
+  let virtualChanged = run runtime.syncVirtual(&mut tree)
+  return handled || virtualChanged
+}
+
+/// Moves the clock to `now` (seconds): fires the timers that are due and, when `frame` is
+/// true, the animation frame subscriptions, then handles their messages.
+pub effect fn tick<A: App<M, C>, M, C: Perform<M, E, R>, E, B: Backend, ? R>(
+  runtime: &mut Runtime<A, M, C>,
+  tree: &mut B,
+  now: f64,
+  frame: bool,
+) -> ()
+  ! E | TreeError | OutOfMemoryError
+  ? R | &mut Allocator {
+  runtime.time = now
+  let mut i: usize = 0
+  while i < runtime.timers.length() {
+    let mut timer = runtime.timers.get(i)
+    if timer.due <= now {
+      // One message per tick, however late: a slow frame does not queue a burst.
+      timer.due = if timer.interval > 0.0 {
+        let mut due = timer.due + timer.interval
+        while due <= now {
+          due = due + timer.interval
+        }
+        due
+      } else {
+        now
+      }
+      runtime.timers.set(i, timer)
+      let delivery = Delivery {
+        kind: SubscriptionKind.Every,
+        key: timer.key,
+        time: now,
+        width: 0.0,
+        height: 0.0,
+      }
+      run runtime.deliver(delivery)
+    }
+    i = i + 1
+  }
+  if frame && runtime.animating {
+    let list = runtime.subscriptions.list()
+    let mut keys = List<u64>.make()
+    let mut j: usize = 0
+    while j < list.length {
+      if list[j].kind == SubscriptionKind.AnimationFrame {
+        run keys.append(list[j].key)
+      }
+      j = j + 1
+    }
+    let mut k: usize = 0
+    while k < keys.length() {
+      let delivery = Delivery {
+        kind: SubscriptionKind.AnimationFrame,
+        key: keys.get(k),
+        time: now,
+        width: 0.0,
+        height: 0.0,
+      }
+      run runtime.deliver(delivery)
+      k = k + 1
+    }
+  }
+  run drain(&mut runtime, &mut tree)
+}
+
+/// Tells resize subscriptions the viewport is now `width` by `height` CSS pixels.
+pub effect fn resize<A: App<M, C>, M, C: Perform<M, E, R>, E, B: Backend, ? R>(
+  runtime: &mut Runtime<A, M, C>,
+  tree: &mut B,
+  width: f32,
+  height: f32,
+) -> ()
+  ! E | TreeError | OutOfMemoryError
+  ? R | &mut Allocator {
+  if width == runtime.width && height == runtime.height {
+    return ()
+  }
+  runtime.width = width
+  runtime.height = height
+  if !runtime.resizes {
+    return ()
+  }
+  let list = runtime.subscriptions.list()
+  let mut keys = List<u64>.make()
+  let mut j: usize = 0
+  while j < list.length {
+    if list[j].kind == SubscriptionKind.Resize {
+      run keys.append(list[j].key)
+    }
+    j = j + 1
+  }
+  let mut k: usize = 0
+  while k < keys.length() {
+    let delivery = Delivery {
+      kind: SubscriptionKind.Resize,
+      key: keys.get(k),
+      time: runtime.time,
+      width: width,
+      height: height,
+    }
+    run runtime.deliver(delivery)
+    k = k + 1
+  }
+  run drain(&mut runtime, &mut tree)
+}
+
+fn same(a: &[u8], b: &[u8]) -> bool {
+  if a.length != b.length {
+    return false
+  }
+  let mut i: usize = 0
+  while i < a.length {
+    if a[i] != b[i] {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+/// The root options of declared window `record`, titled `title`.
+effect fn optionsOf(title: &[u8], record: WindowRecord) -> RootOptions
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut options = RootOptions.default()
+  if let Result<string, InvalidUtf8>.Success { value } = String.fromUtf8(title) {
+    options.title = run String.copy(value)
+  }
+  if record.width > 0.0 && record.height > 0.0 {
+    options.size = Option<Size2<f32>>.some(Size2<f32>.new(record.width, record.height))
+  }
+  options.resizable = record.resizable
+  return move options
+}
+
+fn sameIndices(a: &[usize], b: &[usize]) -> bool {
+  if a.length != b.length {
+    return false
+  }
+  let mut i: usize = 0
+  while i < a.length {
+    if a[i] != b[i] {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}

@@ -1,0 +1,2268 @@
+//! libuv 1.51's file-system requests, thread-pool work, cancellation, name resolution and random
+//! requests, exported as C symbols with libuv's names, signatures and record layouts, so that a
+//! Node-API addon compiled against libuv's uv.h links against the runtime as it linked against
+//! Node: every `uv_fs_*` function except the fs event and fs poll handles, `uv_fs_req_cleanup`,
+//! `uv_fs_scandir_next` and the `uv_fs_get_*` accessors, `uv_queue_work`, `uv_cancel`,
+//! `uv_getaddrinfo`, `uv_freeaddrinfo`, `uv_getnameinfo` and `uv_random`.
+//!
+//! Each export follows the C function of the same name in libuv (src/unix/fs.c, src/threadpool.c,
+//! src/uv-common.c, src/unix/getaddrinfo.c, src/unix/getnameinfo.c, src/idna.c, src/random.c) on
+//! GNU/Linux (x86_64, aarch64) and Darwin (arm64), built without assertions as Node builds it. A
+//! request with a NULL callback runs on the calling thread and returns its result; with a
+//! callback it counts as an active request of the loop (`uvl.requestStarted`), runs on the loop's
+//! thread pool (`uvl.workSubmit`, whose `Work` record sits where libuv keeps `work_req`) and calls
+//! back on the loop's thread. File-system requests are fast I/O work, name resolution slow I/O
+//! work, `uv_queue_work` and `uv_random` CPU work, as in libuv.
+//!
+//! The records are the caller's, with the sizes of libuv's headers: `uv_fs_t` (440 bytes),
+//! `uv_work_t` (128), `uv_getaddrinfo_t` (160), `uv_getnameinfo_t` (1320), `uv_random_t` (144) and
+//! `uv_dir_t` (56). The public fields an addon reads (`type`, `fs_type`, `loop`, `result`, `ptr`,
+//! `path`, `statbuf`, `addrinfo`, `host`, `service`...) are at libuv's offsets, and so are the
+//! private ones: this module uses them as libuv does.
+//!
+//! The `uv_loop_t*` an addon passes is the loop memory of `ext.uv_loop` (the loop facade decides
+//! what an addon's `uv_loop_t` is; `loopMemory` is the one place that maps it).
+//!
+//! Memory that libuv takes from uv__malloc (copied paths, the bufs copy, readlink, realpath, statfs
+//! and readdir results, opendir's uv_dir_t, getaddrinfo's copy of its arguments) comes from
+//! `ext.uv_os`'s uvMalloc, which follows uv_replace_allocator; scandir's entries and realpath's
+//! buffer are the C library's and go back with free(), as in libuv.
+//!
+//! What differs from libuv on purpose:
+//! - io_uring is never used. libuv 1.51 uses it for some asynchronous requests only when the
+//!   UV_USE_IO_URING environment variable asks for it; otherwise it takes the thread pool, as here.
+//! - The random bytes are `ext.uv_api_sys`'s randomFill (libuv's uv__random).
+//! - uv_fs_mkstemp and uv_fs_open never take the loop's cloexec lock: the runtime's loop has none
+//!   (its uv_spawn does not need one), and both use O_CLOEXEC directly (mkostemp).
+import silk.mem.pointer { Pointer }
+import silk.mem.layout { Layout }
+import silk.concurrency.atomic { Atomic, MemoryOrder }
+import silk.core.ownership { Copy }
+import silk.core.option { Option }
+import silk.num.f64
+import silk.num.i32
+import silk.num.i64
+import silk.num.isize
+import silk.num.u8
+import silk.num.u16
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+import ext.uv_loop as uvl
+import ext.uv_loop { Work }
+import silkjsruntime.ext.uv_fs { UvStat, UvTimespec }
+import ext.uv_os as os
+import ext.uv_api_sys as sys
+
+// ---- Records ----------------------------------------------------------------------------------
+type FsCallback = ?extern "C" fn(*mut u8) -> ()
+type WorkCallback = ?extern "C" fn(*mut u8) -> ()
+type AfterWorkCallback = ?extern "C" fn(*mut u8, i32) -> ()
+type RandomCallback = ?extern "C" fn(*mut u8, i32, ?*mut u8, usize) -> ()
+type AddrinfoCallback = ?extern "C" fn(*mut u8, i32, ?*mut u8) -> ()
+type NameinfoCallback = ?extern "C" fn(*mut u8, i32, ?*const u8, ?*const u8) -> ()
+
+/// libuv's uv_buf_t on Unix: a struct iovec.
+extern "C" struct Buf { base: ?*mut u8, len: usize }
+impl Copy for Buf {}
+/// libuv's uv_dirent_t.
+extern "C" struct Dirent { name: ?*const u8, kind: i32, padding: i32 }
+impl Copy for Dirent {}
+/// libuv's uv_dir_t: the caller's entries, their count, four reserved words and the DIR stream.
+extern "C" struct Dir { dirents: ?*mut Dirent, nentries: usize, reserved: [usize; 4], dir: ?*mut u8 }
+extern "C" struct Timespec { seconds: i64, nanoseconds: i64 }
+impl Copy for Timespec {}
+
+/// libuv's uv_fs_t (440 bytes): the request head (data, type, six reserved words), the public
+/// fields, then UV_FS_PRIVATE_FIELDS of uv/unix.h. `mode` is a mode_t (16 bits on Darwin, where
+/// the next two bytes are padding in libuv's record).
+extern "C" struct FsReq {
+  data: ?*mut u8, kind: i32, padding: i32, reserved: [usize; 6],
+  fsType: i32, padding2: i32, loop: ?*mut u8, cb: FsCallback, result: isize, ptr: ?*mut u8, path: ?*const u8, statbuf: UvStat,
+  newPath: ?*const u8, file: i32, flags: i32, mode: u32, nbufs: u32, bufs: ?*mut Buf, off: i64, uid: u32, gid: u32,
+  atime: f64, mtime: f64, work: Work, bufsml: [Buf; 4]
+}
+/// libuv's uv_work_t (128 bytes).
+extern "C" struct WorkReq {
+  data: ?*mut u8, kind: i32, padding: i32, reserved: [usize; 6],
+  loop: ?*mut u8, workCb: WorkCallback, afterWorkCb: AfterWorkCallback, work: Work
+}
+/// libuv's uv_random_t (144 bytes).
+extern "C" struct RandomReq {
+  data: ?*mut u8, kind: i32, padding: i32, reserved: [usize; 6],
+  loop: ?*mut u8, status: i32, padding2: i32, buf: ?*mut u8, buflen: usize, cb: RandomCallback, work: Work
+}
+/// libuv's uv_getaddrinfo_t (160 bytes).
+extern "C" struct AddrinfoReq {
+  data: ?*mut u8, kind: i32, padding: i32, reserved: [usize; 6],
+  loop: ?*mut u8, work: Work, cb: AddrinfoCallback, hints: ?*mut u8, hostname: ?*mut u8, serviceText: ?*mut u8, addrinfo: ?*mut u8,
+  retcode: i32, padding2: i32
+}
+/// libuv's uv_getnameinfo_t (1320 bytes): a sockaddr_storage, the flags, NI_MAXHOST and NI_MAXSERV
+/// bytes of results, and the status.
+extern "C" struct NameinfoReq {
+  data: ?*mut u8, kind: i32, padding: i32, reserved: [usize; 6],
+  loop: ?*mut u8, work: Work, cb: NameinfoCallback, storage: [u64; 16], flags: i32,
+  host: [u8; 1025], serviceText: [u8; 32], retcode: i32, padding2: i32
+}
+// Where each record keeps its Work (libuv's work_req), for container_of.
+const FS_WORK: usize = 336
+const WORK_WORK: usize = 88
+const RANDOM_WORK: usize = 104
+const ADDRINFO_WORK: usize = 72
+const NAMEINFO_WORK: usize = 72
+
+// libuv's uv_req_type and uv_fs_type values.
+const UV_FS: i32 = 6
+const UV_WORK: i32 = 7
+const UV_GETADDRINFO: i32 = 8
+const UV_GETNAMEINFO: i32 = 9
+const UV_RANDOM: i32 = 10
+const FS_OPEN: i32 = 1
+const FS_CLOSE: i32 = 2
+const FS_READ: i32 = 3
+const FS_WRITE: i32 = 4
+const FS_SENDFILE: i32 = 5
+const FS_STAT: i32 = 6
+const FS_LSTAT: i32 = 7
+const FS_FSTAT: i32 = 8
+const FS_FTRUNCATE: i32 = 9
+const FS_UTIME: i32 = 10
+const FS_FUTIME: i32 = 11
+const FS_ACCESS: i32 = 12
+const FS_CHMOD: i32 = 13
+const FS_FCHMOD: i32 = 14
+const FS_FSYNC: i32 = 15
+const FS_FDATASYNC: i32 = 16
+const FS_UNLINK: i32 = 17
+const FS_RMDIR: i32 = 18
+const FS_MKDIR: i32 = 19
+const FS_MKDTEMP: i32 = 20
+const FS_RENAME: i32 = 21
+const FS_SCANDIR: i32 = 22
+const FS_LINK: i32 = 23
+const FS_SYMLINK: i32 = 24
+const FS_READLINK: i32 = 25
+const FS_CHOWN: i32 = 26
+const FS_FCHOWN: i32 = 27
+const FS_REALPATH: i32 = 28
+const FS_COPYFILE: i32 = 29
+const FS_LCHOWN: i32 = 30
+const FS_OPENDIR: i32 = 31
+const FS_READDIR: i32 = 32
+const FS_CLOSEDIR: i32 = 33
+const FS_STATFS: i32 = 34
+const FS_MKSTEMP: i32 = 35
+const FS_LUTIME: i32 = 36
+const COPYFILE_EXCL: i32 = 1
+const COPYFILE_FICLONE: i32 = 2
+const COPYFILE_FICLONE_FORCE: i32 = 4
+// uv_dirent_type_t.
+const DIRENT_UNKNOWN: i32 = 0
+const DIRENT_FILE: i32 = 1
+const DIRENT_DIR: i32 = 2
+const DIRENT_LINK: i32 = 3
+const DIRENT_FIFO: i32 = 4
+const DIRENT_SOCKET: i32 = 5
+const DIRENT_CHAR: i32 = 6
+const DIRENT_BLOCK: i32 = 7
+const UV_EOF: i32 = -4095
+// uv_getaddrinfo's errors.
+const UV_EAI_ADDRFAMILY: i32 = -3000
+const UV_EAI_AGAIN: i32 = -3001
+const UV_EAI_BADFLAGS: i32 = -3002
+const UV_EAI_CANCELED: i32 = -3003
+const UV_EAI_FAIL: i32 = -3004
+const UV_EAI_FAMILY: i32 = -3005
+const UV_EAI_MEMORY: i32 = -3006
+const UV_EAI_NODATA: i32 = -3007
+const UV_EAI_NONAME: i32 = -3008
+const UV_EAI_OVERFLOW: i32 = -3009
+const UV_EAI_SERVICE: i32 = -3010
+const UV_EAI_SOCKTYPE: i32 = -3011
+const UV_EAI_BADHINTS: i32 = -3013
+const UV_EAI_PROTOCOL: i32 = -3014
+// IOV_MAX on both targets (libuv's uv__getiovmax).
+const IOV_MAX: u32 = 1024
+const SSIZE_MAX: i64 = 9223372036854775807
+// Common errno values.
+const EPERM: i32 = 1
+const ENOENT: i32 = 2
+const EINTR: i32 = 4
+const EIO: i32 = 5
+const E2BIG: i32 = 7
+const ENOMEM: i32 = 12
+const EACCES: i32 = 13
+const EBUSY: i32 = 16
+const EXDEV: i32 = 18
+const EINVAL: i32 = 22
+const ESPIPE: i32 = 29
+const POLLOUT: i16 = 4
+const F_GETFD: i32 = 1
+const F_SETFD: i32 = 2
+const FD_CLOEXEC: i32 = 1
+const O_RDONLY: i32 = 0
+const O_WRONLY: i32 = 1
+const DT_FIFO: u8 = 1
+const DT_CHR: u8 = 2
+const DT_DIR: u8 = 4
+const DT_BLK: u8 = 6
+const DT_REG: u8 = 8
+const DT_LNK: u8 = 10
+const DT_SOCK: u8 = 12
+const AF_INET: u32 = 2
+
+extern "C" struct PollFd { fd: i32, events: i16, revents: i16 }
+
+unsafe extern "C" fn free(pointer: ?*mut u8) -> ()
+unsafe extern "C" fn abort() -> ()
+@foreign(noCapture: .("text"))
+unsafe extern "C" fn strlen(text: *const u8) -> usize
+unsafe extern "C" fn strcmp(left: *const u8, right: *const u8) -> i32
+@foreign(noCapture: .("dest", "source"))
+unsafe extern "C" fn memcpy(dest: *mut u8, source: *const u8, count: usize) -> *mut u8
+unsafe extern "C" fn access(path: ?[*]const u8, mode: i32) -> i32
+unsafe extern "C" fn chmod(path: *const u8, mode: u32) -> i32
+unsafe extern "C" fn chown(path: *const u8, uid: u32, gid: u32) -> i32
+unsafe extern "C" fn lchown(path: *const u8, uid: u32, gid: u32) -> i32
+unsafe extern "C" fn fchown(fd: i32, uid: u32, gid: u32) -> i32
+unsafe extern "C" fn fsync(fd: i32) -> i32
+unsafe extern "C" fn ftruncate(fd: i32, length: i64) -> i32
+unsafe extern "C" fn fcntl(fd: i32, command: i32, ...) -> i32
+unsafe extern "C" fn open(path: *const u8, flags: i32, ...) -> i32
+unsafe extern "C" fn read(fd: i32, buffer: ?[*]mut u8, count: usize) -> isize
+unsafe extern "C" fn write(fd: i32, buffer: *const u8, count: usize) -> isize
+unsafe extern "C" fn pread(fd: i32, buffer: ?[*]mut u8, count: usize, offset: i64) -> isize
+unsafe extern "C" fn pwrite(fd: i32, buffer: ?[*]const u8, count: usize, offset: i64) -> isize
+unsafe extern "C" fn readv(fd: i32, vectors: ?[*]const Buf, count: i32) -> isize
+unsafe extern "C" fn writev(fd: i32, vectors: ?[*]const Buf, count: i32) -> isize
+unsafe extern "C" fn preadv(fd: i32, vectors: ?[*]const Buf, count: i32, offset: i64) -> isize
+unsafe extern "C" fn pwritev(fd: i32, vectors: ?[*]const Buf, count: i32, offset: i64) -> isize
+unsafe extern "C" fn utimensat(directory: i32, path: ?[*]const u8, times: ?[*]const Timespec, flags: i32) -> i32
+unsafe extern "C" fn futimens(fd: i32, times: ?[*]const Timespec) -> i32
+unsafe extern "C" fn link(existing: ?[*]const u8, created: ?[*]const u8) -> i32
+unsafe extern "C" fn symlink(target: ?[*]const u8, path: ?[*]const u8) -> i32
+unsafe extern "C" fn readlink(path: ?[*]const u8, buffer: ?[*]mut u8, size: usize) -> isize
+unsafe extern "C" fn rename(from: ?[*]const u8, to: ?[*]const u8) -> i32
+unsafe extern "C" fn unlink(path: ?[*]const u8) -> i32
+unsafe extern "C" fn rmdir(path: ?[*]const u8) -> i32
+unsafe extern "C" fn pathconf(path: ?[*]const u8, name: i32) -> i64
+unsafe extern "C" fn realpath(path: *const u8, result: ?*mut u8) -> ?*mut u8
+unsafe extern "C" fn mkdtemp(template: *mut u8) -> ?*mut u8
+unsafe extern "C" fn mkstemp(template: *mut u8) -> i32
+unsafe extern "C" fn mkostemp(template: *mut u8, flags: i32) -> i32
+unsafe extern "C" fn opendir(path: *const u8) -> ?*mut u8
+unsafe extern "C" fn readdir(stream: *mut u8) -> ?*const u8
+unsafe extern "C" fn closedir(stream: *mut u8) -> i32
+@callbacks("filter", "compare")
+unsafe extern "C" fn scandir(path: *const u8, entries: *mut ?*mut ?*mut u8, filter: extern "C" fn(*const u8) -> i32, compare: extern "C" fn(*const ?*const u8, *const ?*const u8) -> i32) -> i32
+unsafe extern "C" fn getaddrinfo(node: ?*const u8, serviceText: ?*const u8, hints: ?*const u8, result: *mut ?*mut u8) -> i32
+unsafe extern "C" fn freeaddrinfo(result: *mut u8) -> ()
+unsafe extern "C" fn getnameinfo(address: *const u8, length: u32, host: *mut u8, hostLength: u32, serviceText: *mut u8, serviceLength: u32, flags: i32) -> i32
+
+static if Intrinsic.targetOperatingSystem() == "darwin" {
+  unsafe extern "C" fn __error() -> *mut i32
+  unsafe fn errnoSlot() -> *mut i32 { return unsafe __error() }
+  const EAGAIN: i32 = 35
+  const EINPROGRESS: i32 = 36
+  const ENOTSOCK: i32 = 38
+  const ENOTSUP: i32 = 45
+  const ENOSYS: i32 = 78
+  const ECANCELED: i32 = 89
+  const EOPNOTSUPP: i32 = 102
+  const O_CREAT: i32 = 512
+  const O_EXCL: i32 = 2048
+  const O_CLOEXEC: i32 = 16777216
+  const AT_FDCWD: i32 = -2
+  const AT_SYMLINK_NOFOLLOW: i32 = 32
+  const PC_PATH_MAX: i32 = 5
+  const PATH_MAX: i64 = 1024
+  const UTIME_NOW: i64 = -1
+  const UTIME_OMIT: i64 = -2
+  const D_TYPE: usize = 20
+  const D_NAME: usize = 21
+  const AF_INET6: u32 = 30
+  // EAI_* of netdb.h.
+  const EAI_ADDRFAMILY: i32 = 1
+  const EAI_AGAIN: i32 = 2
+  const EAI_BADFLAGS: i32 = 3
+  const EAI_FAIL: i32 = 4
+  const EAI_FAMILY: i32 = 5
+  const EAI_MEMORY: i32 = 6
+  const EAI_NODATA: i32 = 7
+  const EAI_NONAME: i32 = 8
+  const EAI_SERVICE: i32 = 9
+  const EAI_SOCKTYPE: i32 = 10
+  const EAI_SYSTEM: i32 = 11
+  const EAI_BADHINTS: i32 = 12
+  const EAI_PROTOCOL: i32 = 13
+  const EAI_OVERFLOW: i32 = 14
+  unsafe extern "C" fn mkdir(path: ?[*]const u8, mode: u16) -> i32
+  // mode_t is 16 bits on Darwin; declared as the standard library does, with the conversion here.
+  unsafe extern "C" fn fchmod(fd: i32, mode: u32) -> i32
+  unsafe extern "C" fn darwinPoll(fds: [*]mut PollFd, count: u32, timeout: i32) -> i32 as "poll"
+  unsafe fn pollOne(fds: *mut PollFd) -> i32 { return unsafe darwinPoll(unsafe Pointer.assumeManyMut<PollFd>(fds), 1, -1) }
+  unsafe extern "C" fn closeNocancel(fd: i32) -> i32 as "close$NOCANCEL"
+  @foreign(noCapture: .("length"))
+  unsafe extern "C" fn darwinSendfile(fd: i32, socket: i32, offset: i64, length: *mut i64, headers: ?*mut u8, flags: i32) -> i32 as "sendfile"
+  unsafe extern "C" fn statfs(path: *const u8, buffer: *mut [u64; 271]) -> i32
+  // mode_t is 16 bits: libuv's req->mode keeps the low half of what the caller passed.
+  fn modeOf(mode: i32) -> u32 { return i32.wrappingToU32(mode) & 65535 }
+  unsafe fn makeDirectory(path: ?[*]const u8, mode: u32) -> i32 { return unsafe mkdir(path, u32.wrappingToU16(mode)) }
+  unsafe fn changeMode(fd: i32, mode: u32) -> i32 { return unsafe fchmod(fd, mode & 65535) }
+  // The address family of a sockaddr (sa_len comes first).
+  unsafe fn familyOf(address: *const u8) -> u32 { return u8.toU32(unsafe Pointer.read<u8>(unsafe constAt(address, 1))) }
+  // The kernel's `struct stat` (64-bit inodes), which stat, lstat and fstat fill.
+  extern "C" struct NativeStat {
+    dev: i32, mode: u16, nlink: u16, ino: u64, uid: u32, gid: u32, rdev: i32,
+    atime: Timespec, mtime: Timespec, ctime: Timespec, birthtime: Timespec,
+    size: i64, blocks: i64, blksize: i32, flags: u32, gen: u32, spare: i32, reserved: [i64; 2]
+  }
+  unsafe extern "C" fn stat(path: ?[*]const u8, value: *mut NativeStat) -> i32
+  unsafe extern "C" fn lstat(path: ?[*]const u8, value: *mut NativeStat) -> i32
+  unsafe extern "C" fn fstat(fd: i32, value: *mut NativeStat) -> i32
+  fn uvTime(value: Timespec) -> UvTimespec { return UvTimespec { tv_sec: i64.toIsize(value.seconds), tv_nsec: i64.toIsize(value.nanoseconds) } }
+  // libuv's uv__stat, uv__lstat or uv__fstat (`kind` 0, 1, 2) and uv__to_stat. 0 or -1 with errno.
+  unsafe fn systemStat(kind: i32, fd: i32, path: ?*const u8, out: *mut UvStat) -> i32 {
+    unsafe {
+      let zero = Timespec { seconds: 0, nanoseconds: 0 }
+      let mut s = NativeStat { dev: 0, mode: 0, nlink: 0, ino: 0, uid: 0, gid: 0, rdev: 0, atime: zero, mtime: zero, ctime: zero, birthtime: zero, size: 0, blocks: 0, blksize: 0, flags: 0, gen: 0, spare: 0, reserved: [0; 2] }
+      let name = Pointer.assumeMany<u8>(nn(path))
+      let rc = if kind == 2 { fstat(fd, Pointer.fromMutRef<NativeStat>(&mut s)) } else { if kind == 1 { lstat(name, Pointer.fromMutRef<NativeStat>(&mut s)) } else { stat(name, Pointer.fromMutRef<NativeStat>(&mut s)) } }
+      if rc != 0 { return -1 }
+      Pointer.write<UvStat>(out, UvStat {
+        st_dev: i64.wrappingToU64(i32.toI64(s.dev)), st_mode: u16.toU64(s.mode), st_nlink: u16.toU64(s.nlink), st_uid: u32.toU64(s.uid), st_gid: u32.toU64(s.gid),
+        st_rdev: i64.wrappingToU64(i32.toI64(s.rdev)), st_ino: s.ino, st_size: i64.wrappingToU64(s.size), st_blksize: i64.wrappingToU64(i32.toI64(s.blksize)), st_blocks: i64.wrappingToU64(s.blocks),
+        st_flags: u32.toU64(s.flags), st_gen: u32.toU64(s.gen),
+        st_atim: uvTime(s.atime), st_mtim: uvTime(s.mtime), st_ctim: uvTime(s.ctime), st_birthtim: uvTime(s.birthtime)
+      })
+      return 0
+    }
+  }
+  // Darwin has no statx: libuv's uv__fs_statx answers UV_ENOSYS.
+  unsafe fn statxStat(fd: i32, path: ?*const u8, isFstat: bool, isLstat: bool, out: *mut UvStat) -> i32 { return -ENOSYS }
+  // libuv's uv__fs_statfs: struct statfs of sys/mount.h (f_bsize u32 at 0, the counts from 8, f_type
+  // u32 at 60). Darwin's statfs has no f_frsize: libuv 1.52 reports f_bsize.
+  unsafe fn statfsOf(path: *const u8, out: *mut UvStatfsRecord) -> i32 {
+    unsafe {
+      let mut buffer: [u64; 271] = [0; 271]
+      if statfs(path, Pointer.fromMutRef<[u64; 271]>(&mut buffer)) != 0 { return -1 }
+      let bsize = u64.toU64(buffer[0] & 4294967295)
+      let kind = u64.shiftRight(buffer[7], 32)
+      Pointer.write<UvStatfsRecord>(out, UvStatfsRecord { f_type: kind, f_bsize: bsize, f_blocks: buffer[1], f_bfree: buffer[2], f_bavail: buffer[3], f_files: buffer[4], f_ffree: buffer[5], f_frsize: bsize, f_spare: [0; 3] })
+      return 0
+    }
+  }
+  // libuv's uv__fs_fsync on Darwin: F_FULLFSYNC, else F_BARRIERFSYNC, else fsync.
+  unsafe fn fullSync(fd: i32) -> isize {
+    unsafe {
+      let mut r = fcntl(fd, 51)
+      if r != 0 { r = fcntl(fd, 85) }
+      if r != 0 { r = fsync(fd) }
+      return i32.toIsize(r)
+    }
+  }
+  unsafe fn dataSync(fd: i32) -> isize { return unsafe fullSync(fd) }
+  // libuv's uv__fs_sendfile on Darwin: sendfile(2), which only writes to sockets, else the emulation.
+  unsafe fn sendfileCall(r: *mut FsReq) -> isize {
+    unsafe {
+      let mut anchor = () let q = Pointer.borrowMut<(), FsReq>(&mut anchor, r)
+      let input = q.flags let output = q.file let offset = q.off
+      let mut length = u64.wrappingToI64(usize.toU64(q.bufsml[0].len))
+      drop q
+      let rc = darwinSendfile(input, output, offset, Pointer.fromMutRef<i64>(&mut length), Pointer.null<u8>(), 0)
+      let code = errno()
+      if rc == 0 || ((code == EAGAIN || code == EINTR) && length != 0) {
+        let q2 = Pointer.borrowMut<(), FsReq>(&mut anchor, r) q2.off = q2.off + length
+        return i64.toIsize(length)
+      }
+      if code == EINVAL || code == EIO || code == ENOTSOCK || code == EXDEV { setErrno(0) return sendfileEmulation(r) }
+      return -1
+    }
+  }
+  // Without FICLONE, UV_FS_COPYFILE_FICLONE falls back to copying and FICLONE_FORCE is UV_ENOSYS.
+  // 1 when the clone was made, 0 to copy, or a negative error.
+  unsafe fn cloneFile(flags: i32, destination: i32, source: i32) -> i32 {
+    if (flags & COPYFILE_FICLONE_FORCE) != 0 { return -ENOSYS }
+    return 0
+  }
+  unsafe fn isCifsOrSmb(fd: i32) -> bool { return false }
+} else {
+  unsafe extern "C" fn __errno_location() -> *mut i32
+  unsafe fn errnoSlot() -> *mut i32 { return unsafe __errno_location() }
+  const EAGAIN: i32 = 11
+  const ENOSYS: i32 = 38
+  const ENOTSOCK: i32 = 88
+  const EOPNOTSUPP: i32 = 95
+  const ENOTSUP: i32 = 95
+  const EINPROGRESS: i32 = 115
+  const ECANCELED: i32 = 125
+  const O_CREAT: i32 = 64
+  const O_EXCL: i32 = 128
+  const O_CLOEXEC: i32 = 524288
+  const AT_FDCWD: i32 = -100
+  const AT_SYMLINK_NOFOLLOW: i32 = 256
+  const AT_EMPTY_PATH: i32 = 4096
+  const PC_PATH_MAX: i32 = 4
+  const PATH_MAX: i64 = 4096
+  const UTIME_NOW: i64 = 1073741823
+  const UTIME_OMIT: i64 = 1073741822
+  const D_TYPE: usize = 18
+  const D_NAME: usize = 19
+  const AF_INET6: u32 = 10
+  // glibc's EAI_* (with _GNU_SOURCE, as libuv builds).
+  const EAI_BADFLAGS: i32 = -1
+  const EAI_NONAME: i32 = -2
+  const EAI_AGAIN: i32 = -3
+  const EAI_FAIL: i32 = -4
+  const EAI_NODATA: i32 = -5
+  const EAI_FAMILY: i32 = -6
+  const EAI_SOCKTYPE: i32 = -7
+  const EAI_SERVICE: i32 = -8
+  const EAI_ADDRFAMILY: i32 = -9
+  const EAI_MEMORY: i32 = -10
+  const EAI_SYSTEM: i32 = -11
+  const EAI_OVERFLOW: i32 = -12
+  const EAI_CANCELED: i32 = -101
+  // FICLONE, _IOW(0x94, 9, int).
+  const FICLONE: u64 = 1074041865
+  unsafe extern "C" fn mkdir(path: ?[*]const u8, mode: u32) -> i32
+  unsafe extern "C" fn fchmod(fd: i32, mode: u32) -> i32
+  unsafe extern "C" fn fdatasync(fd: i32) -> i32
+  unsafe extern "C" fn syscall(number: i64, ...) -> i64
+  unsafe extern "C" fn ioctl(fd: i32, request: u64, ...) -> i32
+  unsafe extern "C" fn gnuPoll(fds: [*]mut PollFd, count: usize, timeout: i32) -> i32 as "poll"
+  unsafe fn pollOne(fds: *mut PollFd) -> i32 { return unsafe gnuPoll(unsafe Pointer.assumeManyMut<PollFd>(fds), 1, -1) }
+  @foreign(noCapture: .("offset"))
+  unsafe extern "C" fn linuxSendfile(output: i32, input: i32, offset: *mut i64, count: usize) -> isize as "sendfile"
+  unsafe extern "C" fn statfs(path: *const u8, buffer: *mut [u64; 15]) -> i32
+  unsafe extern "C" fn fstatfs(fd: i32, buffer: *mut [u64; 15]) -> i32
+  unsafe extern "C" fn uname(value: *mut [u8; 390]) -> i32
+  fn modeOf(mode: i32) -> u32 { return i32.wrappingToU32(mode) }
+  unsafe fn makeDirectory(path: ?[*]const u8, mode: u32) -> i32 { return unsafe mkdir(path, mode) }
+  unsafe fn changeMode(fd: i32, mode: u32) -> i32 { return unsafe fchmod(fd, mode) }
+  unsafe fn familyOf(address: *const u8) -> u32 { return u16.toU32(unsafe Pointer.read<u16>(unsafe Intrinsic.pointerReinterpret<*const u8, *const u16>(address))) }
+  unsafe fn closeNocancel(fd: i32) -> i32 { return i64.wrappingToI32(unsafe syscall(SYS_CLOSE, i32.toI64(fd))) }
+  static if Intrinsic.targetArchitecture() == "x86_64" {
+    const SYS_CLOSE: i64 = 3
+    const SYS_NEWFSTATAT: i64 = 262
+    const SYS_COPY_FILE_RANGE: i64 = 326
+    const SYS_STATX: i64 = 332
+    // The kernel's `struct stat`, which newfstatat fills (glibc's is the same).
+    extern "C" struct NativeStat {
+      dev: u64, ino: u64, nlink: u64, mode: u32, uid: u32, gid: u32, pad: u32, rdev: u64,
+      size: i64, blksize: i64, blocks: i64, atime: Timespec, mtime: Timespec, ctime: Timespec, unused: [i64; 3]
+    }
+    fn emptyNativeStat() -> NativeStat {
+      let zero = Timespec { seconds: 0, nanoseconds: 0 }
+      return NativeStat { dev: 0, ino: 0, nlink: 0, mode: 0, uid: 0, gid: 0, pad: 0, rdev: 0, size: 0, blksize: 0, blocks: 0, atime: zero, mtime: zero, ctime: zero, unused: [0, 0, 0] }
+    }
+    fn nativeLinks(value: &NativeStat) -> u64 { return value.nlink }
+    fn nativeBlockSize(value: &NativeStat) -> u64 { return i64.wrappingToU64(value.blksize) }
+  } else {
+    const SYS_CLOSE: i64 = 57
+    const SYS_NEWFSTATAT: i64 = 79
+    const SYS_COPY_FILE_RANGE: i64 = 285
+    const SYS_STATX: i64 = 291
+    // The kernel's generic `struct stat`.
+    extern "C" struct NativeStat {
+      dev: u64, ino: u64, mode: u32, nlink: u32, uid: u32, gid: u32, rdev: u64, pad: u64,
+      size: i64, blksize: i32, pad2: i32, blocks: i64, atime: Timespec, mtime: Timespec, ctime: Timespec, unused: [u32; 2]
+    }
+    fn emptyNativeStat() -> NativeStat {
+      let zero = Timespec { seconds: 0, nanoseconds: 0 }
+      return NativeStat { dev: 0, ino: 0, mode: 0, nlink: 0, uid: 0, gid: 0, rdev: 0, pad: 0, size: 0, blksize: 0, pad2: 0, blocks: 0, atime: zero, mtime: zero, ctime: zero, unused: [0, 0] }
+    }
+    fn nativeLinks(value: &NativeStat) -> u64 { return u32.toU64(value.nlink) }
+    fn nativeBlockSize(value: &NativeStat) -> u64 { return i64.wrappingToU64(i32.toI64(value.blksize)) }
+  }
+  fn uvTime(value: Timespec) -> UvTimespec { return UvTimespec { tv_sec: i64.toIsize(value.seconds), tv_nsec: i64.toIsize(value.nanoseconds) } }
+  // libuv's uv__stat, uv__lstat or uv__fstat (`kind` 0, 1, 2) and uv__to_stat on Linux, where the
+  // birth time is the status change time. 0, or -1 with errno.
+  unsafe fn systemStat(kind: i32, fd: i32, path: ?*const u8, out: *mut UvStat) -> i32 {
+    unsafe {
+      let empty: [u8; 1] = [0]
+      let mut s = emptyNativeStat()
+      let directory = if kind == 2 { fd } else { AT_FDCWD }
+      let name: *const u8 = if kind == 2 { Pointer.fromRef<u8>(&empty[0]) } else { nn(path) }
+      let flags = if kind == 2 { AT_EMPTY_PATH } else { if kind == 1 { AT_SYMLINK_NOFOLLOW } else { 0 } }
+      if syscall(SYS_NEWFSTATAT, i32.toI64(directory), name, Pointer.fromMutRef<NativeStat>(&mut s), i32.toI64(flags)) != 0 { return -1 }
+      Pointer.write<UvStat>(out, UvStat {
+        st_dev: s.dev, st_mode: u32.toU64(s.mode), st_nlink: nativeLinks(&s), st_uid: u32.toU64(s.uid), st_gid: u32.toU64(s.gid),
+        st_rdev: s.rdev, st_ino: s.ino, st_size: i64.wrappingToU64(s.size), st_blksize: nativeBlockSize(&s), st_blocks: i64.wrappingToU64(s.blocks),
+        st_flags: 0, st_gen: 0,
+        st_atim: uvTime(s.atime), st_mtim: uvTime(s.mtime), st_ctim: uvTime(s.ctime), st_birthtim: uvTime(s.ctime)
+      })
+      return 0
+    }
+  }
+  extern "C" struct StatxTime { seconds: i64, nanoseconds: u32, reserved: i32 }
+  impl Copy for StatxTime {}
+  extern "C" struct Statx {
+    mask: u32, blksize: u32, attributes: u64, nlink: u32, uid: u32, gid: u32, mode: u16, spare0: u16,
+    ino: u64, size: u64, blocks: u64, attributesMask: u64,
+    atime: StatxTime, btime: StatxTime, ctime: StatxTime, mtime: StatxTime,
+    rdevMajor: u32, rdevMinor: u32, devMajor: u32, devMinor: u32, spare: [u64; 14]
+  }
+  fn statxTime(value: StatxTime) -> UvTimespec { return UvTimespec { tv_sec: i64.toIsize(value.seconds), tv_nsec: u32.toIsize(value.nanoseconds) } }
+  // glibc's makedev.
+  fn device(major: u32, minor: u32) -> u64 {
+    let high = u64.shiftLeft(u32.toU64(major & 4294963200), 32)
+    let middle = u64.shiftLeft(u32.toU64(major & 4095), 8)
+    let low = u64.shiftLeft(u32.toU64(minor & 4294967040), 12)
+    return high | middle | low | u32.toU64(minor & 255)
+  }
+  // libuv's no_statx: set once the kernel has refused statx.
+  unsafe fn noStatx() -> *mut u64 { return Intrinsic.processWord() }
+  // libuv's uv__fs_statx and uv__statx_to_stat: 0, -1 with errno, or -ENOSYS to fall back.
+  unsafe fn statxStat(fd: i32, path: ?*const u8, isFstat: bool, isLstat: bool, out: *mut UvStat) -> i32 {
+    unsafe {
+      if Atomic.load<u64>(noStatx(), MemoryOrder.Relaxed) != 0 { return -ENOSYS }
+      let mut directory = AT_FDCWD
+      let mut flags: i32 = 0
+      if isFstat { directory = fd flags = flags | AT_EMPTY_PATH }
+      if isLstat { flags = flags | AT_SYMLINK_NOFOLLOW }
+      let zero = StatxTime { seconds: 0, nanoseconds: 0, reserved: 0 }
+      let mut s = Statx {
+        mask: 0, blksize: 0, attributes: 0, nlink: 0, uid: 0, gid: 0, mode: 0, spare0: 0, ino: 0, size: 0, blocks: 0, attributesMask: 0,
+        atime: zero, btime: zero, ctime: zero, mtime: zero, rdevMajor: 0, rdevMinor: 0, devMajor: 0, devMinor: 0, spare: [0; 14]
+      }
+      let rc = syscall(SYS_STATX, i32.toI64(directory), nn(path), i32.toI64(flags), 4095, Pointer.fromMutRef<Statx>(&mut s))
+      if rc != 0 {
+        if rc == -1 {
+          // EPERM comes from a seccomp filter that rejects the call, EOPNOTSUPP from DVS exports.
+          let code = errno()
+          if code != EINVAL && code != EPERM && code != ENOSYS && code != EOPNOTSUPP { return -1 }
+        }
+        Atomic.store<u64>(noStatx(), 1, MemoryOrder.Relaxed)
+        return -ENOSYS
+      }
+      Pointer.write<UvStat>(out, UvStat {
+        st_dev: device(s.devMajor, s.devMinor), st_mode: u16.toU64(s.mode), st_nlink: u32.toU64(s.nlink), st_uid: u32.toU64(s.uid), st_gid: u32.toU64(s.gid),
+        st_rdev: device(s.rdevMajor, s.rdevMinor), st_ino: s.ino, st_size: s.size, st_blksize: u32.toU64(s.blksize), st_blocks: s.blocks,
+        st_flags: 0, st_gen: 0,
+        st_atim: statxTime(s.atime), st_mtim: statxTime(s.mtime), st_ctim: statxTime(s.ctime), st_birthtim: statxTime(s.btime)
+      })
+      return 0
+    }
+  }
+  // libuv's uv__fs_statfs: glibc's struct statfs is fifteen words (f_type, f_bsize, f_blocks,
+  // f_bfree, f_bavail, f_files, f_ffree, f_fsid, f_namelen, f_frsize, f_flags, f_spare[4]).
+  unsafe fn statfsOf(path: *const u8, out: *mut UvStatfsRecord) -> i32 {
+    unsafe {
+      let mut buffer: [u64; 15] = [0; 15]
+      if statfs(path, Pointer.fromMutRef<[u64; 15]>(&mut buffer)) != 0 { return -1 }
+      Pointer.write<UvStatfsRecord>(out, UvStatfsRecord { f_type: buffer[0], f_bsize: buffer[1], f_blocks: buffer[2], f_bfree: buffer[3], f_bavail: buffer[4], f_files: buffer[5], f_ffree: buffer[6], f_frsize: buffer[9], f_spare: [0; 3] })
+      return 0
+    }
+  }
+  // The f_type of the file system that `fd` is on, or none.
+  unsafe fn fileSystemType(fd: i32) -> Option<u64> {
+    unsafe {
+      let mut buffer: [u64; 15] = [0; 15]
+      if fstatfs(fd, Pointer.fromMutRef<[u64; 15]>(&mut buffer)) == -1 { return Option<u64>.none() }
+      return Option<u64>.some(buffer[0])
+    }
+  }
+  // libuv's uv__is_buggy_cephfs: CephFS before Linux 4.20.
+  unsafe fn isBuggyCephfs(fd: i32) -> bool {
+    unsafe {
+      if let Option<u64>.Some { value: kind } = fileSystemType(fd) {
+        if kind != 12805120 { return false }
+        return kernelVersion() < 267264
+      }
+      return false
+    }
+  }
+  // libuv's uv__is_cifs_or_smb.
+  unsafe fn isCifsOrSmb(fd: i32) -> bool {
+    unsafe {
+      if let Option<u64>.Some { value: kind } = fileSystemType(fd) {
+        let low = kind & 4294967295
+        return low == 20859 || low == 4266872130 || low == 4283649346
+      }
+      return false
+    }
+  }
+  unsafe fn fullSync(fd: i32) -> isize { return i32.toIsize(unsafe fsync(fd)) }
+  unsafe fn dataSync(fd: i32) -> isize { return i32.toIsize(unsafe fdatasync(fd)) }
+  // libuv's no_copy_file_range_support.
+  unsafe fn noCopyFileRange() -> *mut u64 { return Intrinsic.processWord() }
+  // libuv's uv__fs_try_copy_file_range: the count, or -1 with errno (ENOSYS to use sendfile).
+  unsafe fn tryCopyFileRange(input: i32, offset: *mut i64, output: i32, length: usize) -> isize {
+    unsafe {
+      if Atomic.load<u64>(noCopyFileRange(), MemoryOrder.Relaxed) != 0 { setErrno(ENOSYS) return -1 }
+      let r = syscall(SYS_COPY_FILE_RANGE, i32.toI64(input), offset, i32.toI64(output), Pointer.null<i64>(), u64.wrappingToI64(usize.toU64(length)), 0)
+      if r != -1 { return i64.toIsize(r) }
+      let code = errno()
+      if code == EACCES { if isBuggyCephfs(input) { setErrno(ENOSYS) } }
+      else { if code == ENOSYS { Atomic.store<u64>(noCopyFileRange(), 1, MemoryOrder.Relaxed) }
+      else { if code == EPERM { if isCifsOrSmb(output) { setErrno(ENOSYS) } }
+      else { if code == ENOTSUP || code == EXDEV { setErrno(ENOSYS) } } } }
+      return -1
+    }
+  }
+  // libuv's uv__fs_sendfile on Linux: copy_file_range, then sendfile(2), then the emulation.
+  unsafe fn sendfileCall(r: *mut FsReq) -> isize {
+    unsafe {
+      let mut anchor = () let q = Pointer.borrowMut<(), FsReq>(&mut anchor, r)
+      let input = q.flags let output = q.file let start = q.off let length = q.bufsml[0].len
+      drop q
+      let mut offset = start
+      let mut result = tryCopyFileRange(input, Pointer.fromMutRef<i64>(&mut offset), output, length)
+      let trySendfile = result == -1 && errno() == ENOSYS
+      if trySendfile { result = linuxSendfile(output, input, Pointer.fromMutRef<i64>(&mut offset), length) }
+      if result != -1 || offset > start {
+        let q2 = Pointer.borrowMut<(), FsReq>(&mut anchor, r) q2.off = offset
+        return i64.toIsize(offset - start)
+      }
+      let code = errno()
+      if code == EINVAL || code == EIO || code == ENOTSOCK || code == EXDEV { setErrno(0) return sendfileEmulation(r) }
+      return -1
+    }
+  }
+  // FICLONE: 1 when the clone was made, 0 to copy, or a negative error.
+  unsafe fn cloneFile(flags: i32, destination: i32, source: i32) -> i32 {
+    unsafe {
+      if (flags & COPYFILE_FICLONE) != 0 || (flags & COPYFILE_FICLONE_FORCE) != 0 {
+        if ioctl(destination, FICLONE, source) == 0 { return 1 }
+        if (flags & COPYFILE_FICLONE_FORCE) != 0 { return -errno() }
+      }
+      return 0
+    }
+  }
+  // libuv's uv__kernel_version: major * 65536 + minor * 256 + patch, or 0; cached.
+  unsafe fn kernelVersionWord() -> *mut u64 { return Intrinsic.processWord() }
+  unsafe fn kernelVersion() -> u32 {
+    unsafe {
+      let cached = Atomic.load<u64>(kernelVersionWord(), MemoryOrder.Relaxed)
+      if cached != 0 { return u64.wrappingToU32(cached) }
+      let mut numbers: [u32; 3] = [0; 3]
+      let mut found = false
+      // /proc/version_signature: "Ubuntu <ubuntu version> <mainline version>".
+      let mut signature: [u8; 256] = [0; 256]
+      if slurp(b"/proc/version_signature\0", &mut signature) {
+        let prefix = b"Ubuntu "
+        let mut at: usize = 0
+        let mut matches = true
+        while at < 7 { if signature[at] != prefix[at] { matches = false } at = at + 1 }
+        if matches {
+          while at < 255 && (signature[at] == 32 || signature[at] == 9 || signature[at] == 10) { at = at + 1 }
+          while at < 255 && signature[at] != 0 && signature[at] != 32 && signature[at] != 9 && signature[at] != 10 { at = at + 1 }
+          found = scanVersion(&signature, at, &mut numbers)
+        }
+      }
+      if !found {
+        let mut names: [u8; 390] = [0; 390]
+        if uname(Pointer.fromMutRef<[u8; 390]>(&mut names)) == -1 { return 0 }
+        // The version field (offset 195) names Debian's mainline version: "#1 SMP Debian 5.10.46-4".
+        let needle = b"Debian "
+        let mut at: usize = 195
+        while !found && at + 7 <= 260 {
+          let mut same = true
+          let mut index: usize = 0
+          while index < 7 { if names[at + index] != needle[index] { same = false } index = index + 1 }
+          if same { found = scanVersion(&names, at + 7, &mut numbers) break }
+          if names[at] == 0 { break }
+          at = at + 1
+        }
+        if !found {
+          // The release (offset 65).
+          if !scanVersion(&names, 65, &mut numbers) { return 0 }
+          // UNAME26: kernels >= 3.x identify as 2.6.40+x, >= 4.x as 2.6.60+x.
+          if numbers[0] == 2 && numbers[1] == 6 {
+            if numbers[2] >= 60 { numbers[0] = 4 numbers[1] = numbers[2] - 60 numbers[2] = 0 }
+            else { if numbers[2] >= 40 { numbers[0] = 3 numbers[1] = numbers[2] - 40 numbers[2] = 0 } }
+          }
+        }
+      }
+      let version = u32.wrappingAdd(u32.wrappingAdd(u32.wrappingMultiply(numbers[0], 65536), u32.wrappingMultiply(numbers[1], 256)), numbers[2])
+      Atomic.store<u64>(kernelVersionWord(), u32.toU64(version), MemoryOrder.Relaxed)
+      return version
+    }
+  }
+  // sscanf's "%u.%u.%u" at `at`: true when all three numbers were read.
+  fn scanVersion(text: &[u8], start: usize, numbers: &mut [u32; 3]) -> bool {
+    let mut at = start
+    let mut index: usize = 0
+    while index < 3 {
+      if index > 0 { if at >= text.length || text[at] != 46 { return false } at = at + 1 }
+      if index == 0 { while at < text.length && (text[at] == 32 || text[at] == 9 || text[at] == 10) { at = at + 1 } }
+      if at >= text.length || text[at] < 48 || text[at] > 57 { return false }
+      let mut value: u32 = 0
+      while at < text.length && text[at] >= 48 && text[at] <= 57 { value = u32.wrappingAdd(u32.wrappingMultiply(value, 10), u8.toU32(text[at] - 48)) at = at + 1 }
+      numbers[index] = value
+      index = index + 1
+    }
+    return true
+  }
+  // libuv's uv__slurp: the file's first bytes, NUL-terminated; false when it cannot be read.
+  unsafe fn slurp(path: &[u8], buffer: &mut [u8; 256]) -> bool {
+    unsafe {
+      let fd = open(Pointer.fromRef<u8>(&path[0]), O_RDONLY | O_CLOEXEC)
+      if fd == -1 { return false }
+      let mut count = read(fd, Pointer.fromMutSlice<u8>(&mut buffer.*), 255)
+      while count == -1 && errno() == EINTR { count = read(fd, Pointer.fromMutSlice<u8>(&mut buffer.*), 255) }
+      let _closed = closeNocancel(fd)
+      if count < 0 { return false }
+      buffer[isize.toUsize(count)] = 0
+      return true
+    }
+  }
+}
+
+/// libuv 1.52's uv_statfs_t (1.51's has f_spare[4] where 1.52 has f_frsize, f_spare[3]).
+impl Copy for UvStatfsRecord {}
+extern "C" struct UvStatfsRecord { f_type: u64, f_bsize: u64, f_blocks: u64, f_bfree: u64, f_bavail: u64, f_files: u64, f_ffree: u64, f_frsize: u64, f_spare: [u64; 3] }
+
+// ---- Helpers ----------------------------------------------------------------------------------
+unsafe fn errno() -> i32 { return unsafe Pointer.read<i32>(unsafe errnoSlot()) }
+unsafe fn setErrno(value: i32) -> () { unsafe Pointer.write<i32>(unsafe errnoSlot(), value) }
+unsafe fn nn<T>(pointer: ?*const T) -> *const T { return unsafe Intrinsic.pointerRequalify<?*const T, *const T>(pointer) }
+unsafe fn nnMut<T>(pointer: ?*mut T) -> *mut T { return unsafe Intrinsic.pointerRequalify<?*mut T, *mut T>(pointer) }
+unsafe fn byteAt(base: *mut u8, offset: usize) -> *mut u8 { return unsafe Pointer.atMut<u8>(unsafe Pointer.assumeManyMut<u8>(base), offset) }
+unsafe fn constAt(base: *const u8, offset: usize) -> *const u8 { return unsafe Pointer.at<u8>(unsafe Pointer.assumeMany<u8>(base), offset) }
+unsafe fn offsetMany(base: ?*mut u8, offset: usize) -> ?[*]mut u8 {
+  if Pointer.isNull<u8>(base) { return unsafe Intrinsic.pointerRequalify<?*mut u8, ?[*]mut u8>(base) }
+  return unsafe Pointer.assumeManyMut<u8>(unsafe byteAt(unsafe nnMut<u8>(base), offset))
+}
+// A pointer from an address (libuv's container_of needs one).
+unsafe fn fromAddress(address: usize) -> *mut u8 {
+  let word = address
+  return unsafe Pointer.read<*mut u8>(unsafe Intrinsic.pointerReinterpret<*const usize, *const *mut u8>(Pointer.fromRef<usize>(&word)))
+}
+unsafe fn containerOf(unit: *mut Work, offset: usize) -> *mut u8 { return unsafe fromAddress(Pointer.address<Work>(unit) - offset) }
+unsafe fn fsOf(pointer: *mut u8) -> *mut FsReq { return unsafe Intrinsic.pointerReinterpret<*mut u8, *mut FsReq>(pointer) }
+unsafe fn bufAt(bufs: ?*mut Buf, index: usize) -> *mut Buf { return unsafe Pointer.atMut<Buf>(unsafe Pointer.assumeManyMut<Buf>(unsafe nnMut<Buf>(bufs)), index) }
+unsafe fn sameAddress(a: ?*const u8, b: ?*const u8) -> bool { return Pointer.address<u8>(a) == Pointer.address<u8>(b) }
+fn text(bytes: &[u8]) -> *const u8 { return Pointer.fromRef<u8>(&bytes[0]) }
+/// The loop memory of `ext.uv_loop` that an addon's uv_loop_t* stands for.
+unsafe fn loopMemory(loop: ?*mut u8) -> *mut u8 { return unsafe nnMut<u8>(loop) }
+// libuv's uv__malloc, uv__free and uv__strdup (see the module comment).
+unsafe fn allocate(size: usize) -> ?*mut u8 { return unsafe os.uvMalloc(size) }
+unsafe fn release(pointer: ?*mut u8) -> () { unsafe os.uvFree(pointer) }
+unsafe fn duplicate(source: *const u8) -> ?*mut u8 { return unsafe os.uvStrdup(source) }
+fn zeroTime() -> UvTimespec { return UvTimespec { tv_sec: 0, tv_nsec: 0 } }
+fn zeroStat() -> UvStat {
+  return UvStat { st_dev: 0, st_mode: 0, st_nlink: 0, st_uid: 0, st_gid: 0, st_rdev: 0, st_ino: 0, st_size: 0, st_blksize: 0, st_blocks: 0, st_flags: 0, st_gen: 0, st_atim: zeroTime(), st_mtim: zeroTime(), st_ctim: zeroTime(), st_birthtim: zeroTime() }
+}
+fn emptyWork() -> Work {
+  return Work { work: Intrinsic.pointerNullFunction<?extern "C" fn(*mut Work) -> ()>(), done: Intrinsic.pointerNullFunction<?extern "C" fn(*mut Work, i32) -> ()>(), loop: Pointer.null<u8>(), next: Pointer.null<Work>(), previous: Pointer.null<Work>() }
+}
+fn emptyBuf() -> Buf { return Buf { base: Pointer.null<u8>(), len: 0 } }
+// A uv_fs_t on the stack, for the synchronous requests that uv_fs_copyfile makes.
+fn blankRequest() -> FsReq {
+  return FsReq {
+    data: Pointer.null<u8>(), kind: 0, padding: 0, reserved: [0; 6],
+    fsType: 0, padding2: 0, loop: Pointer.null<u8>(), cb: Intrinsic.pointerNullFunction<FsCallback>(), result: 0, ptr: Pointer.null<u8>(), path: Pointer.null<u8>(), statbuf: zeroStat(),
+    newPath: Pointer.null<u8>(), file: 0, flags: 0, mode: 0, nbufs: 0, bufs: Pointer.null<Buf>(), off: 0, uid: 0, gid: 0,
+    atime: 0.0, mtime: 0.0, work: emptyWork(), bufsml: [emptyBuf(); 4]
+  }
+}
+// uv__fs_to_timespec: infinity is UTIME_NOW, NaN UTIME_OMIT, else microsecond resolution.
+fn timespecOf(time: f64) -> Timespec {
+  if f64.isInfinite(time) { return Timespec { seconds: UTIME_NOW, nanoseconds: UTIME_NOW } }
+  if f64.isNaN(time) { return Timespec { seconds: UTIME_OMIT, nanoseconds: UTIME_OMIT } }
+  let mut seconds = truncate(time)
+  let mut nanoseconds = truncate((time - i64.toF64(seconds)) * 1000000000.0)
+  nanoseconds = nanoseconds - nanoseconds % 1000
+  if nanoseconds < 0 { nanoseconds = nanoseconds + 1000000000 seconds = seconds - 1 }
+  return Timespec { seconds: seconds, nanoseconds: nanoseconds }
+}
+// C's conversion of a double to long (toward zero; out of range gives the x86 "integer indefinite").
+fn truncate(value: f64) -> i64 {
+  if let Option<i64>.Some { value: converted } = f64.checkedToI64(value) { return converted }
+  return -9223372036854775807 - 1
+}
+// uv__close_nocheckstdio: 0, or a negative error; errno is kept.
+unsafe fn closeChecked(fd: i32) -> i32 {
+  unsafe {
+    let saved = errno()
+    let mut rc = closeNocancel(fd)
+    if rc == -1 {
+      rc = -errno()
+      if rc == -EINTR || rc == -EINPROGRESS { rc = 0 }
+      setErrno(saved)
+    }
+    return rc
+  }
+}
+// uv__cloexec(fd, 1): 0, or a negative error with errno set.
+unsafe fn setCloexec(fd: i32) -> i32 {
+  unsafe {
+    let mut rc = fcntl(fd, F_SETFD, FD_CLOEXEC)
+    while rc == -1 && errno() == EINTR { rc = fcntl(fd, F_SETFD, FD_CLOEXEC) }
+    if rc != 0 { return -errno() }
+    return 0
+  }
+}
+
+// ---- The operations (libuv's uv__fs_*): a result, or -1 with errno -------------------------
+// uv__fs_close.
+unsafe fn closeCall(fd: i32) -> isize {
+  unsafe {
+    let mut rc = closeNocancel(fd)
+    if rc == -1 { let code = errno() if code == EINTR || code == EINPROGRESS { rc = 0 } }
+    return i32.toIsize(rc)
+  }
+}
+// uv__fs_mkstemp: the template must end in XXXXXX; mkostemp with O_CLOEXEC, else mkstemp and
+// FD_CLOEXEC. On failure the path becomes empty.
+unsafe fn noCloexecMkostemp() -> *mut u64 { return Intrinsic.processWord() }
+unsafe fn mkstempCall(q: *mut FsReq) -> isize {
+  unsafe {
+    let mut anchor = () let r = Pointer.borrowMut<(), FsReq>(&mut anchor, q)
+    let path = Intrinsic.pointerRequalify<?*const u8, *mut u8>(r.path)
+    drop r
+    let length = strlen(path)
+    let pattern = b"XXXXXX\0"
+    let mut result: i32 = -1
+    if length < 6 || strcmp(constAt(path, length - 6), text(pattern)) != 0 { setErrno(EINVAL) }
+    else {
+      let mut done = false
+      if Atomic.load<u64>(noCloexecMkostemp(), MemoryOrder.Relaxed) == 0 {
+        result = mkostemp(path, O_CLOEXEC)
+        if result >= 0 { return i32.toIsize(result) }
+        if errno() != EINVAL { done = true }
+        else { Atomic.store<u64>(noCloexecMkostemp(), 1, MemoryOrder.Relaxed) }
+      }
+      if !done {
+        result = mkstemp(path)
+        if result >= 0 && setCloexec(result) != 0 {
+          if closeChecked(result) != 0 { abort() }
+          result = -1
+        }
+      }
+    }
+    if result < 0 { Pointer.write<u8>(path, 0) }
+    return i32.toIsize(result)
+  }
+}
+// The iovec count for the system calls: at most IOV_MAX.
+fn vectorCount(count: u32) -> i32 { if count > IOV_MAX { return u32.toI32(IOV_MAX) } return u32.toI32(count) }
+// uv__fs_read.
+unsafe fn readCall(q: *mut FsReq) -> isize {
+  unsafe {
+    let mut anchor = () let r = Pointer.borrowMut<(), FsReq>(&mut anchor, q)
+    let fd = r.file let off = r.off let bufs = r.bufs let count = vectorCount(r.nbufs)
+    let small = Pointer.fromMutRef<Buf>(&mut r.bufsml[0])
+    let async = !Intrinsic.pointerIsNull<FsCallback>(r.cb)
+    drop r
+    let mut result: isize = 0
+    if count >= 1 {
+      let vectors = Intrinsic.pointerRequalify<?*mut Buf, ?[*]const Buf>(bufs)
+      let first = Pointer.read<Buf>(bufAt(bufs, 0))
+      let base = Intrinsic.pointerRequalify<?*mut u8, ?[*]mut u8>(first.base)
+      if off < 0 {
+        if count == 1 { result = read(fd, base, first.len) } else { result = readv(fd, vectors, count) }
+      } else {
+        if count == 1 { result = pread(fd, base, first.len, off) } else { result = preadv(fd, vectors, count, off) }
+      }
+    }
+    // The bufs copy of an asynchronous request is the request's; a synchronous one reads the caller's.
+    if async && Pointer.address<Buf>(bufs) != Pointer.address<Buf>(small) {
+      release(Intrinsic.pointerReinterpret<?*mut Buf, ?*mut u8>(bufs))
+    }
+    let r2 = Pointer.borrowMut<(), FsReq>(&mut anchor, q)
+    r2.bufs = Pointer.null<Buf>() r2.nbufs = 0
+    return result
+  }
+}
+// uv__fs_write: one write of the request's current bufs.
+unsafe fn writeOnce(q: *mut FsReq) -> isize {
+  unsafe {
+    let anchor = () let r = Pointer.borrow<(), FsReq>(&anchor, q)
+    let fd = r.file let off = r.off let bufs = r.bufs let count = r.nbufs
+    drop r
+    if count == 0 { return 0 }
+    let vectors = Intrinsic.pointerRequalify<?*mut Buf, ?[*]const Buf>(bufs)
+    let first = Pointer.read<Buf>(bufAt(bufs, 0))
+    let base = Intrinsic.pointerRequalify<?*mut u8, ?[*]const u8>(first.base)
+    if off < 0 {
+      if count == 1 { return write(fd, nn<u8>(first.base), first.len) }
+      return writev(fd, vectors, u32.toI32(count))
+    }
+    if count == 1 { return pwrite(fd, base, first.len, off) }
+    return pwritev(fd, vectors, u32.toI32(count), off)
+  }
+}
+// uv__fs_buf_offset: how many bufs `size` bytes complete; a partly written one is advanced.
+unsafe fn bufOffset(bufs: ?*mut Buf, total: usize) -> u32 {
+  unsafe {
+    let mut size = total
+    let mut offset: usize = 0
+    while size > 0 && Pointer.read<Buf>(bufAt(bufs, offset)).len <= size {
+      size = size - Pointer.read<Buf>(bufAt(bufs, offset)).len
+      offset = offset + 1
+    }
+    if size > 0 {
+      let slot = bufAt(bufs, offset)
+      let current = Pointer.read<Buf>(slot)
+      Pointer.write<Buf>(slot, Buf { base: Intrinsic.pointerRequalify<?[*]mut u8, ?*mut u8>(offsetMany(current.base, size)), len: current.len - size })
+    }
+    return usize.wrappingToU32(offset)
+  }
+}
+// uv__fs_write_all: writes IOV_MAX bufs at a time until all are written or one write fails.
+unsafe fn writeAll(q: *mut FsReq) -> isize {
+  unsafe {
+    let mut anchor = () let r = Pointer.borrowMut<(), FsReq>(&mut anchor, q)
+    let mut nbufs = r.nbufs let original = r.bufs
+    let small = Pointer.fromMutRef<Buf>(&mut r.bufsml[0])
+    drop r
+    let mut total: isize = 0
+    while nbufs > 0 {
+      let r1 = Pointer.borrowMut<(), FsReq>(&mut anchor, q)
+      r1.nbufs = if nbufs > IOV_MAX { IOV_MAX } else { nbufs }
+      drop r1
+      let mut result = writeOnce(q)
+      while result < 0 && errno() == EINTR { result = writeOnce(q) }
+      if result <= 0 { if total == 0 { total = result } break }
+      let r2 = Pointer.borrowMut<(), FsReq>(&mut anchor, q)
+      if r2.off >= 0 { r2.off = r2.off + isize.toI64(result) }
+      let done = bufOffset(r2.bufs, isize.toUsize(result))
+      r2.nbufs = done
+      r2.bufs = bufAt(r2.bufs, u32.toUsize(done))
+      nbufs = nbufs - done
+      total = total + result
+    }
+    if Pointer.address<Buf>(original) != Pointer.address<Buf>(small) {
+      release(Intrinsic.pointerReinterpret<?*mut Buf, ?*mut u8>(original))
+    }
+    let r3 = Pointer.borrowMut<(), FsReq>(&mut anchor, q)
+    r3.bufs = Pointer.null<Buf>() r3.nbufs = 0
+    return total
+  }
+}
+// uv__fs_scandir_filter and uv__fs_scandir_sort.
+export "C" fn silkUvApiFsScandirFilter(entry: *const u8) -> i32 {
+  unsafe {
+    let name = constAt(entry, D_NAME)
+    if strcmp(name, text(b".\0")) != 0 && strcmp(name, text(b"..\0")) != 0 { return 1 }
+    return 0
+  }
+}
+export "C" fn silkUvApiFsScandirSort(left: *const ?*const u8, right: *const ?*const u8) -> i32 {
+  unsafe { return strcmp(constAt(nn<u8>(Pointer.read<?*const u8>(left)), D_NAME), constAt(nn<u8>(Pointer.read<?*const u8>(right)), D_NAME)) }
+}
+// uv__fs_scandir: the sorted entries from scandir(3), kept in `ptr`; nbufs is the cursor.
+unsafe fn scandirCall(q: *mut FsReq) -> isize {
+  unsafe {
+    let mut anchor = () let r = Pointer.borrowMut<(), FsReq>(&mut anchor, q)
+    let path = nn<u8>(r.path)
+    drop r
+    let mut entries: ?*mut ?*mut u8 = Pointer.null<?*mut u8>()
+    let count = scandir(path, Pointer.fromMutRef<?*mut ?*mut u8>(&mut entries), silkUvApiFsScandirFilter, silkUvApiFsScandirSort)
+    let r2 = Pointer.borrowMut<(), FsReq>(&mut anchor, q)
+    r2.nbufs = 0
+    if count == 0 {
+      // The system allocator's memory: free(), not uv__free.
+      free(Intrinsic.pointerReinterpret<?*mut ?*mut u8, ?*mut u8>(entries))
+      entries = Pointer.null<?*mut u8>()
+    } else { if count == -1 { return -1 } }
+    r2.ptr = Intrinsic.pointerReinterpret<?*mut ?*mut u8, ?*mut u8>(entries)
+    return i32.toIsize(count)
+  }
+}
+// uv__fs_get_dirent_type.
+unsafe fn direntType(entry: *const u8) -> i32 {
+  let kind = unsafe Pointer.read<u8>(unsafe constAt(entry, D_TYPE))
+  if kind == DT_DIR { return DIRENT_DIR }
+  if kind == DT_REG { return DIRENT_FILE }
+  if kind == DT_LNK { return DIRENT_LINK }
+  if kind == DT_FIFO { return DIRENT_FIFO }
+  if kind == DT_SOCK { return DIRENT_SOCKET }
+  if kind == DT_CHR { return DIRENT_CHAR }
+  if kind == DT_BLK { return DIRENT_BLOCK }
+  return DIRENT_UNKNOWN
+}
+fn dirOf(pointer: ?*mut u8) -> *mut Dir { return unsafe Intrinsic.pointerReinterpret<*mut u8, *mut Dir>(unsafe nnMut<u8>(pointer)) }
+// uv__fs_opendir: a uv_dir_t from uv__malloc around opendir(3).
+unsafe fn opendirCall(q: *mut FsReq) -> isize {
+  unsafe {
+    let mut anchor = () let r = Pointer.borrowMut<(), FsReq>(&mut anchor, q)
+    let path = nn<u8>(r.path)
+    drop r
+    let memory = allocate(Layout.of<Dir>().bytes)
+    if !Pointer.isNull<u8>(memory) {
+      let stream = opendir(path)
+      let mut second = () let d = Pointer.borrowMut<(), Dir>(&mut second, dirOf(memory))
+      d.dir = stream drop d
+      if !Pointer.isNull<u8>(stream) {
+        let r2 = Pointer.borrowMut<(), FsReq>(&mut anchor, q) r2.ptr = memory
+        return 0
+      }
+    }
+    release(memory)
+    let r3 = Pointer.borrowMut<(), FsReq>(&mut anchor, q) r3.ptr = Pointer.null<u8>()
+    return -1
+  }
+}
+// uv__fs_readdir: up to nentries entries into the caller's dirents, "." and ".." skipped.
+unsafe fn readdirCall(q: *mut FsReq) -> isize {
+  unsafe {
+    let anchor = () let r = Pointer.borrow<(), FsReq>(&anchor, q)
+    let dir = dirOf(r.ptr)
+    drop r
+    let mut second = () let d = Pointer.borrowMut<(), Dir>(&mut second, dir)
+    let stream = nnMut<u8>(d.dir) let limit = d.nentries let dirents = d.dirents
+    drop d
+    let entries = Pointer.assumeManyMut<Dirent>(nnMut<Dirent>(dirents))
+    let mut index: usize = 0
+    let mut failed = false
+    while index < limit {
+      setErrno(0)
+      let found = readdir(stream)
+      if Pointer.isNull<u8>(found) { if errno() != 0 { failed = true } break }
+      let entry = nn<u8>(found)
+      let name = constAt(entry, D_NAME)
+      if strcmp(name, text(b".\0")) == 0 || strcmp(name, text(b"..\0")) == 0 { continue }
+      let copy = duplicate(name)
+      let slot = Pointer.atMut<Dirent>(entries, index)
+      Pointer.write<Dirent>(slot, Dirent { name: copy, kind: 0, padding: 0 })
+      if Pointer.isNull<u8>(copy) { failed = true break }
+      Pointer.write<Dirent>(slot, Dirent { name: copy, kind: direntType(entry), padding: 0 })
+      index = index + 1
+    }
+    if !failed { return usize.toIsize(index) }
+    let mut cleared: usize = 0
+    while cleared < index {
+      let slot = Pointer.atMut<Dirent>(entries, cleared)
+      let entry = Pointer.read<Dirent>(slot)
+      release(Intrinsic.pointerRequalify<?*const u8, ?*mut u8>(entry.name))
+      Pointer.write<Dirent>(slot, Dirent { name: Pointer.null<u8>(), kind: entry.kind, padding: entry.padding })
+      cleared = cleared + 1
+    }
+    return -1
+  }
+}
+// uv__fs_closedir.
+unsafe fn closedirCall(q: *mut FsReq) -> isize {
+  unsafe {
+    let mut anchor = () let r = Pointer.borrowMut<(), FsReq>(&mut anchor, q)
+    let memory = r.ptr
+    drop r
+    let mut second = () let d = Pointer.borrowMut<(), Dir>(&mut second, dirOf(memory))
+    if !Pointer.isNull<u8>(d.dir) { let _closed = closedir(nnMut<u8>(d.dir)) d.dir = Pointer.null<u8>() }
+    drop d
+    release(memory)
+    let r2 = Pointer.borrowMut<(), FsReq>(&mut anchor, q) r2.ptr = Pointer.null<u8>()
+    return 0
+  }
+}
+// uv__fs_statfs: a uv_statfs_t from uv__malloc.
+unsafe fn statfsCall(q: *mut FsReq) -> isize {
+  unsafe {
+    let mut anchor = () let r = Pointer.borrowMut<(), FsReq>(&mut anchor, q)
+    let path = nn<u8>(r.path)
+    drop r
+    let mut value = UvStatfsRecord { f_type: 0, f_bsize: 0, f_blocks: 0, f_bfree: 0, f_bavail: 0, f_files: 0, f_ffree: 0, f_frsize: 0, f_spare: [0; 3] }
+    if statfsOf(path, Pointer.fromMutRef<UvStatfsRecord>(&mut value)) != 0 { return -1 }
+    let memory = allocate(Layout.of<UvStatfsRecord>().bytes)
+    if Pointer.isNull<u8>(memory) { setErrno(ENOMEM) return -1 }
+    Pointer.put<UvStatfsRecord>(Intrinsic.pointerReinterpret<*mut u8, *mut UvStatfsRecord>(nnMut<u8>(memory)), value)
+    let r2 = Pointer.borrowMut<(), FsReq>(&mut anchor, q) r2.ptr = memory
+    return 0
+  }
+}
+// uv__fs_readlink: a buffer of pathconf(_PC_PATH_MAX) bytes, grown by one when the link fills it.
+unsafe fn readlinkCall(q: *mut FsReq) -> isize {
+  unsafe {
+    let mut anchor = () let r = Pointer.borrowMut<(), FsReq>(&mut anchor, q)
+    let path = Pointer.assumeMany<u8>(nn<u8>(r.path))
+    drop r
+    let mut maxlen = pathconf(path, PC_PATH_MAX)
+    if maxlen == -1 { maxlen = PATH_MAX }
+    let size = i64.wrappingToUsize(maxlen)
+    let mut buffer = allocate(size)
+    if Pointer.isNull<u8>(buffer) { setErrno(ENOMEM) return -1 }
+    let length = readlink(path, offsetMany(buffer, 0), size)
+    if length == -1 { release(buffer) return -1 }
+    if isize.toUsize(length) == size {
+      // uv__reallocf.
+      let grown = os.uvRealloc(buffer, size + 1)
+      if Pointer.isNull<u8>(grown) { release(buffer) return -1 }
+      buffer = grown
+    }
+    Pointer.write<u8>(byteAt(nnMut<u8>(buffer), isize.toUsize(length)), 0)
+    let r2 = Pointer.borrowMut<(), FsReq>(&mut anchor, q) r2.ptr = buffer
+    return 0
+  }
+}
+// uv__fs_realpath: realpath(3)'s result, copied with uv__strdup.
+unsafe fn realpathCall(q: *mut FsReq) -> isize {
+  unsafe {
+    let mut anchor = () let r = Pointer.borrowMut<(), FsReq>(&mut anchor, q)
+    let path = nn<u8>(r.path)
+    drop r
+    let resolved = realpath(path, Pointer.null<u8>())
+    if Pointer.isNull<u8>(resolved) { return -1 }
+    let copy = duplicate(nn<u8>(resolved))
+    free(resolved)
+    if Pointer.isNull<u8>(copy) { setErrno(ENOMEM) return -1 }
+    let r2 = Pointer.borrowMut<(), FsReq>(&mut anchor, q) r2.ptr = copy
+    return 0
+  }
+}
+// uv__fs_sendfile_emul: pread (read when the source cannot seek), write, and poll when the
+// target would block. Read errors count only before anything was sent; write errors always.
+unsafe fn sendfileEmulation(q: *mut FsReq) -> isize {
+  unsafe {
+    let mut anchor = () let r = Pointer.borrowMut<(), FsReq>(&mut anchor, q)
+    let length = r.bufsml[0].len let input = r.flags let output = r.file let mut offset = r.off
+    drop r
+    let mut usePread = true
+    let mut buffer: [u8; 8192] = [0; 8192]
+    let base = Pointer.fromMutSlice<u8>(&mut buffer)
+    let mut sent: isize = 0
+    let mut failed = false
+    while isize.toUsize(sent) < length {
+      let mut chunk = length - isize.toUsize(sent)
+      if chunk > 8192 { chunk = 8192 }
+      let mut count: isize = 0
+      while true {
+        if usePread { count = pread(input, base, chunk, offset) } else { count = read(input, base, chunk) }
+        if !(count == -1 && errno() == EINTR) { break }
+      }
+      if count == 0 { break }
+      if count == -1 {
+        let code = errno()
+        if usePread && sent == 0 && (code == EIO || code == ESPIPE) { usePread = false continue }
+        if sent == 0 { sent = -1 }
+        break
+      }
+      let mut written: isize = 0
+      while written < count {
+        let mut n: isize = 0
+        while true {
+          n = write(output, constAt(Pointer.fromRef<u8>(&buffer[0]), isize.toUsize(written)), isize.toUsize(count - written))
+          if !(n == -1 && errno() == EINTR) { break }
+        }
+        if n != -1 { written = written + n continue }
+        let code = errno()
+        if code != EAGAIN { sent = -1 failed = true break }
+        let mut poll = PollFd { fd: output, events: POLLOUT, revents: 0 }
+        let mut polled: i32 = 0
+        while true {
+          polled = pollOne(Pointer.fromMutRef<PollFd>(&mut poll))
+          if !(polled == -1 && errno() == EINTR) { break }
+        }
+        if polled == -1 || (poll.revents & (~POLLOUT)) != 0 { setErrno(EIO) sent = -1 failed = true break }
+      }
+      if failed { break }
+      offset = offset + isize.toI64(count)
+      sent = sent + count
+    }
+    if sent != -1 { let r2 = Pointer.borrowMut<(), FsReq>(&mut anchor, q) r2.off = offset }
+    return sent
+  }
+}
+// uv__fs_copyfile: open both files, match the destination's times, owner and mode to the
+// source's, clone or copy the bytes, and remove the destination when anything failed.
+unsafe fn copyfileCall(q: *mut FsReq) -> isize {
+  unsafe {
+    let mut anchor = () let r = Pointer.borrowMut<(), FsReq>(&mut anchor, q)
+    let path = r.path let newPath = r.newPath let flags = r.flags
+    drop r
+    let mut scratch = blankRequest()
+    let scratchAt = Intrinsic.pointerReinterpret<*mut FsReq, *mut u8>(Pointer.fromMutRef<FsReq>(&mut scratch))
+    let source = fsOpen(Pointer.null<u8>(), scratchAt, path, O_RDONLY, 0, Intrinsic.pointerNullFunction<FsCallback>())
+    uv_fs_req_cleanup(scratchAt)
+    if source < 0 { return i32.toIsize(source) }
+    let mut destination: i32 = -1
+    let mut err: i32 = 0
+    let mut sourceStat = zeroStat()
+    while true {
+      if systemStat(2, source, Pointer.null<u8>(), Pointer.fromMutRef<UvStat>(&mut sourceStat)) != 0 { err = -errno() break }
+      let mut destinationFlags = O_WRONLY | O_CREAT
+      if (flags & COPYFILE_EXCL) != 0 { destinationFlags = destinationFlags | O_EXCL }
+      destination = fsOpen(Pointer.null<u8>(), scratchAt, newPath, destinationFlags, u64.wrappingToI32(sourceStat.st_mode), Intrinsic.pointerNullFunction<FsCallback>())
+      uv_fs_req_cleanup(scratchAt)
+      if destination < 0 { err = destination break }
+      if (flags & COPYFILE_EXCL) == 0 {
+        let mut destinationStat = zeroStat()
+        if systemStat(2, destination, Pointer.null<u8>(), Pointer.fromMutRef<UvStat>(&mut destinationStat)) != 0 { err = -errno() break }
+        // The same file: nothing to copy.
+        if sourceStat.st_dev == destinationStat.st_dev && sourceStat.st_ino == destinationStat.st_ino { break }
+        if ftruncate(destination, 0) != 0 {
+          err = -errno()
+          // ceph-fuse refuses to truncate a new read-only file with EACCES.
+          if err != -EACCES { break }
+          if destinationStat.st_size > 0 { break }
+          err = 0
+        }
+      }
+      let times: [Timespec; 2] = [
+        Timespec { seconds: isize.toI64(sourceStat.st_atim.tv_sec), nanoseconds: isize.toI64(sourceStat.st_atim.tv_nsec) },
+        Timespec { seconds: isize.toI64(sourceStat.st_mtim.tv_sec), nanoseconds: isize.toI64(sourceStat.st_mtim.tv_nsec) },
+      ]
+      if futimens(destination, Pointer.fromSlice<Timespec>(&times)) == -1 { err = -errno() break }
+      // Like cp -p, an ownership failure is not an error.
+      let _owned = fchown(destination, u64.wrappingToU32(sourceStat.st_uid), u64.wrappingToU32(sourceStat.st_gid))
+      if changeMode(destination, u64.wrappingToU32(sourceStat.st_mode)) == -1 {
+        err = -errno()
+        static if Intrinsic.targetOperatingSystem() == "darwin" { break } else {
+          // fchmod on a CIFS share fails with EPERM unless it is mounted with noperm.
+          if err != -EPERM { break }
+          if !isCifsOrSmb(destination) { break }
+          err = 0
+        }
+      }
+      let cloned = cloneFile(flags, destination, source)
+      if cloned < 0 { err = cloned break }
+      if cloned == 1 { break }
+      let mut remaining = u64.wrappingToI64(sourceStat.st_size)
+      let mut position: i64 = 0
+      while remaining != 0 {
+        let mut chunk = SSIZE_MAX
+        if remaining < chunk { chunk = remaining }
+        let _sent = fsSendfile(Pointer.null<u8>(), scratchAt, destination, source, position, i64.wrappingToUsize(chunk), Intrinsic.pointerNullFunction<FsCallback>())
+        let written = isize.toI64(scratch.result)
+        uv_fs_req_cleanup(scratchAt)
+        if written < 0 { err = i64.wrappingToI32(written) break }
+        remaining = remaining - written
+        position = position + written
+      }
+      break
+    }
+    let mut result: i32 = if err < 0 { err } else { 0 }
+    let closedSource = closeChecked(source)
+    if closedSource != 0 && result == 0 { result = closedSource }
+    if destination >= 0 {
+      let closedDestination = closeChecked(destination)
+      if closedDestination != 0 && result == 0 { result = closedDestination }
+      if result != 0 {
+        let _removed = fsUnlink(Pointer.null<u8>(), scratchAt, newPath, Intrinsic.pointerNullFunction<FsCallback>())
+        uv_fs_req_cleanup(scratchAt)
+      }
+    }
+    if result == 0 { return 0 }
+    setErrno(-result)
+    return -1
+  }
+}
+// uv__fs_stat, uv__fs_lstat, uv__fs_fstat: statx where the kernel has it, else stat(2).
+unsafe fn statCall(kind: i32, fd: i32, path: ?*const u8, out: *mut UvStat) -> isize {
+  unsafe {
+    let empty: [u8; 1] = [0]
+    let name: ?*const u8 = if kind == 2 { Pointer.fromRef<u8>(&empty[0]) } else { path }
+    let rc = statxStat(fd, name, kind == 2, kind == 1, out)
+    if rc != -ENOSYS { return i32.toIsize(rc) }
+    return i32.toIsize(systemStat(kind, fd, path, out))
+  }
+}
+unsafe fn utimeCall(q: *mut FsReq, kind: i32) -> isize {
+  unsafe {
+    let anchor = () let r = Pointer.borrow<(), FsReq>(&anchor, q)
+    let times: [Timespec; 2] = [timespecOf(r.atime), timespecOf(r.mtime)]
+    let fd = r.file let path = Intrinsic.pointerRequalify<?*const u8, ?[*]const u8>(r.path)
+    drop r
+    if kind == FS_FUTIME { return i32.toIsize(futimens(fd, Pointer.fromSlice<Timespec>(&times))) }
+    let flags = if kind == FS_LUTIME { AT_SYMLINK_NOFOLLOW } else { 0 }
+    return i32.toIsize(utimensat(AT_FDCWD, path, Pointer.fromSlice<Timespec>(&times), flags))
+  }
+}
+// One attempt of the request's operation.
+unsafe fn perform(q: *mut FsReq, kind: i32) -> isize {
+  unsafe {
+    let mut anchor = () let r = Pointer.borrowMut<(), FsReq>(&mut anchor, q)
+    let path = r.path let pathMany = Intrinsic.pointerRequalify<?*const u8, ?[*]const u8>(r.path)
+    let newPath = Intrinsic.pointerRequalify<?*const u8, ?[*]const u8>(r.newPath)
+    let fd = r.file let flags = r.flags let mode = r.mode let uid = r.uid let gid = r.gid let off = r.off
+    let statbuf = Pointer.fromMutRef<UvStat>(&mut r.statbuf)
+    drop r
+    if kind == FS_ACCESS { return i32.toIsize(access(pathMany, flags)) }
+    if kind == FS_CHMOD { return i32.toIsize(chmod(nn<u8>(path), mode)) }
+    if kind == FS_CHOWN { return i32.toIsize(chown(nn<u8>(path), uid, gid)) }
+    if kind == FS_CLOSE { return closeCall(fd) }
+    if kind == FS_COPYFILE { return copyfileCall(q) }
+    if kind == FS_FCHMOD { return i32.toIsize(changeMode(fd, mode)) }
+    if kind == FS_FCHOWN { return i32.toIsize(fchown(fd, uid, gid)) }
+    if kind == FS_LCHOWN { return i32.toIsize(lchown(nn<u8>(path), uid, gid)) }
+    if kind == FS_FDATASYNC { return dataSync(fd) }
+    if kind == FS_FSTAT { return statCall(2, fd, path, statbuf) }
+    if kind == FS_FSYNC { return fullSync(fd) }
+    if kind == FS_FTRUNCATE { return i32.toIsize(ftruncate(fd, off)) }
+    if kind == FS_FUTIME || kind == FS_UTIME || kind == FS_LUTIME { return utimeCall(q, kind) }
+    if kind == FS_LSTAT { return statCall(1, fd, path, statbuf) }
+    if kind == FS_LINK { return i32.toIsize(link(pathMany, newPath)) }
+    if kind == FS_MKDIR { return i32.toIsize(makeDirectory(pathMany, mode)) }
+    if kind == FS_MKDTEMP {
+      if Pointer.isNull<u8>(mkdtemp(Intrinsic.pointerRequalify<?*const u8, *mut u8>(path))) { return -1 }
+      return 0
+    }
+    if kind == FS_MKSTEMP { return mkstempCall(q) }
+    if kind == FS_OPEN { return i32.toIsize(open(nn<u8>(path), flags | O_CLOEXEC, mode)) }
+    if kind == FS_READ { return readCall(q) }
+    if kind == FS_SCANDIR { return scandirCall(q) }
+    if kind == FS_OPENDIR { return opendirCall(q) }
+    if kind == FS_READDIR { return readdirCall(q) }
+    if kind == FS_CLOSEDIR { return closedirCall(q) }
+    if kind == FS_READLINK { return readlinkCall(q) }
+    if kind == FS_REALPATH { return realpathCall(q) }
+    if kind == FS_RENAME { return i32.toIsize(rename(pathMany, newPath)) }
+    if kind == FS_RMDIR { return i32.toIsize(rmdir(pathMany)) }
+    if kind == FS_SENDFILE { return sendfileCall(q) }
+    if kind == FS_STAT { return statCall(0, fd, path, statbuf) }
+    if kind == FS_STATFS { return statfsCall(q) }
+    if kind == FS_SYMLINK { return i32.toIsize(symlink(pathMany, newPath)) }
+    if kind == FS_UNLINK { return i32.toIsize(unlink(pathMany)) }
+    if kind == FS_WRITE { return writeAll(q) }
+    abort()
+    return -1
+  }
+}
+// uv__fs_work: the operation, retried on EINTR except for close and read; the result is the
+// count or -errno, and a successful stat points `ptr` at `statbuf`.
+unsafe fn fsWork(q: *mut FsReq) -> () {
+  unsafe {
+    let anchor = () let r = Pointer.borrow<(), FsReq>(&anchor, q)
+    let kind = r.fsType
+    drop r
+    let retry = !(kind == FS_CLOSE || kind == FS_READ)
+    let mut result: isize = 0
+    while true {
+      setErrno(0)
+      result = perform(q, kind)
+      if !(result == -1 && errno() == EINTR && retry) { break }
+    }
+    let mut second = () let r2 = Pointer.borrowMut<(), FsReq>(&mut second, q)
+    if result == -1 { r2.result = i32.toIsize(-errno()) } else { r2.result = result }
+    if result == 0 && (kind == FS_STAT || kind == FS_FSTAT || kind == FS_LSTAT) {
+      r2.ptr = Intrinsic.pointerReinterpret<*mut UvStat, *mut u8>(Pointer.fromMutRef<UvStat>(&mut r2.statbuf))
+    }
+  }
+}
+export "C" fn silkUvApiFsWork(unit: *mut Work) -> () { unsafe fsWork(unsafe fsOf(unsafe containerOf(unit, FS_WORK))) }
+// uv__fs_done: the request stops holding the loop, then its callback runs.
+export "C" fn silkUvApiFsDone(unit: *mut Work, status: i32) -> () {
+  unsafe {
+    let bytes = containerOf(unit, FS_WORK)
+    let mut anchor = () let r = Pointer.borrowMut<(), FsReq>(&mut anchor, fsOf(bytes))
+    uvl.requestFinished(loopMemory(r.loop))
+    if status == -ECANCELED { r.result = i32.toIsize(-ECANCELED) }
+    let callback = r.cb
+    drop r
+    if !Intrinsic.pointerIsNull<FsCallback>(callback) {
+      let present = Intrinsic.pointerRequalify<FsCallback, extern "C" fn(*mut u8) -> ()>(callback)
+      present(bytes)
+    }
+  }
+}
+
+// ---- Request setup (libuv's INIT, PATH, PATH2 and POST) -------------------------------------
+// INIT: false (UV_EINVAL) without a request.
+unsafe fn initRequest(loop: ?*mut u8, req: ?*mut u8, kind: i32, cb: FsCallback) -> bool {
+  if Pointer.isNull<u8>(req) { return false }
+  let mut anchor = () let r = unsafe Pointer.borrowMut<(), FsReq>(&mut anchor, unsafe fsOf(unsafe nnMut<u8>(req)))
+  r.kind = UV_FS r.fsType = kind r.result = 0 r.ptr = Pointer.null<u8>() r.loop = loop
+  r.path = Pointer.null<u8>() r.newPath = Pointer.null<u8>() r.bufs = Pointer.null<Buf>() r.cb = cb
+  return true
+}
+fn isAsync(cb: FsCallback) -> bool { return !Intrinsic.pointerIsNull<FsCallback>(cb) }
+// PATH: the caller's path for a synchronous request, a copy for an asynchronous one. 0 or UV_ENOMEM.
+unsafe fn setPath(req: ?*mut u8, path: ?*const u8, cb: FsCallback) -> i32 {
+  unsafe {
+    let mut anchor = () let r = Pointer.borrowMut<(), FsReq>(&mut anchor, fsOf(nnMut<u8>(req)))
+    if !isAsync(cb) { r.path = path return 0 }
+    let copy = duplicate(nn<u8>(path))
+    r.path = copy
+    if Pointer.isNull<u8>(copy) { return -ENOMEM }
+    return 0
+  }
+}
+// PATH2: both paths in one allocation for an asynchronous request.
+unsafe fn setPaths(req: ?*mut u8, path: ?*const u8, newPath: ?*const u8, cb: FsCallback) -> i32 {
+  unsafe {
+    let mut anchor = () let r = Pointer.borrowMut<(), FsReq>(&mut anchor, fsOf(nnMut<u8>(req)))
+    if !isAsync(cb) { r.path = path r.newPath = newPath return 0 }
+    let pathLength = strlen(nn<u8>(path)) + 1
+    let newPathLength = strlen(nn<u8>(newPath)) + 1
+    let memory = allocate(pathLength + newPathLength)
+    r.path = memory
+    if Pointer.isNull<u8>(memory) { return -ENOMEM }
+    let second = byteAt(nnMut<u8>(memory), pathLength)
+    r.newPath = second
+    let _a = memcpy(nnMut<u8>(memory), nn<u8>(path), pathLength)
+    let _b = memcpy(second, nn<u8>(newPath), newPathLength)
+    return 0
+  }
+}
+// POST: an asynchronous request holds the loop and goes to the pool as fast I/O; a synchronous
+// one runs here and answers its result.
+unsafe fn post(loop: ?*mut u8, req: ?*mut u8, cb: FsCallback) -> i32 {
+  unsafe {
+    let q = fsOf(nnMut<u8>(req))
+    if isAsync(cb) {
+      let memory = loopMemory(loop)
+      uvl.requestStarted(memory)
+      let mut anchor = () let r = Pointer.borrowMut<(), FsReq>(&mut anchor, q)
+      let unit = Pointer.fromMutRef<Work>(&mut r.work)
+      drop r
+      uvl.workSubmit(memory, unit, uvl.WORK_FAST_IO, silkUvApiFsWork, silkUvApiFsDone)
+      return 0
+    }
+    fsWork(q)
+    let anchor = () let r2 = Pointer.borrow<(), FsReq>(&anchor, q)
+    return isize.wrappingToI32(r2.result)
+  }
+}
+unsafe fn setFields(req: ?*mut u8) -> *mut FsReq { return unsafe fsOf(unsafe nnMut<u8>(req)) }
+// A request on a path (PATH), with `fill` done by the caller before POST.
+unsafe fn pathRequest(loop: ?*mut u8, req: ?*mut u8, kind: i32, path: ?*const u8, cb: FsCallback) -> i32 {
+  if !unsafe initRequest(loop, req, kind, cb) { return -EINVAL }
+  return unsafe setPath(req, path, cb)
+}
+unsafe fn fsOpen(loop: ?*mut u8, req: ?*mut u8, path: ?*const u8, flags: i32, mode: i32, cb: FsCallback) -> i32 {
+  unsafe {
+    let status = pathRequest(loop, req, FS_OPEN, path, cb)
+    if status != 0 { return status }
+    let mut anchor = () let r = Pointer.borrowMut<(), FsReq>(&mut anchor, setFields(req))
+    r.flags = flags r.mode = modeOf(mode)
+    drop r
+    return post(loop, req, cb)
+  }
+}
+unsafe fn fsUnlink(loop: ?*mut u8, req: ?*mut u8, path: ?*const u8, cb: FsCallback) -> i32 {
+  unsafe {
+    let status = pathRequest(loop, req, FS_UNLINK, path, cb)
+    if status != 0 { return status }
+    return post(loop, req, cb)
+  }
+}
+unsafe fn fsSendfile(loop: ?*mut u8, req: ?*mut u8, output: i32, input: i32, off: i64, length: usize, cb: FsCallback) -> i32 {
+  unsafe {
+    if !initRequest(loop, req, FS_SENDFILE, cb) { return -EINVAL }
+    let mut anchor = () let r = Pointer.borrowMut<(), FsReq>(&mut anchor, setFields(req))
+    // libuv keeps the input descriptor in `flags` and the length in bufsml[0].len.
+    r.flags = input r.file = output r.off = off r.bufsml[0].len = length
+    drop r
+    return post(loop, req, cb)
+  }
+}
+// A request on a descriptor.
+unsafe fn fileRequest(loop: ?*mut u8, req: ?*mut u8, kind: i32, file: i32, cb: FsCallback) -> i32 {
+  unsafe {
+    if !initRequest(loop, req, kind, cb) { return -EINVAL }
+    let mut anchor = () let r = Pointer.borrowMut<(), FsReq>(&mut anchor, setFields(req))
+    r.file = file
+    return 0
+  }
+}
+// uv_fs_read and uv_fs_write: the bufs are copied for an asynchronous read and for every write.
+unsafe fn ioRequest(loop: ?*mut u8, req: ?*mut u8, kind: i32, file: i32, bufs: ?*const Buf, nbufs: u32, off: i64, cb: FsCallback) -> i32 {
+  unsafe {
+    if !initRequest(loop, req, kind, cb) { return -EINVAL }
+    if Pointer.isNull<Buf>(bufs) || nbufs == 0 { return -EINVAL }
+    let mut anchor = () let r = Pointer.borrowMut<(), FsReq>(&mut anchor, setFields(req))
+    r.file = file r.nbufs = nbufs r.off = off
+    if kind == FS_READ && !isAsync(cb) {
+      r.bufs = Intrinsic.pointerRequalify<?*const Buf, ?*mut Buf>(bufs)
+      drop r
+      return post(loop, req, cb)
+    }
+    let mut copy = Pointer.fromMutRef<Buf>(&mut r.bufsml[0])
+    if nbufs > 4 {
+      let memory = allocate(u32.toUsize(nbufs) * Layout.of<Buf>().bytes)
+      if Pointer.isNull<u8>(memory) { r.bufs = Pointer.null<Buf>() return -ENOMEM }
+      copy = Intrinsic.pointerReinterpret<*mut u8, *mut Buf>(nnMut<u8>(memory))
+    }
+    r.bufs = copy
+    drop r
+    let _copied = memcpy(Intrinsic.pointerReinterpret<*mut Buf, *mut u8>(copy), Intrinsic.pointerReinterpret<*const Buf, *const u8>(nn<Buf>(bufs)), u32.toUsize(nbufs) * Layout.of<Buf>().bytes)
+    return post(loop, req, cb)
+  }
+}
+
+// ---- uv_fs_* ----------------------------------------------------------------------------------
+@deferredCallbacks("cb")
+pub unsafe export "C" fn uv_fs_access(loop: ?*mut u8, req: ?*mut u8, path: ?*const u8, flags: i32, cb: FsCallback) -> i32 {
+  unsafe {
+    let status = pathRequest(loop, req, FS_ACCESS, path, cb)
+    if status != 0 { return status }
+    let mut anchor = () let r = Pointer.borrowMut<(), FsReq>(&mut anchor, setFields(req)) r.flags = flags drop r
+    return post(loop, req, cb)
+  }
+}
+@deferredCallbacks("cb")
+pub unsafe export "C" fn uv_fs_chmod(loop: ?*mut u8, req: ?*mut u8, path: ?*const u8, mode: i32, cb: FsCallback) -> i32 {
+  unsafe {
+    let status = pathRequest(loop, req, FS_CHMOD, path, cb)
+    if status != 0 { return status }
+    let mut anchor = () let r = Pointer.borrowMut<(), FsReq>(&mut anchor, setFields(req)) r.mode = modeOf(mode) drop r
+    return post(loop, req, cb)
+  }
+}
+unsafe fn ownerRequest(loop: ?*mut u8, req: ?*mut u8, kind: i32, path: ?*const u8, uid: u32, gid: u32, cb: FsCallback) -> i32 {
+  unsafe {
+    let status = pathRequest(loop, req, kind, path, cb)
+    if status != 0 { return status }
+    let mut anchor = () let r = Pointer.borrowMut<(), FsReq>(&mut anchor, setFields(req)) r.uid = uid r.gid = gid drop r
+    return post(loop, req, cb)
+  }
+}
+@deferredCallbacks("cb")
+pub unsafe export "C" fn uv_fs_chown(loop: ?*mut u8, req: ?*mut u8, path: ?*const u8, uid: u32, gid: u32, cb: FsCallback) -> i32 { return unsafe ownerRequest(loop, req, FS_CHOWN, path, uid, gid, cb) }
+@deferredCallbacks("cb")
+pub unsafe export "C" fn uv_fs_lchown(loop: ?*mut u8, req: ?*mut u8, path: ?*const u8, uid: u32, gid: u32, cb: FsCallback) -> i32 { return unsafe ownerRequest(loop, req, FS_LCHOWN, path, uid, gid, cb) }
+@deferredCallbacks("cb")
+pub unsafe export "C" fn uv_fs_close(loop: ?*mut u8, req: ?*mut u8, file: i32, cb: FsCallback) -> i32 {
+  unsafe {
+    let status = fileRequest(loop, req, FS_CLOSE, file, cb)
+    if status != 0 { return status }
+    return post(loop, req, cb)
+  }
+}
+@deferredCallbacks("cb")
+pub unsafe export "C" fn uv_fs_fchmod(loop: ?*mut u8, req: ?*mut u8, file: i32, mode: i32, cb: FsCallback) -> i32 {
+  unsafe {
+    let status = fileRequest(loop, req, FS_FCHMOD, file, cb)
+    if status != 0 { return status }
+    let mut anchor = () let r = Pointer.borrowMut<(), FsReq>(&mut anchor, setFields(req)) r.mode = modeOf(mode) drop r
+    return post(loop, req, cb)
+  }
+}
+@deferredCallbacks("cb")
+pub unsafe export "C" fn uv_fs_fchown(loop: ?*mut u8, req: ?*mut u8, file: i32, uid: u32, gid: u32, cb: FsCallback) -> i32 {
+  unsafe {
+    let status = fileRequest(loop, req, FS_FCHOWN, file, cb)
+    if status != 0 { return status }
+    let mut anchor = () let r = Pointer.borrowMut<(), FsReq>(&mut anchor, setFields(req)) r.uid = uid r.gid = gid drop r
+    return post(loop, req, cb)
+  }
+}
+@deferredCallbacks("cb")
+pub unsafe export "C" fn uv_fs_fdatasync(loop: ?*mut u8, req: ?*mut u8, file: i32, cb: FsCallback) -> i32 {
+  unsafe {
+    let status = fileRequest(loop, req, FS_FDATASYNC, file, cb)
+    if status != 0 { return status }
+    return post(loop, req, cb)
+  }
+}
+@deferredCallbacks("cb")
+pub unsafe export "C" fn uv_fs_fstat(loop: ?*mut u8, req: ?*mut u8, file: i32, cb: FsCallback) -> i32 {
+  unsafe {
+    let status = fileRequest(loop, req, FS_FSTAT, file, cb)
+    if status != 0 { return status }
+    return post(loop, req, cb)
+  }
+}
+@deferredCallbacks("cb")
+pub unsafe export "C" fn uv_fs_fsync(loop: ?*mut u8, req: ?*mut u8, file: i32, cb: FsCallback) -> i32 {
+  unsafe {
+    let status = fileRequest(loop, req, FS_FSYNC, file, cb)
+    if status != 0 { return status }
+    return post(loop, req, cb)
+  }
+}
+@deferredCallbacks("cb")
+pub unsafe export "C" fn uv_fs_ftruncate(loop: ?*mut u8, req: ?*mut u8, file: i32, off: i64, cb: FsCallback) -> i32 {
+  unsafe {
+    let status = fileRequest(loop, req, FS_FTRUNCATE, file, cb)
+    if status != 0 { return status }
+    let mut anchor = () let r = Pointer.borrowMut<(), FsReq>(&mut anchor, setFields(req)) r.off = off drop r
+    return post(loop, req, cb)
+  }
+}
+@deferredCallbacks("cb")
+pub unsafe export "C" fn uv_fs_futime(loop: ?*mut u8, req: ?*mut u8, file: i32, atime: f64, mtime: f64, cb: FsCallback) -> i32 {
+  unsafe {
+    let status = fileRequest(loop, req, FS_FUTIME, file, cb)
+    if status != 0 { return status }
+    let mut anchor = () let r = Pointer.borrowMut<(), FsReq>(&mut anchor, setFields(req)) r.atime = atime r.mtime = mtime drop r
+    return post(loop, req, cb)
+  }
+}
+unsafe fn timeRequest(loop: ?*mut u8, req: ?*mut u8, kind: i32, path: ?*const u8, atime: f64, mtime: f64, cb: FsCallback) -> i32 {
+  unsafe {
+    let status = pathRequest(loop, req, kind, path, cb)
+    if status != 0 { return status }
+    let mut anchor = () let r = Pointer.borrowMut<(), FsReq>(&mut anchor, setFields(req)) r.atime = atime r.mtime = mtime drop r
+    return post(loop, req, cb)
+  }
+}
+@deferredCallbacks("cb")
+pub unsafe export "C" fn uv_fs_utime(loop: ?*mut u8, req: ?*mut u8, path: ?*const u8, atime: f64, mtime: f64, cb: FsCallback) -> i32 { return unsafe timeRequest(loop, req, FS_UTIME, path, atime, mtime, cb) }
+@deferredCallbacks("cb")
+pub unsafe export "C" fn uv_fs_lutime(loop: ?*mut u8, req: ?*mut u8, path: ?*const u8, atime: f64, mtime: f64, cb: FsCallback) -> i32 { return unsafe timeRequest(loop, req, FS_LUTIME, path, atime, mtime, cb) }
+unsafe fn plainPathRequest(loop: ?*mut u8, req: ?*mut u8, kind: i32, path: ?*const u8, cb: FsCallback) -> i32 {
+  unsafe {
+    let status = pathRequest(loop, req, kind, path, cb)
+    if status != 0 { return status }
+    return post(loop, req, cb)
+  }
+}
+@deferredCallbacks("cb")
+pub unsafe export "C" fn uv_fs_lstat(loop: ?*mut u8, req: ?*mut u8, path: ?*const u8, cb: FsCallback) -> i32 { return unsafe plainPathRequest(loop, req, FS_LSTAT, path, cb) }
+@deferredCallbacks("cb")
+pub unsafe export "C" fn uv_fs_stat(loop: ?*mut u8, req: ?*mut u8, path: ?*const u8, cb: FsCallback) -> i32 { return unsafe plainPathRequest(loop, req, FS_STAT, path, cb) }
+@deferredCallbacks("cb")
+pub unsafe export "C" fn uv_fs_statfs(loop: ?*mut u8, req: ?*mut u8, path: ?*const u8, cb: FsCallback) -> i32 { return unsafe plainPathRequest(loop, req, FS_STATFS, path, cb) }
+@deferredCallbacks("cb")
+pub unsafe export "C" fn uv_fs_rmdir(loop: ?*mut u8, req: ?*mut u8, path: ?*const u8, cb: FsCallback) -> i32 { return unsafe plainPathRequest(loop, req, FS_RMDIR, path, cb) }
+@deferredCallbacks("cb")
+pub unsafe export "C" fn uv_fs_unlink(loop: ?*mut u8, req: ?*mut u8, path: ?*const u8, cb: FsCallback) -> i32 { return unsafe fsUnlink(loop, req, path, cb) }
+@deferredCallbacks("cb")
+pub unsafe export "C" fn uv_fs_readlink(loop: ?*mut u8, req: ?*mut u8, path: ?*const u8, cb: FsCallback) -> i32 { return unsafe plainPathRequest(loop, req, FS_READLINK, path, cb) }
+@deferredCallbacks("cb")
+pub unsafe export "C" fn uv_fs_realpath(loop: ?*mut u8, req: ?*mut u8, path: ?*const u8, cb: FsCallback) -> i32 { return unsafe plainPathRequest(loop, req, FS_REALPATH, path, cb) }
+@deferredCallbacks("cb")
+pub unsafe export "C" fn uv_fs_opendir(loop: ?*mut u8, req: ?*mut u8, path: ?*const u8, cb: FsCallback) -> i32 { return unsafe plainPathRequest(loop, req, FS_OPENDIR, path, cb) }
+unsafe fn twoPathRequest(loop: ?*mut u8, req: ?*mut u8, kind: i32, path: ?*const u8, newPath: ?*const u8, flags: i32, cb: FsCallback) -> i32 {
+  unsafe {
+    if !initRequest(loop, req, kind, cb) { return -EINVAL }
+    let status = setPaths(req, path, newPath, cb)
+    if status != 0 { return status }
+    let mut anchor = () let r = Pointer.borrowMut<(), FsReq>(&mut anchor, setFields(req))
+    if kind == FS_SYMLINK || kind == FS_COPYFILE { r.flags = flags }
+    drop r
+    return post(loop, req, cb)
+  }
+}
+@deferredCallbacks("cb")
+pub unsafe export "C" fn uv_fs_link(loop: ?*mut u8, req: ?*mut u8, path: ?*const u8, newPath: ?*const u8, cb: FsCallback) -> i32 { return unsafe twoPathRequest(loop, req, FS_LINK, path, newPath, 0, cb) }
+@deferredCallbacks("cb")
+pub unsafe export "C" fn uv_fs_rename(loop: ?*mut u8, req: ?*mut u8, path: ?*const u8, newPath: ?*const u8, cb: FsCallback) -> i32 { return unsafe twoPathRequest(loop, req, FS_RENAME, path, newPath, 0, cb) }
+@deferredCallbacks("cb")
+pub unsafe export "C" fn uv_fs_symlink(loop: ?*mut u8, req: ?*mut u8, path: ?*const u8, newPath: ?*const u8, flags: i32, cb: FsCallback) -> i32 { return unsafe twoPathRequest(loop, req, FS_SYMLINK, path, newPath, flags, cb) }
+@deferredCallbacks("cb")
+pub unsafe export "C" fn uv_fs_copyfile(loop: ?*mut u8, req: ?*mut u8, path: ?*const u8, newPath: ?*const u8, flags: i32, cb: FsCallback) -> i32 {
+  unsafe {
+    if !initRequest(loop, req, FS_COPYFILE, cb) { return -EINVAL }
+    if (flags & (~(COPYFILE_EXCL | COPYFILE_FICLONE | COPYFILE_FICLONE_FORCE))) != 0 { return -EINVAL }
+    let status = setPaths(req, path, newPath, cb)
+    if status != 0 { return status }
+    let mut anchor = () let r = Pointer.borrowMut<(), FsReq>(&mut anchor, setFields(req)) r.flags = flags drop r
+    return post(loop, req, cb)
+  }
+}
+@deferredCallbacks("cb")
+pub unsafe export "C" fn uv_fs_mkdir(loop: ?*mut u8, req: ?*mut u8, path: ?*const u8, mode: i32, cb: FsCallback) -> i32 {
+  unsafe {
+    let status = pathRequest(loop, req, FS_MKDIR, path, cb)
+    if status != 0 { return status }
+    let mut anchor = () let r = Pointer.borrowMut<(), FsReq>(&mut anchor, setFields(req)) r.mode = modeOf(mode) drop r
+    return post(loop, req, cb)
+  }
+}
+// uv_fs_mkdtemp and uv_fs_mkstemp always copy the template; the copy holds the result.
+unsafe fn templateRequest(loop: ?*mut u8, req: ?*mut u8, kind: i32, template: ?*const u8, cb: FsCallback) -> i32 {
+  unsafe {
+    if !initRequest(loop, req, kind, cb) { return -EINVAL }
+    let copy = duplicate(nn<u8>(template))
+    let mut anchor = () let r = Pointer.borrowMut<(), FsReq>(&mut anchor, setFields(req))
+    r.path = copy
+    drop r
+    if Pointer.isNull<u8>(copy) { return -ENOMEM }
+    return post(loop, req, cb)
+  }
+}
+@deferredCallbacks("cb")
+pub unsafe export "C" fn uv_fs_mkdtemp(loop: ?*mut u8, req: ?*mut u8, template: ?*const u8, cb: FsCallback) -> i32 { return unsafe templateRequest(loop, req, FS_MKDTEMP, template, cb) }
+@deferredCallbacks("cb")
+pub unsafe export "C" fn uv_fs_mkstemp(loop: ?*mut u8, req: ?*mut u8, template: ?*const u8, cb: FsCallback) -> i32 { return unsafe templateRequest(loop, req, FS_MKSTEMP, template, cb) }
+@deferredCallbacks("cb")
+pub unsafe export "C" fn uv_fs_open(loop: ?*mut u8, req: ?*mut u8, path: ?*const u8, flags: i32, mode: i32, cb: FsCallback) -> i32 { return unsafe fsOpen(loop, req, path, flags, mode, cb) }
+@deferredCallbacks("cb")
+pub unsafe export "C" fn uv_fs_read(loop: ?*mut u8, req: ?*mut u8, file: i32, bufs: ?*const u8, nbufs: u32, off: i64, cb: FsCallback) -> i32 {
+  return unsafe ioRequest(loop, req, FS_READ, file, unsafe Intrinsic.pointerReinterpret<?*const u8, ?*const Buf>(bufs), nbufs, off, cb)
+}
+@deferredCallbacks("cb")
+pub unsafe export "C" fn uv_fs_write(loop: ?*mut u8, req: ?*mut u8, file: i32, bufs: ?*const u8, nbufs: u32, off: i64, cb: FsCallback) -> i32 {
+  return unsafe ioRequest(loop, req, FS_WRITE, file, unsafe Intrinsic.pointerReinterpret<?*const u8, ?*const Buf>(bufs), nbufs, off, cb)
+}
+@deferredCallbacks("cb")
+pub unsafe export "C" fn uv_fs_scandir(loop: ?*mut u8, req: ?*mut u8, path: ?*const u8, flags: i32, cb: FsCallback) -> i32 {
+  unsafe {
+    let status = pathRequest(loop, req, FS_SCANDIR, path, cb)
+    if status != 0 { return status }
+    let mut anchor = () let r = Pointer.borrowMut<(), FsReq>(&mut anchor, setFields(req)) r.flags = flags drop r
+    return post(loop, req, cb)
+  }
+}
+// uv_fs_readdir and uv_fs_closedir work on the caller's uv_dir_t, kept in `ptr`.
+@deferredCallbacks("cb")
+pub unsafe export "C" fn uv_fs_readdir(loop: ?*mut u8, req: ?*mut u8, dir: ?*mut u8, cb: FsCallback) -> i32 {
+  unsafe {
+    if !initRequest(loop, req, FS_READDIR, cb) { return -EINVAL }
+    if Pointer.isNull<u8>(dir) { return -EINVAL }
+    let anchor = () let d = Pointer.borrow<(), Dir>(&anchor, dirOf(dir))
+    let usable = !Pointer.isNull<u8>(d.dir) && !Pointer.isNull<Dirent>(d.dirents)
+    drop d
+    if !usable { return -EINVAL }
+    let mut second = () let r = Pointer.borrowMut<(), FsReq>(&mut second, setFields(req)) r.ptr = dir drop r
+    return post(loop, req, cb)
+  }
+}
+@deferredCallbacks("cb")
+pub unsafe export "C" fn uv_fs_closedir(loop: ?*mut u8, req: ?*mut u8, dir: ?*mut u8, cb: FsCallback) -> i32 {
+  unsafe {
+    if !initRequest(loop, req, FS_CLOSEDIR, cb) { return -EINVAL }
+    if Pointer.isNull<u8>(dir) { return -EINVAL }
+    let mut anchor = () let r = Pointer.borrowMut<(), FsReq>(&mut anchor, setFields(req)) r.ptr = dir drop r
+    return post(loop, req, cb)
+  }
+}
+@deferredCallbacks("cb")
+pub unsafe export "C" fn uv_fs_sendfile(loop: ?*mut u8, req: ?*mut u8, outFd: i32, inFd: i32, off: i64, length: usize, cb: FsCallback) -> i32 {
+  return unsafe fsSendfile(loop, req, outFd, inFd, off, length, cb)
+}
+
+// uv__fs_scandir_cleanup: the entries not yet handed out, then the array (both from scandir(3)).
+unsafe fn scandirCleanup(q: *mut FsReq) -> () {
+  unsafe {
+    let mut anchor = () let r = Pointer.borrowMut<(), FsReq>(&mut anchor, q)
+    let entries = r.ptr
+    if r.result >= 0 {
+      let list = Pointer.assumeManyMut<?*mut u8>(Intrinsic.pointerReinterpret<*mut u8, *mut ?*mut u8>(nnMut<u8>(entries)))
+      let mut index: u32 = 0
+      if r.nbufs > 0 { index = r.nbufs - 1 }
+      let count = isize.wrappingToU32(r.result)
+      while index < count { free(Pointer.read<?*mut u8>(Pointer.atMut<?*mut u8>(list, u32.toUsize(index)))) index = index + 1 }
+    }
+    free(entries)
+    r.ptr = Pointer.null<u8>()
+  }
+}
+// uv__fs_readdir_cleanup: the names that readdir copied.
+unsafe fn readdirCleanup(q: *mut FsReq) -> () {
+  unsafe {
+    let mut anchor = () let r = Pointer.borrowMut<(), FsReq>(&mut anchor, q)
+    if Pointer.isNull<u8>(r.ptr) { return }
+    let dir = dirOf(r.ptr)
+    r.ptr = Pointer.null<u8>()
+    let count = r.result
+    drop r
+    let second = () let d = Pointer.borrow<(), Dir>(&second, dir)
+    let dirents = d.dirents
+    drop d
+    if Pointer.isNull<Dirent>(dirents) { return }
+    let entries = Pointer.assumeManyMut<Dirent>(nnMut<Dirent>(dirents))
+    let mut index: isize = 0
+    while index < count {
+      let slot = Pointer.atMut<Dirent>(entries, isize.toUsize(index))
+      let entry = Pointer.read<Dirent>(slot)
+      release(Intrinsic.pointerRequalify<?*const u8, ?*mut u8>(entry.name))
+      Pointer.write<Dirent>(slot, Dirent { name: Pointer.null<u8>(), kind: entry.kind, padding: entry.padding })
+      index = index + 1
+    }
+  }
+}
+/// libuv's uv_fs_req_cleanup: frees what the request owns (the copied paths, the bufs copy, scandir's
+/// entries, readdir's names, and the result in `ptr` except opendir's uv_dir_t and `statbuf`).
+pub export "C" fn uv_fs_req_cleanup(req: ?*mut u8) -> () {
+  unsafe {
+    if Pointer.isNull<u8>(req) { return }
+    let q = fsOf(nnMut<u8>(req))
+    let mut anchor = () let r = Pointer.borrowMut<(), FsReq>(&mut anchor, q)
+    // A synchronous request's paths are the caller's, except mkdtemp's and mkstemp's.
+    if !Pointer.isNull<u8>(r.path) && (isAsync(r.cb) || r.fsType == FS_MKDTEMP || r.fsType == FS_MKSTEMP) {
+      release(Intrinsic.pointerRequalify<?*const u8, ?*mut u8>(r.path))
+    }
+    r.path = Pointer.null<u8>() r.newPath = Pointer.null<u8>()
+    let kind = r.fsType let hasPtr = !Pointer.isNull<u8>(r.ptr)
+    drop r
+    if kind == FS_READDIR && hasPtr { readdirCleanup(q) }
+    let r1 = Pointer.borrowMut<(), FsReq>(&mut anchor, q) let hasPtr2 = !Pointer.isNull<u8>(r1.ptr) drop r1
+    if kind == FS_SCANDIR && hasPtr2 { scandirCleanup(q) }
+    let r2 = Pointer.borrowMut<(), FsReq>(&mut anchor, q)
+    let small = Pointer.fromMutRef<Buf>(&mut r2.bufsml[0])
+    if Pointer.address<Buf>(r2.bufs) != Pointer.address<Buf>(small) {
+      release(Intrinsic.pointerReinterpret<?*mut Buf, ?*mut u8>(r2.bufs))
+    }
+    r2.bufs = Pointer.null<Buf>()
+    let statbuf = Pointer.address<UvStat>(Pointer.fromMutRef<UvStat>(&mut r2.statbuf))
+    if kind != FS_OPENDIR && Pointer.address<u8>(r2.ptr) != statbuf { release(r2.ptr) }
+    r2.ptr = Pointer.null<u8>()
+  }
+}
+/// libuv's uv_fs_scandir_next: the next entry of a scandir request, then UV_EOF.
+pub export "C" fn uv_fs_scandir_next(req: *mut u8, ent: *mut u8) -> i32 {
+  unsafe {
+    let mut anchor = () let r = Pointer.borrowMut<(), FsReq>(&mut anchor, fsOf(req))
+    if r.result < 0 { return isize.wrappingToI32(r.result) }
+    // Null when the request was cancelled or found nothing.
+    if Pointer.isNull<u8>(r.ptr) { return UV_EOF }
+    let list = Pointer.assumeManyMut<?*mut u8>(Intrinsic.pointerReinterpret<*mut u8, *mut ?*mut u8>(nnMut<u8>(r.ptr)))
+    if r.nbufs > 0 { free(Pointer.read<?*mut u8>(Pointer.atMut<?*mut u8>(list, u32.toUsize(r.nbufs - 1)))) }
+    if r.nbufs == isize.wrappingToU32(r.result) {
+      free(r.ptr)
+      r.ptr = Pointer.null<u8>()
+      return UV_EOF
+    }
+    let entry = nn<u8>(Pointer.read<?*mut u8>(Pointer.atMut<?*mut u8>(list, u32.toUsize(r.nbufs))))
+    r.nbufs = r.nbufs + 1
+    drop r
+    Pointer.write<Dirent>(Intrinsic.pointerReinterpret<*mut u8, *mut Dirent>(ent), Dirent { name: constAt(entry, D_NAME), kind: direntType(entry), padding: 0 })
+    return 0
+  }
+}
+// The accessors of uv-data-getter-setters.c.
+pub export "C" fn uv_fs_get_type(req: *const u8) -> i32 {
+  let anchor = () let r = unsafe Pointer.borrow<(), FsReq>(&anchor, unsafe Intrinsic.pointerReinterpret<*const u8, *const FsReq>(req))
+  return r.fsType
+}
+pub export "C" fn uv_fs_get_result(req: *const u8) -> isize {
+  let anchor = () let r = unsafe Pointer.borrow<(), FsReq>(&anchor, unsafe Intrinsic.pointerReinterpret<*const u8, *const FsReq>(req))
+  return r.result
+}
+pub export "C" fn uv_fs_get_ptr(req: *const u8) -> ?*mut u8 {
+  let anchor = () let r = unsafe Pointer.borrow<(), FsReq>(&anchor, unsafe Intrinsic.pointerReinterpret<*const u8, *const FsReq>(req))
+  return r.ptr
+}
+pub export "C" fn uv_fs_get_path(req: *const u8) -> ?*const u8 {
+  let anchor = () let r = unsafe Pointer.borrow<(), FsReq>(&anchor, unsafe Intrinsic.pointerReinterpret<*const u8, *const FsReq>(req))
+  return r.path
+}
+pub export "C" fn uv_fs_get_statbuf(req: *mut u8) -> *mut u8 {
+  let mut anchor = () let r = unsafe Pointer.borrowMut<(), FsReq>(&mut anchor, unsafe fsOf(req))
+  return unsafe Intrinsic.pointerReinterpret<*mut UvStat, *mut u8>(Pointer.fromMutRef<UvStat>(&mut r.statbuf))
+}
+/// libuv's uv_fs_get_system_error on Unix: the errno of a failed request.
+pub export "C" fn uv_fs_get_system_error(req: *const u8) -> i32 {
+  let anchor = () let r = unsafe Pointer.borrow<(), FsReq>(&anchor, unsafe Intrinsic.pointerReinterpret<*const u8, *const FsReq>(req))
+  return isize.wrappingToI32(isize.wrappingNegate(r.result))
+}
+
+// ---- uv_queue_work and uv_cancel --------------------------------------------------------------
+export "C" fn silkUvApiQueueWork(unit: *mut Work) -> () {
+  unsafe {
+    let bytes = containerOf(unit, WORK_WORK)
+    let anchor = () let r = Pointer.borrow<(), WorkReq>(&anchor, Intrinsic.pointerReinterpret<*mut u8, *mut WorkReq>(bytes))
+    let callback = Intrinsic.pointerRequalify<WorkCallback, extern "C" fn(*mut u8) -> ()>(r.workCb)
+    drop r
+    callback(bytes)
+  }
+}
+export "C" fn silkUvApiQueueDone(unit: *mut Work, status: i32) -> () {
+  unsafe {
+    let bytes = containerOf(unit, WORK_WORK)
+    let anchor = () let r = Pointer.borrow<(), WorkReq>(&anchor, Intrinsic.pointerReinterpret<*mut u8, *mut WorkReq>(bytes))
+    uvl.requestFinished(loopMemory(r.loop))
+    let callback = r.afterWorkCb
+    drop r
+    if Intrinsic.pointerIsNull<AfterWorkCallback>(callback) { return }
+    let present = Intrinsic.pointerRequalify<AfterWorkCallback, extern "C" fn(*mut u8, i32) -> ()>(callback)
+    present(bytes, status)
+  }
+}
+/// libuv's uv_queue_work: `work_cb(req)` on the pool as CPU work, then `after_work_cb(req, status)`
+/// on the loop's thread.
+@threadCallbacks("workCb")
+@deferredCallbacks("afterWorkCb")
+pub unsafe export "C" fn uv_queue_work(loop: ?*mut u8, req: *mut u8, workCb: WorkCallback, afterWorkCb: AfterWorkCallback) -> i32 {
+  unsafe {
+    if Intrinsic.pointerIsNull<WorkCallback>(workCb) { return -EINVAL }
+    let memory = loopMemory(loop)
+    let mut anchor = () let r = Pointer.borrowMut<(), WorkReq>(&mut anchor, Intrinsic.pointerReinterpret<*mut u8, *mut WorkReq>(req))
+    r.kind = UV_WORK
+    uvl.requestStarted(memory)
+    r.loop = loop r.workCb = workCb r.afterWorkCb = afterWorkCb
+    let unit = Pointer.fromMutRef<Work>(&mut r.work)
+    drop r
+    uvl.workSubmit(memory, unit, uvl.WORK_CPU, silkUvApiQueueWork, silkUvApiQueueDone)
+    return 0
+  }
+}
+/// libuv's uv_cancel: a thread-pool request that has not started finishes with UV_ECANCELED;
+/// UV_EBUSY once it runs or ran, UV_EINVAL for other request types.
+pub export "C" fn uv_cancel(req: *mut u8) -> i32 {
+  unsafe {
+    let kind = Pointer.read<i32>(Intrinsic.pointerReinterpret<*mut u8, *mut i32>(byteAt(req, 8)))
+    let mut loopOffset: usize = 64
+    let mut workOffset: usize = 0
+    if kind == UV_FS { loopOffset = 72 workOffset = FS_WORK }
+    else { if kind == UV_GETADDRINFO { workOffset = ADDRINFO_WORK }
+    else { if kind == UV_GETNAMEINFO { workOffset = NAMEINFO_WORK }
+    else { if kind == UV_RANDOM { workOffset = RANDOM_WORK }
+    else { if kind == UV_WORK { workOffset = WORK_WORK }
+    else { return -EINVAL } } } } }
+    let loop = Pointer.read<?*mut u8>(Intrinsic.pointerReinterpret<*mut u8, *mut ?*mut u8>(byteAt(req, loopOffset)))
+    let unit = Intrinsic.pointerReinterpret<*mut u8, *mut Work>(byteAt(req, workOffset))
+    return uvl.workCancel(loopMemory(loop), unit)
+  }
+}
+
+// ---- uv_random --------------------------------------------------------------------------------
+// libuv's uv__random: nothing to fill succeeds without touching `buffer`, which may then be null.
+unsafe fn randomFill(buffer: ?*mut u8, length: usize) -> i32 {
+  if length == 0 { return 0 }
+  return unsafe sys.randomFill(unsafe nnMut<u8>(buffer), length)
+}
+export "C" fn silkUvApiRandomWork(unit: *mut Work) -> () {
+  unsafe {
+    let bytes = containerOf(unit, RANDOM_WORK)
+    let mut anchor = () let r = Pointer.borrowMut<(), RandomReq>(&mut anchor, Intrinsic.pointerReinterpret<*mut u8, *mut RandomReq>(bytes))
+    let buffer = r.buf let length = r.buflen
+    drop r
+    let status = randomFill(buffer, length)
+    let r2 = Pointer.borrowMut<(), RandomReq>(&mut anchor, Intrinsic.pointerReinterpret<*mut u8, *mut RandomReq>(bytes))
+    r2.status = status
+  }
+}
+export "C" fn silkUvApiRandomDone(unit: *mut Work, status: i32) -> () {
+  unsafe {
+    let bytes = containerOf(unit, RANDOM_WORK)
+    let anchor = () let r = Pointer.borrow<(), RandomReq>(&anchor, Intrinsic.pointerReinterpret<*mut u8, *mut RandomReq>(bytes))
+    uvl.requestFinished(loopMemory(r.loop))
+    let mut result = status
+    if result == 0 { result = r.status }
+    let callback = Intrinsic.pointerRequalify<RandomCallback, extern "C" fn(*mut u8, i32, ?*mut u8, usize) -> ()>(r.cb)
+    let buffer = r.buf let length = r.buflen
+    drop r
+    callback(bytes, result, buffer, length)
+  }
+}
+/// libuv's uv_random: `buflen` random bytes, synchronously without a callback, else as CPU work.
+@deferredCallbacks("cb")
+pub unsafe export "C" fn uv_random(loop: ?*mut u8, req: ?*mut u8, buf: ?*mut u8, buflen: usize, flags: u32, cb: RandomCallback) -> i32 {
+  unsafe {
+    if buflen > 2147483647 { return -E2BIG }
+    if flags != 0 { return -EINVAL }
+    if Intrinsic.pointerIsNull<RandomCallback>(cb) { return randomFill(buf, buflen) }
+    let memory = loopMemory(loop)
+    let mut anchor = () let r = Pointer.borrowMut<(), RandomReq>(&mut anchor, Intrinsic.pointerReinterpret<*mut u8, *mut RandomReq>(nnMut<u8>(req)))
+    r.kind = UV_RANDOM
+    uvl.requestStarted(memory)
+    r.loop = loop r.status = 0 r.cb = cb r.buf = buf r.buflen = buflen
+    let unit = Pointer.fromMutRef<Work>(&mut r.work)
+    drop r
+    uvl.workSubmit(memory, unit, uvl.WORK_CPU, silkUvApiRandomWork, silkUvApiRandomDone)
+    return 0
+  }
+}
+
+// ---- uv_getaddrinfo and uv_getnameinfo --------------------------------------------------------
+// libuv's uv__getaddrinfo_translate_error; an unknown code aborts.
+unsafe fn translateAddrinfoError(code: i32) -> i32 {
+  if code == 0 { return 0 }
+  if code == EAI_ADDRFAMILY { return UV_EAI_ADDRFAMILY }
+  if code == EAI_AGAIN { return UV_EAI_AGAIN }
+  if code == EAI_BADFLAGS { return UV_EAI_BADFLAGS }
+  static if Intrinsic.targetOperatingSystem() == "darwin" {
+    if code == EAI_BADHINTS { return UV_EAI_BADHINTS }
+    if code == EAI_PROTOCOL { return UV_EAI_PROTOCOL }
+  } else {
+    if code == EAI_CANCELED { return UV_EAI_CANCELED }
+  }
+  if code == EAI_FAIL { return UV_EAI_FAIL }
+  if code == EAI_FAMILY { return UV_EAI_FAMILY }
+  if code == EAI_MEMORY { return UV_EAI_MEMORY }
+  if code == EAI_NODATA { return UV_EAI_NODATA }
+  if code == EAI_NONAME { return UV_EAI_NONAME }
+  if code == EAI_OVERFLOW { return UV_EAI_OVERFLOW }
+  if code == EAI_SERVICE { return UV_EAI_SERVICE }
+  if code == EAI_SOCKTYPE { return UV_EAI_SOCKTYPE }
+  if code == EAI_SYSTEM { return -(unsafe errno()) }
+  unsafe abort()
+  return 0
+}
+unsafe fn addrinfoOf(bytes: *mut u8) -> *mut AddrinfoReq { return unsafe Intrinsic.pointerReinterpret<*mut u8, *mut AddrinfoReq>(bytes) }
+unsafe fn addrinfoWork(bytes: *mut u8) -> () {
+  unsafe {
+    let mut anchor = () let r = Pointer.borrowMut<(), AddrinfoReq>(&mut anchor, addrinfoOf(bytes))
+    let code = getaddrinfo(r.hostname, r.serviceText, r.hints, Pointer.fromMutRef<?*mut u8>(&mut r.addrinfo))
+    r.retcode = translateAddrinfoError(code)
+  }
+}
+unsafe fn addrinfoDone(bytes: *mut u8, status: i32) -> () {
+  unsafe {
+    let mut anchor = () let r = Pointer.borrowMut<(), AddrinfoReq>(&mut anchor, addrinfoOf(bytes))
+    uvl.requestFinished(loopMemory(r.loop))
+    // The arguments' copy is one allocation, which starts at the first of them (uv_getaddrinfo).
+    if !Pointer.isNull<u8>(r.hints) { release(r.hints) }
+    else { if !Pointer.isNull<u8>(r.serviceText) { release(r.serviceText) } else { if !Pointer.isNull<u8>(r.hostname) { release(r.hostname) } } }
+    r.hints = Pointer.null<u8>() r.serviceText = Pointer.null<u8>() r.hostname = Pointer.null<u8>()
+    if status == -ECANCELED { r.retcode = UV_EAI_CANCELED }
+    let callback = r.cb let retcode = r.retcode let result = r.addrinfo
+    drop r
+    if !Intrinsic.pointerIsNull<AddrinfoCallback>(callback) {
+      let present = Intrinsic.pointerRequalify<AddrinfoCallback, extern "C" fn(*mut u8, i32, ?*mut u8) -> ()>(callback)
+      present(bytes, retcode, result)
+    }
+  }
+}
+export "C" fn silkUvApiAddrinfoWork(unit: *mut Work) -> () { unsafe addrinfoWork(unsafe containerOf(unit, ADDRINFO_WORK)) }
+export "C" fn silkUvApiAddrinfoDone(unit: *mut Work, status: i32) -> () { unsafe addrinfoDone(unsafe containerOf(unit, ADDRINFO_WORK), status) }
+/// libuv's uv_getaddrinfo: the hostname goes through IDNA (uv__idna_toascii) into 256 bytes, the
+/// arguments are copied, and getaddrinfo(3) runs as slow I/O work (or here without a callback).
+@deferredCallbacks("cb")
+pub unsafe export "C" fn uv_getaddrinfo(loop: ?*mut u8, req: ?*mut u8, cb: AddrinfoCallback, hostname: ?*const u8, serviceText: ?*const u8, hints: ?*const u8) -> i32 {
+  unsafe {
+    if Pointer.isNull<u8>(req) || (Pointer.isNull<u8>(hostname) && Pointer.isNull<u8>(serviceText)) { return -EINVAL }
+    let mut ascii: [u8; 256] = [0; 256]
+    let mut host = hostname
+    if !Pointer.isNull<u8>(hostname) {
+      let source = nn<u8>(hostname)
+      let rc = idnaToAscii(Pointer.assumeMany<u8>(source), strlen(source), Pointer.assumeManyMut<u8>(Pointer.fromMutRef<u8>(&mut ascii[0])), 256)
+      if rc < 0 { return isize.wrappingToI32(rc) }
+      host = Pointer.fromRef<u8>(&ascii[0])
+    }
+    let hostLength: usize = if Pointer.isNull<u8>(host) { 0 } else { strlen(nn<u8>(host)) + 1 }
+    let serviceLength: usize = if Pointer.isNull<u8>(serviceText) { 0 } else { strlen(nn<u8>(serviceText)) + 1 }
+    let hintsLength: usize = if Pointer.isNull<u8>(hints) { 0 } else { 48 }
+    let buffer = allocate(hostLength + serviceLength + hintsLength)
+    if Pointer.isNull<u8>(buffer) { return -ENOMEM }
+    let bytes = nnMut<u8>(req)
+    let memory = loopMemory(loop)
+    let mut anchor = () let r = Pointer.borrowMut<(), AddrinfoReq>(&mut anchor, addrinfoOf(bytes))
+    r.kind = UV_GETADDRINFO
+    uvl.requestStarted(memory)
+    r.loop = loop r.cb = cb r.addrinfo = Pointer.null<u8>() r.hints = Pointer.null<u8>() r.serviceText = Pointer.null<u8>() r.hostname = Pointer.null<u8>() r.retcode = 0
+    // In this order: addrinfoDone frees the first.
+    let start = nnMut<u8>(buffer)
+    let mut length: usize = 0
+    if !Pointer.isNull<u8>(hints) { let _a = memcpy(start, nn<u8>(hints), 48) r.hints = buffer length = 48 }
+    if !Pointer.isNull<u8>(serviceText) { let at = byteAt(start, length) let _b = memcpy(at, nn<u8>(serviceText), serviceLength) r.serviceText = at length = length + serviceLength }
+    if !Pointer.isNull<u8>(host) { let at = byteAt(start, length) let _c = memcpy(at, nn<u8>(host), hostLength) r.hostname = at }
+    let unit = Pointer.fromMutRef<Work>(&mut r.work)
+    drop r
+    if !Intrinsic.pointerIsNull<AddrinfoCallback>(cb) {
+      uvl.workSubmit(memory, unit, uvl.WORK_SLOW_IO, silkUvApiAddrinfoWork, silkUvApiAddrinfoDone)
+      return 0
+    }
+    addrinfoWork(bytes)
+    addrinfoDone(bytes, 0)
+    let second = () let r2 = Pointer.borrow<(), AddrinfoReq>(&second, addrinfoOf(bytes))
+    return r2.retcode
+  }
+}
+/// libuv's uv_freeaddrinfo.
+pub export "C" fn uv_freeaddrinfo(ai: ?*mut u8) -> () {
+  if !Pointer.isNull<u8>(ai) { unsafe freeaddrinfo(unsafe nnMut<u8>(ai)) }
+}
+unsafe fn nameinfoOf(bytes: *mut u8) -> *mut NameinfoReq { return unsafe Intrinsic.pointerReinterpret<*mut u8, *mut NameinfoReq>(bytes) }
+unsafe fn nameinfoWork(bytes: *mut u8) -> () {
+  unsafe {
+    let mut anchor = () let r = Pointer.borrowMut<(), NameinfoReq>(&mut anchor, nameinfoOf(bytes))
+    let address = Intrinsic.pointerReinterpret<*const u64, *const u8>(Pointer.fromRef<u64>(&r.storage[0]))
+    let family = familyOf(address)
+    let mut length: u32 = 0
+    if family == AF_INET { length = 16 } else { if family == AF_INET6 { length = 28 } else { abort() } }
+    let code = getnameinfo(address, length, Pointer.fromMutRef<u8>(&mut r.host[0]), 1025, Pointer.fromMutRef<u8>(&mut r.serviceText[0]), 32, r.flags)
+    r.retcode = translateAddrinfoError(code)
+  }
+}
+unsafe fn nameinfoDone(bytes: *mut u8, status: i32) -> () {
+  unsafe {
+    let mut anchor = () let r = Pointer.borrowMut<(), NameinfoReq>(&mut anchor, nameinfoOf(bytes))
+    uvl.requestFinished(loopMemory(r.loop))
+    let mut host: ?*const u8 = Pointer.null<u8>()
+    let mut serviceText: ?*const u8 = Pointer.null<u8>()
+    if status == -ECANCELED { r.retcode = UV_EAI_CANCELED }
+    else { if r.retcode == 0 { host = Pointer.fromRef<u8>(&r.host[0]) serviceText = Pointer.fromRef<u8>(&r.serviceText[0]) } }
+    let callback = r.cb let retcode = r.retcode
+    drop r
+    if !Intrinsic.pointerIsNull<NameinfoCallback>(callback) {
+      let present = Intrinsic.pointerRequalify<NameinfoCallback, extern "C" fn(*mut u8, i32, ?*const u8, ?*const u8) -> ()>(callback)
+      present(bytes, retcode, host, serviceText)
+    }
+  }
+}
+export "C" fn silkUvApiNameinfoWork(unit: *mut Work) -> () { unsafe nameinfoWork(unsafe containerOf(unit, NAMEINFO_WORK)) }
+export "C" fn silkUvApiNameinfoDone(unit: *mut Work, status: i32) -> () { unsafe nameinfoDone(unsafe containerOf(unit, NAMEINFO_WORK), status) }
+/// libuv's uv_getnameinfo: an IPv4 or IPv6 address is copied and getnameinfo(3) runs as slow I/O
+/// work (or here without a callback).
+@deferredCallbacks("cb")
+pub unsafe export "C" fn uv_getnameinfo(loop: ?*mut u8, req: ?*mut u8, cb: NameinfoCallback, addr: ?*const u8, flags: i32) -> i32 {
+  unsafe {
+    if Pointer.isNull<u8>(req) || Pointer.isNull<u8>(addr) { return -EINVAL }
+    let bytes = nnMut<u8>(req)
+    let family = familyOf(nn<u8>(addr))
+    let mut length: usize = 0
+    if family == AF_INET { length = 16 } else { if family == AF_INET6 { length = 28 } else { return -EINVAL } }
+    let mut anchor = () let r = Pointer.borrowMut<(), NameinfoReq>(&mut anchor, nameinfoOf(bytes))
+    let _copied = memcpy(Intrinsic.pointerReinterpret<*mut u64, *mut u8>(Pointer.fromMutRef<u64>(&mut r.storage[0])), nn<u8>(addr), length)
+    let memory = loopMemory(loop)
+    r.kind = UV_GETNAMEINFO
+    uvl.requestStarted(memory)
+    r.cb = cb r.flags = flags r.loop = loop r.retcode = 0
+    let unit = Pointer.fromMutRef<Work>(&mut r.work)
+    drop r
+    if !Intrinsic.pointerIsNull<NameinfoCallback>(cb) {
+      uvl.workSubmit(memory, unit, uvl.WORK_SLOW_IO, silkUvApiNameinfoWork, silkUvApiNameinfoDone)
+      return 0
+    }
+    nameinfoWork(bytes)
+    nameinfoDone(bytes, 0)
+    let second = () let r2 = Pointer.borrow<(), NameinfoReq>(&second, nameinfoOf(bytes))
+    return r2.retcode
+  }
+}
+
+// ---- IDNA (libuv's src/idna.c) ----------------------------------------------------------------
+const INVALID: u32 = 4294967295
+// uv__utf8_decode1_slow: a two- to four-byte sequence whose first byte `first` was read.
+unsafe fn utf8DecodeSlow(input: [*]const u8, position: &mut usize, end: usize, first: u32) -> u32 {
+  unsafe {
+    let mut a = first
+    if a > 247 { return INVALID }
+    let remaining = end - position.*
+    let mut min: u32 = 0 let mut b: u32 = 0 let mut c: u32 = 0 let mut d: u32 = 0
+    if remaining >= 3 && a > 239 {
+      min = 65536 a = a & 7
+      b = u8.toU32(Pointer.read<u8>(Pointer.at<u8>(input, position.*))) c = u8.toU32(Pointer.read<u8>(Pointer.at<u8>(input, position.* + 1))) d = u8.toU32(Pointer.read<u8>(Pointer.at<u8>(input, position.* + 2)))
+      position.* = position.* + 3
+    } else { if remaining >= 2 && a > 223 {
+      min = 2048 b = 128 | (a & 15)
+      c = u8.toU32(Pointer.read<u8>(Pointer.at<u8>(input, position.*))) d = u8.toU32(Pointer.read<u8>(Pointer.at<u8>(input, position.* + 1)))
+      position.* = position.* + 2
+      a = 0
+    } else { if remaining >= 1 && a > 191 {
+      min = 128 b = 128 c = 128 | (a & 31)
+      d = u8.toU32(Pointer.read<u8>(Pointer.at<u8>(input, position.*)))
+      position.* = position.* + 1
+      a = 0
+    } else { return INVALID } } }
+    if 128 != (192 & (b ^ c ^ d)) { return INVALID }
+    b = b & 63 c = c & 63 d = d & 63
+    a = u32.shiftLeft(a, 18) | u32.shiftLeft(b, 12) | u32.shiftLeft(c, 6) | d
+    if a < min { return INVALID }
+    if a > 1114111 { return INVALID }
+    if a >= 55296 && a <= 57343 { return INVALID }
+    return a
+  }
+}
+/// libuv's uv__utf8_decode1: the code point at `position` (which it advances), or 0xFFFFFFFF.
+pub unsafe fn utf8Decode1(input: [*]const u8, position: &mut usize, end: usize) -> u32 {
+  let a = u8.toU32(unsafe Pointer.read<u8>(unsafe Pointer.at<u8>(input, position.*)))
+  position.* = position.* + 1
+  if a < 128 { return a }
+  return unsafe utf8DecodeSlow(input, &mut position, end, a)
+}
+// uv__idna_toascii_label: one label, Punycode-encoded behind "xn--" when it is not all ASCII.
+unsafe fn idnaLabel(input: [*]const u8, start: usize, end: usize, output: [*]mut u8, d: &mut usize, de: usize) -> i32 {
+  unsafe {
+    let alphabet = b"abcdefghijklmnopqrstuvwxyz0123456789"
+    let mut h: u32 = 0
+    let mut todo: u32 = 0
+    let mut s = start
+    while s < end {
+      let c = utf8Decode1(input, &mut s, end)
+      if c == INVALID { return -EINVAL }
+      if c < 128 { h = h + 1 } else { todo = todo + 1 }
+    }
+    if todo > 0 {
+      let prefix = b"xn--"
+      let mut index: usize = 0
+      while index < 4 { if d.* < de { Pointer.write<u8>(Pointer.atMut<u8>(output, d.*), prefix[index]) d.* = d.* + 1 } index = index + 1 }
+    }
+    let mut x: u32 = 0
+    s = start
+    while s < end {
+      let c = utf8Decode1(input, &mut s, end)
+      if c > 127 { continue }
+      if d.* < de { Pointer.write<u8>(Pointer.atMut<u8>(output, d.*), u32.wrappingToU8(c)) d.* = d.* + 1 }
+      x = x + 1
+      if x == h { break }
+    }
+    if todo == 0 { return u32.wrappingToI32(h) }
+    if h > 0 { if d.* < de { Pointer.write<u8>(Pointer.atMut<u8>(output, d.*), 45) d.* = d.* + 1 } }
+    let mut n: u32 = 128
+    let mut bias: u32 = 72
+    let mut delta: u32 = 0
+    let mut first = true
+    while todo > 0 {
+      let mut m: u32 = INVALID
+      s = start
+      while s < end {
+        let c = utf8Decode1(input, &mut s, end)
+        if c >= n { if c < m { m = c } }
+      }
+      x = m - n
+      let mut y = h + 1
+      if x > (~delta) / y { return -E2BIG }
+      delta = delta + x * y
+      n = m
+      s = start
+      while s < end {
+        let c = utf8Decode1(input, &mut s, end)
+        if c < n { delta = u32.wrappingAdd(delta, 1) if delta == 0 { return -E2BIG } }
+        if c != n { continue }
+        let mut k: u32 = 36
+        let mut q = delta
+        while true {
+          let mut t: u32 = 1
+          if k > bias { t = k - bias }
+          if t > 26 { t = 26 }
+          if q < t { break }
+          x = q - t
+          y = 36 - t
+          q = x / y
+          t = t + x % y
+          if d.* < de { Pointer.write<u8>(Pointer.atMut<u8>(output, d.*), alphabet[u32.toUsize(t)]) d.* = d.* + 1 }
+          k = k + 36
+        }
+        if d.* < de { Pointer.write<u8>(Pointer.atMut<u8>(output, d.*), alphabet[u32.toUsize(q)]) d.* = d.* + 1 }
+        delta = delta / 2
+        if first { delta = delta / 350 first = false }
+        h = h + 1
+        delta = delta + delta / h
+        bias = 0
+        while delta > 455 { delta = delta / 35 bias = bias + 36 }
+        bias = bias + 36 * delta / (delta + 38)
+        delta = 0
+        todo = todo - 1
+      }
+      delta = u32.wrappingAdd(delta, 1)
+      n = n + 1
+    }
+    return 0
+  }
+}
+/// libuv's uv__idna_toascii: `length` bytes of UTF-8 at `input` to at most `capacity` bytes at
+/// `output`, NUL included; the count written, or UV_EINVAL / UV_E2BIG.
+pub unsafe fn idnaToAscii(input: [*]const u8, length: usize, output: [*]mut u8, capacity: usize) -> isize {
+  unsafe {
+    if length == 0 { return i32.toIsize(-EINVAL) }
+    let mut d: usize = 0
+    let mut s: usize = 0
+    let mut si: usize = 0
+    while si < length {
+      let st = si
+      let c = utf8Decode1(input, &mut si, length)
+      if c == INVALID { return i32.toIsize(-EINVAL) }
+      // ".", and the ideographic, fullwidth and halfwidth full stops.
+      if c != 46 && c != 12290 && c != 65294 && c != 65377 { continue }
+      let rc = idnaLabel(input, s, st, output, &mut d, capacity)
+      if rc < 0 { return i32.toIsize(rc) }
+      if d < capacity { Pointer.write<u8>(Pointer.atMut<u8>(output, d), 46) d = d + 1 }
+      s = si
+    }
+    if s < length {
+      let rc = idnaLabel(input, s, length, output, &mut d, capacity)
+      if rc < 0 { return i32.toIsize(rc) }
+    }
+    if d >= capacity { return i32.toIsize(-EINVAL) }
+    Pointer.write<u8>(Pointer.atMut<u8>(output, d), 0)
+    d = d + 1
+    return usize.toIsize(d)
+  }
+}
+
+// Generated by tools/keep_exports.py; do not edit below.
+/// Takes each C export as a value, so that Silk emits it (see tools/keep_exports.py).
+pub fn keepExports() -> () {
+  let _silkUvApiFsScandirFilter: extern "C" fn(*const u8) -> i32 = silkUvApiFsScandirFilter
+  let _silkUvApiFsScandirSort: extern "C" fn(*const ?*const u8, *const ?*const u8) -> i32 = silkUvApiFsScandirSort
+  let _silkUvApiFsWork: extern "C" fn(*mut Work) -> () = silkUvApiFsWork
+  let _silkUvApiFsDone: extern "C" fn(*mut Work, i32) -> () = silkUvApiFsDone
+  let _uv_fs_req_cleanup: extern "C" fn(?*mut u8) -> () = uv_fs_req_cleanup
+  let _uv_fs_scandir_next: extern "C" fn(*mut u8, *mut u8) -> i32 = uv_fs_scandir_next
+  let _uv_fs_get_type: extern "C" fn(*const u8) -> i32 = uv_fs_get_type
+  let _uv_fs_get_result: extern "C" fn(*const u8) -> isize = uv_fs_get_result
+  let _uv_fs_get_ptr: extern "C" fn(*const u8) -> ?*mut u8 = uv_fs_get_ptr
+  let _uv_fs_get_path: extern "C" fn(*const u8) -> ?*const u8 = uv_fs_get_path
+  let _uv_fs_get_statbuf: extern "C" fn(*mut u8) -> *mut u8 = uv_fs_get_statbuf
+  let _uv_fs_get_system_error: extern "C" fn(*const u8) -> i32 = uv_fs_get_system_error
+  let _silkUvApiQueueWork: extern "C" fn(*mut Work) -> () = silkUvApiQueueWork
+  let _silkUvApiQueueDone: extern "C" fn(*mut Work, i32) -> () = silkUvApiQueueDone
+  let _uv_cancel: extern "C" fn(*mut u8) -> i32 = uv_cancel
+  let _silkUvApiRandomWork: extern "C" fn(*mut Work) -> () = silkUvApiRandomWork
+  let _silkUvApiRandomDone: extern "C" fn(*mut Work, i32) -> () = silkUvApiRandomDone
+  let _silkUvApiAddrinfoWork: extern "C" fn(*mut Work) -> () = silkUvApiAddrinfoWork
+  let _silkUvApiAddrinfoDone: extern "C" fn(*mut Work, i32) -> () = silkUvApiAddrinfoDone
+  let _uv_freeaddrinfo: extern "C" fn(?*mut u8) -> () = uv_freeaddrinfo
+  let _silkUvApiNameinfoWork: extern "C" fn(*mut Work) -> () = silkUvApiNameinfoWork
+  let _silkUvApiNameinfoDone: extern "C" fn(*mut Work, i32) -> () = silkUvApiNameinfoDone
+}

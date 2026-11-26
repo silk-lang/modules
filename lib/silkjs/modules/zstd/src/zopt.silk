@@ -1,0 +1,1378 @@
+//! The optimal parser (strategies `btopt`, `btultra` and `btultra2`): a port of
+//! `lib/compress/zstd_opt.c` of Zstandard 1.5.7.
+//!
+//! The price model, the binary-tree match finder and the parser follow the reference statement by
+//! statement, so that the sequences are the same. Positions are indices from `ms.window.base`, as
+//! in the other match finders of the port.
+//!
+//! The reference instantiates its templates on (`dictMode`, `mls`, `optLevel`); here the generic
+//! functions are `@inlineAlways` and take these as arguments that every caller passes as
+//! constants. `dictMode` is `cstate.NO_DICT` or `cstate.EXT_DICT`; the places where the
+//! `dictMatchState` variant differs are marked `dictMatchState:`.
+import mem
+import hist
+import cstate
+import cstate { MatchState, OptState, SeqStore }
+import cparams
+import huf_compress as huf
+import fse_compress as fse
+import silk.core.ownership { Copy }
+import silk.mem.pointer { Pointer }
+import silk.num.u8
+import silk.num.u32
+import silk.num.i32
+import silk.num.u64
+import silk.num.usize
+
+/// `ZSTD_OPT_NUM`.
+pub const OPT_NUM: u32 = 4096
+/// `ZSTD_OPT_SIZE`: the number of entries of `opt.matchTable` and `opt.priceTable`.
+pub const OPT_SIZE: usize = 4099
+/// `sizeof(ZSTD_match_t)`: `u32 off` (an offBase), `u32 len`.
+pub const MATCH_BYTES: usize = 8
+/// `sizeof(ZSTD_optimal_t)`: `i32 price`, `u32 off`, `u32 mlen`, `u32 litlen`, `u32 rep[3]`.
+pub const OPTIMAL_BYTES: usize = 28
+/// The sizes in bytes of the frequency tables of `OptState`.
+pub const LIT_FREQ_BYTES: usize = 1024
+pub const LL_FREQ_BYTES: usize = 144
+pub const ML_FREQ_BYTES: usize = 212
+pub const OFF_FREQ_BYTES: usize = 128
+
+const LITFREQ_ADD: u32 = 2
+const MAX_PRICE: i32 = 1073741824
+const PREDEF_THRESHOLD: usize = 8
+const BITCOST_ACCURACY: u32 = 8
+const BITCOST_MULTIPLIER: u32 = 256
+const BLOCKSIZE_MAX: u32 = 131072
+
+/// `ZSTD_OptPrice_e`.
+pub const ZOP_DYNAMIC: u32 = 0
+pub const ZOP_PREDEF: u32 = 1
+
+// ---- The layout of a `RawSeqStore_t` behind `ms.ldmSeqStore`, as the reference on a 64-bit
+// target: `rawSeq* seq`, `size_t pos`, `size_t posInSequence`, `size_t size`, `size_t capacity`.
+// A `rawSeq` is 12 bytes: `u32 offset`, `u32 litLength`, `u32 matchLength`. ----
+pub const RSS_SEQ: usize = 0
+pub const RSS_POS: usize = 8
+pub const RSS_POS_IN_SEQUENCE: usize = 16
+pub const RSS_SIZE: usize = 24
+pub const RSS_CAPACITY: usize = 32
+pub const RSS_BYTES: usize = 40
+pub const RAWSEQ_BYTES: usize = 12
+
+// ---- Price functions. ----
+
+// `ZSTD_bitWeight`: the cost of a stat in full bits only.
+@inlineAlways
+fn bitWeight(stat: u32) -> u32 { return u32.shiftLeft(mem.highbit32(mem.a32(stat, 1)), BITCOST_ACCURACY) }
+
+// `ZSTD_fracWeight`: the fractional-bit cost of a stat, by linear interpolation.
+@inlineAlways
+fn fracWeight(rawStat: u32) -> u32 {
+  let stat = mem.a32(rawStat, 1)
+  let hb = mem.highbit32(stat)
+  let bWeight = u32.shiftLeft(hb, BITCOST_ACCURACY)
+  let fWeight = mem.shr32(u32.shiftLeft(stat, BITCOST_ACCURACY), hb)
+  return mem.a32(bWeight, fWeight)
+}
+
+// `WEIGHT(stat, opt)`.
+@inlineAlways
+fn weight(stat: u32, optLevel: u32) -> u32 {
+  if optLevel != 0 { return fracWeight(stat) }
+  return bitWeight(stat)
+}
+
+// `ZSTD_compressedLiterals`.
+@inlineAlways
+fn compressedLiterals(o: &OptState) -> bool { return o.literalCompressionMode != cparams.PS_DISABLE }
+
+// `ZSTD_setBasePrices`.
+@inlineAlways
+fn setBasePrices(o: &mut OptState, optLevel: u32) -> () {
+  if compressedLiterals(&o) { o.litSumBasePrice = weight(o.litSum, optLevel) }
+  o.litLengthSumBasePrice = weight(o.litLengthSum, optLevel)
+  o.matchLengthSumBasePrice = weight(o.matchLengthSum, optLevel)
+  o.offCodeSumBasePrice = weight(o.offCodeSum, optLevel)
+}
+
+unsafe fn sumU32(table: [*]mut u8, nbElts: usize) -> u32 {
+  let mut total: u32 = 0
+  let mut n: usize = 0
+  while n < nbElts {
+    total = mem.a32(total, unsafe cstate.tget(table, n))
+    n = n + 1
+  }
+  return total
+}
+
+// `ZSTD_downscaleStats`. `base1` is `base_1guaranteed`.
+unsafe fn downscaleStats(table: [*]mut u8, lastEltIndex: u32, shift: u32, base1: bool) -> u32 {
+  let mut sum: u32 = 0
+  let mut s: usize = 0
+  let n = mem.z(lastEltIndex) + 1
+  while s < n {
+    let v = unsafe cstate.tget(table, s)
+    let base: u32 = if base1 || v > 0 { 1 } else { 0 }
+    let newStat = mem.a32(base, mem.shr32(v, shift))
+    sum = mem.a32(sum, newStat)
+    unsafe cstate.tset(table, s, newStat)
+    s = s + 1
+  }
+  return sum
+}
+
+// `ZSTD_scaleStats`: reduces all frequencies of the table if their sum is too large.
+unsafe fn scaleStats(table: [*]mut u8, lastEltIndex: u32, logTarget: u32) -> u32 {
+  let prevsum = unsafe sumU32(table, mem.z(lastEltIndex) + 1)
+  let factor = mem.shr32(prevsum, logTarget)
+  if factor <= 1 { return prevsum }
+  return unsafe downscaleStats(table, lastEltIndex, mem.highbit32(factor), true)
+}
+
+const BASE_LL_FREQS: [u8; 36] = [4, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+const BASE_OFC_FREQS: [u8; 32] = [6, 2, 1, 1, 2, 3, 4, 4, 4, 3, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+
+// Fills `freq[0..=maxSymbol]` from the costs of an FSE table (`FSE_getMaxNbBits`) and returns
+// the sum.
+unsafe fn freqsFromFse(freq: [*]mut u8, ctable: [*]const u8, maxSymbol: u32) -> u32 {
+  let st = unsafe fse.initCState(ctable)
+  let scaleLog: u32 = 10
+  let mut sum: u32 = 0
+  let mut s: u32 = 0
+  while s <= maxSymbol {
+    let deltaNbBits = unsafe mem.r32(st.symbolTT, mem.z(s) * 8 + 4)
+    let bitCost = u32.shiftRight(mem.a32(deltaNbBits, 65535), 16)
+    let f: u32 = if bitCost != 0 { mem.shl32(1, mem.s32(scaleLog, bitCost)) } else { 1 }
+    unsafe cstate.tset(freq, mem.z(s), f)
+    sum = mem.a32(sum, f)
+    s = s + 1
+  }
+  return sum
+}
+
+// `ZSTD_rescaleFreqs`: on the first block (no statistic yet), initialises the statistics, from
+// the entropy tables of a dictionary if there are any; otherwise scales down the statistics of
+// the previous block.
+unsafe fn rescaleFreqs(o: &mut OptState, src: [*]const u8, srcSize: usize, optLevel: u32) -> () {
+  let compLits = compressedLiterals(&o)
+  let litFreq = unsafe mem.nn(o.litFreq)
+  let litLengthFreq = unsafe mem.nn(o.litLengthFreq)
+  let matchLengthFreq = unsafe mem.nn(o.matchLengthFreq)
+  let offCodeFreq = unsafe mem.nn(o.offCodeFreq)
+  o.priceType = ZOP_DYNAMIC
+  if o.litLengthSum == 0 {
+    // First block: init. Use predefined statistics for too small inputs.
+    if srcSize <= PREDEF_THRESHOLD { o.priceType = ZOP_PREDEF }
+    let costs = unsafe mem.ro(unsafe mem.nn(o.symbolCosts))
+    if unsafe mem.r32(costs, cstate.CBS_HUF_REPEAT) == huf.REPEAT_VALID {
+      // Huffman statistics that cover the full value set: the table of a dictionary.
+      o.priceType = ZOP_DYNAMIC
+      if compLits {
+        let mut sum: u32 = 0
+        let mut lit: u32 = 0
+        while lit <= 255 {
+          let scaleLog: u32 = 11
+          let bitCost = unsafe huf.getNbBitsFromCTable(unsafe mem.addc(costs, cstate.CBS_HUF_CTABLE), lit)
+          let f: u32 = if bitCost != 0 { mem.shl32(1, mem.s32(scaleLog, bitCost)) } else { 1 }
+          unsafe cstate.tset(litFreq, mem.z(lit), f)
+          sum = mem.a32(sum, f)
+          lit = lit + 1
+        }
+        o.litSum = sum
+      }
+      o.litLengthSum = unsafe freqsFromFse(litLengthFreq, unsafe mem.addc(costs, cstate.CBS_LL_CTABLE), cstate.MAX_LL)
+      o.matchLengthSum = unsafe freqsFromFse(matchLengthFreq, unsafe mem.addc(costs, cstate.CBS_ML_CTABLE), cstate.MAX_ML)
+      o.offCodeSum = unsafe freqsFromFse(offCodeFreq, unsafe mem.addc(costs, cstate.CBS_OF_CTABLE), cstate.MAX_OFF)
+    } else {
+      // First block, no dictionary.
+      if compLits {
+        // Base the initial cost of literals on their frequency within src.
+        let mut lit: u32 = 255
+        let _l = unsafe hist.countSimple(litFreq, &mut lit, src, srcSize)
+        o.litSum = unsafe downscaleStats(litFreq, 255, 8, false)
+      }
+      let mut sum: u32 = 0
+      let mut i: usize = 0
+      while i < 36 {
+        let f = u8.toU32(BASE_LL_FREQS[i])
+        unsafe cstate.tset(litLengthFreq, i, f)
+        sum = sum + f
+        i = i + 1
+      }
+      o.litLengthSum = sum
+      i = 0
+      while i < 53 {
+        unsafe cstate.tset(matchLengthFreq, i, 1)
+        i = i + 1
+      }
+      o.matchLengthSum = cstate.MAX_ML + 1
+      sum = 0
+      i = 0
+      while i < 32 {
+        let f = u8.toU32(BASE_OFC_FREQS[i])
+        unsafe cstate.tset(offCodeFreq, i, f)
+        sum = sum + f
+        i = i + 1
+      }
+      o.offCodeSum = sum
+    }
+  } else {
+    // New block: scale down the accumulated statistics.
+    if compLits { o.litSum = unsafe scaleStats(litFreq, 255, 12) }
+    o.litLengthSum = unsafe scaleStats(litLengthFreq, cstate.MAX_LL, 11)
+    o.matchLengthSum = unsafe scaleStats(matchLengthFreq, cstate.MAX_ML, 11)
+    o.offCodeSum = unsafe scaleStats(offCodeFreq, cstate.MAX_OFF, 11)
+  }
+  setBasePrices(&mut o, optLevel)
+}
+
+// `ZSTD_rawLiteralsCost(literals, 1, ...)` (`LIT_PRICE`): the price of the literal `lit`, without
+// the price of the literal length symbol. The parser prices literals one at a time only.
+@inlineAlways
+unsafe fn litPrice(lit: u8, o: &OptState, optLevel: u32) -> i32 {
+  if !compressedLiterals(&o) { return 2048 }
+  if o.priceType == ZOP_PREDEF { return 1536 }
+  let base = o.litSumBasePrice
+  let litPriceMax = mem.s32(base, BITCOST_MULTIPLIER)
+  let mut p = weight(unsafe cstate.tget(unsafe mem.nn(o.litFreq), u8.toUsize(lit)), optLevel)
+  if p > litPriceMax { p = litPriceMax }
+  return u32.wrappingToI32(mem.s32(base, p))
+}
+
+// `ZSTD_litLengthPrice` (`LL_PRICE`): the cost of the literal length symbol.
+@inlineAlways
+unsafe fn litLengthPrice(litLength: u32, o: &OptState, optLevel: u32) -> i32 {
+  if o.priceType == ZOP_PREDEF { return u32.wrappingToI32(weight(litLength, optLevel)) }
+  // `ZSTD_LLcode` cannot give the price of `ZSTD_BLOCKSIZE_MAX`, which the format cannot
+  // represent: pretend that it costs 1 bit more than `ZSTD_BLOCKSIZE_MAX - 1`.
+  let mut extra: u32 = 0
+  let mut ll = litLength
+  if ll == BLOCKSIZE_MAX {
+    extra = BITCOST_MULTIPLIER
+    ll = BLOCKSIZE_MAX - 1
+  }
+  let llCode = cstate.llCode(ll)
+  let bits = u32.shiftLeft(u8.toU32(cstate.LL_BITS[mem.z(llCode)]), BITCOST_ACCURACY)
+  let w = weight(unsafe cstate.tget(unsafe mem.nn(o.litLengthFreq), mem.z(llCode)), optLevel)
+  return u32.wrappingToI32(mem.a32(extra, mem.s32(mem.a32(bits, o.litLengthSumBasePrice), w)))
+}
+
+// `LL_INCPRICE(l)`.
+@inlineAlways
+unsafe fn llIncPrice(litLength: u32, o: &OptState, optLevel: u32) -> i32 {
+  return i32.wrappingSubtract(unsafe litLengthPrice(litLength, &o, optLevel), unsafe litLengthPrice(mem.s32(litLength, 1), &o, optLevel))
+}
+
+// `ZSTD_getMatchPrice`: the cost of the match part (offset and match length) of a sequence.
+// `optLevel < 2` favors small offsets for decompression speed.
+@inlineAlways
+unsafe fn getMatchPrice(offBase: u32, matchLength: u32, o: &OptState, optLevel: u32) -> i32 {
+  let offCode = mem.highbit32(offBase)
+  let mlBase = mem.s32(matchLength, 3)
+  if o.priceType == ZOP_PREDEF {
+    // Fixed scheme, does not use statistics.
+    return u32.wrappingToI32(mem.a32(weight(mlBase, optLevel), u32.shiftLeft(16 + offCode, BITCOST_ACCURACY)))
+  }
+  // Dynamic statistics.
+  let ow = weight(unsafe cstate.tget(unsafe mem.nn(o.offCodeFreq), mem.z(offCode)), optLevel)
+  let mut price = mem.a32(u32.shiftLeft(offCode, BITCOST_ACCURACY), mem.s32(o.offCodeSumBasePrice, ow))
+  if optLevel < 2 && offCode >= 20 {
+    // Handicap for long distance offsets.
+    price = mem.a32(price, u32.shiftLeft((offCode - 19) * 2, BITCOST_ACCURACY))
+  }
+  let mlCode = cstate.mlCode(mlBase)
+  let mw = weight(unsafe cstate.tget(unsafe mem.nn(o.matchLengthFreq), mem.z(mlCode)), optLevel)
+  price = mem.a32(price, mem.a32(u32.shiftLeft(u8.toU32(cstate.ML_BITS[mem.z(mlCode)]), BITCOST_ACCURACY), mem.s32(o.matchLengthSumBasePrice, mw)))
+  // Make matches a bit more costly to favor less sequences.
+  price = mem.a32(price, BITCOST_MULTIPLIER / 5)
+  return u32.wrappingToI32(price)
+}
+
+@inlineAlways
+unsafe fn tinc(table: [*]mut u8, index: usize, by: u32) -> () {
+  unsafe cstate.tset(table, index, mem.a32(unsafe cstate.tget(table, index), by))
+}
+
+// `ZSTD_updateStats`: the literals are `base[literals..literals + litLength]`.
+@inlineAlways
+unsafe fn updateStats(o: &mut OptState, litLength: u32, base: [*]const u8, literals: usize, offBase: u32, matchLength: u32) -> () {
+  if compressedLiterals(&o) {
+    let litFreq = unsafe mem.nn(o.litFreq)
+    let mut u: usize = 0
+    let n = mem.z(litLength)
+    while u < n {
+      unsafe tinc(litFreq, u8.toUsize(unsafe mem.r8(base, mem.ua(literals, u))), LITFREQ_ADD)
+      u = mem.ua(u, 1)
+    }
+    o.litSum = mem.a32(o.litSum, mem.m32(litLength, LITFREQ_ADD))
+  }
+  unsafe tinc(unsafe mem.nn(o.litLengthFreq), mem.z(cstate.llCode(litLength)), 1)
+  o.litLengthSum = mem.a32(o.litLengthSum, 1)
+  unsafe tinc(unsafe mem.nn(o.offCodeFreq), mem.z(mem.highbit32(offBase)), 1)
+  o.offCodeSum = mem.a32(o.offCodeSum, 1)
+  unsafe tinc(unsafe mem.nn(o.matchLengthFreq), mem.z(cstate.mlCode(mem.s32(matchLength, 3))), 1)
+  o.matchLengthSum = mem.a32(o.matchLengthSum, 1)
+}
+
+// `ZSTD_readMINMATCH`: safe only for comparisons; reads 4 bytes.
+@inlineAlways
+unsafe fn readMinMatch(p: [*]const u8, at: usize, length: u32) -> u32 {
+  if length == 3 { return u32.shiftLeft(unsafe mem.r32(p, at), 8) }
+  return unsafe mem.r32(p, at)
+}
+
+const PRIME3: u32 = 506832829
+
+// `ZSTD_hash3Ptr`.
+@inlineAlways
+unsafe fn hash3(p: [*]const u8, at: usize, h: u32) -> usize {
+  return mem.z(mem.shr32(mem.m32(u32.shiftLeft(unsafe mem.r32(p, at), 8), PRIME3), 32 - h))
+}
+
+// `ZSTD_insertAndFindFirstIndexHash3`: updates `hashTable3` up to `ip` (excluded), always within
+// the prefix, and returns the candidate of `ip`.
+@inlineAlways
+unsafe fn insertAndFindFirstIndexHash3(ms: &MatchState, nextToUpdate3: &mut u32, ip: usize) -> u32 {
+  let hashTable3 = ms.hashTable3
+  let hashLog3 = ms.hashLog3
+  let base = ms.window.base
+  let mut idx = nextToUpdate3.*
+  let target = mem.t32(ip)
+  let h3 = unsafe hash3(base, ip, hashLog3)
+  while idx < target {
+    unsafe cstate.tset(hashTable3, unsafe hash3(base, mem.z(idx), hashLog3), idx)
+    idx = mem.a32(idx, 1)
+  }
+  nextToUpdate3.* = target
+  return unsafe cstate.tget(hashTable3, h3)
+}
+
+// ---- Binary tree search. ----
+
+// The position of a tree node that is not to be written (`&dummy32`).
+const DUMMY: usize = 0xFFFFFFFFFFFFFFFF
+
+// `ZSTD_insertBt1`: adds the position `ip` (which is at most `iend - 8`) to the tree. `target` is
+// the position that `updateTree` fills to. Returns the number of positions added.
+@inlineAlways
+unsafe fn insertBt1(ms: &MatchState, ip: usize, iend: usize, target: u32, mls: u32, extDict: bool) -> u32 {
+  let hashTable = ms.hashTable
+  let hashLog = ms.cParams.hashLog
+  let base = ms.window.base
+  let h = unsafe cstate.hashPtr(base, ip, hashLog, mls)
+  let bt = ms.chainTable
+  let btLog = ms.cParams.chainLog - 1
+  let btMask = mem.s32(mem.shl32(1, btLog), 1)
+  let mut matchIndex = unsafe cstate.tget(hashTable, h)
+  let mut commonLengthSmaller: usize = 0
+  let mut commonLengthLarger: usize = 0
+  let dictBase = ms.window.dictBase
+  let dictLimit = ms.window.dictLimit
+  let dictLimitZ = mem.z(dictLimit)
+  let curr = mem.t32(ip)
+  let btLow: u32 = if btMask >= curr { 0 } else { curr - btMask }
+  let mut smallerPtr: usize = usize.wrappingMultiply(mem.z(curr & btMask), 2)
+  let mut largerPtr: usize = mem.ua(smallerPtr, 1)
+  // windowLow is based on target because only the positions that are in the window at the end of
+  // the tree update are needed.
+  let windowLow = cstate.getLowestMatchIndex(&ms, target, ms.cParams.windowLog)
+  let mut matchEndIdx = mem.a32(curr, 9)
+  let mut bestLength: usize = 8
+  let mut nbCompares = mem.shl32(1, ms.cParams.searchLog)
+  unsafe cstate.tset(hashTable, h, curr)
+  while nbCompares != 0 && matchIndex >= windowLow {
+    let nextPtr = usize.wrappingMultiply(mem.z(matchIndex & btMask), 2)
+    let matchIndexZ = mem.z(matchIndex)
+    // The guaranteed minimum number of common bytes.
+    let mut matchLength = if commonLengthSmaller < commonLengthLarger { commonLengthSmaller } else { commonLengthLarger }
+    let mut inPrefix = true
+    if !extDict || mem.ua(matchIndexZ, matchLength) >= dictLimitZ {
+      matchLength = mem.ua(matchLength, unsafe cstate.count(base, mem.ua(ip, matchLength), base, mem.ua(matchIndexZ, matchLength), iend))
+    } else {
+      matchLength = mem.ua(matchLength, unsafe cstate.count2segments(base, mem.ua(ip, matchLength), iend, dictBase, mem.ua(matchIndexZ, matchLength), dictLimitZ, dictLimitZ))
+      // To prepare for the next usage of match[matchLength].
+      inPrefix = mem.ua(matchIndexZ, matchLength) >= dictLimitZ
+    }
+    if matchLength > bestLength {
+      bestLength = matchLength
+      if matchLength > mem.z(mem.s32(matchEndIdx, matchIndex)) { matchEndIdx = mem.a32(matchIndex, mem.t32(matchLength)) }
+    }
+    if mem.ua(ip, matchLength) == iend {
+      // Equal: no way to know if inf or sup. Drop, to guarantee consistency.
+      break
+    }
+    let matchByte = if inPrefix { unsafe mem.r8(base, mem.ua(matchIndexZ, matchLength)) } else { unsafe mem.r8(dictBase, mem.ua(matchIndexZ, matchLength)) }
+    if matchByte < unsafe mem.r8(base, mem.ua(ip, matchLength)) {
+      // The match is smaller than current.
+      unsafe cstate.tset(bt, smallerPtr, matchIndex)
+      commonLengthSmaller = matchLength
+      if matchIndex <= btLow { smallerPtr = DUMMY break }
+      smallerPtr = mem.ua(nextPtr, 1)
+      matchIndex = unsafe cstate.tget(bt, mem.ua(nextPtr, 1))
+    } else {
+      // The match is larger than current.
+      unsafe cstate.tset(bt, largerPtr, matchIndex)
+      commonLengthLarger = matchLength
+      if matchIndex <= btLow { largerPtr = DUMMY break }
+      largerPtr = nextPtr
+      matchIndex = unsafe cstate.tget(bt, nextPtr)
+    }
+    nbCompares = mem.s32(nbCompares, 1)
+  }
+  if smallerPtr != DUMMY { unsafe cstate.tset(bt, smallerPtr, 0) }
+  if largerPtr != DUMMY { unsafe cstate.tset(bt, largerPtr, 0) }
+  let mut positions: u32 = 0
+  if bestLength > 384 {
+    let over = mem.t32(mem.us(bestLength, 384))
+    positions = if over < 192 { over } else { 192 }
+  }
+  let advance = mem.s32(matchEndIdx, mem.a32(curr, 8))
+  return if positions > advance { positions } else { advance }
+}
+
+// `ZSTD_updateTree_internal`: inserts the positions from `ms.nextToUpdate` to `ip` (excluded).
+@inlineAlways
+unsafe fn updateTreeInternal(ms: &mut MatchState, ip: usize, iend: usize, mls: u32, extDict: bool) -> () {
+  let target = mem.t32(ip)
+  let mut idx = ms.nextToUpdate
+  while idx < target {
+    let forward = unsafe insertBt1(&ms, mem.z(idx), iend, target, mls, extDict)
+    idx = mem.a32(idx, forward)
+  }
+  ms.nextToUpdate = target
+}
+
+/// `ZSTD_updateTree`: inserts the positions before `base[ip]` into the binary tree. `ip` and
+/// `iend` are indices from `ms.window.base`.
+pub unsafe fn updateTree(ms: &mut MatchState, ip: usize, iend: usize) -> () {
+  let mls = ms.cParams.minMatch
+  unsafe updateTreeInternal(&mut ms, ip, iend, mls, false)
+}
+
+@inlineAlways
+unsafe fn setMatch(matches: [*]mut u8, n: u32, off: u32, len: u32) -> () {
+  let at = usize.wrappingMultiply(mem.z(n), MATCH_BYTES)
+  unsafe mem.w32(matches, at, off)
+  unsafe mem.w32(matches, mem.ua(at, 4), len)
+}
+@inlineAlways
+unsafe fn matchOff(matches: [*]mut u8, n: u32) -> u32 { return unsafe mem.r32(unsafe mem.ro(matches), usize.wrappingMultiply(mem.z(n), MATCH_BYTES)) }
+@inlineAlways
+unsafe fn matchLen(matches: [*]mut u8, n: u32) -> u32 { return unsafe mem.r32(unsafe mem.ro(matches), mem.ua(usize.wrappingMultiply(mem.z(n), MATCH_BYTES), 4)) }
+
+// `ZSTD_insertBtAndGetAllMatches`: inserts `ip` into the tree and stores in `matches` the matches
+// found there, by increasing length, each longer than `lengthToBeat - 1`. `rep0..rep2` is the
+// offset history at `ip`; `ll0` is 1 if the literal length there is 0. Returns their number.
+@inlineAlways
+unsafe fn insertBtAndGetAllMatches(matches: [*]mut u8, ms: &mut MatchState, nextToUpdate3: &mut u32, ip: usize, iLimit: usize, dictMode: u32, rep0: u32, rep1: u32, rep2: u32, ll0: u32, lengthToBeat: u32, mls: u32) -> u32 {
+  let targetLength = ms.cParams.targetLength
+  let sufficientLen: u32 = if targetLength < OPT_NUM - 1 { targetLength } else { OPT_NUM - 1 }
+  let base = ms.window.base
+  let curr = mem.t32(ip)
+  let hashLog = ms.cParams.hashLog
+  let minMatch: u32 = if mls == 3 { 3 } else { 4 }
+  let hashTable = ms.hashTable
+  let h = unsafe cstate.hashPtr(base, ip, hashLog, mls)
+  let mut matchIndex = unsafe cstate.tget(hashTable, h)
+  let bt = ms.chainTable
+  let btLog = ms.cParams.chainLog - 1
+  let btMask = mem.s32(mem.shl32(1, btLog), 1)
+  let mut commonLengthSmaller: usize = 0
+  let mut commonLengthLarger: usize = 0
+  let dictBase = ms.window.dictBase
+  let dictLimit = ms.window.dictLimit
+  let dictLimitZ = mem.z(dictLimit)
+  let btLow: u32 = if btMask >= curr { 0 } else { curr - btMask }
+  let windowLow = cstate.getLowestMatchIndex(&ms, curr, ms.cParams.windowLog)
+  let matchLow: u32 = if windowLow != 0 { windowLow } else { 1 }
+  let mut smallerPtr: usize = usize.wrappingMultiply(mem.z(curr & btMask), 2)
+  let mut largerPtr: usize = mem.ua(smallerPtr, 1)
+  // The farthest referenced position of any match: detects repetitive patterns.
+  let mut matchEndIdx = mem.a32(curr, 9)
+  let mut mnum: u32 = 0
+  let mut nbCompares = mem.shl32(1, ms.cParams.searchLog)
+  let minMatchZ = mem.z(minMatch)
+  // dictMatchState: the `dms*` values of the reference (`optDmsView`, at the end of the file).
+  let dv = unsafe optDmsView(&ms, dictMode == cstate.DICT_MATCH_STATE, windowLow)
+  let mut bestLength: usize = mem.z(mem.s32(lengthToBeat, 1))
+
+  // Check the repeat offsets.
+  let lastR = cstate.REP_NUM + ll0
+  let mut repCode = ll0
+  while repCode < lastR {
+    let repOffset: u32 = if repCode == 0 { rep0 } else if repCode == 1 { rep1 } else if repCode == 2 { rep2 } else { mem.s32(rep0, 1) }
+    let repIndex = mem.s32(curr, repOffset)
+    let mut repLen: u32 = 0
+    if mem.s32(repOffset, 1) < mem.s32(curr, dictLimit) {
+      // Equivalent to `curr > repIndex >= dictLimit`. The offset must be validated because with a
+      // dictionary the valid range shrinks when the dictionary goes out of bounds.
+      if repIndex >= windowLow && unsafe readMinMatch(base, ip, minMatch) == unsafe readMinMatch(base, mem.us(ip, mem.z(repOffset)), minMatch) {
+        repLen = mem.a32(mem.t32(unsafe cstate.count(base, mem.ua(ip, minMatchZ), base, mem.us(mem.ua(ip, minMatchZ), mem.z(repOffset)), iLimit)), minMatch)
+      }
+    } else {
+      // repIndex < dictLimit || repIndex >= curr.
+      if dictMode == cstate.EXT_DICT
+        && mem.s32(repOffset, 1) < mem.s32(curr, windowLow)
+        && cstate.indexOverlapCheck(dictLimit, repIndex)
+        && unsafe readMinMatch(base, ip, minMatch) == unsafe readMinMatch(dictBase, mem.z(repIndex), minMatch) {
+        repLen = mem.a32(mem.t32(unsafe cstate.count2segments(base, mem.ua(ip, minMatchZ), iLimit, dictBase, mem.ua(mem.z(repIndex), minMatchZ), dictLimitZ, dictLimitZ)), minMatch)
+      }
+      // dictMatchState: the repeat match inside the dictionary.
+      if dictMode == cstate.DICT_MATCH_STATE
+        && mem.s32(repOffset, 1) < mem.s32(curr, mem.a32(dv.lowLimit, dv.indexDelta))
+        && cstate.indexOverlapCheck(dictLimit, repIndex)
+        && unsafe readMinMatch(base, ip, minMatch) == unsafe readMinMatch(dv.base, mem.z(mem.s32(repIndex, dv.indexDelta)), minMatch) {
+        repLen = mem.a32(mem.t32(unsafe cstate.count2segments(base, mem.ua(ip, minMatchZ), iLimit, dv.base, mem.ua(mem.z(mem.s32(repIndex, dv.indexDelta)), minMatchZ), mem.z(dv.highLimit), dictLimitZ)), minMatch)
+      }
+    }
+    // Save the longer solution.
+    if mem.z(repLen) > bestLength {
+      bestLength = mem.z(repLen)
+      unsafe setMatch(matches, mnum, mem.a32(mem.s32(repCode, ll0), 1), repLen)
+      mnum = mem.a32(mnum, 1)
+      if repLen > sufficientLen || mem.ua(ip, mem.z(repLen)) == iLimit {
+        // Best possible.
+        return mnum
+      }
+    }
+    repCode = mem.a32(repCode, 1)
+  }
+
+  // HC3 match finder.
+  if mls == 3 && bestLength < 3 {
+    let matchIndex3 = unsafe insertAndFindFirstIndexHash3(&ms, &mut nextToUpdate3, ip)
+    if matchIndex3 >= matchLow && mem.s32(curr, matchIndex3) < 262144 {
+      // Heuristic: a longer distance is likely too expensive.
+      let mut mlen: usize = 0
+      if dictMode != cstate.EXT_DICT || matchIndex3 >= dictLimit {
+        mlen = unsafe cstate.count(base, ip, base, mem.z(matchIndex3), iLimit)
+      } else {
+        mlen = unsafe cstate.count2segments(base, ip, iLimit, dictBase, mem.z(matchIndex3), dictLimitZ, dictLimitZ)
+      }
+      // Save the best solution.
+      if mlen >= 3 {
+        bestLength = mlen
+        unsafe setMatch(matches, 0, cstate.offsetToOffBase(mem.s32(curr, matchIndex3)), mem.t32(mlen))
+        mnum = 1
+        if mlen > mem.z(sufficientLen) || mem.ua(ip, mlen) == iLimit {
+          // Best possible length: skip the insertion.
+          ms.nextToUpdate = mem.a32(curr, 1)
+          return 1
+        }
+      }
+    }
+    // No dictMatchState lookup: dictionaries don't have a populated HC3 table.
+  }
+
+  unsafe cstate.tset(hashTable, h, curr)
+
+  while nbCompares != 0 && matchIndex >= matchLow {
+    let nextPtr = usize.wrappingMultiply(mem.z(matchIndex & btMask), 2)
+    let matchIndexZ = mem.z(matchIndex)
+    // The guaranteed minimum number of common bytes.
+    let mut matchLength = if commonLengthSmaller < commonLengthLarger { commonLengthSmaller } else { commonLengthLarger }
+    let mut inPrefix = true
+    if dictMode != cstate.EXT_DICT || mem.ua(matchIndexZ, matchLength) >= dictLimitZ {
+      matchLength = mem.ua(matchLength, unsafe cstate.count(base, mem.ua(ip, matchLength), base, mem.ua(matchIndexZ, matchLength), iLimit))
+    } else {
+      matchLength = mem.ua(matchLength, unsafe cstate.count2segments(base, mem.ua(ip, matchLength), iLimit, dictBase, mem.ua(matchIndexZ, matchLength), dictLimitZ, dictLimitZ))
+      // Prepare for the read of match[matchLength].
+      inPrefix = mem.ua(matchIndexZ, matchLength) >= dictLimitZ
+    }
+    if matchLength > bestLength {
+      if matchLength > mem.z(mem.s32(matchEndIdx, matchIndex)) { matchEndIdx = mem.a32(matchIndex, mem.t32(matchLength)) }
+      bestLength = matchLength
+      unsafe setMatch(matches, mnum, cstate.offsetToOffBase(mem.s32(curr, matchIndex)), mem.t32(matchLength))
+      mnum = mem.a32(mnum, 1)
+      if matchLength > mem.z(OPT_NUM) || mem.ua(ip, matchLength) == iLimit {
+        // Equal: no way to know if inf or sup. Drop, to preserve the consistency of the tree.
+        // dictMatchState: skip the search of the dictionary too.
+        if dictMode == cstate.DICT_MATCH_STATE { nbCompares = 0 }
+        break
+      }
+    }
+    let matchByte = if inPrefix { unsafe mem.r8(base, mem.ua(matchIndexZ, matchLength)) } else { unsafe mem.r8(dictBase, mem.ua(matchIndexZ, matchLength)) }
+    if matchByte < unsafe mem.r8(base, mem.ua(ip, matchLength)) {
+      // The match is smaller than current.
+      unsafe cstate.tset(bt, smallerPtr, matchIndex)
+      commonLengthSmaller = matchLength
+      if matchIndex <= btLow { smallerPtr = DUMMY break }
+      smallerPtr = mem.ua(nextPtr, 1)
+      matchIndex = unsafe cstate.tget(bt, mem.ua(nextPtr, 1))
+    } else {
+      unsafe cstate.tset(bt, largerPtr, matchIndex)
+      commonLengthLarger = matchLength
+      if matchIndex <= btLow { largerPtr = DUMMY break }
+      largerPtr = nextPtr
+      matchIndex = unsafe cstate.tget(bt, nextPtr)
+    }
+    nbCompares = mem.s32(nbCompares, 1)
+  }
+  if smallerPtr != DUMMY { unsafe cstate.tset(bt, smallerPtr, 0) }
+  if largerPtr != DUMMY { unsafe cstate.tset(bt, largerPtr, 0) }
+
+  // dictMatchState: the search of the tree of the dictionary, with the compares that are left.
+  if dictMode == cstate.DICT_MATCH_STATE && nbCompares != 0 {
+    mnum = unsafe optDmsSearchTree(matches, &ms, &dv, ip, iLimit, mls, nbCompares, mnum, &mut bestLength, &mut matchEndIdx)
+  }
+
+  // Skip repetitive patterns.
+  ms.nextToUpdate = mem.s32(matchEndIdx, 8)
+  return mnum
+}
+
+// `ZSTD_btGetAllMatches_internal`.
+@inlineAlways
+unsafe fn btGetAllMatchesInternal(matches: [*]mut u8, ms: &mut MatchState, nextToUpdate3: &mut u32, ip: usize, iHighLimit: usize, rep0: u32, rep1: u32, rep2: u32, ll0: u32, lengthToBeat: u32, dictMode: u32, mls: u32) -> u32 {
+  if ip < mem.z(ms.nextToUpdate) { return 0 }
+  unsafe updateTreeInternal(&mut ms, ip, iHighLimit, mls, dictMode == cstate.EXT_DICT)
+  return unsafe insertBtAndGetAllMatches(matches, &mut ms, &mut nextToUpdate3, ip, iHighLimit, dictMode, rep0, rep1, rep2, ll0, lengthToBeat, mls)
+}
+
+// `ZSTD_btGetAllMatches_<dictMode>_<mls>`.
+@inlineNever
+unsafe fn btGetAllMatchesNoDict3(matches: [*]mut u8, ms: &mut MatchState, nextToUpdate3: &mut u32, ip: usize, iHighLimit: usize, rep0: u32, rep1: u32, rep2: u32, ll0: u32, lengthToBeat: u32) -> u32 {
+  return unsafe btGetAllMatchesInternal(matches, &mut ms, &mut nextToUpdate3, ip, iHighLimit, rep0, rep1, rep2, ll0, lengthToBeat, cstate.NO_DICT, 3)
+}
+@inlineNever
+unsafe fn btGetAllMatchesNoDict4(matches: [*]mut u8, ms: &mut MatchState, nextToUpdate3: &mut u32, ip: usize, iHighLimit: usize, rep0: u32, rep1: u32, rep2: u32, ll0: u32, lengthToBeat: u32) -> u32 {
+  return unsafe btGetAllMatchesInternal(matches, &mut ms, &mut nextToUpdate3, ip, iHighLimit, rep0, rep1, rep2, ll0, lengthToBeat, cstate.NO_DICT, 4)
+}
+@inlineNever
+unsafe fn btGetAllMatchesNoDict5(matches: [*]mut u8, ms: &mut MatchState, nextToUpdate3: &mut u32, ip: usize, iHighLimit: usize, rep0: u32, rep1: u32, rep2: u32, ll0: u32, lengthToBeat: u32) -> u32 {
+  return unsafe btGetAllMatchesInternal(matches, &mut ms, &mut nextToUpdate3, ip, iHighLimit, rep0, rep1, rep2, ll0, lengthToBeat, cstate.NO_DICT, 5)
+}
+@inlineNever
+unsafe fn btGetAllMatchesNoDict6(matches: [*]mut u8, ms: &mut MatchState, nextToUpdate3: &mut u32, ip: usize, iHighLimit: usize, rep0: u32, rep1: u32, rep2: u32, ll0: u32, lengthToBeat: u32) -> u32 {
+  return unsafe btGetAllMatchesInternal(matches, &mut ms, &mut nextToUpdate3, ip, iHighLimit, rep0, rep1, rep2, ll0, lengthToBeat, cstate.NO_DICT, 6)
+}
+@inlineNever
+unsafe fn btGetAllMatchesExtDict3(matches: [*]mut u8, ms: &mut MatchState, nextToUpdate3: &mut u32, ip: usize, iHighLimit: usize, rep0: u32, rep1: u32, rep2: u32, ll0: u32, lengthToBeat: u32) -> u32 {
+  return unsafe btGetAllMatchesInternal(matches, &mut ms, &mut nextToUpdate3, ip, iHighLimit, rep0, rep1, rep2, ll0, lengthToBeat, cstate.EXT_DICT, 3)
+}
+@inlineNever
+unsafe fn btGetAllMatchesExtDict4(matches: [*]mut u8, ms: &mut MatchState, nextToUpdate3: &mut u32, ip: usize, iHighLimit: usize, rep0: u32, rep1: u32, rep2: u32, ll0: u32, lengthToBeat: u32) -> u32 {
+  return unsafe btGetAllMatchesInternal(matches, &mut ms, &mut nextToUpdate3, ip, iHighLimit, rep0, rep1, rep2, ll0, lengthToBeat, cstate.EXT_DICT, 4)
+}
+@inlineNever
+unsafe fn btGetAllMatchesExtDict5(matches: [*]mut u8, ms: &mut MatchState, nextToUpdate3: &mut u32, ip: usize, iHighLimit: usize, rep0: u32, rep1: u32, rep2: u32, ll0: u32, lengthToBeat: u32) -> u32 {
+  return unsafe btGetAllMatchesInternal(matches, &mut ms, &mut nextToUpdate3, ip, iHighLimit, rep0, rep1, rep2, ll0, lengthToBeat, cstate.EXT_DICT, 5)
+}
+@inlineNever
+unsafe fn btGetAllMatchesExtDict6(matches: [*]mut u8, ms: &mut MatchState, nextToUpdate3: &mut u32, ip: usize, iHighLimit: usize, rep0: u32, rep1: u32, rep2: u32, ll0: u32, lengthToBeat: u32) -> u32 {
+  return unsafe btGetAllMatchesInternal(matches, &mut ms, &mut nextToUpdate3, ip, iHighLimit, rep0, rep1, rep2, ll0, lengthToBeat, cstate.EXT_DICT, 6)
+}
+
+// `ZSTD_selectBtGetAllMatches` and the call of the selected function. `mls` is
+// `BOUNDED(3, minMatch, 6)`.
+@inlineAlways
+unsafe fn getAllMatches(matches: [*]mut u8, ms: &mut MatchState, nextToUpdate3: &mut u32, ip: usize, iHighLimit: usize, rep0: u32, rep1: u32, rep2: u32, ll0: u32, lengthToBeat: u32, dictMode: u32, mls: u32) -> u32 {
+  if dictMode == cstate.DICT_MATCH_STATE {
+    // (`optDms*`, at the end of the file.)
+    if mls == 3 { return unsafe btGetAllMatchesDms3(matches, &mut ms, &mut nextToUpdate3, ip, iHighLimit, rep0, rep1, rep2, ll0, lengthToBeat) }
+    if mls == 4 { return unsafe btGetAllMatchesDms4(matches, &mut ms, &mut nextToUpdate3, ip, iHighLimit, rep0, rep1, rep2, ll0, lengthToBeat) }
+    if mls == 5 { return unsafe btGetAllMatchesDms5(matches, &mut ms, &mut nextToUpdate3, ip, iHighLimit, rep0, rep1, rep2, ll0, lengthToBeat) }
+    return unsafe btGetAllMatchesDms6(matches, &mut ms, &mut nextToUpdate3, ip, iHighLimit, rep0, rep1, rep2, ll0, lengthToBeat)
+  }
+  if dictMode == cstate.EXT_DICT {
+    if mls == 3 { return unsafe btGetAllMatchesExtDict3(matches, &mut ms, &mut nextToUpdate3, ip, iHighLimit, rep0, rep1, rep2, ll0, lengthToBeat) }
+    if mls == 4 { return unsafe btGetAllMatchesExtDict4(matches, &mut ms, &mut nextToUpdate3, ip, iHighLimit, rep0, rep1, rep2, ll0, lengthToBeat) }
+    if mls == 5 { return unsafe btGetAllMatchesExtDict5(matches, &mut ms, &mut nextToUpdate3, ip, iHighLimit, rep0, rep1, rep2, ll0, lengthToBeat) }
+    return unsafe btGetAllMatchesExtDict6(matches, &mut ms, &mut nextToUpdate3, ip, iHighLimit, rep0, rep1, rep2, ll0, lengthToBeat)
+  }
+  if mls == 3 { return unsafe btGetAllMatchesNoDict3(matches, &mut ms, &mut nextToUpdate3, ip, iHighLimit, rep0, rep1, rep2, ll0, lengthToBeat) }
+  if mls == 4 { return unsafe btGetAllMatchesNoDict4(matches, &mut ms, &mut nextToUpdate3, ip, iHighLimit, rep0, rep1, rep2, ll0, lengthToBeat) }
+  if mls == 5 { return unsafe btGetAllMatchesNoDict5(matches, &mut ms, &mut nextToUpdate3, ip, iHighLimit, rep0, rep1, rep2, ll0, lengthToBeat) }
+  return unsafe btGetAllMatchesNoDict6(matches, &mut ms, &mut nextToUpdate3, ip, iHighLimit, rep0, rep1, rep2, ll0, lengthToBeat)
+}
+
+// ---- LDM helper functions. ----
+
+// `ZSTD_optLdm_t`: what is needed to decide about the inclusion of a long-distance match. The
+// store is a copy of `ms.ldmSeqStore`, as in the reference; `seq` is null if there is none.
+struct OptLdm {
+  seq: ?[*]mut u8,
+  pos: usize,
+  posInSequence: usize,
+  size: usize,
+  startPosInBlock: u32,
+  endPosInBlock: u32,
+  offset: u32,
+}
+impl Copy for OptLdm {}
+
+unsafe fn readPointer(p: [*]const u8, at: usize) -> ?[*]mut u8 {
+  return unsafe Pointer.readUnaligned<?[*]mut u8>(unsafe Intrinsic.pointerReinterpret<*const u8, *const align(1) ?[*]mut u8>(unsafe Pointer.at<u8>(p, at)))
+}
+
+unsafe fn optLdmInit(ldmSeqStore: ?[*]mut u8) -> OptLdm {
+  let mut l = OptLdm { seq: mem.nullp(), pos: 0, posInSequence: 0, size: 0, startPosInBlock: 0, endPosInBlock: 0, offset: 0 }
+  if !Pointer.isNullMany<u8>(ldmSeqStore) {
+    let s = unsafe mem.ro(unsafe mem.nn(ldmSeqStore))
+    l.seq = unsafe readPointer(s, RSS_SEQ)
+    l.pos = u64.toUsize(unsafe mem.r64(s, RSS_POS))
+    l.posInSequence = u64.toUsize(unsafe mem.r64(s, RSS_POS_IN_SEQUENCE))
+    l.size = u64.toUsize(unsafe mem.r64(s, RSS_SIZE))
+  }
+  return l
+}
+
+// `ZSTD_optLdm_skipRawSeqStoreBytes`: moves forward in the store by `nbBytes`.
+unsafe fn optLdmSkipRawSeqStoreBytes(l: &mut OptLdm, nbBytes: usize) -> () {
+  let mut currPos = mem.t32(mem.ua(l.posInSequence, nbBytes))
+  while currPos != 0 && l.pos < l.size {
+    let seq = unsafe mem.ro(unsafe mem.nn(l.seq))
+    let at = usize.wrappingMultiply(l.pos, RAWSEQ_BYTES)
+    let total = mem.a32(unsafe mem.r32(seq, at + 4), unsafe mem.r32(seq, at + 8))
+    if currPos >= total {
+      currPos = currPos - total
+      l.pos = l.pos + 1
+    } else {
+      l.posInSequence = mem.z(currPos)
+      break
+    }
+  }
+  if currPos == 0 || l.pos == l.size { l.posInSequence = 0 }
+}
+
+// `ZSTD_opt_getNextMatchAndUpdateSeqStore`: computes the beginning and the end of the next match
+// in the current block, and moves forward in the store.
+unsafe fn optGetNextMatchAndUpdateSeqStore(l: &mut OptLdm, currPosInBlock: u32, blockBytesRemaining: u32) -> () {
+  // Setting the match end position to MAX ensures that no LDM is used during this block.
+  if l.size == 0 || l.pos >= l.size {
+    l.startPosInBlock = 0xFFFFFFFF
+    l.endPosInBlock = 0xFFFFFFFF
+    return
+  }
+  // The bytes left in matchLength and litLength, adjusted by posInSequence.
+  let seq = unsafe mem.ro(unsafe mem.nn(l.seq))
+  let at = usize.wrappingMultiply(l.pos, RAWSEQ_BYTES)
+  let seqOffset = unsafe mem.r32(seq, at)
+  let seqLitLength = unsafe mem.r32(seq, at + 4)
+  let seqMatchLength = unsafe mem.r32(seq, at + 8)
+  let posInSequence = mem.t32(l.posInSequence)
+  let currBlockEndPos = mem.a32(currPosInBlock, blockBytesRemaining)
+  let literalsBytesRemaining: u32 = if l.posInSequence < mem.z(seqLitLength) { mem.s32(seqLitLength, posInSequence) } else { 0 }
+  let matchBytesRemaining: u32 = if literalsBytesRemaining == 0 { mem.s32(seqMatchLength, mem.s32(posInSequence, seqLitLength)) } else { seqMatchLength }
+  // If there are more literal bytes than bytes remaining in the block, no LDM is possible.
+  if literalsBytesRemaining >= blockBytesRemaining {
+    l.startPosInBlock = 0xFFFFFFFF
+    l.endPosInBlock = 0xFFFFFFFF
+    unsafe optLdmSkipRawSeqStoreBytes(&mut l, mem.z(blockBytesRemaining))
+    return
+  }
+  // Matches may be shorter than minMatch by this process: they are rejected when deciding
+  // whether or not to add the LDM.
+  l.startPosInBlock = mem.a32(currPosInBlock, literalsBytesRemaining)
+  l.endPosInBlock = mem.a32(l.startPosInBlock, matchBytesRemaining)
+  l.offset = seqOffset
+  if l.endPosInBlock > currBlockEndPos {
+    // The match ends after the block ends: the whole match cannot be used.
+    l.endPosInBlock = currBlockEndPos
+    unsafe optLdmSkipRawSeqStoreBytes(&mut l, mem.z(mem.s32(currBlockEndPos, currPosInBlock)))
+  } else {
+    // Consume as many bytes as the size of the sequence left.
+    unsafe optLdmSkipRawSeqStoreBytes(&mut l, mem.z(mem.a32(literalsBytesRemaining, matchBytesRemaining)))
+  }
+}
+
+// `ZSTD_optLdm_maybeAddMatch`: adds the long-distance match to `matches` if it is long enough,
+// keeping the order of `matches`.
+unsafe fn optLdmMaybeAddMatch(matches: [*]mut u8, nbMatches: &mut u32, l: &OptLdm, currPosInBlock: u32, minMatch: u32) -> () {
+  let posDiff = mem.s32(currPosInBlock, l.startPosInBlock)
+  let candidateMatchLength = mem.s32(mem.s32(l.endPosInBlock, l.startPosInBlock), posDiff)
+  // Ensure that the current block position is not outside of the match.
+  if currPosInBlock < l.startPosInBlock || currPosInBlock >= l.endPosInBlock || candidateMatchLength < minMatch { return }
+  let n = nbMatches.*
+  if n == 0 || (candidateMatchLength > unsafe matchLen(matches, n - 1) && n < OPT_NUM) {
+    unsafe setMatch(matches, n, cstate.offsetToOffBase(l.offset), candidateMatchLength)
+    nbMatches.* = n + 1
+  }
+}
+
+// `ZSTD_optLdm_processMatchCandidate`.
+@inlineAlways
+unsafe fn optLdmProcessMatchCandidate(l: &mut OptLdm, matches: [*]mut u8, nbMatches: &mut u32, currPosInBlock: u32, remainingBytes: u32, minMatch: u32) -> () {
+  if l.size == 0 || l.pos >= l.size { return }
+  if currPosInBlock >= l.endPosInBlock {
+    if currPosInBlock > l.endPosInBlock {
+      // The position is not necessarily at the end of a match of the store, and is often some
+      // bytes beyond it: correct for the overshoot.
+      let posOvershoot = currPosInBlock - l.endPosInBlock
+      unsafe optLdmSkipRawSeqStoreBytes(&mut l, mem.z(posOvershoot))
+    }
+    unsafe optGetNextMatchAndUpdateSeqStore(&mut l, currPosInBlock, remainingBytes)
+  }
+  unsafe optLdmMaybeAddMatch(matches, &mut nbMatches, &l, currPosInBlock, minMatch)
+}
+
+// ---- The optimal parser. ----
+
+// A `ZSTD_optimal_t` in registers.
+struct Stretch {
+  price: i32,
+  off: u32,
+  mlen: u32,
+  litlen: u32,
+  rep0: u32,
+  rep1: u32,
+  rep2: u32,
+}
+impl Copy for Stretch {}
+
+const O_PRICE: usize = 0
+const O_OFF: usize = 4
+const O_MLEN: usize = 8
+const O_LITLEN: usize = 12
+const O_REP: usize = 16
+
+@inlineAlways
+fn oAt(pos: u32) -> usize { return usize.wrappingMultiply(mem.z(pos), OPTIMAL_BYTES) }
+@inlineAlways
+unsafe fn oGet(opt: [*]mut u8, pos: u32, field: usize) -> u32 { return unsafe mem.r32(unsafe mem.ro(opt), mem.ua(oAt(pos), field)) }
+@inlineAlways
+unsafe fn oSet(opt: [*]mut u8, pos: u32, field: usize, value: u32) -> () { unsafe mem.w32(opt, mem.ua(oAt(pos), field), value) }
+@inlineAlways
+unsafe fn oPrice(opt: [*]mut u8, pos: u32) -> i32 { return u32.wrappingToI32(unsafe oGet(opt, pos, O_PRICE)) }
+@inlineAlways
+unsafe fn oSetPrice(opt: [*]mut u8, pos: u32, price: i32) -> () { unsafe oSet(opt, pos, O_PRICE, i32.wrappingToU32(price)) }
+
+@inlineAlways
+unsafe fn oLoad(opt: [*]mut u8, pos: u32) -> Stretch {
+  let p = unsafe mem.ro(opt)
+  let at = oAt(pos)
+  return Stretch {
+    price: u32.wrappingToI32(unsafe mem.r32(p, at)),
+    off: unsafe mem.r32(p, mem.ua(at, 4)),
+    mlen: unsafe mem.r32(p, mem.ua(at, 8)),
+    litlen: unsafe mem.r32(p, mem.ua(at, 12)),
+    rep0: unsafe mem.r32(p, mem.ua(at, 16)),
+    rep1: unsafe mem.r32(p, mem.ua(at, 20)),
+    rep2: unsafe mem.r32(p, mem.ua(at, 24)),
+  }
+}
+
+@inlineAlways
+unsafe fn oStore(opt: [*]mut u8, pos: u32, s: Stretch) -> () {
+  let at = oAt(pos)
+  unsafe mem.w32(opt, at, i32.wrappingToU32(s.price))
+  unsafe mem.w32(opt, mem.ua(at, 4), s.off)
+  unsafe mem.w32(opt, mem.ua(at, 8), s.mlen)
+  unsafe mem.w32(opt, mem.ua(at, 12), s.litlen)
+  unsafe mem.w32(opt, mem.ua(at, 16), s.rep0)
+  unsafe mem.w32(opt, mem.ua(at, 20), s.rep1)
+  unsafe mem.w32(opt, mem.ua(at, 24), s.rep2)
+}
+
+// `ZSTD_newRep`, written at `dst[at..at + 12]`: the offset history `rep0..rep2` after a sequence
+// of `offBase`. `ll0` tells whether the sequence has no literal.
+@inlineAlways
+unsafe fn writeNewRep(dst: [*]mut u8, at: usize, rep0: u32, rep1: u32, rep2: u32, offBase: u32, ll0: bool) -> () {
+  let mut n0 = rep0
+  let mut n1 = rep1
+  let mut n2 = rep2
+  if offBase > cstate.REP_NUM {
+    n2 = rep1
+    n1 = rep0
+    n0 = mem.s32(offBase, cstate.REP_NUM)
+  } else {
+    let ll0v: u32 = if ll0 { 1 } else { 0 }
+    let repCode = offBase - 1 + ll0v
+    if repCode > 0 {
+      let currentOffset: u32 = if repCode == cstate.REP_NUM { mem.s32(rep0, 1) } else if repCode == 1 { rep1 } else { rep2 }
+      if repCode >= 2 { n2 = rep1 }
+      n1 = rep0
+      n0 = currentOffset
+    }
+  }
+  unsafe mem.w32(dst, at, n0)
+  unsafe mem.w32(dst, mem.ua(at, 4), n1)
+  unsafe mem.w32(dst, mem.ua(at, 8), n2)
+}
+
+// `ZSTD_compressBlock_opt_generic`. `rep` is the offset history (`u32[3]`), updated on return.
+// Returns the size of the last literals.
+@inlineAlways
+unsafe fn compressBlockOptGeneric(ms: &mut MatchState, seqStore: &mut SeqStore, rep: [*]mut u8, src: [*]const u8, srcSize: usize, optLevel: u32, dictMode: u32) -> usize {
+  let base = ms.window.base
+  let istart = mem.us(mem.addr(src), mem.addr(base))
+  let mut ip = istart
+  let mut anchor = istart
+  let iend = mem.ua(istart, srcSize)
+  // `iend - 8`; no position is below it when the block is shorter.
+  let ilimit: usize = if iend >= 8 { iend - 8 } else { 0 }
+  let prefixStart = mem.z(ms.window.dictLimit)
+  let targetLength = ms.cParams.targetLength
+  let sufficientLen: u32 = if targetLength < OPT_NUM - 1 { targetLength } else { OPT_NUM - 1 }
+  let cMinMatch = ms.cParams.minMatch
+  let mls: u32 = if cMinMatch < 3 { 3 } else if cMinMatch > 6 { 6 } else { cMinMatch }
+  let minMatch: u32 = if cMinMatch == 3 { 3 } else { 4 }
+  let mut nextToUpdate3 = ms.nextToUpdate
+  let opt = unsafe mem.nn(ms.opt.priceTable)
+  let matches = unsafe mem.nn(ms.opt.matchTable)
+  let mut lastStretch = Stretch { price: 0, off: 0, mlen: 0, litlen: 0, rep0: 0, rep1: 0, rep2: 0 }
+  let mut optLdm = unsafe optLdmInit(ms.ldmSeqStore)
+  unsafe optGetNextMatchAndUpdateSeqStore(&mut optLdm, 0, mem.t32(srcSize))
+
+  // Init.
+  unsafe rescaleFreqs(&mut ms.opt, src, srcSize, optLevel)
+  if ip == prefixStart { ip = ip + 1 }
+
+  // Match loop.
+  while ip < ilimit {
+    let mut cur: u32 = 0
+    let mut lastPos: u32 = 0
+    let mut shortestPath = false
+
+    // Find the first match.
+    let litlen0 = mem.t32(mem.us(ip, anchor))
+    let ll00: u32 = if litlen0 == 0 { 1 } else { 0 }
+    let r0 = unsafe mem.r32(unsafe mem.ro(rep), 0)
+    let r1 = unsafe mem.r32(unsafe mem.ro(rep), 4)
+    let r2 = unsafe mem.r32(unsafe mem.ro(rep), 8)
+    let mut nbMatches0 = unsafe getAllMatches(matches, &mut ms, &mut nextToUpdate3, ip, iend, r0, r1, r2, ll00, minMatch, dictMode, mls)
+    unsafe optLdmProcessMatchCandidate(&mut optLdm, matches, &mut nbMatches0, mem.t32(mem.us(ip, istart)), mem.t32(mem.us(iend, ip)), minMatch)
+    if nbMatches0 == 0 {
+      ip = mem.ua(ip, 1)
+      continue
+    }
+
+    // A match is found: store this solution, and eventually find more candidates. During this
+    // forward pass, `opt` stores stretches: a match followed by N literals (a sequence is N
+    // literals followed by a match).
+    unsafe oSet(opt, 0, O_MLEN, 0)
+    unsafe oSet(opt, 0, O_LITLEN, litlen0)
+    // The price of the literals before the first match is static for the duration of the forward
+    // pass: only the price of the literal length is included.
+    let price0 = unsafe litLengthPrice(litlen0, &ms.opt, optLevel)
+    unsafe oSetPrice(opt, 0, price0)
+    unsafe oSet(opt, 0, O_REP, r0)
+    unsafe oSet(opt, 0, O_REP + 4, r1)
+    unsafe oSet(opt, 0, O_REP + 8, r2)
+
+    // Large match: immediate encoding.
+    let maxML = unsafe matchLen(matches, nbMatches0 - 1)
+    if maxML > sufficientLen {
+      lastStretch.litlen = 0
+      lastStretch.mlen = maxML
+      lastStretch.off = unsafe matchOff(matches, nbMatches0 - 1)
+      cur = 0
+      lastPos = maxML
+      shortestPath = true
+    } else {
+      // Set the prices of the first matches, which start at position 0.
+      let mut pos: u32 = 1
+      while pos < minMatch {
+        unsafe oSetPrice(opt, pos, MAX_PRICE)
+        unsafe oSet(opt, pos, O_MLEN, 0)
+        unsafe oSet(opt, pos, O_LITLEN, mem.a32(litlen0, pos))
+        pos = pos + 1
+      }
+      let ll0Price = unsafe litLengthPrice(0, &ms.opt, optLevel)
+      let mut matchNb: u32 = 0
+      while matchNb < nbMatches0 {
+        let offBase = unsafe matchOff(matches, matchNb)
+        let end = unsafe matchLen(matches, matchNb)
+        while pos <= end {
+          let matchPrice = unsafe getMatchPrice(offBase, pos, &ms.opt, optLevel)
+          let sequencePrice = i32.wrappingAdd(price0, matchPrice)
+          unsafe oSet(opt, pos, O_MLEN, pos)
+          unsafe oSet(opt, pos, O_OFF, offBase)
+          unsafe oSet(opt, pos, O_LITLEN, 0)
+          unsafe oSetPrice(opt, pos, i32.wrappingAdd(sequencePrice, ll0Price))
+          pos = mem.a32(pos, 1)
+        }
+        matchNb = mem.a32(matchNb, 1)
+      }
+      lastPos = pos - 1
+      unsafe oSetPrice(opt, pos, MAX_PRICE)
+    }
+
+    // Check further positions.
+    if !shortestPath {
+      cur = 1
+      while cur <= lastPos {
+        let inr = mem.ua(ip, mem.z(cur))
+
+        // Fix the current position with one literal if cheaper.
+        let litlen = mem.a32(unsafe oGet(opt, mem.s32(cur, 1), O_LITLEN), 1)
+        let price = i32.wrappingAdd(i32.wrappingAdd(unsafe oPrice(opt, mem.s32(cur, 1)), unsafe litPrice(unsafe mem.r8(base, mem.us(inr, 1)), &ms.opt, optLevel)), unsafe llIncPrice(litlen, &ms.opt, optLevel))
+        if price <= unsafe oPrice(opt, cur) {
+          let prevMatch = unsafe oLoad(opt, cur)
+          let mut e = unsafe oLoad(opt, mem.s32(cur, 1))
+          e.litlen = litlen
+          e.price = price
+          unsafe oStore(opt, cur, e)
+          // Additional check, only for higher modes: replace a match when ll1 is cheaper than ll0.
+          if optLevel >= 1 && prevMatch.litlen == 0 && inr < iend && unsafe llIncPrice(1, &ms.opt, optLevel) < 0 {
+            // Check the next position, in case it would be cheaper.
+            let nextLit = unsafe litPrice(unsafe mem.r8(base, inr), &ms.opt, optLevel)
+            let with1literal = i32.wrappingAdd(i32.wrappingAdd(prevMatch.price, nextLit), unsafe llIncPrice(1, &ms.opt, optLevel))
+            let withMoreLiterals = i32.wrappingAdd(i32.wrappingAdd(price, nextLit), unsafe llIncPrice(mem.a32(litlen, 1), &ms.opt, optLevel))
+            if with1literal < withMoreLiterals && with1literal < unsafe oPrice(opt, mem.a32(cur, 1)) {
+              // Update the offset history, before it disappears.
+              let prev = mem.s32(cur, prevMatch.mlen)
+              let p = unsafe oLoad(opt, prev)
+              let mut n = prevMatch
+              n.litlen = 1
+              n.price = with1literal
+              unsafe oStore(opt, mem.a32(cur, 1), n)
+              unsafe writeNewRep(opt, mem.ua(oAt(mem.a32(cur, 1)), O_REP), p.rep0, p.rep1, p.rep2, prevMatch.off, p.litlen == 0)
+              if lastPos < mem.a32(cur, 1) { lastPos = mem.a32(cur, 1) }
+            }
+          }
+        }
+
+        // The offset history is not updated during the comparison of matches: do it here, now
+        // that the match is selected and confirmed.
+        if unsafe oGet(opt, cur, O_LITLEN) == 0 {
+          // Just finished a match: alter the offset history.
+          let prev = mem.s32(cur, unsafe oGet(opt, cur, O_MLEN))
+          let p = unsafe oLoad(opt, prev)
+          unsafe writeNewRep(opt, mem.ua(oAt(cur), O_REP), p.rep0, p.rep1, p.rep2, unsafe oGet(opt, cur, O_OFF), p.litlen == 0)
+        }
+
+        // The last match must start at a minimum distance of 8 from the end.
+        if inr > ilimit {
+          cur = mem.a32(cur, 1)
+          continue
+        }
+        if cur == lastPos { break }
+
+        let curPrice = unsafe oPrice(opt, cur)
+        if optLevel == 0 && unsafe oPrice(opt, mem.a32(cur, 1)) <= i32.wrappingAdd(curPrice, 128) {
+          // Skip unpromising positions.
+          cur = mem.a32(cur, 1)
+          continue
+        }
+
+        let c = unsafe oLoad(opt, cur)
+        let ll0: u32 = if c.litlen == 0 { 1 } else { 0 }
+        let basePrice = i32.wrappingAdd(curPrice, unsafe litLengthPrice(0, &ms.opt, optLevel))
+        let mut nbMatches = unsafe getAllMatches(matches, &mut ms, &mut nextToUpdate3, inr, iend, c.rep0, c.rep1, c.rep2, ll0, minMatch, dictMode, mls)
+        unsafe optLdmProcessMatchCandidate(&mut optLdm, matches, &mut nbMatches, mem.t32(mem.us(inr, istart)), mem.t32(mem.us(iend, inr)), minMatch)
+        if nbMatches == 0 {
+          cur = mem.a32(cur, 1)
+          continue
+        }
+
+        let longestML = unsafe matchLen(matches, nbMatches - 1)
+        if longestML > sufficientLen || mem.a32(cur, longestML) >= OPT_NUM || mem.ua(inr, mem.z(longestML)) >= iend {
+          lastStretch.mlen = longestML
+          lastStretch.off = unsafe matchOff(matches, nbMatches - 1)
+          lastStretch.litlen = 0
+          lastPos = mem.a32(cur, longestML)
+          shortestPath = true
+          break
+        }
+
+        // Set the prices using the matches found at position `cur`.
+        let mut matchNb: u32 = 0
+        while matchNb < nbMatches {
+          let offset = unsafe matchOff(matches, matchNb)
+          let lastML = unsafe matchLen(matches, matchNb)
+          let startML: u32 = if matchNb > 0 { mem.a32(unsafe matchLen(matches, mem.s32(matchNb, 1)), 1) } else { minMatch }
+          let mut mlen = lastML
+          // Scan downward.
+          while mlen >= startML {
+            let pos = mem.a32(cur, mlen)
+            let mprice = i32.wrappingAdd(basePrice, unsafe getMatchPrice(offset, mlen, &ms.opt, optLevel))
+            if pos > lastPos || mprice < unsafe oPrice(opt, pos) {
+              while lastPos < pos {
+                // Fill the empty positions, for future comparisons.
+                lastPos = mem.a32(lastPos, 1)
+                unsafe oSetPrice(opt, lastPos, MAX_PRICE)
+                // Just needs to be != 0, to mean "not an end of match".
+                unsafe oSet(opt, lastPos, O_LITLEN, 1)
+              }
+              unsafe oSet(opt, pos, O_MLEN, mlen)
+              unsafe oSet(opt, pos, O_OFF, offset)
+              unsafe oSet(opt, pos, O_LITLEN, 0)
+              unsafe oSetPrice(opt, pos, mprice)
+            } else {
+              // Early update abort.
+              if optLevel == 0 { break }
+            }
+            mlen = mem.s32(mlen, 1)
+          }
+          matchNb = mem.a32(matchNb, 1)
+        }
+        unsafe oSetPrice(opt, mem.a32(lastPos, 1), MAX_PRICE)
+        cur = mem.a32(cur, 1)
+      }
+      if !shortestPath {
+        lastStretch = unsafe oLoad(opt, lastPos)
+        cur = mem.s32(lastPos, lastStretch.mlen)
+      }
+    }
+
+    // The shortest path: `cur`, `lastPos` and `lastStretch` are set.
+    if lastStretch.mlen == 0 {
+      // No solution: all matches have been converted into literals.
+      ip = mem.ua(ip, mem.z(lastPos))
+      continue
+    }
+
+    // Update the offset history.
+    if lastStretch.litlen == 0 {
+      // Finishing on a match.
+      let c = unsafe oLoad(opt, cur)
+      unsafe writeNewRep(rep, 0, c.rep0, c.rep1, c.rep2, lastStretch.off, c.litlen == 0)
+    } else {
+      unsafe mem.w32(rep, 0, lastStretch.rep0)
+      unsafe mem.w32(rep, 4, lastStretch.rep1)
+      unsafe mem.w32(rep, 8, lastStretch.rep2)
+      cur = cur - lastStretch.litlen
+    }
+
+    // Write the shortest path solution. It is stored in `opt` in reverse order, starting from
+    // `storeEnd` (`cur + 2`), partially overwriting `opt`. The content changes too: so far `opt`
+    // stored stretches (a match followed by literals); now it stores sequences (literals
+    // followed by a match).
+    let storeEnd = cur + 2
+    let mut storeStart = storeEnd
+    let mut stretchPos = cur
+    if lastStretch.litlen > 0 {
+      // The reference writes the unfinished last "sequence" (a bunch of literals) here, and then
+      // overwrites it below: its two blocks are not alternatives.
+      unsafe oSet(opt, storeEnd, O_LITLEN, lastStretch.litlen)
+      unsafe oSet(opt, storeEnd, O_MLEN, 0)
+      unsafe oStore(opt, storeEnd - 1, lastStretch)
+    }
+    // Note: litlen will be fixed.
+    unsafe oStore(opt, storeEnd, lastStretch)
+    storeStart = storeEnd
+    while true {
+      let nextStretch = unsafe oLoad(opt, stretchPos)
+      unsafe oSet(opt, storeStart, O_LITLEN, nextStretch.litlen)
+      if nextStretch.mlen == 0 {
+        // Reaching the beginning of the segment.
+        break
+      }
+      storeStart = storeStart - 1
+      unsafe oStore(opt, storeStart, nextStretch)
+      stretchPos = stretchPos - (nextStretch.litlen + nextStretch.mlen)
+    }
+
+    // Save the sequences.
+    let mut storePos = storeStart
+    while storePos <= storeEnd {
+      let llen = unsafe oGet(opt, storePos, O_LITLEN)
+      let mlen = unsafe oGet(opt, storePos, O_MLEN)
+      let offBase = unsafe oGet(opt, storePos, O_OFF)
+      if mlen == 0 {
+        // Only literals: the last "sequence", which starts a new stream of sequences. Don't
+        // progress the anchor.
+        ip = mem.ua(anchor, mem.z(llen))
+      } else {
+        unsafe updateStats(&mut ms.opt, llen, base, anchor, offBase, mlen)
+        unsafe cstate.storeSeq(&mut seqStore, mem.z(llen), base, anchor, iend, offBase, mem.z(mlen))
+        anchor = mem.ua(anchor, mem.z(llen + mlen))
+        ip = anchor
+      }
+      storePos = storePos + 1
+    }
+
+    // Update all costs.
+    setBasePrices(&mut ms.opt, optLevel)
+  }
+
+  // Return the size of the last literals.
+  return mem.us(iend, anchor)
+}
+
+// `ZSTD_compressBlock_opt0` and `ZSTD_compressBlock_opt2`, by dictMode.
+@inlineNever
+unsafe fn compressBlockOpt0NoDict(ms: &mut MatchState, seqStore: &mut SeqStore, rep: [*]mut u8, src: [*]const u8, srcSize: usize) -> usize {
+  return unsafe compressBlockOptGeneric(&mut ms, &mut seqStore, rep, src, srcSize, 0, cstate.NO_DICT)
+}
+@inlineNever
+unsafe fn compressBlockOpt2NoDict(ms: &mut MatchState, seqStore: &mut SeqStore, rep: [*]mut u8, src: [*]const u8, srcSize: usize) -> usize {
+  return unsafe compressBlockOptGeneric(&mut ms, &mut seqStore, rep, src, srcSize, 2, cstate.NO_DICT)
+}
+@inlineNever
+unsafe fn compressBlockOpt0ExtDict(ms: &mut MatchState, seqStore: &mut SeqStore, rep: [*]mut u8, src: [*]const u8, srcSize: usize) -> usize {
+  return unsafe compressBlockOptGeneric(&mut ms, &mut seqStore, rep, src, srcSize, 0, cstate.EXT_DICT)
+}
+@inlineNever
+unsafe fn compressBlockOpt2ExtDict(ms: &mut MatchState, seqStore: &mut SeqStore, rep: [*]mut u8, src: [*]const u8, srcSize: usize) -> usize {
+  return unsafe compressBlockOptGeneric(&mut ms, &mut seqStore, rep, src, srcSize, 2, cstate.EXT_DICT)
+}
+
+/// `ZSTD_compressBlock_btopt`. As every block compressor: appends the sequences of
+/// `src[0..srcSize]` to `seqStore`, updates the offset history `rep` (`u32[3]`) and returns the
+/// size of the last literals.
+pub unsafe fn compressBlockBtopt(ms: &mut MatchState, seqStore: &mut SeqStore, rep: [*]mut u8, src: [*]const u8, srcSize: usize) -> usize {
+  return unsafe compressBlockOpt0NoDict(&mut ms, &mut seqStore, rep, src, srcSize)
+}
+
+// `ZSTD_initStats_ultra`: makes a first compression pass, just to seed the statistics with more
+// accurate starting values. Only works on the first block, with no dictionary and no LDM.
+unsafe fn initStatsUltra(ms: &mut MatchState, seqStore: &mut SeqStore, rep: [*]mut u8, src: [*]const u8, srcSize: usize) -> () {
+  // The updated repeat offsets sink here.
+  let mut tmpRep: [u8; 12] = [0; 12]
+  let tmp = unsafe mem.nn(Pointer.fromMutSlice<u8>(&mut tmpRep))
+  let _c = unsafe mem.memcpy(tmp, unsafe mem.ro(rep), 12)
+  // Generate the statistics into ms.opt.
+  let _l = unsafe compressBlockOpt2NoDict(&mut ms, &mut seqStore, tmp, src, srcSize)
+  // Invalidate the first scan from the history, only keep the entropy statistics.
+  cstate.resetSeqStore(&mut seqStore)
+  ms.window.base = unsafe mem.subc(ms.window.base, srcSize)
+  ms.window.dictLimit = mem.a32(ms.window.dictLimit, mem.t32(srcSize))
+  ms.window.lowLimit = ms.window.dictLimit
+  ms.nextToUpdate = ms.window.dictLimit
+}
+
+/// `ZSTD_compressBlock_btultra`.
+pub unsafe fn compressBlockBtultra(ms: &mut MatchState, seqStore: &mut SeqStore, rep: [*]mut u8, src: [*]const u8, srcSize: usize) -> usize {
+  return unsafe compressBlockOpt2NoDict(&mut ms, &mut seqStore, rep, src, srcSize)
+}
+
+/// `ZSTD_compressBlock_btultra2`: as `btultra`, with a first pass over the first block of a
+/// frame that collects statistics to seed the real pass. After the first pass the history is
+/// forgotten, so this only happens when nothing was loaded in the tables before: no dictionary,
+/// no prefix, no LDM.
+pub unsafe fn compressBlockBtultra2(ms: &mut MatchState, seqStore: &mut SeqStore, rep: [*]mut u8, src: [*]const u8, srcSize: usize) -> usize {
+  let curr = mem.t32(mem.us(mem.addr(src), mem.addr(ms.window.base)))
+  if ms.opt.litLengthSum == 0
+    && seqStore.nbSeq == 0
+    && ms.window.dictLimit == ms.window.lowLimit
+    && curr == ms.window.dictLimit
+    && srcSize > PREDEF_THRESHOLD {
+    unsafe initStatsUltra(&mut ms, &mut seqStore, rep, src, srcSize)
+  }
+  return unsafe compressBlockOpt2NoDict(&mut ms, &mut seqStore, rep, src, srcSize)
+}
+
+/// `ZSTD_compressBlock_btopt_extDict`.
+pub unsafe fn compressBlockBtoptExtDict(ms: &mut MatchState, seqStore: &mut SeqStore, rep: [*]mut u8, src: [*]const u8, srcSize: usize) -> usize {
+  return unsafe compressBlockOpt0ExtDict(&mut ms, &mut seqStore, rep, src, srcSize)
+}
+
+/// `ZSTD_compressBlock_btultra_extDict`. `btultra2` uses it too, as in the reference.
+pub unsafe fn compressBlockBtultraExtDict(ms: &mut MatchState, seqStore: &mut SeqStore, rep: [*]mut u8, src: [*]const u8, srcSize: usize) -> usize {
+  return unsafe compressBlockOpt2ExtDict(&mut ms, &mut seqStore, rep, src, srcSize)
+}
+
+// =================================================================================================
+// ---- `dictMatchState`: an attached CDict (`cdict.silk`). Added by the dictionary port: the
+// dictionary parts of `ZSTD_insertBtAndGetAllMatches` (called at the places marked
+// `dictMatchState:` above) and the `_dictMatchState` block compressors. ----
+// =================================================================================================
+
+/// The `dms*` values of `ZSTD_insertBtAndGetAllMatches`.
+struct OptDms {
+  hashTable: [*]mut u8,
+  bt: [*]mut u8,
+  base: [*]const u8,
+  hashLog: u32,
+  /// `dmsHighLimit`: `dms.window.nextSrc - dms.window.base`.
+  highLimit: u32,
+  /// `dmsLowLimit`.
+  lowLimit: u32,
+  /// `dmsIndexDelta`: `windowLow - dmsHighLimit`.
+  indexDelta: u32,
+  btMask: u32,
+  btLow: u32,
+}
+
+/// The `dms*` values, or placeholders when `on` is false (there is no attached dictionary).
+@inlineAlways
+unsafe fn optDmsView(ms: &MatchState, on: bool, windowLow: u32) -> OptDms {
+  if !on {
+    return OptDms { hashTable: ms.hashTable, bt: ms.chainTable, base: ms.window.base, hashLog: 0, highLimit: 0, lowLimit: 0, indexDelta: 0, btMask: 0, btLow: 0 }
+  }
+  let anchor = ()
+  let dms = unsafe Pointer.borrow<(), MatchState>(&anchor, unsafe Intrinsic.pointerRequalify<?*mut MatchState, *const MatchState>(ms.dictMatchState))
+  let highLimit = mem.t32(mem.us(mem.addr(dms.window.nextSrc), mem.addr(dms.window.base)))
+  let lowLimit = dms.window.lowLimit
+  let btMask = mem.s32(mem.shl32(1, mem.s32(dms.cParams.chainLog, 1)), 1)
+  let btLow = if btMask < mem.s32(highLimit, lowLimit) { mem.s32(highLimit, btMask) } else { lowLimit }
+  return OptDms {
+    hashTable: dms.hashTable, bt: dms.chainTable, base: dms.window.base, hashLog: dms.cParams.hashLog,
+    highLimit: highLimit, lowLimit: lowLimit, indexDelta: mem.s32(windowLow, highLimit), btMask: btMask, btLow: btLow,
+  }
+}
+
+/// The search of the tree of the dictionary in `ZSTD_insertBtAndGetAllMatches`: appends the
+/// matches found to `matches[mnum..]` and returns the new number of matches.
+@inlineAlways
+unsafe fn optDmsSearchTree(matches: [*]mut u8, ms: &MatchState, dv: &OptDms, ip: usize, iLimit: usize, mls: u32, nbCompares0: u32, mnum0: u32, bestLength: &mut usize, matchEndIdx: &mut u32) -> u32 {
+  let base = ms.window.base
+  let prefixStart = mem.z(ms.window.dictLimit)
+  let curr = mem.t32(ip)
+  let dmsEnd = mem.z(dv.highLimit)
+  let mut nbCompares = nbCompares0
+  let mut mnum = mnum0
+  let mut dictMatchIndex = unsafe cstate.tget(dv.hashTable, unsafe cstate.hashPtr(base, ip, dv.hashLog, mls))
+  let mut commonLengthSmaller: usize = 0
+  let mut commonLengthLarger: usize = 0
+  while nbCompares != 0 && dictMatchIndex > dv.lowLimit {
+    let nextPtr = usize.wrappingMultiply(mem.z(dictMatchIndex & dv.btMask), 2)
+    let mut matchLength = if commonLengthSmaller < commonLengthLarger { commonLengthSmaller } else { commonLengthLarger }
+    let mut mBase = dv.base
+    let mut mPos = mem.z(dictMatchIndex)
+    matchLength = mem.ua(matchLength, unsafe cstate.count2segments(base, mem.ua(ip, matchLength), iLimit, dv.base, mem.ua(mPos, matchLength), dmsEnd, prefixStart))
+    if mem.ua(mem.z(dictMatchIndex), matchLength) >= dmsEnd {
+      // Prepare the next read of match[matchLength].
+      mBase = base
+      mPos = mem.ua(mem.z(dictMatchIndex), mem.z(dv.indexDelta))
+    }
+    if matchLength > bestLength.* {
+      let matchIndex = mem.a32(dictMatchIndex, dv.indexDelta)
+      if matchLength > mem.z(mem.s32(matchEndIdx.*, matchIndex)) { matchEndIdx.* = mem.a32(matchIndex, mem.t32(matchLength)) }
+      bestLength.* = matchLength
+      unsafe setMatch(matches, mnum, cstate.offsetToOffBase(mem.s32(curr, matchIndex)), mem.t32(matchLength))
+      mnum = mem.a32(mnum, 1)
+      if matchLength > mem.z(OPT_NUM) || mem.ua(ip, matchLength) == iLimit { break }
+    }
+    if dictMatchIndex <= dv.btLow { break }
+    if unsafe mem.r8(mBase, mem.ua(mPos, matchLength)) < unsafe mem.r8(base, mem.ua(ip, matchLength)) {
+      commonLengthSmaller = matchLength
+      dictMatchIndex = unsafe cstate.tget(dv.bt, mem.ua(nextPtr, 1))
+    } else {
+      commonLengthLarger = matchLength
+      dictMatchIndex = unsafe cstate.tget(dv.bt, nextPtr)
+    }
+    nbCompares = mem.s32(nbCompares, 1)
+  }
+  return mnum
+}
+
+@inlineNever
+unsafe fn btGetAllMatchesDms3(matches: [*]mut u8, ms: &mut MatchState, nextToUpdate3: &mut u32, ip: usize, iHighLimit: usize, rep0: u32, rep1: u32, rep2: u32, ll0: u32, lengthToBeat: u32) -> u32 {
+  return unsafe btGetAllMatchesInternal(matches, &mut ms, &mut nextToUpdate3, ip, iHighLimit, rep0, rep1, rep2, ll0, lengthToBeat, cstate.DICT_MATCH_STATE, 3)
+}
+@inlineNever
+unsafe fn btGetAllMatchesDms4(matches: [*]mut u8, ms: &mut MatchState, nextToUpdate3: &mut u32, ip: usize, iHighLimit: usize, rep0: u32, rep1: u32, rep2: u32, ll0: u32, lengthToBeat: u32) -> u32 {
+  return unsafe btGetAllMatchesInternal(matches, &mut ms, &mut nextToUpdate3, ip, iHighLimit, rep0, rep1, rep2, ll0, lengthToBeat, cstate.DICT_MATCH_STATE, 4)
+}
+@inlineNever
+unsafe fn btGetAllMatchesDms5(matches: [*]mut u8, ms: &mut MatchState, nextToUpdate3: &mut u32, ip: usize, iHighLimit: usize, rep0: u32, rep1: u32, rep2: u32, ll0: u32, lengthToBeat: u32) -> u32 {
+  return unsafe btGetAllMatchesInternal(matches, &mut ms, &mut nextToUpdate3, ip, iHighLimit, rep0, rep1, rep2, ll0, lengthToBeat, cstate.DICT_MATCH_STATE, 5)
+}
+@inlineNever
+unsafe fn btGetAllMatchesDms6(matches: [*]mut u8, ms: &mut MatchState, nextToUpdate3: &mut u32, ip: usize, iHighLimit: usize, rep0: u32, rep1: u32, rep2: u32, ll0: u32, lengthToBeat: u32) -> u32 {
+  return unsafe btGetAllMatchesInternal(matches, &mut ms, &mut nextToUpdate3, ip, iHighLimit, rep0, rep1, rep2, ll0, lengthToBeat, cstate.DICT_MATCH_STATE, 6)
+}
+
+@inlineNever
+unsafe fn compressBlockOpt0Dms(ms: &mut MatchState, seqStore: &mut SeqStore, rep: [*]mut u8, src: [*]const u8, srcSize: usize) -> usize {
+  return unsafe compressBlockOptGeneric(&mut ms, &mut seqStore, rep, src, srcSize, 0, cstate.DICT_MATCH_STATE)
+}
+@inlineNever
+unsafe fn compressBlockOpt2Dms(ms: &mut MatchState, seqStore: &mut SeqStore, rep: [*]mut u8, src: [*]const u8, srcSize: usize) -> usize {
+  return unsafe compressBlockOptGeneric(&mut ms, &mut seqStore, rep, src, srcSize, 2, cstate.DICT_MATCH_STATE)
+}
+
+/// `ZSTD_compressBlock_btopt_dictMatchState`.
+pub unsafe fn compressBlockBtoptDictMatchState(ms: &mut MatchState, seqStore: &mut SeqStore, rep: [*]mut u8, src: [*]const u8, srcSize: usize) -> usize {
+  return unsafe compressBlockOpt0Dms(&mut ms, &mut seqStore, rep, src, srcSize)
+}
+
+/// `ZSTD_compressBlock_btultra_dictMatchState`. `btultra2` uses it too, as in the reference.
+pub unsafe fn compressBlockBtultraDictMatchState(ms: &mut MatchState, seqStore: &mut SeqStore, rep: [*]mut u8, src: [*]const u8, srcSize: usize) -> usize {
+  return unsafe compressBlockOpt2Dms(&mut ms, &mut seqStore, rep, src, srcSize)
+}
+// ---- (end of the dictMatchState section) ----

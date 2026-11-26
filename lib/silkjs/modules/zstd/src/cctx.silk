@@ -1,0 +1,541 @@
+//! The compression context and the compression of one block: a port of `ZSTD_CCtx`,
+//! `ZSTD_resetCCtx_internal`, `ZSTD_reset_matchState`, `ZSTD_buildSeqStore` and
+//! `ZSTD_compressBlock_internal` of `lib/compress/zstd_compress.c` of Zstandard 1.5.7.
+//!
+//! `compress` holds the frame and streaming driver on top of this module; a block splitter
+//! (`ZSTD_compressBlock_splitBlock`) builds on [`buildSeqStore`] and on the entropy modules.
+import mem
+import errors
+import xxh64
+import xxh64 { Xxh64 }
+import cparams
+import cparams { Params }
+import cstate
+import cstate { MatchState, SeqStore, Cwksp, Window, OptState }
+import cseq
+import cdispatch
+import zldm
+import silk.mem.pointer { Pointer }
+import silk.mem.layout { Layout }
+import silk.num.u8
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+
+// ---- `ZSTD_compressionStage_e`. ----
+pub const CS_CREATED: u32 = 0
+pub const CS_INIT: u32 = 1
+pub const CS_ONGOING: u32 = 2
+pub const CS_ENDING: u32 = 3
+
+// ---- `ZSTD_cStreamStage`. ----
+pub const ZCSS_INIT: u32 = 0
+pub const ZCSS_LOAD: u32 = 1
+pub const ZCSS_FLUSH: u32 = 2
+
+/// `ZSTDbss_compress`: [`buildSeqStore`] filled the sequence store.
+pub const BSS_COMPRESS: usize = 0
+/// `ZSTDbss_noCompress`: the block is too small to compress.
+pub const BSS_NO_COMPRESS: usize = 1
+
+/// `TMP_WORKSPACE_SIZE`.
+pub const TMP_WORKSPACE_SIZE: usize = 8924
+
+/// `ldmState_t`, as far as the context allocates it. `ldm.silk` owns its use.
+pub struct LdmState {
+  pub window: Window,
+  /// `ldmEntry_t[1 << hashLog]`, 8 bytes each; null if long distance matching is off.
+  pub hashTable: ?[*]mut u8,
+  pub loadedDictEnd: u32,
+  pub bucketOffsets: ?[*]mut u8,
+}
+
+/// `ZSTD_CCtx`.
+pub struct CCtx {
+  pub stage: u32,
+  pub cParamsChanged: bool,
+  pub requestedParams: Params,
+  pub appliedParams: Params,
+  pub dictID: u32,
+  pub dictContentSize: usize,
+  pub workspace: Cwksp,
+  pub blockSizeMax: usize,
+  pub pledgedSrcSizePlusOne: u64,
+  pub consumedSrcSize: u64,
+  pub producedCSize: u64,
+  pub xxhState: Xxh64,
+  pub isFirstBlock: bool,
+  pub initialized: bool,
+  pub seqStore: SeqStore,
+  pub ldmState: LdmState,
+  /// `rawSeq[maxNbLdmSequences]`, 12 bytes each; null if long distance matching is off.
+  pub ldmSequences: ?[*]mut u8,
+  pub maxNbLdmSequences: usize,
+  /// `blockState.prevCBlock` and `nextCBlock`: block states (`cstate.CBS_*`).
+  pub prevCBlock: [*]mut u8,
+  pub nextCBlock: [*]mut u8,
+  /// `blockState.matchState`.
+  pub matchState: MatchState,
+  pub tmpWorkspace: [*]mut u8,
+  pub tmpWkspSize: usize,
+  // Streaming.
+  pub inBuff: [*]mut u8,
+  pub inBuffSize: usize,
+  pub inToCompress: usize,
+  pub inBuffPos: usize,
+  pub inBuffTarget: usize,
+  pub outBuff: [*]mut u8,
+  pub outBuffSize: usize,
+  pub outBuffContentSize: usize,
+  pub outBuffFlushedSize: usize,
+  pub streamStage: u32,
+  pub frameEnded: bool,
+  // Expected buffers of the stable modes: the address of `src`, its size and its position.
+  pub expectedInSrc: usize,
+  pub expectedInSize: usize,
+  pub expectedInPos: usize,
+  pub stableInNotConsumed: usize,
+  pub expectedOutBufferSize: usize,
+  // Dictionaries (`localDict` and `prefixDict`). Nothing loads them into the match state yet.
+  pub localDictBuffer: ?[*]mut u8,
+  pub localDictSize: usize,
+  pub prefixDict: ?[*]mut u8,
+  pub prefixDictSize: usize,
+  /// `localDict.cdict`: the CDict built from `localDictBuffer` (`cdict.silk`), one allocation.
+  pub localCDict: ?[*]mut u8,
+  /// The default distributions (`cseq.initConsts`).
+  pub consts: [*]mut u8,
+  /// `externSeqStore`: a `RawSeqStore_t` (`zopt.RSS_*`) of sequences that the next blocks use
+  /// (`ZSTD_referenceExternalSequences`); `zldm.silk` and `zmt.silk` own its use.
+  pub externSeqStore: [*]mut u8,
+  /// The multithreaded context (`mtctx`, a `zmt.MtCtx`), or null; `zmt.silk` owns it.
+  pub mtctx: ?[*]mut u8,
+}
+
+/// Borrows the context behind the opaque pointer `c` of the public API.
+@inlineAlways
+pub unsafe fn of<'a>(anchor: &'a mut (), c: [*]mut u8) -> &'a mut CCtx {
+  return unsafe Pointer.borrowMut<(), CCtx>(&mut anchor, unsafe Pointer.atMut<CCtx>(unsafe Intrinsic.pointerReinterpret<[*]mut u8, [*]mut CCtx>(c), 0))
+}
+
+/// `ZSTD_createCCtx`: returns a new context with the default parameters, or null.
+pub unsafe fn create() -> ?[*]mut u8 {
+  let size = Layout.of<CCtx>().bytes
+  let raw = unsafe mem.calloc(1, size + cseq.CONSTS_SIZE + 40)
+  if Pointer.isNullMany<u8>(raw) { return raw }
+  let p = unsafe mem.nn(raw)
+  let consts = unsafe mem.add(p, size)
+  unsafe cseq.initConsts(consts)
+  let slot = unsafe Pointer.atMut<CCtx>(unsafe Intrinsic.pointerReinterpret<[*]mut u8, [*]mut CCtx>(p), 0)
+  unsafe Pointer.put<CCtx>(slot, CCtx {
+    stage: CS_CREATED,
+    cParamsChanged: false,
+    requestedParams: cparams.paramsInit(cparams.CLEVEL_DEFAULT),
+    appliedParams: cparams.paramsInit(cparams.CLEVEL_DEFAULT),
+    dictID: 0,
+    dictContentSize: 0,
+    workspace: Cwksp { workspace: mem.nullp(), workspaceEnd: 0, objectEnd: 0, tableEnd: 0, tableValidEnd: 0, allocStart: 0, initOnceStart: 0, allocFailed: false, workspaceOversizedDuration: 0, phase: cstate.WS_PHASE_OBJECTS },
+    blockSizeMax: 0,
+    pledgedSrcSizePlusOne: 0,
+    consumedSrcSize: 0,
+    producedCSize: 0,
+    xxhState: xxh64.make(),
+    isFirstBlock: false,
+    initialized: false,
+    seqStore: SeqStore { sequencesStart: p, nbSeq: 0, litStart: p, litSize: 0, llCode: p, mlCode: p, ofCode: p, maxNbSeq: 0, maxNbLit: 0, longLengthType: 0, longLengthPos: 0 },
+    ldmState: LdmState { window: cstate.windowInit(), hashTable: mem.nullp(), loadedDictEnd: 0, bucketOffsets: mem.nullp() },
+    ldmSequences: mem.nullp(),
+    maxNbLdmSequences: 0,
+    prevCBlock: p,
+    nextCBlock: p,
+    matchState: MatchState {
+      window: cstate.windowInit(),
+      loadedDictEnd: 0,
+      nextToUpdate: 0,
+      hashLog3: 0,
+      rowHashLog: 0,
+      tagTable: mem.nullp(),
+      hashCache: [0; 8],
+      hashSalt: 0,
+      hashSaltEntropy: 0,
+      hashTable: p,
+      hashTable3: p,
+      chainTable: p,
+      forceNonContiguous: false,
+      dedicatedDictSearch: false,
+      opt: OptState {
+        litFreq: mem.nullp(), litLengthFreq: mem.nullp(), matchLengthFreq: mem.nullp(), offCodeFreq: mem.nullp(),
+        matchTable: mem.nullp(), priceTable: mem.nullp(),
+        litSum: 0, litLengthSum: 0, matchLengthSum: 0, offCodeSum: 0,
+        litSumBasePrice: 0, litLengthSumBasePrice: 0, matchLengthSumBasePrice: 0, offCodeSumBasePrice: 0,
+        priceType: 0, symbolCosts: mem.nullp(), literalCompressionMode: 0,
+      },
+      dictMatchState: Pointer.null<MatchState>(),
+      cParams: cparams.paramsInit(0).cParams,
+      ldmSeqStore: mem.nullp(),
+      prefetchCDictTables: false,
+      lazySkipping: false,
+    },
+    tmpWorkspace: p,
+    tmpWkspSize: 0,
+    inBuff: p,
+    inBuffSize: 0,
+    inToCompress: 0,
+    inBuffPos: 0,
+    inBuffTarget: 0,
+    outBuff: p,
+    outBuffSize: 0,
+    outBuffContentSize: 0,
+    outBuffFlushedSize: 0,
+    streamStage: ZCSS_INIT,
+    frameEnded: false,
+    expectedInSrc: 0,
+    expectedInSize: 0,
+    expectedInPos: 0,
+    stableInNotConsumed: 0,
+    expectedOutBufferSize: 0,
+    localDictBuffer: mem.nullp(),
+    localDictSize: 0,
+    prefixDict: mem.nullp(),
+    prefixDictSize: 0,
+    localCDict: mem.nullp(),
+    consts: consts,
+    externSeqStore: unsafe mem.add(p, size + cseq.CONSTS_SIZE),
+    mtctx: mem.nullp(),
+  })
+  return raw
+}
+
+/// `ZSTD_clearAllDicts`.
+pub unsafe fn clearAllDicts(c: &mut CCtx) -> () {
+  unsafe mem.free(c.localDictBuffer)
+  c.localDictBuffer = mem.nullp()
+  c.localDictSize = 0
+  unsafe mem.free(c.localCDict)
+  c.localCDict = mem.nullp()
+  c.prefixDict = mem.nullp()
+  c.prefixDictSize = 0
+}
+
+/// `ZSTD_freeCCtx`.
+pub unsafe fn destroy(raw: ?[*]mut u8) -> () {
+  if Pointer.isNullMany<u8>(raw) { return () }
+  let mut anchor = ()
+  let c = unsafe of(&mut anchor, unsafe mem.nn(raw))
+  unsafe clearAllDicts(&mut c)
+  unsafe cstate.wsFree(&mut c.workspace)
+  unsafe mem.free(raw)
+}
+
+// ---- Sizes (`ZSTD_estimateCCtxSize_usingCCtxParams_internal`). ----
+
+/// `ZSTD_maxNbSeq`.
+pub fn maxNbSeq(blockSize: usize, minMatch: u32) -> usize {
+  if minMatch == 3 { return blockSize / 3 }
+  return blockSize / 4
+}
+
+// `ZSTD_sizeof_matchState` for a context.
+fn sizeofMatchState(cp: &cparams.CParams, useRowMatchFinder: u32) -> usize {
+  let chainSize: usize = if cparams.allocateChainTable(cp.strategy, useRowMatchFinder, false) { mem.shlz(1, cp.chainLog) } else { 0 }
+  let hSize = mem.shlz(1, cp.hashLog)
+  let hashLog3: u32 = if cp.minMatch == 3 { if cp.windowLog < 17 { cp.windowLog } else { 17 } } else { 0 }
+  let h3Size: usize = if hashLog3 != 0 { mem.shlz(1, hashLog3) } else { 0 }
+  let tableSpace = chainSize * 4 + hSize * 4 + h3Size * 4
+  let optPotentialSpace = cstate.wsAligned64(53 * 4) + cstate.wsAligned64(36 * 4) + cstate.wsAligned64(32 * 4) + cstate.wsAligned64(256 * 4)
+    + cstate.wsAligned64(4099 * 8) + cstate.wsAligned64(4099 * 28)
+  let lazyAdditionalSpace: usize = if cparams.rowMatchFinderUsed(cp.strategy, useRowMatchFinder) { cstate.wsAligned64(hSize) } else { 0 }
+  let optSpace: usize = if cp.strategy >= cparams.BTOPT { optPotentialSpace } else { 0 }
+  return tableSpace + optSpace + cstate.WS_SLACK + lazyAdditionalSpace
+}
+
+fn estimateCCtxSize(p: &Params, buffInSize: usize, buffOutSize: usize, pledgedSrcSize: u64) -> usize {
+  let mut windowSize64 = mem.shl64(1, p.cParams.windowLog)
+  if windowSize64 > pledgedSrcSize { windowSize64 = pledgedSrcSize }
+  if windowSize64 < 1 { windowSize64 = 1 }
+  let windowSize = u64.toUsize(windowSize64)
+  let maxBlock = cparams.resolveMaxBlockSize(p.maxBlockSize)
+  let blockSize = if maxBlock < windowSize { maxBlock } else { windowSize }
+  let nbSeq = maxNbSeq(blockSize, p.cParams.minMatch)
+  let tokenSpace = (cstate.WILDCOPY_OVERLENGTH + blockSize) + cstate.wsAligned64(nbSeq * 8) + 3 * nbSeq
+  let blockStateSpace = 2 * cstate.CBS_SIZE
+  let matchStateSize = sizeofMatchState(&p.cParams, p.useRowMatchFinder)
+  let mut ldmSpace: usize = 0
+  let mut ldmSeqSpace: usize = 0
+  if p.ldmParams.enableLdm == cparams.PS_ENABLE {
+    let bucketLog = if p.ldmParams.bucketSizeLog < p.ldmParams.hashLog { p.ldmParams.bucketSizeLog } else { p.ldmParams.hashLog }
+    ldmSpace = mem.shlz(1, p.ldmParams.hashLog - bucketLog) + mem.shlz(1, p.ldmParams.hashLog) * 8
+    ldmSeqSpace = cstate.wsAligned64((blockSize / mem.z(p.ldmParams.minMatchLength)) * 12)
+  }
+  return TMP_WORKSPACE_SIZE + blockStateSpace + ldmSpace + ldmSeqSpace + matchStateSize + tokenSpace + buffInSize + buffOutSize
+}
+
+fn bitmix(val0: u64, len: u64) -> u64 {
+  let mut val = val0
+  val = val ^ u64.rotateRight(val, 49) ^ u64.rotateRight(val, 24)
+  val = u64.wrappingMultiply(val, 0x9FB21C651E98DF25)
+  val = val ^ u64.wrappingAdd(u64.shiftRight(val, 35), len)
+  val = u64.wrappingMultiply(val, 0x9FB21C651E98DF25)
+  return val ^ u64.shiftRight(val, 28)
+}
+
+// `ZSTD_invalidateMatchState`.
+fn invalidateMatchState(ms: &mut MatchState) -> () {
+  cstate.windowClear(&mut ms.window)
+  ms.nextToUpdate = ms.window.dictLimit
+  ms.loadedDictEnd = 0
+  ms.opt.litLengthSum = 0
+  ms.dictMatchState = Pointer.null<MatchState>()
+}
+
+// `ZSTD_reset_matchState` for a context (`ZSTD_resetTarget_CCtx`).
+unsafe fn resetMatchState(ms: &mut MatchState, ws: &mut Cwksp, cp: &cparams.CParams, useRowMatchFinder: u32, makeClean: bool, resetIndex: bool) -> usize {
+  let chainSize: usize = if cparams.allocateChainTable(cp.strategy, useRowMatchFinder, false) { mem.shlz(1, cp.chainLog) } else { 0 }
+  let hSize = mem.shlz(1, cp.hashLog)
+  let hashLog3: u32 = if cp.minMatch == 3 { if cp.windowLog < 17 { cp.windowLog } else { 17 } } else { 0 }
+  let h3Size: usize = if hashLog3 != 0 { mem.shlz(1, hashLog3) } else { 0 }
+  if resetIndex {
+    ms.window = cstate.windowInit()
+    cstate.wsMarkTablesDirty(&mut ws)
+  }
+  ms.hashLog3 = hashLog3
+  ms.lazySkipping = false
+  invalidateMatchState(&mut ms)
+  cstate.wsClearTables(&mut ws)
+  ms.hashTable = unsafe cstate.wsReserveTable(&mut ws, hSize * 4)
+  ms.chainTable = unsafe cstate.wsReserveTable(&mut ws, chainSize * 4)
+  ms.hashTable3 = unsafe cstate.wsReserveTable(&mut ws, h3Size * 4)
+  if ws.allocFailed { return errors.err(errors.E_MEMORY_ALLOCATION) }
+  if makeClean { unsafe cstate.wsCleanTables(&mut ws) }
+  if cparams.rowMatchFinderUsed(cp.strategy, useRowMatchFinder) {
+    // The row match finder needs a tag table; it is salted so that it needs no reset.
+    ms.tagTable = unsafe cstate.wsReserveAlignedInitOnce(&mut ws, hSize)
+    ms.hashSalt = bitmix(ms.hashSalt, 8) ^ bitmix(u32.toU64(ms.hashSaltEntropy), 4)
+    let mut rowLog = cp.searchLog
+    if rowLog > 6 { rowLog = 6 }
+    if rowLog < 4 { rowLog = 4 }
+    ms.rowHashLog = cp.hashLog - rowLog
+  }
+  // The optimal parser's tables.
+  if cp.strategy >= cparams.BTOPT {
+    ms.opt.litFreq = unsafe cstate.wsReserveAligned64(&mut ws, 256 * 4)
+    ms.opt.litLengthFreq = unsafe cstate.wsReserveAligned64(&mut ws, 36 * 4)
+    ms.opt.matchLengthFreq = unsafe cstate.wsReserveAligned64(&mut ws, 53 * 4)
+    ms.opt.offCodeFreq = unsafe cstate.wsReserveAligned64(&mut ws, 32 * 4)
+    ms.opt.matchTable = unsafe cstate.wsReserveAligned64(&mut ws, 4099 * 8)
+    ms.opt.priceTable = unsafe cstate.wsReserveAligned64(&mut ws, 4099 * 28)
+  }
+  ms.cParams = cp.*
+  if ws.allocFailed { return errors.err(errors.E_MEMORY_ALLOCATION) }
+  return 0
+}
+
+/// `ZSTD_resetCCtx_internal`: prepares the context for a frame with `params`. `buffered` is
+/// `ZSTDb_buffered`: allocate the buffers of the streaming modes.
+pub unsafe fn resetInternal(c: &mut CCtx, params: &Params, pledgedSrcSize: u64, loadedDictSize: usize, makeClean: bool, buffered: bool) -> usize {
+  c.isFirstBlock = true
+  c.appliedParams = params.*
+  if c.appliedParams.ldmParams.enableLdm == cparams.PS_ENABLE {
+    // Adjust the long distance matching parameters.
+    let cp = c.appliedParams.cParams
+    cparams.ldmAdjustParameters(&mut c.appliedParams.ldmParams, &cp)
+  }
+  let p = c.appliedParams
+  let mut windowSize64 = mem.shl64(1, p.cParams.windowLog)
+  if windowSize64 > pledgedSrcSize { windowSize64 = pledgedSrcSize }
+  if windowSize64 < 1 { windowSize64 = 1 }
+  let windowSize = u64.toUsize(windowSize64)
+  let blockSize = if p.maxBlockSize < windowSize { p.maxBlockSize } else { windowSize }
+  let nbSeq = maxNbSeq(blockSize, p.cParams.minMatch)
+  let buffOutSize: usize = if buffered && p.outBufferMode == 0 { cparams.compressBound(blockSize) + 1 } else { 0 }
+  let buffInSize: usize = if buffered && p.inBufferMode == 0 { windowSize + blockSize } else { 0 }
+  let ldmOn = p.ldmParams.enableLdm == cparams.PS_ENABLE
+  let maxNbLdmSeq: usize = if ldmOn { blockSize / mem.z(p.ldmParams.minMatchLength) } else { 0 }
+  let w = c.matchState.window
+  let indexTooClose = mem.us(mem.addr(w.nextSrc), mem.addr(w.base)) > mem.z(cstate.CURRENT_MAX) - 16777216
+  let dictTooBig = loadedDictSize > mem.z(cstate.CHUNKSIZE_MAX)
+  let mut needsIndexReset = indexTooClose || dictTooBig || !c.initialized
+  let neededSpace = estimateCCtxSize(&p, buffInSize, buffOutSize, pledgedSrcSize)
+  cstate.wsBumpOversizedDuration(&mut c.workspace, 0)
+  // Check if the workspace is large enough, and not wastefully large; allocate if not.
+  let workspaceTooSmall = cstate.wsSizeof(&c.workspace) < neededSpace
+  let workspaceWasteful = cstate.wsCheckWasteful(&c.workspace, neededSpace)
+  if workspaceTooSmall || workspaceWasteful {
+    needsIndexReset = true
+    unsafe cstate.wsFree(&mut c.workspace)
+    let e = unsafe cstate.wsCreate(&mut c.workspace, neededSpace)
+    if errors.isError(e) { return e }
+    // Statically sized space; the entropy workspace never moves.
+    c.prevCBlock = unsafe cstate.wsReserveObject(&mut c.workspace, cstate.CBS_SIZE)
+    if c.workspace.allocFailed { return errors.err(errors.E_MEMORY_ALLOCATION) }
+    c.nextCBlock = unsafe cstate.wsReserveObject(&mut c.workspace, cstate.CBS_SIZE)
+    if c.workspace.allocFailed { return errors.err(errors.E_MEMORY_ALLOCATION) }
+    c.tmpWorkspace = unsafe cstate.wsReserveObject(&mut c.workspace, TMP_WORKSPACE_SIZE)
+    if c.workspace.allocFailed { return errors.err(errors.E_MEMORY_ALLOCATION) }
+    c.tmpWkspSize = TMP_WORKSPACE_SIZE
+  }
+  cstate.wsClear(&mut c.workspace)
+  // Init params.
+  c.matchState.cParams = p.cParams
+  c.matchState.prefetchCDictTables = p.prefetchCDictTables == cparams.PS_ENABLE
+  c.pledgedSrcSizePlusOne = u64.wrappingAdd(pledgedSrcSize, 1)
+  c.consumedSrcSize = 0
+  c.producedCSize = 0
+  if pledgedSrcSize == cparams.CONTENTSIZE_UNKNOWN { c.appliedParams.contentSizeFlag = 0 }
+  c.blockSizeMax = blockSize
+  xxh64.reset(&mut c.xxhState)
+  c.stage = CS_INIT
+  c.dictID = 0
+  c.dictContentSize = 0
+  unsafe cstate.resetCompressedBlockState(c.prevCBlock)
+  let e = unsafe resetMatchState(&mut c.matchState, &mut c.workspace, &p.cParams, p.useRowMatchFinder, makeClean, needsIndexReset)
+  if errors.isError(e) { return e }
+  c.seqStore.sequencesStart = unsafe cstate.wsReserveAligned64(&mut c.workspace, nbSeq * 8)
+  // Long distance matching: initialize the tables and the sequence storage.
+  if ldmOn {
+    let ldmHSize = mem.shlz(1, p.ldmParams.hashLog)
+    let table = unsafe cstate.wsReserveAligned64(&mut c.workspace, ldmHSize * 8)
+    if !c.workspace.allocFailed { let _m = unsafe mem.memset(table, 0, ldmHSize * 8) }
+    c.ldmState.hashTable = table
+    c.ldmSequences = unsafe cstate.wsReserveAligned64(&mut c.workspace, maxNbLdmSeq * 12)
+    c.maxNbLdmSequences = maxNbLdmSeq
+    c.ldmState.window = cstate.windowInit()
+    c.ldmState.loadedDictEnd = 0
+  }
+  // Buffers. The sequence storage is reserved from the same space, after the aligned tables.
+  c.seqStore.litStart = unsafe cstate.wsReserveBuffer(&mut c.workspace, blockSize + cstate.WILDCOPY_OVERLENGTH)
+  c.seqStore.maxNbLit = blockSize
+  c.inBuffSize = buffInSize
+  c.inBuff = unsafe cstate.wsReserveBuffer(&mut c.workspace, buffInSize)
+  c.outBuffSize = buffOutSize
+  c.outBuff = unsafe cstate.wsReserveBuffer(&mut c.workspace, buffOutSize)
+  if ldmOn {
+    let numBuckets = mem.shlz(1, p.ldmParams.hashLog - p.ldmParams.bucketSizeLog)
+    let buckets = unsafe cstate.wsReserveBuffer(&mut c.workspace, numBuckets)
+    if !c.workspace.allocFailed { let _m = unsafe mem.memset(buckets, 0, numBuckets) }
+    c.ldmState.bucketOffsets = buckets
+  }
+  c.seqStore.maxNbSeq = nbSeq
+  c.seqStore.llCode = unsafe cstate.wsReserveBuffer(&mut c.workspace, nbSeq)
+  c.seqStore.mlCode = unsafe cstate.wsReserveBuffer(&mut c.workspace, nbSeq)
+  c.seqStore.ofCode = unsafe cstate.wsReserveBuffer(&mut c.workspace, nbSeq)
+  if c.workspace.allocFailed { return errors.err(errors.E_MEMORY_ALLOCATION) }
+  c.initialized = true
+  return 0
+}
+
+// ---- One block. ----
+
+/// `ZSTD_noCompressBlock`: a raw block, with its header.
+pub unsafe fn noCompressBlock(dst: [*]mut u8, dstCapacity: usize, src: [*]const u8, srcSize: usize, lastBlock: u32) -> usize {
+  let cBlockHeader24 = mem.a32(lastBlock, mem.t32(usize.shiftLeft(srcSize, 3)))
+  if srcSize + cstate.BLOCK_HEADER_SIZE > dstCapacity { return errors.err(errors.E_DSTSIZE_TOOSMALL) }
+  unsafe mem.w24(dst, 0, cBlockHeader24)
+  let _c = unsafe mem.memcpy(unsafe mem.add(dst, cstate.BLOCK_HEADER_SIZE), src, srcSize)
+  return cstate.BLOCK_HEADER_SIZE + srcSize
+}
+
+/// `ZSTD_rleCompressBlock`: a block of `srcSize` times the byte `value`, with its header.
+pub unsafe fn rleCompressBlock(dst: [*]mut u8, dstCapacity: usize, value: u8, srcSize: usize, lastBlock: u32) -> usize {
+  let cBlockHeader = mem.a32(lastBlock + 2, mem.t32(usize.shiftLeft(srcSize, 3)))
+  if dstCapacity < 4 { return errors.err(errors.E_DSTSIZE_TOOSMALL) }
+  unsafe mem.w24(dst, 0, cBlockHeader)
+  unsafe mem.w8(dst, 3, value)
+  return 4
+}
+
+/// `ZSTD_isRLE`: whether the `length` bytes at `src` are all the same. `length` is not 0.
+pub unsafe fn isRLE(src: [*]const u8, length: usize) -> bool {
+  let value = unsafe mem.r8(src, 0)
+  let wide = u64.wrappingMultiply(u8.toU64(value), 0x0101010101010101)
+  let mut i: usize = 0
+  while i + 8 <= length {
+    if unsafe mem.r64(src, i) != wide { return false }
+    i = i + 8
+  }
+  while i < length {
+    if unsafe mem.r8(src, i) != value { return false }
+    i = i + 1
+  }
+  return true
+}
+
+/// `ZSTD_blockState_confirmRepcodesAndEntropyTables`: the tables and repeat offsets that the
+/// block just built become those of the previous block.
+pub fn confirmRepcodesAndEntropyTables(c: &mut CCtx) -> () {
+  let tmp = c.prevCBlock
+  c.prevCBlock = c.nextCBlock
+  c.nextCBlock = tmp
+}
+
+/// `ZSTD_buildSeqStore`: runs the match finder on the block `src[0..srcSize]` and leaves its
+/// sequences and literals in `c.seqStore`, and its repeat offsets in `c.nextCBlock`. Returns
+/// [`BSS_COMPRESS`], [`BSS_NO_COMPRESS`], or an error.
+pub unsafe fn buildSeqStore(c: &mut CCtx, src: [*]const u8, srcSize: usize) -> usize {
+  // Don't even attempt compression below a certain size.
+  if srcSize < cstate.MIN_CBLOCK_SIZE + cstate.BLOCK_HEADER_SIZE + 1 + 1 {
+    // `ZSTD_ldm_skipRawSeqStoreBytes` / `ZSTD_ldm_skipSequences` on the external sequences.
+    unsafe zldm.skipBlock(&mut c, srcSize)
+    return BSS_NO_COMPRESS
+  }
+  cstate.resetSeqStore(&mut c.seqStore)
+  // Required for the optimal parser to read the statistics of the previous block.
+  c.matchState.opt.symbolCosts = c.prevCBlock
+  c.matchState.opt.literalCompressionMode = c.appliedParams.literalCompressionMode
+  // Limit how far back the tables are updated: a far `nextToUpdate` means a long skipped area.
+  let curr = mem.t32(mem.us(mem.addr(src), mem.addr(c.matchState.window.base)))
+  if curr > mem.a32(c.matchState.nextToUpdate, 384) {
+    let gap = mem.s32(mem.s32(curr, c.matchState.nextToUpdate), 384)
+    c.matchState.nextToUpdate = mem.s32(curr, if gap < 192 { gap } else { 192 })
+  }
+  // Select and store the sequences.
+  let dictMode = cstate.dictMode(&c.matchState)
+  let _r = unsafe mem.memcpy(unsafe mem.add(c.nextCBlock, cstate.CBS_REP), unsafe mem.addc(unsafe mem.ro(c.prevCBlock), cstate.CBS_REP), 12)
+  let mut lastLLSize: usize = 0
+  if unsafe zldm.isActive(&c) {
+    // External sequences (the long distance matches of a worker job), or long distance
+    // matching: `ZSTD_ldm_generateSequences` and `ZSTD_ldm_blockCompress` (`zldm.silk`).
+    lastLLSize = unsafe zldm.compressBlock(&mut c, src, srcSize)
+    if errors.isError(lastLLSize) { return lastLLSize }
+  } else {
+    c.matchState.ldmSeqStore = mem.nullp()
+    lastLLSize = unsafe cdispatch.compressBlock(c.appliedParams.cParams.strategy, c.appliedParams.useRowMatchFinder, dictMode, &mut c.matchState, &mut c.seqStore, unsafe mem.add(c.nextCBlock, cstate.CBS_REP), src, srcSize)
+  }
+  // `ZSTD_storeLastLiterals`.
+  let _c = unsafe mem.memcpy(unsafe mem.add(c.seqStore.litStart, c.seqStore.litSize), unsafe mem.addc(src, srcSize - lastLLSize), lastLLSize)
+  c.seqStore.litSize = c.seqStore.litSize + lastLLSize
+  return BSS_COMPRESS
+}
+
+/// `ZSTD_entropyCompressSeqStore` on the sequence store of the context.
+pub unsafe fn entropyCompress(c: &mut CCtx, dst: [*]mut u8, dstCapacity: usize, srcSize: usize) -> usize {
+  return unsafe cseq.entropyCompressSeqStore(&c.seqStore, unsafe mem.ro(c.prevCBlock), c.nextCBlock, c.appliedParams.cParams.strategy, cparams.literalsCompressionIsDisabled(&c.appliedParams), dst, dstCapacity, srcSize, c.tmpWorkspace, c.tmpWkspSize, unsafe mem.ro(c.consts))
+}
+
+/// `ZSTD_compressBlock_internal` with `frame = 1`: compresses the block `src[0..srcSize]` into
+/// `dst`, without the block header. Returns the compressed size; 0 if the block is to be stored
+/// raw; 1 if it is one repeated byte, which is then at `dst[0]`.
+pub unsafe fn compressBlockInternal(c: &mut CCtx, dst: [*]mut u8, dstCapacity: usize, src: [*]const u8, srcSize: usize) -> usize {
+  // This is an estimated upper bound for the size of an RLE block: the compressed size of a
+  // block of one repeated byte is below it.
+  let rleMaxLength: usize = 25
+  let mut cSize: usize = 0
+  let bss = unsafe buildSeqStore(&mut c, src, srcSize)
+  if errors.isError(bss) { return bss }
+  if bss != BSS_NO_COMPRESS {
+    // Encode the sequence store into a compressed block.
+    cSize = unsafe entropyCompress(&mut c, dst, dstCapacity, srcSize)
+    // The first block of a frame is never RLE: decoders before 1.4.3 reject it.
+    if !c.isFirstBlock && cSize < rleMaxLength && unsafe isRLE(src, srcSize) {
+      cSize = 1
+      unsafe mem.w8(dst, 0, unsafe mem.r8(src, 0))
+    }
+  }
+  if !errors.isError(cSize) && cSize > 1 { confirmRepcodesAndEntropyTables(&mut c) }
+  // The offset codes are not validated when a block is not compressed with them: the next
+  // block must check the table again.
+  if unsafe mem.r32(unsafe mem.ro(c.prevCBlock), cstate.CBS_OF_REPEAT) == cstate.FSE_REPEAT_VALID {
+    unsafe mem.w32(c.prevCBlock, cstate.CBS_OF_REPEAT, cstate.FSE_REPEAT_CHECK)
+  }
+  return cSize
+}

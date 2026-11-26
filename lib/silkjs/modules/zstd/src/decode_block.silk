@@ -1,0 +1,779 @@
+//! Decoding of one compressed block (`zstd_decompress_block.c` of the reference): the literals
+//! section, the sequence tables, and the execution of sequences into the output.
+//!
+//! The output of a frame is addressed as the reference does, with two segments: the prefix, which
+//! is contiguous with the block being written, and the external segment before it (a dictionary,
+//! or the end of the ring buffer after it wrapped).
+import mem
+import errors
+import entropy
+import huf_decode
+import xxh64 { Xxh64 }
+import silk.simd.cpu { CpuFeatures }
+import silk.core.target { Arch, Target }
+import silk.num.u8
+import silk.num.u16
+import silk.num.u32
+import silk.num.u64
+import silk.num.i32
+import silk.num.usize
+
+/// `ZSTD_BLOCKSIZE_MAX`.
+pub const BLOCK_MAX: usize = 131072
+/// `WILDCOPY_OVERLENGTH`.
+pub const WILDCOPY: usize = 32
+
+const MAX_LL: u32 = 35
+const MAX_ML: u32 = 52
+const MAX_OFF: u32 = 31
+const LL_FSE_LOG: u32 = 9
+const ML_FSE_LOG: u32 = 9
+const OFF_FSE_LOG: u32 = 8
+const LONG_NB_SEQ: usize = 0x7F00
+
+const KIND_LL: u32 = 0
+const KIND_OF: u32 = 1
+const KIND_ML: u32 = 2
+
+const LL_BASE: [u32; 36] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 18, 20, 22, 24, 28, 32, 40, 48, 64, 0x80, 0x100, 0x200, 0x400, 0x800, 0x1000, 0x2000, 0x4000, 0x8000, 0x10000]
+const LL_BITS: [u8; 36] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 3, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+const ML_BASE: [u32; 53] = [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 37, 39, 41, 43, 47, 51, 59, 67, 83, 99, 0x83, 0x103, 0x203, 0x403, 0x803, 0x1003, 0x2003, 0x4003, 0x8003, 0x10003]
+const ML_BITS: [u8; 53] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 3, 3, 4, 4, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+const OF_BASE: [u32; 32] = [0, 1, 1, 5, 0xD, 0x1D, 0x3D, 0x7D, 0xFD, 0x1FD, 0x3FD, 0x7FD, 0xFFD, 0x1FFD, 0x3FFD, 0x7FFD, 0xFFFD, 0x1FFFD, 0x3FFFD, 0x7FFFD, 0xFFFFD, 0x1FFFFD, 0x3FFFFD, 0x7FFFFD, 0xFFFFFD, 0x1FFFFFD, 0x3FFFFFD, 0x7FFFFFD, 0xFFFFFFD, 0x1FFFFFFD, 0x3FFFFFFD, 0x7FFFFFFD]
+const LL_DEFAULT_NORM: [i32; 36] = [4, 3, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 3, 2, 1, 1, 1, 1, 1, -1, -1, -1, -1]
+const ML_DEFAULT_NORM: [i32; 53] = [1, 4, 3, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, -1, -1, -1, -1, -1, -1, -1]
+const OF_DEFAULT_NORM: [i32; 29] = [1, 1, 1, 1, 1, 1, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, -1, -1, -1, -1, -1]
+
+/// The number of `u64` cells of a literal-length or match-length table: a header and 512 cells.
+pub const LONG_TABLE_CELLS: usize = 513
+/// The number of `u64` cells of an offset table: a header and 256 cells.
+pub const OFFSET_TABLE_CELLS: usize = 257
+
+/// The state of a decoder (`ZSTD_DCtx`): the entropy tables and window of the frame being decoded,
+/// and the state of the frame and stream layers that `decode.silk` drives.
+///
+/// A sequence table is a byte buffer of 8-byte cells: cell 0 holds the table log, and each cell after it
+/// packs the next state (16 bits), the number of additional bits (8), the number of state bits
+/// (8) and the base value (32), from the low bits up.
+pub struct Dctx {
+  // The entropy tables this context owns, and the ones in use (its own, the defaults, or the
+  // dictionary's).
+  pub llSpace: [*]mut u8,
+  pub ofSpace: [*]mut u8,
+  pub mlSpace: [*]mut u8,
+  pub llDefault: [*]mut u8,
+  pub ofDefault: [*]mut u8,
+  pub mlDefault: [*]mut u8,
+  pub hufSpace: [*]mut u8,
+  pub llPtr: [*]const u8,
+  pub ofPtr: [*]const u8,
+  pub mlPtr: [*]const u8,
+  pub hufPtr: [*]const u8,
+  pub rep: [u32; 3],
+  pub litEntropy: bool,
+  pub fseEntropy: bool,
+  // The literals of the block being decoded: `litSize` bytes at `litBase[litStart..]`.
+  pub litBuffer: [*]mut u8,
+  pub litBase: [*]const u8,
+  pub litStart: usize,
+  pub litSize: usize,
+  // The most bytes the sequences of the block may write: the room, or less when the reference
+  // would keep the literals in the output buffer after the block.
+  pub sequenceRoom: usize,
+  // The window: the prefix is `prefixBase[prefixStart..previousDstEnd]`, the external segment is
+  // `extBase[0..extLen]`.
+  pub prefixBase: [*]const u8,
+  pub prefixStart: usize,
+  pub previousDstEnd: usize,
+  pub extBase: [*]const u8,
+  pub extLen: usize,
+  // The frame (ZSTD_decompressContinue).
+  pub stage: u32,
+  pub expected: usize,
+  pub blockType: u32,
+  pub rleSize: usize,
+  pub headerSize: usize,
+  pub headerBuffer: [*]mut u8,
+  pub frameType: u32,
+  pub frameContentSize: u64,
+  pub windowSize: u64,
+  pub blockSizeMax: usize,
+  pub frameDictId: u32,
+  pub checksumFlag: bool,
+  pub validateChecksum: bool,
+  pub decodedSize: u64,
+  pub hash: Xxh64,
+  pub dictId: u32,
+  // The stream (ZSTD_decompressStream).
+  pub streamStage: u32,
+  pub lhSize: usize,
+  pub inBuff: ?[*]mut u8,
+  pub inBuffSize: usize,
+  pub inPos: usize,
+  pub outBuff: ?[*]mut u8,
+  pub outBuffSize: usize,
+  pub outStart: usize,
+  pub outEnd: usize,
+  pub hostageByte: bool,
+  pub noForwardProgress: u32,
+  pub oversizedDuration: u32,
+  // Parameters.
+  pub maxWindowSize: u64,
+  pub forceIgnoreChecksum: bool,
+  pub maxBlockSizeParam: usize,
+  // The loaded dictionary: a copy of its bytes, and its entropy tables when it has them.
+  pub dict: ?[*]mut u8,
+  pub dictSize: usize,
+  pub dictEntropy: bool,
+  pub dictDictId: u32,
+  pub dictLl: ?[*]mut u8,
+  pub dictOf: ?[*]mut u8,
+  pub dictMl: ?[*]mut u8,
+  pub dictHuf: ?[*]mut u8,
+  pub dictRep: [u32; 3],
+}
+
+@inlineAlways
+unsafe fn cells(table: [*]mut u8) -> [*]mut u8 { return table }
+@inlineAlways
+unsafe fn cellsRo(table: [*]const u8) -> [*]const u8 { return table }
+@inlineAlways
+unsafe fn tableRo(table: [*]mut u8) -> [*]const u8 { return unsafe mem.ro(table) }
+
+@inlineAlways
+fn baseOf(kind: u32, symbol: usize) -> u32 {
+  if kind == KIND_LL { return LL_BASE[symbol] }
+  if kind == KIND_ML { return ML_BASE[symbol] }
+  return OF_BASE[symbol]
+}
+
+@inlineAlways
+fn bitsOf(kind: u32, symbol: usize) -> u32 {
+  if kind == KIND_LL { return u8.toU32(LL_BITS[symbol]) }
+  if kind == KIND_ML { return u8.toU32(ML_BITS[symbol]) }
+  return usize.toU32(symbol)
+}
+
+@inlineAlways
+fn pack(nextState: u32, additionalBits: u32, stateBits: u32, base: u32) -> u64 {
+  return u32.toU64(nextState) | u64.shiftLeft(u32.toU64(additionalBits), 16) | u64.shiftLeft(u32.toU64(stateBits), 24) | u64.shiftLeft(u32.toU64(base), 32)
+}
+
+/// Builds the sequence decoding table of `kind` at `table` from the distribution `norm`
+/// (`ZSTD_buildFSETable`). The distribution was validated by its reader.
+pub unsafe fn buildFseTable(table: [*]mut u8, norm: &[i32; 256], maxSymbol: u32, kind: u32, tableLog: u32) -> () {
+  let bytes = unsafe cells(table)
+  let tableSize = u32.shiftLeft(1, tableLog)
+  let mut symbolNext: [u32; 64] = [0; 64]
+  let mut highThreshold = tableSize - 1
+  unsafe mem.w64(bytes, 0, u32.toU64(tableLog))
+  let mut symbol: u32 = 0
+  while symbol <= maxSymbol {
+    let count = norm[u32.toUsize(symbol)]
+    if count == -1 {
+      unsafe mem.w64(bytes, u32.toUsize(highThreshold + 1) * 8, u64.shiftLeft(u32.toU64(symbol), 32))
+      highThreshold = u32.wrappingSubtract(highThreshold, 1)
+      symbolNext[u32.toUsize(symbol)] = 1
+    } else {
+      symbolNext[u32.toUsize(symbol)] = i32.toU32(count)
+    }
+    symbol = symbol + 1
+  }
+  let tableMask = tableSize - 1
+  let step = entropy.tableStep(tableSize)
+  if highThreshold == tableSize - 1 {
+    // No symbol of probability "less than one": lay the symbols down in order, then spread them
+    // with a fixed stride, as the reference does to avoid a data-dependent inner loop.
+    let mut spread: [u8; 528] = [0; 528]
+    let mut filled: usize = 0
+    symbol = 0
+    while symbol <= maxSymbol {
+      let count = i32.toUsize(norm[u32.toUsize(symbol)])
+      let mut placed: usize = 0
+      while placed < count {
+        spread[filled + placed] = u32.wrappingToU8(symbol)
+        placed = placed + 1
+      }
+      filled = filled + count
+      symbol = symbol + 1
+    }
+    let mut position: u32 = 0
+    let mut index: u32 = 0
+    while index < tableSize {
+      unsafe mem.w64(bytes, u32.toUsize(position + 1) * 8, u64.shiftLeft(u8.toU64(spread[u32.toUsize(index)]), 32))
+      position = u32.wrappingAdd(position, step) & tableMask
+      index = index + 1
+    }
+  } else {
+    let mut position: u32 = 0
+    symbol = 0
+    while symbol <= maxSymbol {
+      let count = norm[u32.toUsize(symbol)]
+      let mut placed: i32 = 0
+      while placed < count {
+        unsafe mem.w64(bytes, u32.toUsize(position + 1) * 8, u64.shiftLeft(u32.toU64(symbol), 32))
+        position = (position + step) & tableMask
+        while position > highThreshold { position = (position + step) & tableMask }
+        placed = placed + 1
+      }
+      symbol = symbol + 1
+    }
+  }
+  let mut cell: u32 = 0
+  while cell < tableSize {
+    let at = u32.toUsize(cell + 1) * 8
+    let cellSymbol = u64.toUsize(u64.shiftRight(unsafe mem.r64(unsafe mem.ro(bytes), at), 32))
+    let nextState = symbolNext[cellSymbol]
+    symbolNext[cellSymbol] = nextState + 1
+    let stateBits = tableLog - mem.highbit32(nextState)
+    let newState = u32.shiftLeft(nextState, stateBits) - tableSize
+    unsafe mem.w64(bytes, at, pack(newState, bitsOf(kind, cellSymbol), stateBits, baseOf(kind, cellSymbol)))
+    cell = cell + 1
+  }
+}
+
+/// Builds the three predefined sequence tables of `dctx`. A new context calls it one time.
+pub unsafe fn buildDefaultTables(dctx: &mut Dctx) -> () {
+  let mut norm: [i32; 256] = [0; 256]
+  let mut index: usize = 0
+  while index < 36 { norm[index] = LL_DEFAULT_NORM[index] index = index + 1 }
+  unsafe buildFseTable(dctx.llDefault, &norm, 35, KIND_LL, 6)
+  index = 0
+  while index < 53 { norm[index] = ML_DEFAULT_NORM[index] index = index + 1 }
+  unsafe buildFseTable(dctx.mlDefault, &norm, 52, KIND_ML, 6)
+  index = 0
+  while index < 29 { norm[index] = OF_DEFAULT_NORM[index] index = index + 1 }
+  unsafe buildFseTable(dctx.ofDefault, &norm, 28, KIND_OF, 5)
+}
+
+/// Reads the dictionary's sequence table of `kind` from `src[at..end]` into `table`, as
+/// `ZSTD_loadDEntropy` does for each of the three. Returns the bytes read, or
+/// `dictionary_corrupted`.
+pub unsafe fn loadDictTable(table: [*]mut u8, kind: u32, src: [*]const u8, at: usize, end: usize) -> usize {
+  let mut norm: [i32; 256] = [0; 256]
+  let mut maxSymbol = MAX_OFF
+  let mut maxLog = OFF_FSE_LOG
+  if kind == KIND_LL { maxSymbol = MAX_LL maxLog = LL_FSE_LOG }
+  if kind == KIND_ML { maxSymbol = MAX_ML maxLog = ML_FSE_LOG }
+  let limit = maxSymbol
+  let mut tableLog: u32 = 0
+  let headerSize = unsafe entropy.readNCount(&mut norm, &mut maxSymbol, &mut tableLog, src, at, end - at)
+  if errors.isError(headerSize) { return errors.err(errors.E_DICTIONARY_CORRUPTED) }
+  if maxSymbol > limit { return errors.err(errors.E_DICTIONARY_CORRUPTED) }
+  if tableLog > maxLog { return errors.err(errors.E_DICTIONARY_CORRUPTED) }
+  unsafe buildFseTable(table, &norm, maxSymbol, kind, tableLog)
+  return headerSize
+}
+
+/// The `kind` values of [`loadDictTable`].
+pub const DICT_KIND_LL: u32 = 0
+pub const DICT_KIND_OF: u32 = 1
+pub const DICT_KIND_ML: u32 = 2
+
+// ZSTD_buildSeqTable: sets the table in use for one of the three codes from its encoding type.
+// The caller then points the table in use at `space` or at the default. Returns the bytes read, or an error.
+unsafe fn buildSeqTable(space: [*]mut u8, encoding: u32, kind: u32, repeatAllowed: bool, src: [*]const u8, at: usize, end: usize) -> usize {
+  let mut max = MAX_OFF
+  let mut maxLog = OFF_FSE_LOG
+  if kind == KIND_LL { max = MAX_LL maxLog = LL_FSE_LOG }
+  if kind == KIND_ML { max = MAX_ML maxLog = ML_FSE_LOG }
+  if encoding == 1 {
+    // set_rle
+    if at >= end { return errors.err(errors.E_SRCSIZE_WRONG) }
+    let symbol = u8.toU32(unsafe mem.r8(src, at))
+    if symbol > max { return errors.err(errors.E_CORRUPTION_DETECTED) }
+    let bytes = unsafe cells(space)
+    unsafe mem.w64(bytes, 0, 0)
+    unsafe mem.w64(bytes, 8, pack(0, bitsOf(kind, u32.toUsize(symbol)), 0, baseOf(kind, u32.toUsize(symbol))))
+    return 1
+  }
+  if encoding == 0 {
+    // set_basic
+    return 0
+  }
+  if encoding == 3 {
+    // set_repeat
+    if !repeatAllowed { return errors.err(errors.E_CORRUPTION_DETECTED) }
+    return 0
+  }
+  // set_compressed
+  let mut norm: [i32; 256] = [0; 256]
+  let mut tableLog: u32 = 0
+  let headerSize = unsafe entropy.readNCount(&mut norm, &mut max, &mut tableLog, src, at, end - at)
+  if errors.isError(headerSize) { return errors.err(errors.E_CORRUPTION_DETECTED) }
+  if tableLog > maxLog { return errors.err(errors.E_CORRUPTION_DETECTED) }
+  unsafe buildFseTable(space, &norm, max, kind, tableLog)
+  return headerSize
+}
+
+// ZSTD_decodeSeqHeaders. Returns the bytes read, or an error; sets the number of sequences.
+unsafe fn decodeSeqHeaders(dctx: &mut Dctx, sequenceCount: &mut usize, src: [*]const u8, at: usize, size: usize) -> usize {
+  let end = at + size
+  let mut ip = at
+  if size < 1 { return errors.err(errors.E_SRCSIZE_WRONG) }
+  let mut count = u8.toUsize(unsafe mem.r8(src, ip))
+  ip = ip + 1
+  if count > 0x7F {
+    if count == 0xFF {
+      if ip + 2 > end { return errors.err(errors.E_SRCSIZE_WRONG) }
+      count = u16.toUsize(unsafe mem.r16(src, ip)) + LONG_NB_SEQ
+      ip = ip + 2
+    } else {
+      if ip >= end { return errors.err(errors.E_SRCSIZE_WRONG) }
+      count = (count - 0x80) * 256 + u8.toUsize(unsafe mem.r8(src, ip))
+      ip = ip + 1
+    }
+  }
+  sequenceCount.* = count
+  if count == 0 {
+    if ip != end { return errors.err(errors.E_CORRUPTION_DETECTED) }
+    return ip - at
+  }
+  if ip + 1 > end { return errors.err(errors.E_SRCSIZE_WRONG) }
+  let modes = u8.toU32(unsafe mem.r8(src, ip))
+  if (modes & 3) != 0 { return errors.err(errors.E_CORRUPTION_DETECTED) }
+  ip = ip + 1
+  let repeatAllowed = dctx.fseEntropy
+  let llMode = u32.shiftRight(modes, 6)
+  let llSize = unsafe buildSeqTable(dctx.llSpace, llMode, KIND_LL, repeatAllowed, src, ip, end)
+  if errors.isError(llSize) { return errors.err(errors.E_CORRUPTION_DETECTED) }
+  if llMode == 0 { dctx.llPtr = unsafe tableRo(dctx.llDefault) } else if llMode != 3 { dctx.llPtr = unsafe tableRo(dctx.llSpace) }
+  ip = ip + llSize
+  let ofMode = u32.shiftRight(modes, 4) & 3
+  let ofSize = unsafe buildSeqTable(dctx.ofSpace, ofMode, KIND_OF, repeatAllowed, src, ip, end)
+  if errors.isError(ofSize) { return errors.err(errors.E_CORRUPTION_DETECTED) }
+  if ofMode == 0 { dctx.ofPtr = unsafe tableRo(dctx.ofDefault) } else if ofMode != 3 { dctx.ofPtr = unsafe tableRo(dctx.ofSpace) }
+  ip = ip + ofSize
+  let mlMode = u32.shiftRight(modes, 2) & 3
+  let mlSize = unsafe buildSeqTable(dctx.mlSpace, mlMode, KIND_ML, repeatAllowed, src, ip, end)
+  if errors.isError(mlSize) { return errors.err(errors.E_CORRUPTION_DETECTED) }
+  if mlMode == 0 { dctx.mlPtr = unsafe tableRo(dctx.mlDefault) } else if mlMode != 3 { dctx.mlPtr = unsafe tableRo(dctx.mlSpace) }
+  ip = ip + mlSize
+  return ip - at
+}
+
+// ZSTD_decodeLiteralsBlock. Returns the size of the literals section, or an error.
+unsafe fn decodeLiterals(dctx: &mut Dctx, src: [*]const u8, at: usize, size: usize, dstCapacity: usize, streaming: bool) -> usize {
+  dctx.sequenceRoom = dstCapacity
+  if size < 2 { return errors.err(errors.E_CORRUPTION_DETECTED) }
+  let first = u8.toU32(unsafe mem.r8(src, at))
+  let encoding = first & 3
+  let blockSizeMax = dctx.blockSizeMax
+  let mut expectedWriteSize = blockSizeMax
+  if dstCapacity < expectedWriteSize { expectedWriteSize = dstCapacity }
+  let sizeFormat = u32.shiftRight(first, 2) & 3
+  if encoding >= 2 {
+    // set_compressed or set_repeat
+    if encoding == 3 && !dctx.litEntropy { return errors.err(errors.E_DICTIONARY_CORRUPTED) }
+    if size < 5 { return errors.err(errors.E_CORRUPTION_DETECTED) }
+    let header = unsafe mem.r32(src, at)
+    let mut singleStream = false
+    let mut headerSize: usize = 3
+    let mut litSize: usize = 0
+    let mut litCSize: usize = 0
+    if sizeFormat == 2 {
+      headerSize = 4
+      litSize = u32.toUsize(u32.shiftRight(header, 4) & 0x3FFF)
+      litCSize = u32.toUsize(u32.shiftRight(header, 18))
+    } else if sizeFormat == 3 {
+      headerSize = 5
+      litSize = u32.toUsize(u32.shiftRight(header, 4) & 0x3FFFF)
+      litCSize = u32.toUsize(u32.shiftRight(header, 22)) + u8.toUsize(unsafe mem.r8(src, at + 4)) * 1024
+    } else {
+      singleStream = sizeFormat == 0
+      litSize = u32.toUsize(u32.shiftRight(header, 4) & 0x3FF)
+      litCSize = u32.toUsize(u32.shiftRight(header, 14) & 0x3FF)
+    }
+    if litSize > blockSizeMax { return errors.err(errors.E_CORRUPTION_DETECTED) }
+    if !singleStream && litSize < 6 { return errors.err(errors.E_LITERALS_HEADERWRONG) }
+    if litCSize + headerSize > size { return errors.err(errors.E_CORRUPTION_DETECTED) }
+    if expectedWriteSize < litSize { return errors.err(errors.E_DSTSIZE_TOOSMALL) }
+    if !streaming && dstCapacity > blockSizeMax + WILDCOPY + litSize + WILDCOPY { dctx.sequenceRoom = blockSizeMax + WILDCOPY }
+    let mut result: usize = 0
+    let body = at + headerSize
+    if encoding == 3 {
+      if singleStream {
+        result = unsafe huf_decode.decompress1X(dctx.litBuffer, 0, litSize, src, body, litCSize, dctx.hufPtr)
+      } else {
+        result = unsafe huf_decode.decompress4X(dctx.litBuffer, 0, litSize, src, body, litCSize, dctx.hufPtr)
+      }
+    } else if singleStream {
+      // HUF_decompress1X1_DCtx_wksp
+      let tableSize = unsafe huf_decode.readTableX1(dctx.hufSpace, src, body, litCSize)
+      if errors.isError(tableSize) {
+        result = tableSize
+      } else if tableSize >= litCSize {
+        result = errors.err(errors.E_SRCSIZE_WRONG)
+      } else {
+        result = unsafe huf_decode.decompress1X1(dctx.litBuffer, 0, litSize, src, body + tableSize, litCSize - tableSize, unsafe mem.ro(dctx.hufSpace))
+      }
+    } else {
+      result = unsafe huf_decode.decompress4XWithTable(dctx.hufSpace, dctx.litBuffer, 0, litSize, src, body, litCSize)
+    }
+    if errors.isError(result) { return errors.err(errors.E_CORRUPTION_DETECTED) }
+    dctx.litBase = unsafe mem.ro(dctx.litBuffer)
+    dctx.litStart = 0
+    dctx.litSize = litSize
+    dctx.litEntropy = true
+    if encoding == 2 { dctx.hufPtr = unsafe mem.ro(dctx.hufSpace) }
+    return litCSize + headerSize
+  }
+  let mut headerSize: usize = 1
+  let mut litSize = u32.toUsize(u32.shiftRight(first, 3))
+  if sizeFormat == 1 {
+    headerSize = 2
+    if encoding == 1 && size < 3 { return errors.err(errors.E_CORRUPTION_DETECTED) }
+    litSize = u16.toUsize(u16.shiftRight(unsafe mem.r16(src, at), 4))
+  } else if sizeFormat == 3 {
+    headerSize = 3
+    if encoding == 0 && size < 3 { return errors.err(errors.E_CORRUPTION_DETECTED) }
+    if encoding == 1 && size < 4 { return errors.err(errors.E_CORRUPTION_DETECTED) }
+    litSize = (u16.toUsize(unsafe mem.r16(src, at)) + u8.toUsize(unsafe mem.r8(src, at + 2)) * 65536) / 16
+  }
+  if litSize > blockSizeMax { return errors.err(errors.E_CORRUPTION_DETECTED) }
+  if expectedWriteSize < litSize { return errors.err(errors.E_DSTSIZE_TOOSMALL) }
+  let inDst = !streaming && dstCapacity > blockSizeMax + WILDCOPY + litSize + WILDCOPY
+  if encoding == 0 {
+    // set_basic: raw literals
+    if headerSize + litSize + WILDCOPY > size {
+      if litSize + headerSize > size { return errors.err(errors.E_CORRUPTION_DETECTED) }
+      if litSize != 0 { let _c = unsafe mem.memcpy(dctx.litBuffer, unsafe mem.addc(src, at + headerSize), litSize) }
+      if inDst { dctx.sequenceRoom = blockSizeMax + WILDCOPY }
+      dctx.litBase = unsafe mem.ro(dctx.litBuffer)
+      dctx.litStart = 0
+      dctx.litSize = litSize
+      return headerSize + litSize
+    }
+    dctx.litBase = src
+    dctx.litStart = at + headerSize
+    dctx.litSize = litSize
+    return headerSize + litSize
+  }
+  // set_rle
+  if inDst { dctx.sequenceRoom = blockSizeMax + WILDCOPY }
+  if litSize != 0 { let _s = unsafe mem.memset(dctx.litBuffer, u8.toI32(unsafe mem.r8(src, at + headerSize)), litSize) }
+  dctx.litBase = unsafe mem.ro(dctx.litBuffer)
+  dctx.litStart = 0
+  dctx.litSize = litSize
+  return headerSize + 1
+}
+
+@inlineAlways
+unsafe fn copy16(to: [*]mut u8, at: usize, from: [*]const u8, source: usize) -> () {
+  let low = unsafe mem.r64(from, source)
+  let high = unsafe mem.r64(from, usize.wrappingAdd(source, 8))
+  unsafe mem.w64(to, at, low)
+  unsafe mem.w64(to, usize.wrappingAdd(at, 8), high)
+}
+
+// ZSTD_wildcopy without overlap: copies `length` bytes in pieces of 16 and can write up to 32
+// bytes after them.
+@inlineAlways
+unsafe fn wildcopy(to: [*]mut u8, at: usize, from: [*]const u8, source: usize, length: usize) -> () {
+  unsafe copy16(to, at, from, source)
+  if length <= 16 { return () }
+  let end = usize.wrappingAdd(at, length)
+  let mut op = usize.wrappingAdd(at, 16)
+  let mut ip = usize.wrappingAdd(source, 16)
+  while true {
+    unsafe copy16(to, op, from, ip)
+    unsafe copy16(to, usize.wrappingAdd(op, 16), from, usize.wrappingAdd(ip, 16))
+    op = usize.wrappingAdd(op, 32)
+    ip = usize.wrappingAdd(ip, 32)
+    if op >= end { break }
+  }
+}
+
+// ZSTD_wildcopy for a source at least 8 bytes before the destination, in the same buffer.
+@inlineAlways
+unsafe fn wildcopyOverlap(out: [*]mut u8, at: usize, source: usize, length: usize) -> () {
+  let read = unsafe mem.ro(out)
+  let end = usize.wrappingAdd(at, length)
+  let mut op = at
+  let mut ip = source
+  if usize.wrappingSubtract(at, source) < 16 {
+    while true {
+      unsafe mem.w64(out, op, unsafe mem.r64(read, ip))
+      op = usize.wrappingAdd(op, 8)
+      ip = usize.wrappingAdd(ip, 8)
+      if op >= end { break }
+    }
+    return ()
+  }
+  unsafe wildcopy(out, at, read, source, length)
+}
+
+const DEC32: [usize; 8] = [0, 1, 2, 1, 4, 4, 4, 4]
+const DEC64: [usize; 8] = [8, 8, 8, 7, 8, 9, 10, 11]
+
+// ZSTD_overlapCopy8: copies 8 bytes of a match whose offset can be under 8, and returns the new
+// source position, which is at least 8 bytes before the new destination `at + 8`.
+@inlineAlways
+unsafe fn overlapCopy8(out: [*]mut u8, at: usize, source: usize, offset: usize) -> usize {
+  let read = unsafe mem.ro(out)
+  if offset < 8 {
+    unsafe mem.w8(out, at, unsafe mem.r8(read, source))
+    unsafe mem.w8(out, usize.wrappingAdd(at, 1), unsafe mem.r8(read, usize.wrappingAdd(source, 1)))
+    unsafe mem.w8(out, usize.wrappingAdd(at, 2), unsafe mem.r8(read, usize.wrappingAdd(source, 2)))
+    unsafe mem.w8(out, usize.wrappingAdd(at, 3), unsafe mem.r8(read, usize.wrappingAdd(source, 3)))
+    let second = usize.wrappingAdd(source, DEC32[offset & 7])
+    unsafe mem.w32(out, usize.wrappingAdd(at, 4), unsafe mem.r32(read, second))
+    return usize.wrappingAdd(usize.wrappingSubtract(second, DEC64[offset & 7]), 8)
+  }
+  unsafe mem.w64(out, at, unsafe mem.r64(read, source))
+  return usize.wrappingAdd(source, 8)
+}
+
+// ZSTD_safecopy for literals (no overlap): never writes at or after `oend`.
+unsafe fn safeCopyLiterals(out: [*]mut u8, at: usize, oendW: usize, from: [*]const u8, source: usize, length: usize) -> () {
+  let end = at + length
+  let mut op = at
+  let mut ip = source
+  if length >= 8 && end <= oendW {
+    unsafe wildcopy(out, op, from, ip, length)
+    return ()
+  }
+  if length >= 8 && op <= oendW && oendW > op {
+    let fast = oendW - op
+    unsafe wildcopy(out, op, from, ip, fast)
+    ip = ip + fast
+    op = op + fast
+  }
+  while op < end {
+    unsafe mem.w8(out, op, unsafe mem.r8(from, ip))
+    op = op + 1
+    ip = ip + 1
+  }
+}
+
+// ZSTD_safecopy for a match in the same buffer (the source is before the destination).
+unsafe fn safeCopyMatch(out: [*]mut u8, at: usize, oendW: usize, source: usize, length: usize) -> () {
+  let read = unsafe mem.ro(out)
+  let end = at + length
+  let mut op = at
+  let mut ip = source
+  let mut left = length
+  if left >= 8 {
+    ip = unsafe overlapCopy8(out, op, ip, op - ip)
+    op = op + 8
+    left = left - 8
+    if end <= oendW {
+      if left != 0 { unsafe wildcopyOverlap(out, op, ip, left) }
+      return ()
+    }
+    if op < oendW {
+      let fast = oendW - op
+      unsafe wildcopyOverlap(out, op, ip, fast)
+      ip = ip + fast
+      op = op + fast
+    }
+  }
+  while op < end {
+    unsafe mem.w8(out, op, unsafe mem.r8(read, ip))
+    op = op + 1
+    ip = ip + 1
+  }
+}
+
+// ZSTD_execSequenceEnd: a sequence near the end of the output or of the literals, with every
+// bound checked. Returns the bytes written, or an error.
+@inlineNever
+unsafe fn execSequenceEnd(out: [*]mut u8, op: usize, oend: usize, litLength: usize, matchLength: usize, offset: usize, lit: [*]const u8, litPos: usize, litLimit: usize, prefixStart: usize, ext: [*]const u8, extLen: usize) -> usize {
+  let sequenceLength = litLength + matchLength
+  let oLitEnd = op + litLength
+  let mut oendW: usize = 0
+  if oend >= WILDCOPY { oendW = oend - WILDCOPY }
+  if sequenceLength > oend - op { return errors.err(errors.E_DSTSIZE_TOOSMALL) }
+  if litLength > litLimit - litPos { return errors.err(errors.E_CORRUPTION_DETECTED) }
+  unsafe safeCopyLiterals(out, op, oendW, lit, litPos, litLength)
+  let mut at = oLitEnd
+  let mut left = matchLength
+  let mut matchPos = usize.wrappingSubtract(oLitEnd, offset)
+  if offset > oLitEnd - prefixStart {
+    let back = offset - (oLitEnd - prefixStart)
+    if back > extLen { return errors.err(errors.E_CORRUPTION_DETECTED) }
+    let from = extLen - back
+    if back >= left {
+      let _m = unsafe mem.memmove(unsafe mem.add(out, oLitEnd), unsafe mem.addc(ext, from), left)
+      return sequenceLength
+    }
+    let _m = unsafe mem.memmove(unsafe mem.add(out, oLitEnd), unsafe mem.addc(ext, from), back)
+    at = oLitEnd + back
+    left = left - back
+    matchPos = prefixStart
+  }
+  unsafe safeCopyMatch(out, at, oendW, matchPos, left)
+  return sequenceLength
+}
+
+// Decodes the sequences of a block and executes them (ZSTD_decompressSequences). Returns the
+// number of bytes written at `out[start..]`, or an error. Where the CPU has BMI2, it runs the
+// body compiled for it, as the reference does: the bit reads become single instructions.
+unsafe fn decompressSequences(dctx: &mut Dctx, out: [*]mut u8, start: usize, capacity: usize, src: [*]const u8, at: usize, size: usize, sequenceCount: usize) -> usize {
+  static if Target.arch() == Arch.X86_64 {
+    if CpuFeatures.available("bmi2") {
+      return unsafe decompressSequencesBmi2(&mut dctx, out, start, capacity, src, at, size, sequenceCount)
+    }
+  }
+  return unsafe decompressSequencesBody(&mut dctx, out, start, capacity, src, at, size, sequenceCount)
+}
+
+static if Target.arch() == Arch.X86_64 {
+  @features("bmi2")
+  @inlineNever
+  unsafe fn decompressSequencesBmi2(dctx: &mut Dctx, out: [*]mut u8, start: usize, capacity: usize, src: [*]const u8, at: usize, size: usize, sequenceCount: usize) -> usize {
+    return unsafe decompressSequencesBody(&mut dctx, out, start, capacity, src, at, size, sequenceCount)
+  }
+}
+
+// ZSTD_decompressSequences_body.
+@inlineAlways
+unsafe fn decompressSequencesBody(dctx: &mut Dctx, out: [*]mut u8, start: usize, capacity: usize, src: [*]const u8, at: usize, size: usize, sequenceCount: usize) -> usize {
+  let oend = start + capacity
+  let mut op = start
+  let lit = dctx.litBase
+  let mut litPos = dctx.litStart
+  let litLimit = litPos + dctx.litSize
+  let prefixStart = dctx.prefixStart
+  let ext = dctx.extBase
+  let extLen = dctx.extLen
+  if sequenceCount != 0 {
+    let mut oendW: usize = 0
+    if oend >= WILDCOPY { oendW = oend - WILDCOPY }
+    dctx.fseEntropy = true
+    let mut rep0 = u32.toUsize(dctx.rep[0])
+    let mut rep1 = u32.toUsize(dctx.rep[1])
+    let mut rep2 = u32.toUsize(dctx.rep[2])
+    let mut bits = entropy.emptyDStream(src)
+    if errors.isError(unsafe entropy.initDStream(&mut bits, src, at, size)) { return errors.err(errors.E_CORRUPTION_DETECTED) }
+    let llTable = unsafe mem.addc(unsafe cellsRo(dctx.llPtr), 8)
+    let ofTable = unsafe mem.addc(unsafe cellsRo(dctx.ofPtr), 8)
+    let mlTable = unsafe mem.addc(unsafe cellsRo(dctx.mlPtr), 8)
+    let mut stateLl = u64.toUsize(entropy.readBits(&mut bits, u64.toU32(unsafe mem.r64(unsafe cellsRo(dctx.llPtr), 0))))
+    let _r1 = unsafe entropy.reload(&mut bits)
+    let mut stateOf = u64.toUsize(entropy.readBits(&mut bits, u64.toU32(unsafe mem.r64(unsafe cellsRo(dctx.ofPtr), 0))))
+    let _r2 = unsafe entropy.reload(&mut bits)
+    let mut stateMl = u64.toUsize(entropy.readBits(&mut bits, u64.toU32(unsafe mem.r64(unsafe cellsRo(dctx.mlPtr), 0))))
+    let _r3 = unsafe entropy.reload(&mut bits)
+    let mut remaining = sequenceCount
+    while remaining != 0 {
+      // ZSTD_decodeSequence
+      let llInfo = unsafe mem.r64(llTable, usize.wrappingMultiply(stateLl, 8))
+      let mlInfo = unsafe mem.r64(mlTable, usize.wrappingMultiply(stateMl, 8))
+      let ofInfo = unsafe mem.r64(ofTable, usize.wrappingMultiply(stateOf, 8))
+      let mut matchLength = u64.wrappingToUsize(u64.shiftRight(mlInfo, 32))
+      let mut litLength = u64.wrappingToUsize(u64.shiftRight(llInfo, 32))
+      let ofBase = u64.wrappingToUsize(u64.shiftRight(ofInfo, 32))
+      let llBits = u64.wrappingToU32(u64.shiftRight(llInfo, 16)) & 255
+      let mlBits = u64.wrappingToU32(u64.shiftRight(mlInfo, 16)) & 255
+      let ofBits = u64.wrappingToU32(u64.shiftRight(ofInfo, 16)) & 255
+      let mut offset: usize = 0
+      if ofBits > 1 {
+        offset = usize.wrappingAdd(ofBase, u64.wrappingToUsize(entropy.readBitsFast(&mut bits, ofBits)))
+        rep2 = rep1
+        rep1 = rep0
+        rep0 = offset
+      } else {
+        let ll0 = litLength == 0
+        if ofBits == 0 {
+          if ll0 {
+            offset = rep1
+            rep1 = rep0
+            rep0 = offset
+          } else {
+            offset = rep0
+          }
+        } else {
+          let mut code = usize.wrappingAdd(ofBase, u64.wrappingToUsize(entropy.readBitsFast(&mut bits, 1)))
+          if ll0 { code = usize.wrappingAdd(code, 1) }
+          let mut candidate: usize = 0
+          if code == 3 { candidate = usize.wrappingSubtract(rep0, 1) } else if code == 1 { candidate = rep1 } else if code == 2 { candidate = rep2 } else { candidate = rep0 }
+          if candidate == 0 { candidate = usize.wrappingSubtract(candidate, 1) }
+          if code != 1 { rep2 = rep1 }
+          rep1 = rep0
+          rep0 = candidate
+          offset = candidate
+        }
+      }
+      if mlBits > 0 { matchLength = usize.wrappingAdd(matchLength, u64.wrappingToUsize(entropy.readBitsFast(&mut bits, mlBits))) }
+      if llBits + mlBits + ofBits >= 31 { let _r = unsafe entropy.reload(&mut bits) }
+      if llBits > 0 { litLength = usize.wrappingAdd(litLength, u64.wrappingToUsize(entropy.readBitsFast(&mut bits, llBits))) }
+      if remaining != 1 {
+        stateLl = usize.wrappingAdd(u64.wrappingToUsize(llInfo & 0xFFFF), u64.wrappingToUsize(entropy.readBits(&mut bits, u64.wrappingToU32(u64.shiftRight(llInfo, 24)) & 255)))
+        stateMl = usize.wrappingAdd(u64.wrappingToUsize(mlInfo & 0xFFFF), u64.wrappingToUsize(entropy.readBits(&mut bits, u64.wrappingToU32(u64.shiftRight(mlInfo, 24)) & 255)))
+        stateOf = usize.wrappingAdd(u64.wrappingToUsize(ofInfo & 0xFFFF), u64.wrappingToUsize(entropy.readBits(&mut bits, u64.wrappingToU32(u64.shiftRight(ofInfo, 24)) & 255)))
+        let _r = unsafe entropy.reload(&mut bits)
+      }
+      // ZSTD_execSequence
+      let oLitEnd = usize.wrappingAdd(op, litLength)
+      let sequenceLength = usize.wrappingAdd(litLength, matchLength)
+      let oMatchEnd = usize.wrappingAdd(op, sequenceLength)
+      let iLitEnd = usize.wrappingAdd(litPos, litLength)
+      if iLitEnd > litLimit || oMatchEnd > oendW {
+        let written = unsafe execSequenceEnd(out, op, oend, litLength, matchLength, offset, lit, litPos, litLimit, prefixStart, ext, extLen)
+        if errors.isError(written) { return written }
+        litPos = iLitEnd
+        op = oMatchEnd
+      } else {
+        unsafe copy16(out, op, lit, litPos)
+        if litLength > 16 { unsafe wildcopy(out, usize.wrappingAdd(op, 16), lit, usize.wrappingAdd(litPos, 16), litLength - 16) }
+        litPos = iLitEnd
+        let mut target = oLitEnd
+        let mut matchPos = usize.wrappingSubtract(oLitEnd, offset)
+        let mut left = matchLength
+        let mut done = false
+        if offset > usize.wrappingSubtract(oLitEnd, prefixStart) {
+          let back = offset - (oLitEnd - prefixStart)
+          if back > extLen { return errors.err(errors.E_CORRUPTION_DETECTED) }
+          let from = extLen - back
+          if back >= left {
+            unsafe mem.moveBytes(unsafe mem.add(out, oLitEnd), unsafe mem.addc(ext, from), left)
+            done = true
+          } else {
+            unsafe mem.moveBytes(unsafe mem.add(out, oLitEnd), unsafe mem.addc(ext, from), back)
+            target = oLitEnd + back
+            left = left - back
+            matchPos = prefixStart
+          }
+        }
+        if !done {
+          if offset >= 16 {
+            unsafe wildcopy(out, target, unsafe mem.ro(out), matchPos, left)
+          } else {
+            let next = unsafe overlapCopy8(out, target, matchPos, offset)
+            if left > 8 { unsafe wildcopyOverlap(out, usize.wrappingAdd(target, 8), next, left - 8) }
+          }
+        }
+        op = oMatchEnd
+      }
+      remaining = remaining - 1
+    }
+    if !entropy.endOfDStream(&bits) { return errors.err(errors.E_CORRUPTION_DETECTED) }
+    dctx.rep[0] = usize.wrappingToU32(rep0)
+    dctx.rep[1] = usize.wrappingToU32(rep1)
+    dctx.rep[2] = usize.wrappingToU32(rep2)
+  }
+  let lastLiterals = litLimit - litPos
+  if lastLiterals > oend - op { return errors.err(errors.E_DSTSIZE_TOOSMALL) }
+  if lastLiterals != 0 {
+    unsafe mem.copyBytes(unsafe mem.add(out, op), unsafe mem.addc(lit, litPos), lastLiterals)
+    op = op + lastLiterals
+  }
+  return op - start
+}
+
+/// Decodes the compressed block at `src[at..at+size]` into `out[start..start+capacity]`
+/// (`ZSTD_decompressBlock_internal`). `streaming` is false when the whole frame is decoded in one
+/// call into the caller's buffer. Returns the number of bytes written, or an error.
+pub unsafe fn decompressBlock(dctx: &mut Dctx, out: [*]mut u8, start: usize, capacity: usize, src: [*]const u8, at: usize, size: usize, streaming: bool) -> usize {
+  if size > dctx.blockSizeMax { return errors.err(errors.E_SRCSIZE_WRONG) }
+  let literalsSize = unsafe decodeLiterals(&mut dctx, src, at, size, capacity, streaming)
+  if errors.isError(literalsSize) { return literalsSize }
+  let mut sequenceCount: usize = 0
+  let headersSize = unsafe decodeSeqHeaders(&mut dctx, &mut sequenceCount, src, at + literalsSize, size - literalsSize)
+  if errors.isError(headersSize) { return headersSize }
+  if capacity == 0 && sequenceCount > 0 { return errors.err(errors.E_DSTSIZE_TOOSMALL) }
+  let consumed = literalsSize + headersSize
+  let room = dctx.sequenceRoom
+  return unsafe decompressSequences(&mut dctx, out, start, room, src, at + consumed, size - consumed, sequenceCount)
+}

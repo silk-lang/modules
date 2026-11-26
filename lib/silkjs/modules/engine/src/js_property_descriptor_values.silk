@@ -1,0 +1,206 @@
+//! Descriptor/object conversion, quickjs.c:40790-40867,53312-53348.
+//! Inputs are borrowed; descriptor fields and returned objects are owned. The
+//! pinned source deliberately keeps HasProperty/field-definition error quirks.
+import js_realm { Realm }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.effect { Effect }
+import silk.core.result { Result }
+import runtime_memory { AllocationObserver }
+import js_value { ValueBits }
+import js_intl_realm as ops
+import js_owned_value { Value, immediateRef, ValueRef }
+import js_core_types { PropertyDescriptor, JS_PROP_C_W_E, JS_PROP_ENUMERABLE,
+  JS_PROP_CONFIGURABLE, JS_PROP_WRITABLE, JS_PROP_HAS_ENUMERABLE,
+  JS_PROP_HAS_CONFIGURABLE, JS_PROP_HAS_WRITABLE, JS_PROP_HAS_VALUE,
+  JS_PROP_HAS_GET, JS_PROP_HAS_SET, ObjectData, ShapeData, JS_PROP_TMASK }
+import js_primitives as primitives
+import js_heap { HeapCell, HeapHeader }
+import js_shapes as shapes
+import js_class_data as classes
+import silk.mem.pointer { Pointer }
+import silk.core.option { Option }
+import silk.num.u8
+import js_gc { HeapHooks }
+import js_atom_data as atoms
+import js_coercion_host { CoercionHooks }
+import js_property_host { OwnPropertyHooks, HasPropertyHooks }
+import js_property_write_host { PropertyWriteHooks }
+import js_property_queries as queries
+import js_object_allocate as objects
+import js_proxy_core as core
+import js_exceptions { JsException }
+
+effect fn hasFailure(error: JsException) -> bool { drop error return true }
+@inlineAlways
+fn truthy(value: ValueBits) -> bool { return unsafe primitives.toBoolean(value) != 0 }
+/// ToPropertyDescriptor's checks after its reads: accessors callable or
+/// undefined, and not mixed with value or writable.
+effect fn checkDescriptor<'a, H: CoercionHooks>(hooks: &mut H, realm: Realm<'a>, descriptor: &mut PropertyDescriptor)
+  -> () ! JsException ? &mut Allocator {
+  if (descriptor.flags & JS_PROP_HAS_GET) != 0 && !(core.undefined(descriptor.getter.view()) || CoercionHooks.isCallable(&mut hooks, realm, descriptor.getter.borrow())) {
+    return run ops.error(&mut hooks,realm, b"invalid getter")
+  }
+  if (descriptor.flags & JS_PROP_HAS_SET) != 0 && !(core.undefined(descriptor.setter.view()) || CoercionHooks.isCallable(&mut hooks, realm, descriptor.setter.borrow())) {
+    return run ops.error(&mut hooks,realm, b"invalid setter")
+  }
+  if (descriptor.flags & (JS_PROP_HAS_GET | JS_PROP_HAS_SET)) != 0 &&
+    (descriptor.flags & (JS_PROP_HAS_VALUE | JS_PROP_HAS_WRITABLE)) != 0 {
+    return run ops.error(&mut hooks,realm, b"cannot have setter/getter and value or writable")
+  }
+}
+/// The six keys of a property descriptor, in ToPropertyDescriptor's order.
+const DESCRIPTOR_KEYS: [u32; 6] = [atoms.JS_ATOM_enumerable, atoms.JS_ATOM_configurable, atoms.JS_ATOM_value,
+  atoms.JS_ATOM_writable, atoms.JS_ATOM_get, atoms.JS_ATOM_set]
+/// ToPropertyDescriptor for an ordinary object over Object.prototype whose
+/// descriptor keys are all own data properties or absent, read straight from
+/// its slots: nothing it reads can run code, so the twelve HasProperty and Get
+/// steps reduce to six shape lookups. False, having read nothing, otherwise.
+fn plainDescriptor<'a>(realm: Realm<'a>, object: ValueBits, descriptor: &mut PropertyDescriptor) -> bool {
+  let node = match object { ValueBits.Object { reference } => reference _ => { return false } }
+  let objectPrototype = match realm.classPrototype(classes.JS_CLASS_OBJECT).view() { ValueBits.Object { reference: found } => found _ => { return false } }
+  let anchor = ()
+  let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, node)
+  if data.classId() != classes.JS_CLASS_OBJECT || data.isExotic() { return false }
+  let shapeData = unsafe HeapCell.payload<ShapeData, ()>(&anchor, data.shape)
+  if Pointer.address<HeapHeader>(objectPrototype) != Pointer.address<HeapHeader>(unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(shapeData.prototype)) { return false }
+  drop shapeData
+  let epoch = realm.runtimeState(&anchor).shapeEpoch
+  if realm.state(&anchor).descriptorEpoch != epoch && !rememberDescriptorPrototype(realm, objectPrototype) { return false }
+  let mut slots: [usize; 6] = [0; 6]
+  let mut found: [bool; 6] = [false; 6]
+  let mut k: usize = 0
+  while k < 6 {
+    match unsafe shapes.lookup(data.shape, DESCRIPTOR_KEYS[k]) {
+      Option<usize>.Some { value: index } => {
+        if (u8.toU32(unsafe shapes.slotFlagsUnchecked(data.shape, index)) & JS_PROP_TMASK) != 0 { return false }
+        slots[k] = index found[k] = true
+      }
+      Option<usize>.None => ()
+    }
+    k = k + 1
+  }
+  if found[0] { descriptor.flags = descriptor.flags | JS_PROP_HAS_ENUMERABLE if truthy(data.slot(slots[0]).valueBits()) { descriptor.flags = descriptor.flags | JS_PROP_ENUMERABLE } }
+  if found[1] { descriptor.flags = descriptor.flags | JS_PROP_HAS_CONFIGURABLE if truthy(data.slot(slots[1]).valueBits()) { descriptor.flags = descriptor.flags | JS_PROP_CONFIGURABLE } }
+  if found[2] { descriptor.flags = descriptor.flags | JS_PROP_HAS_VALUE descriptor.value = unsafe Value.adoptBits(unsafe data.slot(slots[2]).valueBits().retained()) }
+  if found[3] { descriptor.flags = descriptor.flags | JS_PROP_HAS_WRITABLE if truthy(data.slot(slots[3]).valueBits()) { descriptor.flags = descriptor.flags | JS_PROP_WRITABLE } }
+  if found[4] { descriptor.flags = descriptor.flags | JS_PROP_HAS_GET descriptor.getter = unsafe Value.adoptBits(unsafe data.slot(slots[4]).valueBits().retained()) }
+  if found[5] { descriptor.flags = descriptor.flags | JS_PROP_HAS_SET descriptor.setter = unsafe Value.adoptBits(unsafe data.slot(slots[5]).valueBits().retained()) }
+  return true
+}
+/// Whether Object.prototype (prototype) is not exotic and holds no descriptor
+/// key, remembered for the current epoch when so.
+fn rememberDescriptorPrototype<'a>(realm: Realm<'a>, prototype: *mut HeapHeader) -> bool {
+  let anchor = ()
+  let holder = unsafe HeapCell.payload<ObjectData, ()>(&anchor, prototype)
+  if holder.isExotic() { return false }
+  let mut k: usize = 0
+  while k < 6 {
+    match unsafe shapes.lookup(holder.shape, DESCRIPTOR_KEYS[k]) { Option<usize>.Some { .. } => { return false } Option<usize>.None => () }
+    k = k + 1
+  }
+  drop holder
+  // From here on a change to its shape moves the epoch.
+  unsafe shapes.markPrototype(unsafe Intrinsic.pointerRequalify<*mut HeapHeader, ?*mut HeapHeader>(prototype))
+  let epoch = realm.runtimeState(&anchor).shapeEpoch
+  let mut stateAnchor = () let context = realm.stateMut(&mut stateAnchor)
+  context.descriptorEpoch = epoch
+  return true
+}
+effect fn hasField<'a, 'b, H: HeapHooks + OwnPropertyHooks + HasPropertyHooks + CoercionHooks>(
+  hooks: &mut H, realm: Realm<'a>, object: ValueRef<'b>, atom: u32) -> bool ? &mut Allocator {
+  let result = run Effect.result(queries.hasProperty(&mut hooks, realm, object, atom))
+  return match move result {
+    Result<bool, OutOfMemoryError | JsException>.Success { value } => value
+    Result<bool, OutOfMemoryError | JsException>.Failure { error } => {
+      // C tests the signed return directly: -1 is true, with its exception live.
+      return run Effect.catch<JsException>(ops.materialize(&mut hooks,realm, move error), hasFailure)
+    }
+  }
+}
+effect fn field<'a, 'b, H: CoercionHooks>(hooks: &mut H, realm: Realm<'a>,
+  object: ValueRef<'b>, atom: u32) -> Value ? &mut Allocator {
+  let result = run Effect.result(CoercionHooks.getProperty(&mut hooks, realm, object.borrow(), atom))
+  return match move result {
+    Result<ValueBits, OutOfMemoryError | JsException>.Success { value } => unsafe Value.adoptBits(value)
+    Result<ValueBits, OutOfMemoryError | JsException>.Failure { error } =>
+      Value.immediate(run Effect.catch<JsException>(ops.materialize(&mut hooks,realm, move error), core.exceptionValue))
+  }
+}
+effect fn convert<'a, 'b, H: HeapHooks + OwnPropertyHooks + HasPropertyHooks + CoercionHooks>(
+  hooks: &mut H, realm: Realm<'a>, object: ValueRef<'b>, descriptor: &mut PropertyDescriptor)
+  -> () ! JsException ? &mut Allocator {
+  if !object.view().isObject() { return run OwnPropertyHooks.throwNotObject(&mut hooks, realm) }
+  if plainDescriptor(realm, object.view(), &mut descriptor) { return run checkDescriptor(&mut hooks, realm, &mut descriptor) }
+  if run hasField(&mut hooks, realm, object, atoms.JS_ATOM_enumerable) {
+    let enumerable = run field(&mut hooks, realm, object, atoms.JS_ATOM_enumerable)
+    if enumerable.view().isException() { fail JsException {} }
+    descriptor.flags = descriptor.flags | JS_PROP_HAS_ENUMERABLE
+    if core.toBoolFree(&mut hooks, realm, move enumerable) { descriptor.flags = descriptor.flags | JS_PROP_ENUMERABLE }
+  }
+  if run hasField(&mut hooks, realm, object, atoms.JS_ATOM_configurable) {
+    let configurable = run field(&mut hooks, realm, object, atoms.JS_ATOM_configurable)
+    if configurable.view().isException() { fail JsException {} }
+    descriptor.flags = descriptor.flags | JS_PROP_HAS_CONFIGURABLE
+    if core.toBoolFree(&mut hooks, realm, move configurable) { descriptor.flags = descriptor.flags | JS_PROP_CONFIGURABLE }
+  }
+  if run hasField(&mut hooks, realm, object, atoms.JS_ATOM_value) {
+    descriptor.flags = descriptor.flags | JS_PROP_HAS_VALUE
+    descriptor.value = run field(&mut hooks, realm, object, atoms.JS_ATOM_value)
+    if descriptor.value.view().isException() { fail JsException {} }
+  }
+  if run hasField(&mut hooks, realm, object, atoms.JS_ATOM_writable) {
+    let writable = run field(&mut hooks, realm, object, atoms.JS_ATOM_writable)
+    if writable.view().isException() { fail JsException {} }
+    descriptor.flags = descriptor.flags | JS_PROP_HAS_WRITABLE
+    if core.toBoolFree(&mut hooks, realm, move writable) { descriptor.flags = descriptor.flags | JS_PROP_WRITABLE }
+  }
+  if run hasField(&mut hooks, realm, object, atoms.JS_ATOM_get) {
+    descriptor.flags = descriptor.flags | JS_PROP_HAS_GET
+    descriptor.getter = run field(&mut hooks, realm, object, atoms.JS_ATOM_get)
+    // Unlike the other Get operations, even a thrown getter is replaced here.
+    if descriptor.getter.view().isException() || !(core.undefined(descriptor.getter.view()) || CoercionHooks.isCallable(&mut hooks, realm, descriptor.getter.borrow())) {
+      return run ops.error(&mut hooks,realm, b"invalid getter")
+    }
+  }
+  if run hasField(&mut hooks, realm, object, atoms.JS_ATOM_set) {
+    descriptor.flags = descriptor.flags | JS_PROP_HAS_SET
+    descriptor.setter = run field(&mut hooks, realm, object, atoms.JS_ATOM_set)
+    if descriptor.setter.view().isException() || !(core.undefined(descriptor.setter.view()) || CoercionHooks.isCallable(&mut hooks, realm, descriptor.setter.borrow())) {
+      return run ops.error(&mut hooks,realm, b"invalid setter")
+    }
+  }
+  if (descriptor.flags & (JS_PROP_HAS_GET | JS_PROP_HAS_SET)) != 0 &&
+    (descriptor.flags & (JS_PROP_HAS_VALUE | JS_PROP_HAS_WRITABLE)) != 0 {
+    return run ops.error(&mut hooks,realm, b"cannot have setter/getter and value or writable")
+  }
+}
+pub effect fn toPropertyDescriptor<'a, 'b, H: HeapHooks + OwnPropertyHooks + HasPropertyHooks + CoercionHooks>(
+  hooks: &mut H, realm: Realm<'a>, object: ValueRef<'b>) -> PropertyDescriptor ! JsException ? &mut Allocator {
+  let mut descriptor = PropertyDescriptor { flags: 0, value: Value.immediate(ValueBits.Undefined),
+    getter: Value.immediate(ValueBits.Undefined), setter: Value.immediate(ValueBits.Undefined) }
+  run convert(&mut hooks, realm, object, &mut descriptor)
+  return move descriptor
+}
+effect fn ignoredDefinition(error: JsException) -> bool { drop error return false }
+effect fn defineField<'a, 'b, H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks>(
+  hooks: &mut H, realm: Realm<'a>, object: ValueRef<'b>, atom: u32, value: ValueRef<'b>) -> () ? &mut Allocator {
+  // js_create_desc ignores every DefinePropertyValue return, including -1.
+  let _ignored = run Effect.catch<JsException>(core.defineValue(&mut hooks, realm,
+    object, atom, value.dup(), JS_PROP_C_W_E), ignoredDefinition)
+}
+pub effect fn fromPropertyDescriptor<'a, 'b, H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks>(
+  hooks: &mut H, memory: &AllocationObserver, realm: Realm<'a>,
+  value: ValueRef<'b>, getter: ValueRef<'b>, setter: ValueRef<'b>, flags: u32) -> Value ! JsException ? &mut Allocator {
+  let allocated = run Effect.result(objects.object(&mut hooks, memory, realm))
+  let object = match move allocated {
+    Result<ValueBits, OutOfMemoryError>.Success { value: created } => unsafe Value.adoptBits(created)
+    Result<ValueBits, OutOfMemoryError>.Failure { error } => run ops.materialize(&mut hooks,realm, move error)
+  }
+  if (flags & JS_PROP_HAS_GET) != 0 { run defineField(&mut hooks, realm, object.borrow(), atoms.JS_ATOM_get, getter) }
+  if (flags & JS_PROP_HAS_SET) != 0 { run defineField(&mut hooks, realm, object.borrow(), atoms.JS_ATOM_set, setter) }
+  if (flags & JS_PROP_HAS_VALUE) != 0 { run defineField(&mut hooks, realm, object.borrow(), atoms.JS_ATOM_value, value) }
+  if (flags & JS_PROP_HAS_WRITABLE) != 0 { run defineField(&mut hooks, realm, object.borrow(), atoms.JS_ATOM_writable, immediateRef(ValueBits.Bool { value: (flags & JS_PROP_WRITABLE) != 0 })) }
+  if (flags & JS_PROP_HAS_ENUMERABLE) != 0 { run defineField(&mut hooks, realm, object.borrow(), atoms.JS_ATOM_enumerable, immediateRef(ValueBits.Bool { value: (flags & JS_PROP_ENUMERABLE) != 0 })) }
+  if (flags & JS_PROP_HAS_CONFIGURABLE) != 0 { run defineField(&mut hooks, realm, object.borrow(), atoms.JS_ATOM_configurable, immediateRef(ValueBits.Bool { value: (flags & JS_PROP_CONFIGURABLE) != 0 })) }
+  return move object
+}

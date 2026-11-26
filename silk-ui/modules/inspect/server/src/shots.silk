@@ -1,0 +1,423 @@
+//! Screenshots of the frames the window host drew on the GPU, encoded off the UI thread.
+//!
+//! A screenshot drawn on the CPU stops the app's loop while it renders and encodes: seconds in
+//! a debug build, long enough to freeze every animation and to make timed captures useless. A
+//! host that can read its frames back from the GPU says so (`Inspector.liveFrames`); a
+//! screenshot request then waits here ([`Shots.wait`]) for the next frame the host copies out,
+//! and the copy is unpacked, cropped, reduced and encoded as PNG on a worker thread. The UI
+//! thread only queues the copy and, later, hands the finished reply to the session that asked.
+import capture { reduced }
+import reply { writeBase64 }
+import ui_tree.inspect { encodePng, writeInt }
+import codec.image { ImageError }
+import vector.pixmap { Pixmap }
+import silk.collections.list { List }
+import silk.concurrency.sync { Arc, Mutex, Parker, Unparker }
+import silk.concurrency.thread { Transferable }
+import silk.concurrency.thread_native { JoinHandle, NativeThread, SpawnError }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f32
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+import silk.text.string { String }
+
+/// A screenshot request waiting for the next frame the host reads back.
+pub struct Shot {
+  /// The session that asked.
+  pub session: u64,
+  /// The start of the reply: `{"id":…,"ok":true`.
+  pub head: String,
+  /// The node to crop to, or NONE for the whole frame.
+  pub node: u32,
+  /// Device pixels left, top, right and bottom of the crop (all zero for the whole frame).
+  pub crop: [u32; 4],
+  /// Reduce to this width before encoding (0: keep the frame's).
+  pub maxWidth: u32,
+}
+
+/// A frame copy with the requests it answers, for the worker.
+struct Job {
+  session: u64,
+  head: String,
+  node: u32,
+  crop: [u32; 4],
+  maxWidth: u32,
+  rows: List<u8>,
+  stride: u32,
+  width: u32,
+  height: u32,
+  bgra: bool,
+  scale: f32,
+  frame: u64,
+}
+
+/// A finished reply line for a session.
+pub struct Done {
+  pub session: u64,
+  pub line: String,
+}
+
+struct Queue {
+  jobs: List<Job>,
+  done: List<Done>,
+  stop: bool,
+}
+
+// Everything in the queue is allocated with the system allocator and moved only under the lock.
+impl Transferable for Queue {}
+
+/// The screenshots waiting for a frame, and the worker that encodes them.
+pub struct Shots {
+  /// Requests that wait for the host's next frame copy.
+  pub waiting: List<Shot>,
+  /// Requests handed to the worker and not answered yet.
+  pub encoding: usize,
+  shared: Option<Arc<Mutex<Queue>>>,
+  wake: Option<Unparker>,
+  worker: Option<JoinHandle<()>>,
+}
+
+impl Shots {
+  pub fn make() -> Shots {
+    return Shots {
+      waiting: List<Shot>.make(),
+      encoding: 0,
+      shared: Option<Arc<Mutex<Queue>>>.None,
+      wake: Option<Unparker>.None,
+      worker: Option<JoinHandle<()>>.None,
+    }
+  }
+
+  /// Queues `shot` until the host's next frame copy.
+  pub effect fn wait(self: &mut Self, shot: Shot) -> ()
+    ! OutOfMemoryError {
+    let mut heap = Allocator.systemAllocatorProvider()
+    run self.waiting.append(move shot) |> Effect.provideMut<Allocator>(&mut heap)
+  }
+
+  /// Whether a request waits for a frame copy.
+  pub fn wantsFrame(self: &Self) -> bool {
+    return self.waiting.length() != 0
+  }
+
+  /// Whether a request is waiting or being encoded.
+  pub fn busy(self: &Self) -> bool {
+    return self.waiting.length() != 0 || self.encoding != 0
+  }
+
+  /// Hands the frame copy to the worker for every waiting request. `rows` holds `height` rows
+  /// of `stride` bytes (BGRA when `bgra`). Returns false when the worker cannot start; the
+  /// requests stay waiting then.
+  pub effect fn frame(
+    self: &mut Self,
+    rows: List<u8>,
+    stride: u32,
+    width: u32,
+    height: u32,
+    bgra: bool,
+    scale: f32,
+    frame: u64,
+  ) -> bool
+    ! OutOfMemoryError {
+    if self.waiting.length() == 0 {
+      return true
+    }
+    if !run self.start() {
+      return false
+    }
+    let mut heap = Allocator.systemAllocatorProvider()
+    let queue = match &self.shared {
+      Option<Arc<Mutex<Queue>>>.Some { value } => value.clone()
+      Option<Arc<Mutex<Queue>>>.None => {
+        return false
+      }
+    }
+    let mut rows = move rows
+    let mut guard = queue.get().lock()
+    let state = guard.getMut()
+    while self.waiting.length() != 0 {
+      let shot = self.waiting.remove(0)
+      // The last request takes the copy itself; any before it get their own.
+      let mine = if self.waiting.length() == 0 {
+        Intrinsic.replace(rows, List<u8>.make())
+      } else {
+        let mut copy = List<u8>.make()
+        run copy.appendSlice(rows.asSlice()) |> Effect.provideMut<Allocator>(&mut heap)
+        move copy
+      }
+      run state.jobs.append(
+        Job {
+          session: shot.session,
+          head: move shot.head,
+          node: shot.node,
+          crop: shot.crop,
+          maxWidth: shot.maxWidth,
+          rows: move mine,
+          stride: stride,
+          width: width,
+          height: height,
+          bgra: bgra,
+          scale: scale,
+          frame: frame,
+        },
+      )
+        |> Effect.provideMut<Allocator>(&mut heap)
+      self.encoding = self.encoding + 1
+    }
+    drop guard
+    if let Option<Unparker>.Some { value } = &self.wake {
+      value.unpark()
+    }
+    return true
+  }
+
+  /// Moves the replies the worker finished into `out`.
+  pub effect fn finished(self: &mut Self, out: &mut List<Done>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if self.encoding == 0 {
+      return ()
+    }
+    if let Option<Arc<Mutex<Queue>>>.Some { value } = &self.shared {
+      let mut guard = value.get().lock()
+      let state = guard.getMut()
+      while state.done.length() != 0 {
+        run out.append(state.done.remove(0))
+        self.encoding = self.encoding - 1
+      }
+    }
+  }
+
+  /// Drops the requests of a session that is gone, waiting or finished.
+  pub fn forget(self: &mut Self, session: u64) -> () {
+    let mut i: usize = 0
+    while i < self.waiting.length() {
+      if self.waiting.asSlice()[i].session == session {
+        drop self.waiting.remove(i)
+      } else {
+        i = i + 1
+      }
+    }
+  }
+
+  /// Stops the worker. Requests still waiting are dropped unanswered.
+  pub fn stop(self: &mut Self) -> () {
+    self.waiting.clear()
+    if let Option<Arc<Mutex<Queue>>>.Some { value } = &self.shared {
+      let mut guard = value.get().lock()
+      let state = guard.getMut()
+      state.stop = true
+    }
+    if let Option<Unparker>.Some { value } = &self.wake {
+      value.unpark()
+    }
+    let worker = Intrinsic.replace(self.worker, Option<JoinHandle<()>>.None)
+    drop worker
+    self.shared = Option<Arc<Mutex<Queue>>>.None
+    self.wake = Option<Unparker>.None
+    self.encoding = 0
+  }
+
+  // Starts the worker on first use.
+  effect fn start(self: &mut Self) -> bool
+    ! OutOfMemoryError {
+    if self.worker.isSome() {
+      return true
+    }
+    let mut heap = Allocator.systemAllocatorProvider()
+    let queue = Queue { jobs: List<Job>.make(), done: List<Done>.make(), stop: false }
+    let mutex = run Mutex<Queue>.make(move queue) |> Effect.provideMut<Allocator>(&mut heap)
+    let shared = run Arc<Mutex<Queue>>.make(move mutex) |> Effect.provideMut<Allocator>(&mut heap)
+    let parker = run Parker.make() |> Effect.provideMut<Allocator>(&mut heap)
+    let wake = parker.unparker()
+    let theirs = shared.clone()
+    let spawned = run Effect.result(
+      NativeThread.spawn(
+        || -> () {
+          let shared = move theirs
+          let parker = move parker
+          work(&shared, &parker)
+        },
+      ),
+    )
+      |> Effect.provideMut<Allocator>(&mut heap)
+    match move spawned {
+      Result.Success { value } => {
+        self.worker = Option<JoinHandle<()>>.some(move value)
+        self.shared = Option<Arc<Mutex<Queue>>>.some(move shared)
+        self.wake = Option<Unparker>.some(move wake)
+        return true
+      }
+      Result.Failure { error } => match move error {
+        SpawnError failure => {
+          drop failure
+          return false
+        }
+        OutOfMemoryError failure => {
+          fail move failure
+        }
+      }
+    }
+  }
+}
+
+// The worker: takes jobs until told to stop.
+fn work(shared: &Arc<Mutex<Queue>>, parker: &Parker) -> () {
+  let mut heap = Allocator.systemAllocatorProvider()
+  while true {
+    let mut guard = shared.get().lock()
+    let state = guard.getMut()
+    if state.stop {
+      return ()
+    }
+    if state.jobs.length() == 0 {
+      drop guard
+      parker.park()
+      continue
+    }
+    let job = state.jobs.remove(0)
+    drop guard
+    let mut line = String.make()
+    let made = run Effect.result(encode(&job, &mut line)) |> Effect.provideMut<Allocator>(&mut heap)
+    match move made {
+      Result<(), ImageError | OutOfMemoryError>.Success { .. } => {}
+      Result<(), ImageError | OutOfMemoryError>.Failure { error } => {
+        drop error
+        line.clear()
+        drop run Effect.result(failed(&job, &mut line)) |> Effect.provideMut<Allocator>(&mut heap)
+      }
+    }
+    let mut again = shared.get().lock()
+    drop run Effect.result(
+      again.getMut().done.append(Done { session: job.session, line: move line }),
+    )
+      |> Effect.provideMut<Allocator>(&mut heap)
+  }
+}
+
+effect fn failed(job: &Job, out: &mut String) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  // The head ends in `"ok":true`; a failure replaces it.
+  let head = String.view(&job.head)
+  run out.append(String.slice(head, 0, String.byteLength(head) - 4))
+  run out.append("false,\"error\":\"encoding the screenshot failed\"}")
+}
+
+// Unpacks, crops and reduces the copy, then writes the screenshot reply.
+effect fn encode(job: &Job, out: &mut String) -> ()
+  ! ImageError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut x0: u32 = 0
+  let mut y0: u32 = 0
+  let mut x1 = job.width
+  let mut y1 = job.height
+  if job.crop[2] > job.crop[0] && job.crop[3] > job.crop[1] {
+    x0 = least(job.crop[0], job.width)
+    y0 = least(job.crop[1], job.height)
+    x1 = most(x0, least(job.crop[2], job.width))
+    y1 = most(y0, least(job.crop[3], job.height))
+  }
+  let width = x1 - x0
+  let height = y1 - y0
+  let mut pixels = run Pixmap.make(
+    if width == 0 {
+      1
+    } else {
+      width
+    },
+    if height == 0 {
+      1
+    } else {
+      height
+    },
+  )
+  let rows = job.rows.asSlice()
+  let target = pixels.dataMut()
+  let red: usize = if job.bgra {
+    2
+  } else {
+    0
+  }
+  let blue: usize = 2 - red
+  let mut y: u32 = 0
+  while y < height {
+    let mut from = u32.toUsize((y0 + y) * job.stride + x0 * 4)
+    let mut to = u32.toUsize(y * width * 4)
+    let end = to + u32.toUsize(width * 4)
+    while to < end {
+      target[to] = rows[from + red]
+      target[to + 1] = rows[from + 1]
+      target[to + 2] = rows[from + blue]
+      target[to + 3] = rows[from + 3]
+      from = from + 4
+      to = to + 4
+    }
+    y = y + 1
+  }
+  let sourceWidth = pixels.width()
+  if job.maxWidth > 0 && pixels.width() > job.maxWidth {
+    pixels = run reduced(&pixels, job.maxWidth)
+  }
+  let png = run encodePng(&pixels)
+  out.clear()
+  run out.append(String.view(&job.head))
+  if job.node != u32.MAX {
+    run out.append(",\"node\":")
+    run writeInt(&mut out, u32.toU64(job.node))
+  }
+  run out.append(",\"width\":")
+  run writeInt(&mut out, u32.toU64(pixels.width()))
+  run out.append(",\"height\":")
+  run writeInt(&mut out, u32.toU64(pixels.height()))
+  run out.append(",\"scale\":")
+  run writeScale(&mut out, job.scale * u32.toF32(pixels.width()) / u32.toF32(sourceWidth))
+  run out.append(",\"frame\":")
+  run writeInt(&mut out, job.frame)
+  run out.append(",\"source\":\"gpu\",\"png\":\"")
+  run writeBase64(&mut out, png.asSlice())
+  run out.append("\"}")
+}
+
+fn least(a: u32, b: u32) -> u32 {
+  return if a < b {
+    a
+  } else {
+    b
+  }
+}
+
+fn most(a: u32, b: u32) -> u32 {
+  return if a > b {
+    a
+  } else {
+    b
+  }
+}
+
+// A scale with up to three decimals, as the CPU path's `putNumber` writes it.
+effect fn writeScale(out: &mut String, scale: f32) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let thousandths = f32.toU64(f32.round(f32.max(0.0, scale) * 1000.0))
+  run writeInt(&mut out, thousandths / 1000)
+  let rest = thousandths % 1000
+  if rest != 0 {
+    run out.append(".")
+    if rest < 100 {
+      run out.append("0")
+    }
+    if rest < 10 {
+      run out.append("0")
+    }
+    let mut trimmed = rest
+    while trimmed % 10 == 0 {
+      trimmed = trimmed / 10
+    }
+    run writeInt(&mut out, trimmed)
+  }
+}

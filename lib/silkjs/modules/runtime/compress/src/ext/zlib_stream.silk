@@ -1,0 +1,425 @@
+//! zlib's stream calls (`deflateInit2`, `deflate`, `deflateParams`, `inflateInit2`, `inflate`,
+//! and the rest that Node's zlib binding makes) over the Silk DEFLATE codecs, with zlib's status
+//! codes and messages. src/ext/compression_native.silk drives it where it drove the C zlib.
+//!
+//! The codecs are the standard library's `silk.compress.deflate` and `silk.compress.inflate`,
+//! through the copies in src/stdlib_copy (ZLIB_NOTES.md says why). What is specific to zlib's
+//! calling convention or to Node is here, not in the codecs: the window bits that choose a
+//! format, the detection of gzip or zlib by the first two bytes, the status codes, and the
+//! message texts.
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.effect { Effect }
+import silk.core.result { Result }
+import silk.core.target { OperatingSystem, Target }
+import silk.collections.slice { Slice }
+import silk.num.i32
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+import stdlib_copy.compress.deflate { EncodeError, EncodeProgress, EncodeStatus, Encoder, Flush, Hash, Options, Strategy }
+import stdlib_copy.compress.inflate { DecodeError, Decoder, ErrorDetail, ErrorKind, Format, Limits, MEMORY_BOUND, Progress, Status }
+
+pub const Z_OK: i32 = 0
+pub const Z_STREAM_END: i32 = 1
+pub const Z_NEED_DICT: i32 = 2
+pub const Z_STREAM_ERROR: i32 = -2
+pub const Z_DATA_ERROR: i32 = -3
+pub const Z_MEM_ERROR: i32 = -4
+pub const Z_BUF_ERROR: i32 = -5
+/// The loaded dictionary is not the one that the stream names: zlib's `inflateSetDictionary`
+/// answers `Z_DATA_ERROR` there, which Node reports as "Bad dictionary".
+pub const BAD_DICTIONARY: i32 = -3001
+
+pub const Z_FINISH: i32 = 4
+pub const Z_BLOCK: i32 = 5
+
+/// The version of zlib whose behaviour and compressed bytes these streams reproduce (Chromium's,
+/// which Node 24 builds), which is what `process.versions.zlib` reports, as Node's does.
+pub const VERSION: &'static [u8] = b"1.3.2.1-motley-285e94b"
+
+/// [`VERSION`] as a C string.
+pub const VERSION_TEXT: [u8; 23] = [49, 46, 51, 46, 50, 46, 49, 45, 109, 111, 116, 108, 101, 121, 45, 50, 56, 53, 101, 57, 52, 98, 0]
+
+/// What one call did: zlib's return code, the input and output it used, and the number of its
+/// message (0 for none; see [`message`]).
+pub struct Call {
+  pub status: i32,
+  pub consumed: usize,
+  pub written: usize,
+  pub message: u32,
+}
+
+/// The text of zlib's `msg` for a message number of a [`Call`].
+pub fn message(number: u32) -> &'static [u8] {
+  if number == 1 { return b"incorrect header check" }
+  if number == 2 { return b"unknown compression method" }
+  if number == 3 { return b"invalid window size" }
+  if number == 4 { return b"unknown header flags set" }
+  if number == 5 { return b"header crc mismatch" }
+  if number == 6 { return b"invalid block type" }
+  if number == 7 { return b"invalid stored block lengths" }
+  if number == 8 { return b"too many length or distance symbols" }
+  if number == 9 { return b"invalid code lengths set" }
+  if number == 10 { return b"invalid bit length repeat" }
+  if number == 11 { return b"invalid code -- missing end-of-block" }
+  if number == 12 { return b"invalid literal/lengths set" }
+  if number == 13 { return b"invalid distances set" }
+  if number == 14 { return b"invalid literal/length code" }
+  if number == 15 { return b"invalid distance code" }
+  if number == 16 { return b"invalid distance too far back" }
+  if number == 17 { return b"incorrect data check" }
+  if number == 18 { return b"incorrect length check" }
+  if number == 19 { return b"stream error" }
+  if number == 20 { return b"buffer error" }
+  return b""
+}
+
+fn messageOf(detail: ErrorDetail) -> u32 {
+  return match detail {
+    ErrorDetail.HeaderCheck => 1
+    ErrorDetail.Method => 2
+    ErrorDetail.WindowSize => 3
+    ErrorDetail.HeaderFlags => 4
+    ErrorDetail.HeaderCrc => 5
+    ErrorDetail.BlockType => 6
+    ErrorDetail.StoredLengths => 7
+    ErrorDetail.SymbolCounts => 8
+    ErrorDetail.CodeLengthsSet => 9
+    ErrorDetail.LengthRepeat => 10
+    ErrorDetail.MissingEndOfBlock => 11
+    ErrorDetail.LiteralLengthsSet => 12
+    ErrorDetail.DistancesSet => 13
+    ErrorDetail.LiteralLengthCode => 14
+    ErrorDetail.DistanceCode => 15
+    ErrorDetail.DistanceTooFar => 16
+    ErrorDetail.DataCheck => 17
+    ErrorDetail.LengthCheck => 18
+    _ => 0
+  }
+}
+
+fn strategyOf(value: i32) -> Strategy {
+  if value == 1 { return Strategy.Filtered }
+  if value == 2 { return Strategy.HuffmanOnly }
+  if value == 3 { return Strategy.Rle }
+  if value == 4 { return Strategy.Fixed }
+  return Strategy.Default
+}
+
+fn flushOf(value: i32) -> Flush {
+  if value == 1 { return Flush.Partial }
+  if value == 2 { return Flush.Sync }
+  if value == 3 { return Flush.Full }
+  if value == 4 { return Flush.Finish }
+  if value == 5 { return Flush.Block }
+  return Flush.None
+}
+
+// The operating system byte that zlib 1.3.1 writes in a gzip header (OS_CODE of zutil.h).
+fn gzipSystem() -> u8 {
+  static if Target.operatingSystem() == OperatingSystem.Darwin {
+    return 19
+  }
+  static if Target.operatingSystem() == OperatingSystem.Windows {
+    return 10
+  }
+  return 3
+}
+
+/// A compressing stream: zlib's `z_stream` after `deflateInit2`.
+pub struct Deflater {
+  encoder: Encoder,
+  // The stream ended, or an input came after its end.
+  ended: bool,
+}
+
+impl Deflater {
+  /// zlib's `deflateInit2` with its `level` (-1 for the default), `windowBits` (negative for raw
+  /// DEFLATE, more than 15 for gzip), `memLevel` and `strategy`. A value that zlib rejects with
+  /// `Z_STREAM_ERROR` is a `Failure` with that code.
+  ///
+  /// The stream finds matches with the hash of Chromium's zlib, which Node 24 builds, so its
+  /// bytes are Node's.
+  pub effect fn make(level: i32, windowBits: i32, memLevel: i32, strategy: i32) -> Result<Deflater, i32> ! OutOfMemoryError ? &mut Allocator {
+    return run Deflater.makeWith(level, windowBits, memLevel, strategy, Hash.Multiplicative)
+  }
+
+  /// [`Deflater.make`] with the hash that finds matches: `Hash.Rolling` writes zlib 1.3.1's
+  /// bytes (the differential harness checks both).
+  pub effect fn makeWith(level: i32, windowBits: i32, memLevel: i32, strategy: i32, hash: Hash) -> Result<Deflater, i32> ! OutOfMemoryError ? &mut Allocator {
+    let mut format = Format.Zlib
+    let mut bits = windowBits
+    if bits < 0 {
+      if bits < -15 { return Result<Deflater, i32>.failResult(Z_STREAM_ERROR) }
+      format = Format.Raw
+      bits = 0 - bits
+    } else if bits > 15 {
+      format = Format.Gzip
+      bits = bits - 16
+    }
+    let mut effort = level
+    if effort == -1 { effort = 6 }
+    if effort < 0 || effort > 9 || memLevel < 1 || memLevel > 9 || strategy < 0 || strategy > 4 || bits < 8 || bits > 15 {
+      return Result<Deflater, i32>.failResult(Z_STREAM_ERROR)
+    }
+    let options = Options { level: i32.toU32(effort), windowBits: i32.toU32(bits), memoryLevel: i32.toU32(memLevel), strategy: strategyOf(strategy), hash: hash }
+    let made = run Effect.result(Encoder.make(format, move options))
+    return match move made {
+      Result<Encoder, OutOfMemoryError | EncodeError>.Success { value } => {
+        let mut encoder = move value
+        Encoder.setGzipSystem(&mut encoder, gzipSystem())
+        Result<Deflater, i32>.succeed(Deflater { encoder: move encoder, ended: false })
+      }
+      Result<Encoder, OutOfMemoryError | EncodeError>.Failure { error } => {
+        match move error {
+          OutOfMemoryError {} => { fail OutOfMemoryError {} }
+          EncodeError {..} => Result<Deflater, i32>.failResult(Z_STREAM_ERROR)
+        }
+      }
+    }
+  }
+
+  /// zlib's `deflate`.
+  pub fn deflate(self: &mut Self, input: &[u8], output: &mut [u8], flush: i32) -> Call {
+    if flush < 0 || flush > 5 || (self.ended && flush != Z_FINISH) {
+      return Call { status: Z_STREAM_ERROR, consumed: 0, written: 0, message: 19 }
+    }
+    if output.length == 0 {
+      return Call { status: Z_BUF_ERROR, consumed: 0, written: 0, message: 20 }
+    }
+    return match Encoder.step(&mut self.encoder, input, &mut output, flushOf(flush)) {
+      Result<EncodeProgress, EncodeError>.Success { value } => {
+        let mut status = Z_OK
+        let mut text: u32 = 0
+        if value.status == EncodeStatus.Finished {
+          status = Z_STREAM_END
+          self.ended = true
+        } else if value.consumed == 0 && value.written == 0 {
+          // zlib says so when a call can do nothing; Node passes over it.
+          status = Z_BUF_ERROR
+          text = 20
+        }
+        Call { status: status, consumed: value.consumed, written: value.written, message: text }
+      }
+      Result<EncodeProgress, EncodeError>.Failure { error } => {
+        // Input after the end of the stream, which zlib answers with Z_BUF_ERROR.
+        self.ended = true
+        Call { status: Z_BUF_ERROR, consumed: error.consumed, written: error.written, message: 20 }
+      }
+    }
+  }
+
+  /// zlib's `deflateParams`. The block that zlib would end at this call ends at the start of
+  /// the next [`Deflater.deflate`], so this call writes nothing.
+  pub fn params(self: &mut Self, level: i32, strategy: i32) -> i32 {
+    let mut effort = level
+    if effort == -1 { effort = 6 }
+    if effort < 0 || effort > 9 || strategy < 0 || strategy > 4 {
+      return Z_STREAM_ERROR
+    }
+    return match Encoder.setParameters(&mut self.encoder, i32.toU32(effort), strategyOf(strategy)) {
+      Result<(), EncodeError>.Success {..} => Z_OK
+      Result<(), EncodeError>.Failure {..} => Z_STREAM_ERROR
+    }
+  }
+
+  /// zlib's `deflateReset`.
+  pub fn reset(self: &mut Self) -> i32 {
+    Encoder.reset(&mut self.encoder)
+    self.ended = false
+    return Z_OK
+  }
+
+  /// zlib's `deflateSetDictionary`.
+  pub fn setDictionary(self: &mut Self, dictionary: &[u8]) -> i32 {
+    return match Encoder.setDictionary(&mut self.encoder, dictionary) {
+      Result<(), EncodeError>.Success {..} => Z_OK
+      Result<(), EncodeError>.Failure {..} => Z_STREAM_ERROR
+    }
+  }
+}
+
+const WRAP_RAW: u32 = 0
+const WRAP_ZLIB: u32 = 1
+const WRAP_GZIP: u32 = 2
+// gzip or zlib, by the first two bytes.
+const WRAP_EITHER: u32 = 3
+
+fn limits() -> Limits {
+  // zlib has no limits; Node's maxOutputLength is kept by lib/zlib.js.
+  return Limits { maxInputBytes: u64.MAX, maxOutputBytes: u64.MAX, maxMembers: u64.MAX, maxHeaderBytes: u64.MAX, maxMemoryBytes: MEMORY_BOUND }
+}
+
+/// A decompressing stream: zlib's `z_stream` after `inflateInit2`.
+pub struct Inflater {
+  decoder: Decoder,
+  wrap: u32,
+  // The first two bytes of a WRAP_EITHER stream, held until both are there.
+  held: [u8; 2],
+  heldCount: usize,
+  detected: bool,
+  ended: bool,
+  // The status and message of the failure that ended the stream, as zlib's BAD state keeps them.
+  failed: i32,
+  failedMessage: u32,
+}
+
+impl Inflater {
+  /// zlib's `inflateInit2` with its `windowBits`: negative for raw DEFLATE, 0 or 8 to 15 for
+  /// zlib, 16 more for gzip, 32 more for either. A value that zlib rejects is a `Failure` with
+  /// `Z_STREAM_ERROR`.
+  pub effect fn make(windowBits: i32) -> Result<Inflater, i32> ! OutOfMemoryError ? &mut Allocator {
+    let mut wrap = WRAP_ZLIB
+    let mut bits = windowBits
+    if bits < 0 {
+      if bits < -15 { return Result<Inflater, i32>.failResult(Z_STREAM_ERROR) }
+      wrap = WRAP_RAW
+      bits = 0 - bits
+    } else {
+      if bits >= 48 { return Result<Inflater, i32>.failResult(Z_STREAM_ERROR) }
+      if bits >= 32 { wrap = WRAP_EITHER } else if bits >= 16 { wrap = WRAP_GZIP }
+      bits = bits % 16
+    }
+    if bits != 0 && (bits < 8 || bits > 15) {
+      return Result<Inflater, i32>.failResult(Z_STREAM_ERROR)
+    }
+    if bits == 0 && wrap != WRAP_ZLIB && wrap != WRAP_EITHER {
+      // Only a zlib header can name the window.
+      bits = 15
+    }
+    let made = run Effect.result(Decoder.make(formatOf(wrap), limits()))
+    return match move made {
+      Result<Decoder, OutOfMemoryError | DecodeError>.Success { value } => {
+        let mut decoder = move value
+        Decoder.setMemberStop(&mut decoder, true)
+        match Decoder.setWindowBits(&mut decoder, i32.toU32(bits)) {
+          Result<(), DecodeError>.Success {..} => Result<Inflater, i32>.succeed(Inflater { decoder: move decoder, wrap: wrap, held: [0; 2], heldCount: 0, detected: wrap != WRAP_EITHER, ended: false, failed: 0, failedMessage: 0 })
+          Result<(), DecodeError>.Failure {..} => Result<Inflater, i32>.failResult(Z_STREAM_ERROR)
+        }
+      }
+      Result<Decoder, OutOfMemoryError | DecodeError>.Failure { error } => {
+        match move error {
+          OutOfMemoryError {} => { fail OutOfMemoryError {} }
+          DecodeError {..} => Result<Inflater, i32>.failResult(Z_STREAM_ERROR)
+        }
+      }
+    }
+  }
+
+  /// zlib's `inflateReset`. A dictionary must be loaded again.
+  pub fn reset(self: &mut Self) -> i32 {
+    let format = formatOf(self.wrap)
+    match Decoder.reset(&mut self.decoder, format, limits()) {
+      Result<(), DecodeError>.Success {..} => ()
+      Result<(), DecodeError>.Failure {..} => { return Z_STREAM_ERROR }
+    }
+    self.heldCount = 0
+    self.detected = self.wrap != WRAP_EITHER
+    self.ended = false
+    self.failed = 0
+    self.failedMessage = 0
+    return Z_OK
+  }
+
+  /// Loads the dictionary that a raw stream refers to, or that a zlib stream may name, before the
+  /// first input of a stream. Where zlib would ask for it with `Z_NEED_DICT` and take it then, the
+  /// stream finds it loaded; a gzip stream has none.
+  pub fn setDictionary(self: &mut Self, dictionary: &[u8]) -> i32 {
+    if self.wrap == WRAP_GZIP {
+      return Z_OK
+    }
+    return match Decoder.setDictionary(&mut self.decoder, dictionary) {
+      Result<(), DecodeError>.Success {..} => Z_OK
+      Result<(), DecodeError>.Failure {..} => Z_STREAM_ERROR
+    }
+  }
+
+  /// zlib's `inflate`. `Z_NEED_DICT` means that the stream names a dictionary and none is
+  /// loaded, and [`BAD_DICTIONARY`] that it names another one than the loaded.
+  pub fn inflate(self: &mut Self, input: &[u8], output: &mut [u8], flush: i32) -> Call {
+    if self.failed != 0 {
+      return Call { status: self.failed, consumed: 0, written: 0, message: self.failedMessage }
+    }
+    if self.ended {
+      return Call { status: Z_STREAM_END, consumed: 0, written: 0, message: 0 }
+    }
+    let mut taken: usize = 0
+    if self.detected == false {
+      while self.heldCount < 2 && taken < input.length {
+        self.held[self.heldCount] = input[taken]
+        self.heldCount = self.heldCount + 1
+        taken = taken + 1
+      }
+      if self.heldCount < 2 {
+        return progress(taken, 0, flush)
+      }
+      self.detected = true
+      if self.held[0] == 31 && self.held[1] == 139 {
+        // The decoder was made for zlib, where a dictionary could be loaded.
+        match Decoder.reset(&mut self.decoder, Format.Gzip, limits()) {
+          Result<(), DecodeError>.Success {..} => ()
+          Result<(), DecodeError>.Failure {..} => { return Inflater.halt(&mut self, Z_STREAM_ERROR, 19, taken, 0) }
+        }
+      }
+      let first = self.held
+      let mut none: [u8; 1] = [0; 1]
+      match Decoder.step(&mut self.decoder, &first, Slice.viewMut<u8>(&mut none, 0, 0), false) {
+        Result<Progress, DecodeError>.Success {..} => ()
+        Result<Progress, DecodeError>.Failure { error } => { return Inflater.failure(&mut self, error.kind, taken, 0) }
+      }
+      if flush == Z_BLOCK && (first[0] != 31 || first[1] != 139) && first[1] / 32 % 2 == 0 {
+        // A zlib header with no dictionary id ends with these two bytes, and Z_BLOCK returns
+        // at the first block.
+        return progress(taken, 0, flush)
+      }
+    }
+    Decoder.setBlockStop(&mut self.decoder, flush == Z_BLOCK)
+    let rest = Slice.view<u8>(input, taken, input.length - taken)
+    return match Decoder.step(&mut self.decoder, rest, &mut output, false) {
+      Result<Progress, DecodeError>.Success { value } => {
+        if value.status == Status.Finished {
+          self.ended = true
+          Call { status: Z_STREAM_END, consumed: taken + value.consumed, written: value.written, message: 0 }
+        } else {
+          progress(taken + value.consumed, value.written, flush)
+        }
+      }
+      Result<Progress, DecodeError>.Failure { error } => Inflater.failure(&mut self, error.kind, taken + error.consumed, error.written)
+    }
+  }
+
+  fn failure(self: &mut Self, kind: ErrorKind, consumed: usize, written: usize) -> Call {
+    if kind == ErrorKind.MissingDictionary {
+      return Inflater.halt(&mut self, Z_NEED_DICT, 0, consumed, written)
+    }
+    if kind == ErrorKind.DictionaryMismatch {
+      return Inflater.halt(&mut self, BAD_DICTIONARY, 0, consumed, written)
+    }
+    let text = messageOf(Decoder.failureDetail(&self.decoder))
+    if text == 0 {
+      return Inflater.halt(&mut self, Z_STREAM_ERROR, 19, consumed, written)
+    }
+    return Inflater.halt(&mut self, Z_DATA_ERROR, text, consumed, written)
+  }
+
+  fn halt(self: &mut Self, status: i32, text: u32, consumed: usize, written: usize) -> Call {
+    self.failed = status
+    self.failedMessage = text
+    return Call { status: status, consumed: consumed, written: written, message: text }
+  }
+}
+
+fn formatOf(wrap: u32) -> Format {
+  if wrap == WRAP_RAW { return Format.Raw }
+  if wrap == WRAP_GZIP { return Format.Gzip }
+  return Format.Zlib
+}
+
+// zlib's answer for a call that did not end the stream: Z_BUF_ERROR when it could do nothing, or
+// when Z_FINISH asked for the end.
+fn progress(consumed: usize, written: usize, flush: i32) -> Call {
+  if (consumed == 0 && written == 0) || flush == Z_FINISH {
+    return Call { status: Z_BUF_ERROR, consumed: consumed, written: written, message: 0 }
+  }
+  return Call { status: Z_OK, consumed: consumed, written: written, message: 0 }
+}

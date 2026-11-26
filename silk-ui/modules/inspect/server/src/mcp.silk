@@ -1,0 +1,1384 @@
+//! The Model Context Protocol bridge: MCP tool calls in, inspector protocol requests out, so an
+//! agent (Claude Code, or any MCP client) can snapshot, inspect and drive a running Silk UI.
+//!
+//! [`Bridge`] does no I/O. The driver (ui-inspect-mcp) reads JSON-RPC messages, one per line,
+//! from standard input and hands each to [`Bridge.handle`]. The returned [`Action`] says what to
+//! do with `out`: write it to standard output as the response, or send it to the app as an
+//! inspector request line and give the reply to [`Bridge.answer`], which returns the next
+//! action. A `wait` that does not hold yet answers [`Action.Retry`]: ask the same request again
+//! a little later. Tests drive the bridge with `Protocol.handle` in place of a socket.
+//!
+//! Tools are the inspector commands with a `ui_` prefix (`hello` is `ui_status`). Their
+//! arguments are the command's request members, passed on unchanged, so the protocol README
+//! documents them all. Results are text (the reply line, or the text of `snapshot` and
+//! `inspect`), except `ui_screenshot`, which returns the PNG as image content.
+//!
+//! The app's extensions (see `extension.silk`) add tools of their own: `tools/list` asks the app
+//! for `hello` and lists a tool for each extension command after the inspector's, named
+//! `<id>_<command>` with the characters MCP does not allow in a name made `_`, and described
+//! as the extension describes it. A call to a tool the bridge has not seen listed asks `hello`
+//! first.
+import reply { appendNumber, writeString }
+import capture { Capture }
+import codec.png { PngError }
+import codec.image { ImageError }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.json.scanner { JsonError }
+import silk.json.value { Json, Value }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.collections.list { List }
+import silk.text.string { String }
+import ui_tree.inspect { writeInt }
+import silk.num.u32
+
+/// The MCP revision this server implements; an initialize request asking for another known
+/// revision gets that one back.
+pub const PROTOCOL_VERSION: string = "2025-06-18"
+
+/// The server name in `initialize`.
+pub const SERVER_NAME: string = "silk-ui-inspect"
+
+/// How long `ui_wait` waits when the call names no `timeout`, in milliseconds.
+pub const WAIT_TIMEOUT: u64 = 5000
+
+/// How long to pause before asking a pending `wait` again, in milliseconds.
+pub const RETRY_PAUSE: u64 = 50
+
+const KNOWN_VERSIONS: [string<'static>; 4] = [
+  "2024-11-05",
+  "2025-03-26",
+  "2025-06-18",
+  "2025-11-25",
+]
+
+const INSTRUCTIONS: string = r"""Inspects and drives a running Silk UI (ui-tree) app through its inspector socket. The app must be a debug build started with SILK_UI_INSPECT set (1 means silk-ui-inspect.sock in its working directory). Start with ui_snapshot to see the tree as text (kind, #id, role, label, text, rect), then target nodes by node id, role, name, label, text or testId. Text matches are trimmed, case-insensitive substrings and the first match in tree order wins. Input tools (ui_click, ui_type, ui_press, ui_scroll, ui_hover) wait for the app to draw its answer before the next call, so a snapshot right after a click shows the result; use ui_wait for slower changes. ui_screenshot returns a PNG. ui_frames times the frames, ui_set_style tries a style on a live node (ui_reset_styles takes it back) and ui_audit lists accessibility problems. Design changes people make in devtools (style edits and comments) wait in ui_edits: read the open ones, change the source so the app does what they ask, then mark them done with ui_resolve. The app's framework may add tools of its own, listed after these and named after it (<extension>_<command>); ui_status lists the extensions. Read them: they often say why the UI is in the state it is in."""
+
+/// The target members every node-picking tool takes.
+const TARGET: string = r"""
+"node":{"type":"integer","description":"The node's client id, the #id in a snapshot."},
+"role":{"type":"string","description":"ARIA role as the snapshot prints it: button, link, listitem, textbox, checkbox, heading, ..."},
+"name":{"type":"string","description":"Accessible name: the label, or the text inside."},
+"label":{"type":"string","description":"The node's label attribute."},
+"text":{"type":"string","description":"Text content."},
+"testId":{"type":"string","description":"The node's testId attribute."},
+"within":{"type":"integer","description":"Only match inside this node's subtree."},
+"exact":{"type":"boolean","description":"Match whole values, with case, instead of substrings."},
+"hidden":{"type":"boolean","description":"Also match hidden nodes."}"""
+
+/// The target members of a tool whose `text` is its own (`ui_comment`): to match by text, put
+/// the target in `query`.
+const TARGET_BUT_TEXT: string = r"""
+"node":{"type":"integer","description":"The node's client id, the #id in a snapshot."},
+"role":{"type":"string","description":"ARIA role as the snapshot prints it: button, link, listitem, textbox, checkbox, heading, ..."},
+"name":{"type":"string","description":"Accessible name: the label, or the text inside."},
+"label":{"type":"string","description":"The node's label attribute."},
+"testId":{"type":"string","description":"The node's testId attribute."},
+"within":{"type":"integer","description":"Only match inside this node's subtree."},
+"exact":{"type":"boolean","description":"Match whole values, with case, instead of substrings."},
+"hidden":{"type":"boolean","description":"Also match hidden nodes."}"""
+
+const POINT: string = r"""
+"x":{"type":"number","description":"X in CSS pixels, instead of a target."},
+"y":{"type":"number","description":"Y in CSS pixels, instead of a target."}"""
+
+const MODIFIERS: string = r"""
+"modifiers":{"type":"array","items":{"type":"string","enum":["shift","control","alt","meta"]},"description":"Modifier keys held during the input."}"""
+
+/// What the driver does with `out` after [`Bridge.handle`] or [`Bridge.answer`].
+pub enum Action {
+  /// Write `out` (a JSON-RPC response) to standard output, followed by a newline.
+  Respond,
+  /// Send `out` to the app as an inspector request and pass the reply to [`Bridge.answer`].
+  Ask,
+  /// Pause `bridge.retryDelay(elapsed)` milliseconds, then send `out` again and pass the
+  /// reply to [`Bridge.answer`].
+  Retry,
+  /// Nothing to write (a notification).
+  Nothing,
+}
+
+/// What the pending request to the app is for.
+enum Asking {
+  /// A tool call.
+  Call,
+  /// `tools/list`: `hello`, for the extensions' tools.
+  Tools,
+  /// `hello`, to learn the extensions' tools before the held call.
+  Learn,
+}
+
+/// A tool an extension command becomes.
+struct ExtensionTool {
+  name: String,
+  /// The command, `<id>.<command>`.
+  command: String,
+  title: String,
+  description: String,
+  /// The input schema as JSON text.
+  schema: String,
+  readOnly: bool,
+}
+
+/// The MCP side of one session. Calls are answered one at a time, in order.
+pub struct Bridge {
+  asking: Asking,
+  /// The tools of the app's extensions, from its last `hello`.
+  tools: List<ExtensionTool>,
+  learned: bool,
+  /// The call that waits until the extensions' tools are learned.
+  held: String,
+  /// The JSON text of the pending call's id.
+  callId: String,
+  /// The pending call's inspector command.
+  cmd: String,
+  /// The pending call's inspector request line, kept for retries.
+  request: String,
+  /// For `wait`: how long the call may wait, in milliseconds.
+  timeout: u64,
+  capture: Capture,
+  /// Where the app is expected, for error messages (such as `unix:/path`).
+  pub address: String,
+}
+
+impl Bridge {
+  /// A bridge whose error messages name `address`.
+  pub effect fn make(address: string) -> Bridge
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return Bridge {
+      asking: Asking.Call,
+      tools: List<ExtensionTool>.make(),
+      learned: false,
+      held: String.make(),
+      callId: String.make(),
+      cmd: String.make(),
+      request: String.make(),
+      timeout: WAIT_TIMEOUT,
+      capture: Capture.make(),
+      address: run String.copy(address),
+    }
+  }
+
+  /// Delay before retrying, accounting for decoding/composition time in the client.
+  /// `elapsed` is monotonic milliseconds since this tool call began.
+  pub fn retryDelay(self: &Self, elapsed: u64) -> u64 {
+    if String.view(&self.cmd) == "capture" {
+      let due = u32.toU64(self.capture.taken) * self.capture.interval
+      return if due > elapsed {
+        due - elapsed
+      } else {
+        0
+      }
+    }
+    return RETRY_PAUSE
+  }
+
+  /// Handles one JSON-RPC message from the client and writes what to send into `out`.
+  pub effect fn handle(self: &mut Self, line: &[u8], out: &mut String) -> Action
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    out.clear()
+    let parsed = run Effect.result(Json.parse(line))
+    let message = match move parsed {
+      Result<Value, JsonError | OutOfMemoryError>.Success { value } => move value
+      Result<Value, JsonError | OutOfMemoryError>.Failure { error } => {
+        drop error
+        run rpcError(&mut out, "null", 32700, "Parse error")
+        return Action.Respond
+      }
+    }
+    let mut id = String.make()
+    let hasId = match Json.field(&message, "id") {
+      Option<&Value>.Some { value } => {
+        run writeValue(&mut id, value)
+        true
+      }
+      Option<&Value>.None => false
+    }
+    let method = match Json.asString(Json.field(&message, "method")) {
+      Option<string>.Some { value } => value
+      Option<string>.None => {
+        if !hasId {
+          // A response to a request we never sent, or junk without an id.
+          return Action.Nothing
+        }
+        run rpcError(&mut out, String.view(&id), 32600, "Invalid Request")
+        return Action.Respond
+      }
+    }
+    if !hasId {
+      // Notifications (initialized, cancelled, ...) get no response.
+      return Action.Nothing
+    }
+    let params = Json.field(&message, "params")
+    if method == "initialize" {
+      run initialize(&mut out, String.view(&id), params)
+      return Action.Respond
+    }
+    if method == "ping" {
+      run result(&mut out, String.view(&id), "{}")
+      return Action.Respond
+    }
+    if method == "tools/list" {
+      // The extensions' tools come from the app's hello.
+      self.callId.clear()
+      run self.callId.append(String.view(&id))
+      self.asking = Asking.Tools
+      self.request.clear()
+      run self.request.append("{\"cmd\":\"hello\"}")
+      run out.append(String.view(&self.request))
+      return Action.Ask
+    }
+    if method == "tools/call" {
+      return run self.call(String.view(&id), params, line, &mut out)
+    }
+    run rpcError(&mut out, String.view(&id), 32601, "Method not found")
+    return Action.Respond
+  }
+
+  /// The command of extension tool `name`, or "".
+  fn extensionCommand(self: &Self, name: string) -> string {
+    let list = self.tools.asSlice()
+    let mut i: usize = 0
+    while i < list.length {
+      if String.view(&list[i].name) == name {
+        return String.view(&list[i].command)
+      }
+      i = i + 1
+    }
+    return ""
+  }
+
+  /// Learns the extensions' tools from a `hello` reply.
+  effect fn learn(self: &mut Self, hello: &Value) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    self.tools.clear()
+    self.learned = true
+    let extensions = arrayOf(hello, "extensions")
+    let mut i: usize = 0
+    while i < extensions.length {
+      let extension = &extensions[i]
+      let id = Json.asString(Json.field(extension, "id")).unwrapOr("")
+      let commands = arrayOf(extension, "commands")
+      let described = arrayOf(extension, "tools")
+      let mut c: usize = 0
+      while c < commands.length {
+        let command = Json.asString(Option<&Value>.Some { value: &commands[c] }).unwrapOr("")
+        if id != "" && command != "" {
+          let mut full = run String.copy(id)
+          run full.append(".")
+          run full.append(command)
+          let mut name = String.make()
+          run toolName(&mut name, id, command)
+          let mut tool = ExtensionTool {
+            name: move name,
+            command: move full,
+            title: String.make(),
+            description: String.make(),
+            schema: run String.copy(
+              "{\"type\":\"object\",\"properties\":{},\"additionalProperties\":true}",
+            ),
+            readOnly: false,
+          }
+          run tool.title.append(id)
+          run tool.title.append(" ")
+          run tool.title.append(command)
+          run tool.description.append("Runs the command ")
+          run tool.description.append(String.view(&tool.command))
+          run tool.description.append(" of the app's ")
+          run tool.description.append(id)
+          run tool.description.append(" extension; the arguments are its request members.")
+          let mut d: usize = 0
+          while d < described.length {
+            if Json.asString(Json.field(&described[d], "command")).unwrapOr("") == command {
+              tool.title.clear()
+              run tool.title.append(
+                Json.asString(Json.field(&described[d], "title")).unwrapOr(command),
+              )
+              tool.description.clear()
+              run tool.description.append(
+                Json.asString(Json.field(&described[d], "description")).unwrapOr(""),
+              )
+              if let Option<&Value>.Some { value: schema } = Json.field(
+                &described[d],
+                "inputSchema",
+              ) {
+                tool.schema.clear()
+                run writeValue(&mut tool.schema, schema)
+              }
+              tool.readOnly = flag(&described[d], "readOnly")
+            }
+            d = d + 1
+          }
+          run self.tools.append(move tool)
+        }
+        c = c + 1
+      }
+      i = i + 1
+    }
+  }
+
+  /// Starts a `tools/call`: writes the inspector request into `out`. `line` is the message, held
+  /// while the extensions' tools are learned.
+  effect fn call(
+    self: &mut Self,
+    id: string,
+    params: Option<&Value>,
+    line: &[u8],
+    out: &mut String,
+  ) -> Action
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let name = match Json.asString(Json.fieldAt(params, "name")) {
+      Option<string>.Some { value } => value
+      Option<string>.None => {
+        run rpcError(&mut out, id, 32602, "tools/call needs a tool name")
+        return Action.Respond
+      }
+    }
+    let mut command = run String.copy(commandOf(name))
+    if command.ownedByteLength() == 0 {
+      run command.append(self.extensionCommand(name))
+    }
+    if command.ownedByteLength() == 0 && !self.learned {
+      // Perhaps an extension's: learn them, then take the call again.
+      self.callId.clear()
+      run self.callId.append(id)
+      self.held.clear()
+      run self.held.append(unsafe String.fromUtf8Unchecked(line))
+      self.asking = Asking.Learn
+      self.request.clear()
+      run self.request.append("{\"cmd\":\"hello\"}")
+      run out.append(String.view(&self.request))
+      return Action.Ask
+    }
+    let cmd = String.view(&command)
+    if cmd == "" {
+      let mut message = run String.copy("Unknown tool: ")
+      run message.append(name)
+      run rpcError(&mut out, id, 32602, String.view(&message))
+      return Action.Respond
+    }
+    let arguments = Json.fieldAt(params, "arguments")
+    match arguments {
+      Option<&Value>.Some { value } => {
+        match &value.* {
+          Value.Object { entries: _ } => {}
+          Value.Null => {}
+          _ => {
+            run rpcError(&mut out, id, 32602, "tool arguments must be an object")
+            return Action.Respond
+          }
+        }
+      }
+      Option<&Value>.None => {}
+    }
+    self.capture = Capture.make()
+    if cmd == "capture" && !self.capture.configure(arguments) {
+      run rpcError(
+        &mut out,
+        id,
+        32602,
+        "capture requires count 1..24, intervalMs 16..60000, columns 1..6 (at most count), tileWidth 160..800",
+      )
+      return Action.Respond
+    }
+    self.asking = Asking.Call
+    self.callId.clear()
+    run self.callId.append(id)
+    self.cmd.clear()
+    run self.cmd.append(cmd)
+    self.timeout = match Json.asU64(Json.fieldAt(arguments, "timeout")) {
+      Option<u64>.Some { value } => value
+      Option<u64>.None => WAIT_TIMEOUT
+    }
+    self.request.clear()
+    run self.request.append("{\"cmd\":")
+    if cmd == "capture" {
+      run writeString(&mut self.request, "screenshot")
+    } else {
+      run writeString(&mut self.request, cmd)
+    }
+    match arguments {
+      Option<&Value>.Some { value } => {
+        match &value.* {
+          Value.Object { entries } => {
+            let items = entries.asSlice()
+            let mut i: usize = 0
+            while i < items.length {
+              let key = String.view(&items[i].key)
+              if key != "cmd" && key != "id" {
+                run self.request.append(",")
+                run writeString(&mut self.request, key)
+                run self.request.append(":")
+                run writeValue(&mut self.request, &items[i].value)
+              }
+              i = i + 1
+            }
+          }
+          _ => {}
+        }
+      }
+      Option<&Value>.None => {}
+    }
+    if cmd == "wait" && !has(arguments, "timeout") {
+      run self.request.append(",\"timeout\":")
+      run writeInt(&mut self.request, WAIT_TIMEOUT)
+    }
+    if cmd == "capture" {
+      run self.request.append(",\"maxWidth\":")
+      run writeInt(&mut self.request, u32.toU64(self.capture.tileWidth))
+    }
+    run self.request.append("}")
+    out.clear()
+    run out.append(String.view(&self.request))
+    return Action.Ask
+  }
+
+  /// Takes the app's reply to the pending call's request (`reached` false when the app could
+  /// not be reached; `waited` is how long the call has been running, in milliseconds) and
+  /// writes the tool result, or the request again, into `out`.
+  pub effect fn answer(
+    self: &mut Self,
+    reply: &[u8],
+    reached: bool,
+    waited: u64,
+    out: &mut String,
+  ) -> Action
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    out.clear()
+    if self.asking == Asking.Tools {
+      // `tools/list`: the inspector's tools, then the extensions' the app has, if it answers.
+      if reached {
+        let parsed = run Effect.result(Json.parse(reply))
+        if let Result<Value, JsonError | OutOfMemoryError>.Success { value } = move parsed {
+          run self.learn(&value)
+        }
+      }
+      self.asking = Asking.Call
+      run startResult(&mut out, String.view(&self.callId))
+      run toolList(&mut out, &self.tools)
+      run out.append("}}")
+      return Action.Respond
+    }
+    if self.asking == Asking.Learn {
+      self.asking = Asking.Call
+      if reached {
+        let parsed = run Effect.result(Json.parse(reply))
+        if let Result<Value, JsonError | OutOfMemoryError>.Success { value } = move parsed {
+          run self.learn(&value)
+        }
+      }
+      self.learned = true
+      let held = run String.copy(String.view(&self.held))
+      return run self.handle(held.ownedUtf8Bytes(), &mut out)
+    }
+    let id = String.view(&self.callId)
+    if !reached {
+      let mut message = run String.copy("Could not reach the Silk UI at ")
+      run message.append(String.view(&self.address))
+      run message.append(
+        ". Is the app running as a debug build with SILK_UI_INSPECT set? Both sides must agree on the address (1 means silk-ui-inspect.sock in the app's working directory; ui-inspect-mcp takes --connect ADDRESS).",
+      )
+      run toolText(&mut out, id, String.view(&message), true)
+      return Action.Respond
+    }
+    let parsed = run Effect.result(Json.parse(reply))
+    let document = match move parsed {
+      Result<Value, JsonError | OutOfMemoryError>.Success { value } => move value
+      Result<Value, JsonError | OutOfMemoryError>.Failure { error } => {
+        drop error
+        run toolText(&mut out, id, "The app's reply is not JSON.", true)
+        return Action.Respond
+      }
+    }
+    if !flag(&document, "ok") {
+      if flag(&document, "pending") {
+        if waited < self.timeout {
+          run out.append(String.view(&self.request))
+          return Action.Retry
+        }
+        let mut message = run String.copy("Timed out after ")
+        run writeInt(&mut message, self.timeout)
+        run message.append(" ms: the condition did not hold.")
+        run toolText(&mut out, id, String.view(&message), true)
+        return Action.Respond
+      }
+      let error = match Json.asString(Json.field(&document, "error")) {
+        Option<string>.Some { value } => value
+        Option<string>.None => "the command failed"
+      }
+      run toolText(&mut out, id, error, true)
+      return Action.Respond
+    }
+    let cmd = String.view(&self.cmd)
+    if cmd == "capture" {
+      let added = run Effect.result(self.capture.append(&document, waited))
+      match move added {
+        Result<(), PngError | ImageError | OutOfMemoryError>.Failure { error: _ } => {
+          run toolText(&mut out, id, "Could not decode a capture frame; sequence aborted.", true)
+          return Action.Respond
+        }
+        Result<(), PngError | ImageError | OutOfMemoryError>.Success { value: _ } => {}
+      }
+      if self.capture.taken < self.capture.count {
+        run out.append(String.view(&self.request))
+        return Action.Retry
+      }
+      let mut mosaic = String.make()
+      let finished = run Effect.result(self.capture.finish(&mut mosaic))
+      match move finished {
+        Result<(), ImageError | OutOfMemoryError>.Failure { error: _ } => {
+          run toolText(&mut out, id, "Could not encode the capture mosaic.", true)
+          return Action.Respond
+        }
+        Result<(), ImageError | OutOfMemoryError>.Success { value: _ } => {}
+      }
+      self.cmd = run String.copy("screenshot")
+      return run self.answer(mosaic.ownedUtf8Bytes(), true, waited, &mut out)
+    }
+    if cmd == "snapshot" || cmd == "inspect" {
+      match Json.asString(Json.field(&document, "text")) {
+        Option<string>.Some { value } => {
+          run toolText(&mut out, id, value, false)
+          return Action.Respond
+        }
+        Option<string>.None => {}
+      }
+    }
+    if cmd == "screenshot" {
+      match Json.asString(Json.field(&document, "png")) {
+        Option<string>.Some { value } => {
+          run startResult(&mut out, id)
+          run out.append("\"content\":[{\"type\":\"image\",\"mimeType\":\"image/png\",\"data\":")
+          run writeString(&mut out, value)
+          run out.append("},{\"type\":\"text\",\"text\":")
+          let mut summary = run String.copy("PNG ")
+          run writeNumberField(&mut summary, &document, "width")
+          run summary.append("x")
+          run writeNumberField(&mut summary, &document, "height")
+          run summary.append(" device pixels at scale ")
+          run writeNumberField(&mut summary, &document, "scale")
+          if self.capture.taken != 0 {
+            run summary.append(
+              ". Contact sheet in reading order. Captions: sample +elapsed milliseconds, f=source frame. Each sample is the frame the window drew, read back from the GPU, where the app can do that, else a CPU drawing of its last frame; not an FPS benchmark. Samples: [",
+            )
+            run summary.append(self.capture.timings())
+            run summary.append("]")
+          }
+          run writeString(&mut out, String.view(&summary))
+          run out.append("}],\"isError\":false}}")
+          return Action.Respond
+        }
+        Option<string>.None => {
+          run toolText(&mut out, id, "The reply has no PNG.", true)
+          return Action.Respond
+        }
+      }
+    }
+    run toolText(&mut out, id, unsafe String.fromUtf8Unchecked(reply), false)
+    return Action.Respond
+  }
+}
+
+/// The inspector command for tool `name`, or "" when there is no such tool.
+pub fn commandOf(name: string) -> string<'static> {
+  let mut i: usize = 0
+  while i < TOOLS.length {
+    if TOOLS[i] == name {
+      return COMMANDS[i]
+    }
+    i = i + 1
+  }
+  return ""
+}
+
+const TOOLS: [string<'static>; 28] = [
+  "ui_status",
+  "ui_snapshot",
+  "ui_query",
+  "ui_inspect",
+  "ui_pick",
+  "ui_highlight",
+  "ui_screenshot",
+  "ui_click",
+  "ui_hover",
+  "ui_scroll",
+  "ui_press",
+  "ui_type",
+  "ui_wait",
+  "ui_stats",
+  "ui_events",
+  "ui_pointer",
+  "ui_key",
+  "ui_capture",
+  "ui_frames",
+  "ui_performance",
+  "ui_styles",
+  "ui_set_style",
+  "ui_reset_styles",
+  "ui_pick_mode",
+  "ui_audit",
+  "ui_edits",
+  "ui_comment",
+  "ui_resolve",
+]
+
+const COMMANDS: [string<'static>; 28] = [
+  "hello",
+  "snapshot",
+  "query",
+  "inspect",
+  "pick",
+  "highlight",
+  "screenshot",
+  "click",
+  "hover",
+  "scroll",
+  "press",
+  "type",
+  "wait",
+  "stats",
+  "events",
+  "pointer",
+  "key",
+  "capture",
+  "frames",
+  "performance",
+  "styles",
+  "setStyle",
+  "resetStyles",
+  "pickMode",
+  "audit",
+  "edits",
+  "comment",
+  "resolve",
+]
+
+fn has(value: Option<&Value>, key: string) -> bool {
+  return match Json.fieldAt(value, key) {
+    Option<&Value>.Some { value: _ } => true
+    Option<&Value>.None => false
+  }
+}
+
+fn flag(document: &Value, key: string) -> bool {
+  return match Json.field(document, key) {
+    Option<&Value>.Some { value } => match &value.* {
+      Value.Bool { value: b } => b
+      _ => false
+    }
+    Option<&Value>.None => false
+  }
+}
+
+/// Appends number member `key` of `document`, or "?".
+effect fn writeNumberField(out: &mut String, document: &Value, key: string) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if let Option<&Value>.Some { value } = Json.field(document, key) {
+    if let Value.Number { value: number } = &value.* {
+      run appendNumber(&mut out, &number)
+      return ()
+    }
+  }
+  run out.append("?")
+}
+
+/// Appends `value` as JSON.
+pub effect fn writeValue(out: &mut String, value: &Value) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  match &value.* {
+    Value.Null => {
+      run out.append("null")
+    }
+    Value.Bool { value: b } => {
+      if b {
+        run out.append("true")
+      } else {
+        run out.append("false")
+      }
+    }
+    Value.Number { value: number } => {
+      run appendNumber(&mut out, &number)
+    }
+    Value.String { text } => {
+      run writeString(&mut out, String.view(&text))
+    }
+    Value.Array { values } => {
+      run out.append("[")
+      let items = values.asSlice()
+      let mut i: usize = 0
+      while i < items.length {
+        if i > 0 {
+          run out.append(",")
+        }
+        run writeValue(&mut out, &items[i])
+        i = i + 1
+      }
+      run out.append("]")
+    }
+    Value.Object { entries } => {
+      run out.append("{")
+      let items = entries.asSlice()
+      let mut i: usize = 0
+      while i < items.length {
+        if i > 0 {
+          run out.append(",")
+        }
+        run writeString(&mut out, String.view(&items[i].key))
+        run out.append(":")
+        run writeValue(&mut out, &items[i].value)
+        i = i + 1
+      }
+      run out.append("}")
+    }
+  }
+}
+
+/// Appends `text` without its line breaks (MCP messages are one line each).
+effect fn appendFlat(out: &mut String, text: string) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let bytes = String.utf8Bytes(text)
+  let mut start: usize = 0
+  let mut i: usize = 0
+  while i <= bytes.length {
+    if i == bytes.length || bytes[i] == 10 || bytes[i] == 13 {
+      if i > start {
+        run out.append(String.slice(text, start, i - start))
+      }
+      start = i + 1
+    }
+    i = i + 1
+  }
+}
+
+effect fn startResult(out: &mut String, id: string) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  out.clear()
+  run out.append("{\"jsonrpc\":\"2.0\",\"id\":")
+  run out.append(id)
+  run out.append(",\"result\":{")
+}
+
+effect fn result(out: &mut String, id: string, body: string) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  out.clear()
+  run out.append("{\"jsonrpc\":\"2.0\",\"id\":")
+  run out.append(id)
+  run out.append(",\"result\":")
+  run out.append(body)
+  run out.append("}")
+}
+
+effect fn rpcError(out: &mut String, id: string, code: u64, message: string) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  out.clear()
+  run out.append("{\"jsonrpc\":\"2.0\",\"id\":")
+  run out.append(id)
+  run out.append(",\"error\":{\"code\":")
+  run out.append("-")
+  run writeInt(&mut out, code)
+  run out.append(",\"message\":")
+  run writeString(&mut out, message)
+  run out.append("}}")
+}
+
+/// A tool result with one text item.
+effect fn toolText(out: &mut String, id: string, text: string, isError: bool) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run startResult(&mut out, id)
+  run out.append("\"content\":[{\"type\":\"text\",\"text\":")
+  run writeString(&mut out, text)
+  run out.append("}],\"isError\":")
+  if isError {
+    run out.append("true}}")
+  } else {
+    run out.append("false}}")
+  }
+}
+
+effect fn initialize(out: &mut String, id: string, params: Option<&Value>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let asked = match Json.asString(Json.fieldAt(params, "protocolVersion")) {
+    Option<string>.Some { value } => value
+    Option<string>.None => ""
+  }
+  let mut version = PROTOCOL_VERSION
+  let mut i: usize = 0
+  while i < KNOWN_VERSIONS.length {
+    if KNOWN_VERSIONS[i] == asked {
+      version = KNOWN_VERSIONS[i]
+    }
+    i = i + 1
+  }
+  run startResult(&mut out, id)
+  run out.append("\"protocolVersion\":")
+  run writeString(&mut out, version)
+  run out.append(",\"capabilities\":{\"tools\":{}},\"serverInfo\":{\"name\":")
+  run writeString(&mut out, SERVER_NAME)
+  run out.append(",\"version\":\"0.1.0\"},\"instructions\":")
+  run writeString(&mut out, INSTRUCTIONS)
+  run out.append("}}")
+}
+
+/// Appends one tool: `properties` is the inside of the schema's properties object (it may
+/// span lines; they are dropped) and `required` the inside of its required array.
+effect fn tool(
+  out: &mut String,
+  first: bool,
+  name: string,
+  title: string,
+  description: string,
+  properties: &String,
+  required: string,
+  readOnly: bool,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if !first {
+    run out.append(",")
+  }
+  run out.append("{\"name\":")
+  run writeString(&mut out, name)
+  run out.append(",\"title\":")
+  run writeString(&mut out, title)
+  run out.append(",\"description\":")
+  run writeString(&mut out, description)
+  run out.append(",\"inputSchema\":{\"type\":\"object\",\"properties\":{")
+  run appendFlat(&mut out, String.view(&properties))
+  run out.append("}")
+  if required != "" {
+    run out.append(",\"required\":[")
+    run out.append(required)
+    run out.append("]")
+  }
+  run out.append("},\"annotations\":{\"readOnlyHint\":")
+  if readOnly {
+    run out.append("true")
+  } else {
+    run out.append("false")
+  }
+  run out.append(",\"openWorldHint\":false}}")
+}
+
+/// Joins schema property fragments with commas.
+effect fn props(parts: &[string]) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut out = String.make()
+  let mut i: usize = 0
+  while i < parts.length {
+    if parts[i] != "" {
+      if out.ownedByteLength() != 0 {
+        run out.append(",")
+      }
+      run out.append(parts[i])
+    }
+    i = i + 1
+  }
+  return move out
+}
+
+/// The members of array `key` of `value`.
+fn arrayOf<'a>(value: &'a Value, key: string) -> &'a [Value] {
+  return match Json.field(value, key) {
+    Option<&'a Value>.Some { value: found } => match &found.* {
+      Value.Array { values } => values.asSlice()
+      _ => &[]
+    }
+    Option<&'a Value>.None => &[]
+  }
+}
+
+/// Appends the MCP tool name of `<id>.<command>`: `<id>_<command>` with every character but
+/// ASCII letters, digits, `_` and `-` made `_`.
+effect fn toolName(out: &mut String, id: string, command: string) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut raw = run String.copy(id)
+  run raw.append("_")
+  run raw.append(command)
+  let bytes = String.utf8Bytes(String.view(&raw))
+  let mut i: usize = 0
+  while i < bytes.length {
+    let b = bytes[i]
+    let plain = (b >= 48 && b <= 57) || (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || b == 95
+    if plain {
+      run out.append(String.slice(String.view(&raw), i, 1))
+    } else {
+      run out.append("_")
+    }
+    i = i + 1
+  }
+}
+
+/// Appends `"tools":[...]`: the inspector's, then `extra`.
+effect fn toolList(out: &mut String, extra: &List<ExtensionTool>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run out.append("\"tools\":[")
+  let none = String.make()
+  run tool(
+    &mut out,
+    true,
+    "ui_status",
+    "App status",
+    "Checks that the app is reachable. Returns the inspector protocol version, the viewport size (CSS pixels) and scale, the frame number, the root node and the node count.",
+    &none,
+    "",
+    true,
+  )
+  let snapshot = run props(
+    &[
+      TARGET,
+      r""" "styles":{"type":"boolean","description":"Also list each node's non-default style."}""",
+    ],
+  )
+  run tool(
+    &mut out,
+    false,
+    "ui_snapshot",
+    "Snapshot the UI tree",
+    "The UI tree as indented text, one line per node: kind, #id, role, label, testId, text and rect (x, y, width, height in CSS pixels). Read this first to find nodes. With a target, only that node's subtree.",
+    &snapshot,
+    "",
+    true,
+  )
+  let query = run props(
+    &[TARGET, r""" "limit":{"type":"integer","description":"At most this many nodes."}"""],
+  )
+  run tool(
+    &mut out,
+    false,
+    "ui_query",
+    "Find nodes",
+    "All nodes a target matches, in tree order, as JSON objects with id, kind, role, name, testId, rect, focused and hovered.",
+    &query,
+    "",
+    true,
+  )
+  let inspect = run props(
+    &[
+      TARGET,
+      r""" "computed":{"type":"boolean","description":"Include the computed style section (default true)."}""",
+      r""" "patches":{"type":"boolean","description":"Include the style patches the client set (default true)."}""",
+    ],
+  )
+  run tool(
+    &mut out,
+    false,
+    "ui_inspect",
+    "Inspect a node",
+    "A devtools-style view of the first node the target matches: attributes, box model (content, padding, border, margin), styles, text and layout fragments.",
+    &inspect,
+    "",
+    true,
+  )
+  let pick = run props(
+    &[
+      r""" "x":{"type":"number","description":"X in CSS pixels."},"y":{"type":"number","description":"Y in CSS pixels."}""",
+    ],
+  )
+  run tool(
+    &mut out,
+    false,
+    "ui_pick",
+    "Node at a point",
+    "The node the element picker selects at a point, and the ids hit testing reaches from the root.",
+    &pick,
+    "\"x\",\"y\"",
+    true,
+  )
+  let highlight = run props(
+    &[
+      TARGET,
+      r""" "nodes":{"type":"array","items":{"type":"integer"},"description":"Node ids to highlight, instead of a target."},"selected":{"type":"array","items":{"type":"integer"},"description":"Node ids to ring as selected."}""",
+    ],
+  )
+  run tool(
+    &mut out,
+    false,
+    "ui_highlight",
+    "Highlight nodes",
+    "Draws the devtools highlight over nodes in the app's window (and in later screenshots): the listed ids, or every node the target matches, washed and outlined, and the selected ids ringed. Without any, clears the highlight.",
+    &highlight,
+    "",
+    false,
+  )
+  let screenshot = run props(
+    &[
+      TARGET,
+      r""" "highlight":{"type":"boolean","description":"Include the highlight overlay (default true)."},"maxWidth":{"type":"integer","minimum":1,"maximum":4096,"description":"Reduce before encoding, preserving aspect ratio; omitted for full device resolution."}""",
+    ],
+  )
+  run tool(
+    &mut out,
+    false,
+    "ui_screenshot",
+    "Screenshot",
+    "A PNG of the app's last frame (the CPU reference rendering, over a transparent background). With a target, that node alone, cropped.",
+    &screenshot,
+    "",
+    true,
+  )
+  let click = run props(
+    &[
+      TARGET,
+      POINT,
+      r""" "count":{"type":"integer","description":"Clicks in a row (2 for a double click)."}""",
+      MODIFIERS,
+    ],
+  )
+  run tool(
+    &mut out,
+    false,
+    "ui_click",
+    "Click",
+    "Clicks the centre of the node's visible box (or a point). Fails when the node is hidden, scrolled out of view or covered. Returns the node and the point clicked.",
+    &click,
+    "",
+    false,
+  )
+  let hover = run props(&[TARGET, POINT, MODIFIERS])
+  run tool(
+    &mut out,
+    false,
+    "ui_hover",
+    "Hover",
+    "Moves the pointer over the node (or a point), so hover styles and tooltips show.",
+    &hover,
+    "",
+    false,
+  )
+  let scroll = run props(
+    &[
+      TARGET,
+      POINT,
+      r""" "dx":{"type":"number","description":"Horizontal scroll in CSS pixels."},"dy":{"type":"number","description":"Vertical scroll in CSS pixels; positive scrolls down."}""",
+      MODIFIERS,
+    ],
+  )
+  run tool(
+    &mut out,
+    false,
+    "ui_scroll",
+    "Scroll",
+    "Sends wheel input over the node (or a point); the nearest scroll container under it scrolls.",
+    &scroll,
+    "",
+    false,
+  )
+  let press = run props(
+    &[
+      r""" "key":{"type":"string","description":"UI Events key value: Enter, Tab, Escape, ArrowDown, Backspace, a, ..."},"code":{"type":"string","description":"UI Events code; defaults to the key."},"times":{"type":"integer","description":"How many presses."}""",
+      MODIFIERS,
+    ],
+  )
+  run tool(
+    &mut out,
+    false,
+    "ui_press",
+    "Press a key",
+    "Presses a key in the focused node (Tab moves focus, Enter activates, and so on).",
+    &press,
+    "\"key\"",
+    false,
+  )
+  let mut typing = run String.copy(
+    r""" "text":{"type":"string","description":"The text. Newlines and tabs are sent as Enter and Tab."},"query":{"type":"object","description":"A target to click first (to focus an input), with the members node, role, name, label, text, testId, within, exact, hidden.","properties":{""",
+  )
+  run typing.append(TARGET)
+  run typing.append("}}")
+  run tool(
+    &mut out,
+    false,
+    "ui_type",
+    "Type text",
+    "Types text into the focused input, or into the node in query after clicking it.",
+    &typing,
+    "\"text\"",
+    false,
+  )
+  let wait = run props(
+    &[
+      TARGET,
+      r""" "gone":{"type":"boolean","description":"Wait until no node matches instead."},"timeout":{"type":"integer","description":"Milliseconds to wait (default 5000)."}""",
+    ],
+  )
+  run tool(
+    &mut out,
+    false,
+    "ui_wait",
+    "Wait for a node",
+    "Waits until a node matches the target (or, with gone, until none does). Returns the node. Fails after the timeout.",
+    &wait,
+    "",
+    true,
+  )
+  run tool(
+    &mut out,
+    false,
+    "ui_stats",
+    "Frame stats",
+    "Counters for the last frame: nodes, fragments, layout passes and cache hits, replayed and repainted subtrees, glyphs and primitives. Also `work`: the tree's work counts since it was made (style resolves by cause, mutations, frames), to difference over an input.",
+    &none,
+    "",
+    true,
+  )
+  let events = run props(
+    &[
+      r""" "since":{"type":"integer","description":"Only records after this seq (the reply's next minus one reads on from the last call)."}""",
+      r""" "limit":{"type":"integer","description":"At most this many of the newest records."}""",
+    ],
+  )
+  run tool(
+    &mut out,
+    false,
+    "ui_events",
+    "Event log",
+    "The event records the app took from the UI tree (click, keydown, input, focus, scroll and so on), oldest first, each with seq, frame, kind, target id, the id path from the root and, where they apply, position, key and input value. Only kinds some node listens for are recorded. next is the seq the next record will get.",
+    &events,
+    "",
+    true,
+  )
+  let pointer = run props(
+    &[
+      TARGET,
+      POINT,
+      MODIFIERS,
+      r""" "phase":{"type":"string","enum":["down","move","up"]},"button":{"type":"integer","minimum":0,"maximum":5},"count":{"type":"integer","description":"Native click count on down; defaults to 1."}""",
+    ],
+  )
+  run tool(
+    &mut out,
+    false,
+    "ui_pointer",
+    "Pointer event",
+    "Sends a single native-equivalent pointer input through hit testing, focus and capture. Use down, moves, then up to drag. Positions are viewport CSS pixels.",
+    &pointer,
+    "\"phase\"",
+    false,
+  )
+  let key = run props(
+    &[
+      MODIFIERS,
+      r""" "phase":{"type":"string","enum":["down","up"]},"key":{"type":"string"},"code":{"type":"string"},"repeat":{"type":"boolean"}""",
+    ],
+  )
+  run tool(
+    &mut out,
+    false,
+    "ui_key",
+    "Key event",
+    "Sends a key down or up through the normal focused-node input dispatcher. Allows holding Space or modifier keys across pointer commands.",
+    &key,
+    "\"phase\",\"key\"",
+    false,
+  )
+  let capture = run props(
+    &[
+      TARGET,
+      r""" "count":{"type":"integer","minimum":1,"maximum":24,"default":10},"intervalMs":{"type":"integer","minimum":16,"maximum":60000,"default":100},"columns":{"type":"integer","minimum":1,"maximum":6},"tileWidth":{"type":"integer","minimum":160,"maximum":800,"default":480},"highlight":{"type":"boolean"}""",
+    ],
+  )
+  run tool(
+    &mut out,
+    false,
+    "ui_capture",
+    "Timed capture mosaic",
+    "Captures a sequence of the app's frames and returns one PNG mosaic. Defaults to 10 samples at 100 ms intervals, 5 columns. Captions show actual elapsed milliseconds and source frame numbers. Sampling is in the client, and the app keeps running and animating while it captures: a window app copies each frame it draws back from the GPU and encodes it off its UI thread. Slow encoding may stretch the requested interval. Not an FPS benchmark.",
+    &capture,
+    "",
+    true,
+  )
+  let frames = run props(
+    &[
+      r""" "since":{"type":"integer","description":"Only frames after this frame number."}""",
+      r""" "limit":{"type":"integer","description":"At most this many of the newest frames."}""",
+    ],
+  )
+  run tool(
+    &mut out,
+    false,
+    "ui_frames",
+    "Frame timeline",
+    "The last 240 frames: layout and paint time in milliseconds (zero when the host does not time them), whether layout was skipped, layout passes, repainted and replayed subtrees, fragments, primitives and glyphs; then the slowest and the average.",
+    &frames,
+    "",
+    true,
+  )
+  let performance = run props(
+    &[
+      r""" "since":{"type":"integer","description":"Only interactions shown after this frame number."}""",
+      r""" "limit":{"type":"integer","description":"At most this many of the newest interactions."}""",
+    ],
+  )
+  run tool(
+    &mut out,
+    false,
+    "ui_performance",
+    "What the app makes people wait for",
+    "Each recent input that ran handlers (press, click, key, type, wheel, paste), what it was done to (role and name), and how long until the frame that showed it: totalMs, split into handleMs (handlers and the program's update), layoutMs and paintMs. slow counts interactions over 100 ms and slowest names the worst. Also startup (ms from the host's start to the window, the GPU and the first frame) and memoryBytes, the process's memory as the system's own tools show it.",
+    &performance,
+    "",
+    true,
+  )
+  let styles = run props(&[TARGET])
+  run tool(
+    &mut out,
+    false,
+    "ui_styles",
+    "A node's declarations",
+    "The declarations the first matching node has in each state (base, hover, active, focus, focus-visible), each as CSS text.",
+    &styles,
+    "",
+    true,
+  )
+  let setStyle = run props(
+    &[
+      TARGET,
+      r""" "style":{"type":"string","description":"CSS declarations, such as 'width: 200px; color: red'."}""",
+      r""" "state":{"type":"string","enum":["base","hover","active","focus","focus-visible"],"description":"The state the declarations apply in; base without it."}""",
+      r""" "replace":{"type":"boolean","description":"Replace the state's declarations instead of adding to them."}""",
+    ],
+  )
+  run tool(
+    &mut out,
+    false,
+    "ui_set_style",
+    "Edit a node's style",
+    "Sets CSS declarations on the first matching node while the app runs, and draws. The declarations are laid over what the app sets, so they stay when the app updates the node, until ui_reset_styles takes them back or ui_resolve marks them done. Each property becomes an edit in ui_edits. Returns the declarations the node shows in that state and the ids of its open edits.",
+    &setStyle,
+    "\"style\"",
+    false,
+  )
+  let reset = run props(
+    &[
+      TARGET,
+      r""" "state":{"type":"string","enum":["base","hover","active","focus","focus-visible"],"description":"Only the edits in this state (with a target)."}""",
+      r""" "property":{"type":"string","description":"Only the edit of this CSS property, such as padding-left (with a target; state defaults to base)."}""",
+    ],
+  )
+  run tool(
+    &mut out,
+    false,
+    "ui_reset_styles",
+    "Take style edits back",
+    "Takes style edits back, so nodes show what the app sets again: every edit, or with a target that node's (in one state, or of one property). The open edits taken back leave ui_edits; resolved ones and comments stay. Returns restored (node and state pairs or properties) and removed (edits).",
+    &reset,
+    "",
+    false,
+  )
+  let pickMode = run props(
+    &[r""" "on":{"type":"boolean","description":"Turn picking on or off; leave out to ask."}"""],
+  )
+  run tool(
+    &mut out,
+    false,
+    "ui_pick_mode",
+    "Pick with the pointer",
+    "While on, the pointer in the app's window highlights the node under it and a press picks that node instead of reaching the app (Escape cancels). Ask again without 'on' for the picked node.",
+    &pickMode,
+    "",
+    false,
+  )
+  let audit = run props(&[TARGET])
+  run tool(
+    &mut out,
+    false,
+    "ui_audit",
+    "Accessibility audit",
+    "Checks the visible tree (or the target's subtree) and lists issues, each with its rule, a message and the node: unnamed (a control or image without an accessible name), no-role (listens for clicks without a role), not-focusable (clickable but unreachable by keyboard), small-target (under 24 by 24), contrast (text under 4.5:1, or 3:1 for large text).",
+    &audit,
+    "",
+    true,
+  )
+  let edits = run props(
+    &[
+      r""" "status":{"type":"string","enum":["open","resolved","all"],"description":"open: what is left to do. Both without it."}""",
+      r""" "kind":{"type":"string","enum":["edit","comment"],"description":"Only edits, or only comments."}""",
+      r""" "since":{"type":"integer","description":"Only entries that changed after this seq (the seq of an earlier reply)."}""",
+    ],
+  )
+  run tool(
+    &mut out,
+    false,
+    "ui_edits",
+    "Design changes to make",
+    "The style edits and comments people made on the running app (in devtools, or with ui_set_style and ui_comment), for you to carry into the source code; the app keeps them until it exits. Each edit is one CSS property of one node in one state (base, hover, active, focus, focus-visible): before is the app's value when the edit was made (null: the app sets none), after the value wanted (null: the app's should go). Each comment has text, an author and a thread of replies. Each target says which node: root, node (its id now), path (ids from the root down), element (kind, role, accessible name, testId, rect), named (the nearest node at or above it with a testId, label or accessible name) and keys (the testIds along the path). There is no source location: search the code for the named element's testId, label or text and the property. applied says whether the edit still shows in the app (false once its node is gone). Pass status open for the work left. Then change the code that builds the node so it sets after, and call ui_resolve with the ids.",
+    &edits,
+    "",
+    true,
+  )
+  let comment = run props(
+    &[
+      TARGET_BUT_TEXT,
+      r""" "text":{"type":"string","description":"What to say."}""",
+      r""" "author":{"type":"string","description":"Who says it, such as your name."}""",
+      r""" "reply":{"type":"integer","description":"A comment's id: add text to its thread instead of a new comment."}""",
+    ],
+  )
+  run tool(
+    &mut out,
+    false,
+    "ui_comment",
+    "Comment on a node",
+    "Leaves a comment on the first matching node (on the app as a whole without a target), or with reply adds to a comment's thread, for example to say what you changed or to ask what was meant. Returns the comment.",
+    &comment,
+    "\"text\"",
+    false,
+  )
+  let resolve = run props(
+    &[
+      r""" "entries":{"type":"array","items":{"type":"integer"},"description":"The ids of the edits and comments."}""",
+      r""" "entry":{"type":"integer","description":"One id, instead of entries."}""",
+      r""" "reopen":{"type":"boolean","description":"Open them again instead."}""",
+    ],
+  )
+  run tool(
+    &mut out,
+    false,
+    "ui_resolve",
+    "Mark changes done",
+    "Marks edits and comments from ui_edits resolved, once the source code does what they ask. Resolving an edit takes it off the running app: the node shows what the app's code sets, which is your change once the app is rebuilt and run again (until then, the old value). With reopen, opens them again and lays reopened edits on their nodes again. An unknown id changes nothing. Returns each entry.",
+    &resolve,
+    "",
+    false,
+  )
+  let list = extra.asSlice()
+  let mut i: usize = 0
+  while i < list.length {
+    let t = &list[i]
+    run out.append(",{\"name\":")
+    run writeString(&mut out, String.view(&t.name))
+    run out.append(",\"title\":")
+    run writeString(&mut out, String.view(&t.title))
+    run out.append(",\"description\":")
+    run writeString(&mut out, String.view(&t.description))
+    run out.append(",\"inputSchema\":")
+    run out.append(String.view(&t.schema))
+    run out.append(",\"annotations\":{\"readOnlyHint\":")
+    run out.append(
+      if t.readOnly {
+        "true"
+      } else {
+        "false"
+      },
+    )
+    run out.append(",\"openWorldHint\":false}}")
+    i = i + 1
+  }
+  run out.append("]")
+}

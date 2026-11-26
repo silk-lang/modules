@@ -1,0 +1,309 @@
+//! [`Dom`]: the browser document as a [`Backend`]. A render's mutations go to
+//! `js/silk-ui-dom.js` as one buffer; the events it hears come back one record at a time.
+import wire { writeMutation, readEvent, readByte, readFloat }
+import templates { Templates }
+import virtual { Ports }
+import loom.backend { Backend, Measured, TreeError }
+import ui_protocol.mutation { Mutation, FIRST_ROOT }
+import ui_protocol.record { Event }
+import ui_protocol.root { RootEvent, RootEventKind, RootSupport }
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.geometry.rect { Rect }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.mem.pointer { Pointer }
+import silk.text.string { String, InvalidUtf8 }
+
+static if Intrinsic.targetArchitecture() == "wasm32" {
+  @foreign(noCapture: .("bytes"))
+  unsafe extern "C" fn hostApply(bytes: ?[*]const u8, length: usize) -> () as "dom#apply"
+
+  @foreign(noCapture: .("out"))
+  unsafe extern "C" fn hostMeasure(id: u32, out: ?[*]mut u8) -> u32 as "dom#measure"
+
+  @foreign(noCapture: .("bytes"))
+  unsafe extern "C" fn hostNavigate(bytes: ?[*]const u8, length: usize) -> () as "dom#navigate"
+
+  fn apply(bytes: &[u8]) -> () {
+    unsafe hostApply(Pointer.fromSlice(bytes), bytes.length)
+  }
+
+  fn went(path: &[u8]) -> () {
+    unsafe hostNavigate(Pointer.fromSlice(path), path.length)
+  }
+
+  fn measureInto(id: u32, out: &mut [u8]) -> bool {
+    return unsafe hostMeasure(id, Pointer.fromMutSlice(&mut out)) != 0
+  }
+} else {
+  // No document off the browser: batches are still encoded, for tests to read.
+  fn apply(bytes: &[u8]) -> () {
+    return ()
+  }
+
+  fn went(path: &[u8]) -> () {
+    return ()
+  }
+
+  fn measureInto(id: u32, out: &mut [u8]) -> bool {
+    return false
+  }
+}
+
+pub struct Dom {
+  /// The last batch, encoded.
+  pub out: Bytes,
+  /// Where the host writes an event record before it calls in.
+  pub scratch: Bytes,
+  /// Mutations the document backend dropped since the start (see `wire`).
+  pub dropped: usize,
+  /// Whether a subtree like one made before is written as a copy of it (see `templates`).
+  /// Off until the first render is over: that one may adopt the nodes of a server render,
+  /// which only single nodes can.
+  pub cloning: bool,
+  templates: Templates,
+  /// Whether `out` holds the start of a render that `mutateEarly` wrote and `mutate` has yet
+  /// to end.
+  early: bool,
+  width: f32,
+  height: f32,
+  waiting: List<Event>,
+  rootsWaiting: List<RootEvent>,
+  virtuals: Ports,
+}
+
+impl Dom {
+  pub fn make() -> Dom {
+    return Dom {
+      out: Bytes.make(),
+      scratch: Bytes.make(),
+      dropped: 0,
+      cloning: false,
+      early: false,
+      templates: Templates.make(),
+      width: 0.0,
+      height: 0.0,
+      waiting: List<Event>.make(),
+      rootsWaiting: List<RootEvent>.make(),
+      virtuals: Ports.make(),
+    }
+  }
+
+  /// The viewport is now `width` by `height` CSS pixels.
+  pub fn setViewport(self: &mut Self, width: f32, height: f32) -> () {
+    self.width = width
+    self.height = height
+  }
+
+  /// Makes room for a record of `size` bytes and returns where the host writes it.
+  pub effect fn reserve(self: &mut Self, size: usize) -> usize
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if self.scratch.length() < size {
+      self.scratch = run Bytes.zeroed(size)
+    }
+    return Pointer.addressMany(Pointer.fromSlice(self.scratch.asSlice()))
+  }
+
+  /// Queues the record the host wrote in the first `length` bytes of the scratch.
+  pub effect fn receive(self: &mut Self, length: usize) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if length > self.scratch.length() {
+      return ()
+    }
+    let event = run readEvent(self.scratch.asSlice())
+    run self.waiting.append(move event)
+  }
+
+  /// Reads the virtual list report the host wrote in the first `length` bytes of the scratch.
+  /// Returns whether a list may want other rows.
+  pub effect fn reportVirtual(self: &mut Self, length: usize) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if length > self.scratch.length() {
+      return false
+    }
+    return run self.virtuals.report(Slice.view<u8>(self.scratch.asSlice(), 0, length))
+  }
+
+  /// Where item `index` of virtual list `id` starts in the list, as the page's spacers place it.
+  pub fn virtualPrefix(self: &Self, id: u32, index: usize) -> f32 {
+    return self.virtuals.prefix(id, index)
+  }
+
+  /// Sends the spacers of lists whose measurements changed when no render did.
+  pub effect fn flushVirtual(self: &mut Self) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if !self.virtuals.pending() {
+      return ()
+    }
+    self.out.clear()
+    run self.virtuals.write(&mut self.out)
+    apply(self.out.asSlice())
+  }
+
+  /// The text the host wrote in the first `length` bytes of the scratch: a location.
+  pub fn written(self: &Self, length: usize) -> string {
+    return self.writtenAt(0, length)
+  }
+
+  /// The text the host wrote in the `length` bytes of the scratch from `start`.
+  pub fn writtenAt(self: &Self, start: usize, length: usize) -> string {
+    if start + length > self.scratch.length() {
+      return ""
+    }
+    return match String.fromUtf8(Slice.view<u8>(self.scratch.asSlice(), start, length)) {
+      Result<string, InvalidUtf8>.Success { value } => value
+      Result<string, InvalidUtf8>.Failure { .. } => ""
+    }
+  }
+}
+
+impl Dom {
+  /// Writes `list` to `out` in the wire format. A subtree is written as a copy of a template
+  /// only when all of it is in `list`.
+  effect fn write(self: &mut Self, list: &[Mutation]) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut i: usize = 0
+    while i < list.length {
+      // The document shows the mounted element only: another root fails, and there is
+      // nothing to close for it.
+      let mut other = false
+      match &list[i] {
+        Mutation.OpenRoot { root, .. } => {
+          if root != FIRST_ROOT {
+            other = true
+            run self.rootsWaiting.append(RootEvent { root: root, kind: RootEventKind.Failed })
+          }
+        }
+        Mutation.CloseRoot { root } => {
+          other = root != FIRST_ROOT
+        }
+        _ => {}
+      }
+      if run self.virtuals.take(&list[i]) {
+        i = i + 1
+        continue
+      }
+      if self.cloning {
+        run self.templates.placing(&mut self.out, list, i)
+      }
+      let at = self.out.length()
+      if !other && !run writeMutation(&mut self.out, &list[i]) {
+        self.dropped = self.dropped + 1
+      }
+      if self.cloning {
+        run self.templates.wrote(&self.out, at, &list[i], i)
+      }
+      i = i + 1
+    }
+    if self.cloning {
+      self.templates.endBatch()
+    }
+    run self.virtuals.settle()
+  }
+}
+
+impl Backend for Dom {
+  fn copiesBatches(self: &Self) -> bool {
+    return true
+  }
+
+  effect fn mutate(self: &mut Self, batch: List<Mutation>) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    if !self.early {
+      self.out.clear()
+    }
+    self.early = false
+    run self.write(batch.asSlice())
+    if self.virtuals.pending() {
+      run self.virtuals.write(&mut self.out)
+    }
+    if self.out.length() != 0 {
+      apply(self.out.asSlice())
+    }
+  }
+
+  effect fn mutateEarly(self: &mut Self, batch: &mut List<Mutation>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    // The bytes wait in `out` for the `mutate` that ends the render: the page gets one batch.
+    if !self.early {
+      self.out.clear()
+    }
+    self.early = true
+    run self.write(batch.asSlice())
+    batch.clear()
+  }
+
+  effect fn events(self: &mut Self, out: &mut List<Event>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut taken = Intrinsic.replace(self.waiting, List<Event>.make())
+    while taken.length() != 0 {
+      run out.append(taken.remove(0))
+    }
+  }
+
+  effect fn rootEvents(self: &mut Self, out: &mut List<RootEvent>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run out.appendSlice(self.rootsWaiting.asSlice())
+    self.rootsWaiting.clear()
+  }
+
+  fn viewport(self: &Self, root: u32) -> Rect<f32> {
+    if root != FIRST_ROOT {
+      return Rect<f32>.new(0.0, 0.0, 0.0, 0.0)
+    }
+    return Rect<f32>.new(0.0, 0.0, self.width, self.height)
+  }
+
+  fn roots(self: &Self) -> RootSupport {
+    return RootSupport.single()
+  }
+
+  fn navigate(self: &mut Self, path: string) -> () {
+    went(String.utf8Bytes(path))
+  }
+
+  effect fn indices(self: &Self, id: u32, out: &mut List<usize>) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return run self.virtuals.indices(id, &mut out)
+  }
+
+  effect fn measure(self: &Self, id: u32) -> Option<Measured>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    // Four floats (left, top, width, height) and three flags (pressed, hovered, focused).
+    let mut box = run Bytes.zeroed(19)
+    if !measureInto(id, box.asMutSlice()) {
+      return Option<Measured>.None
+    }
+    let bytes = box.asSlice()
+    let mut at: usize = 0
+    let left = readFloat(bytes, &mut at)
+    let top = readFloat(bytes, &mut at)
+    let width = readFloat(bytes, &mut at)
+    let height = readFloat(bytes, &mut at)
+    let pressed = readByte(bytes, &mut at) != 0
+    let hovered = readByte(bytes, &mut at) != 0
+    let focused = readByte(bytes, &mut at) != 0
+    return Option<Measured>.Some {
+      value: Measured {
+        bounds: Rect<f32>.new(left, top, width, height),
+        pressed: pressed,
+        hovered: hovered,
+        focused: focused,
+      },
+    }
+  }
+}

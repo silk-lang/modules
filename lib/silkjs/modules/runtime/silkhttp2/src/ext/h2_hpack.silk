@@ -1,0 +1,367 @@
+//! HPACK (RFC 7541) for the HTTP/2 session, with nghttp2's choices: the deflater indexes what
+//! nghttp2 indexes (never `authorization`, short cookies or fields sent as sensitive; not `:path`,
+//! `age`, `content-length`, `etag`, `if-modified-since`, `if-none-match`, `location`,
+//! `set-cookie` or fields larger than three quarters of the table), caps its table at the session's
+//! maximum deflate table size and announces table size changes as nghttp2 does; the inflater
+//! decodes a whole field block, Huffman strings included, with nghttp2's limit of 64 KiB per name
+//! or value and its rules for table size updates. Strings are sent as literals, never Huffman
+//! coded. The static table and the Huffman decoder are silk.http's.
+import silk.mem.pointer { Pointer }
+import silk.mem.layout { Layout }
+import silk.num.u8
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+import silk.http.hpack_tables as Tables
+import ext.h2_mem { Buf, emptyBuf, getU32, at, atConst, byte, setByte, moveBytes, same, equals, realloc, free, textPointer, constant }
+
+const MAX_NV: usize = 65536
+const NO_INDEX: u8 = 1
+
+struct Entry { name: Buf, value: Buf }
+
+/// A dynamic table: entries oldest first.
+pub struct Table { entries: ?*mut Entry, count: usize, capacity: usize, pub size: usize, pub maximum: usize }
+
+fn table(maximum: usize) -> Table { return Table { entries: Pointer.null<Entry>(), count: 0, capacity: 0, size: 0, maximum: maximum } }
+unsafe fn entryAt(t: &Table, index: usize) -> *mut Entry {
+  let base = unsafe Intrinsic.pointerReinterpret<?*mut Entry, ?*mut u8>(t.entries)
+  return unsafe Intrinsic.pointerReinterpret<*mut u8, *mut Entry>(unsafe at(base, index * Layout.of<Entry>().bytes))
+}
+unsafe fn evictOldest(t: &mut Table) -> () {
+  let first = unsafe entryAt(&t.*, 0)
+  let mut entry = unsafe Pointer.take<Entry>(first)
+  t.size = t.size - entry.name.length - entry.value.length - 32
+  unsafe entry.name.release() unsafe entry.value.release()
+  let base = unsafe Intrinsic.pointerReinterpret<?*mut Entry, ?*mut u8>(t.entries)
+  let width = Layout.of<Entry>().bytes
+  unsafe moveBytes(base, unsafe constant(unsafe at(base, width)), (t.count - 1) * width)
+  t.count = t.count - 1
+}
+unsafe fn evict(t: &mut Table, incoming: usize) -> () {
+  while t.count > 0 && (t.size > t.maximum || incoming > t.maximum - t.size) { unsafe evictOldest(&mut t.*) }
+}
+unsafe fn clear(t: &mut Table) -> () { while t.count > 0 { unsafe evictOldest(&mut t.*) } }
+pub unsafe fn releaseTable(t: &mut Table) -> () {
+  unsafe clear(&mut t.*)
+  unsafe free(unsafe Intrinsic.pointerReinterpret<?*mut Entry, ?*mut u8>(t.entries))
+  t.entries = Pointer.null<Entry>() t.capacity = 0
+}
+/// Adds a field, evicting as RFC 7541 says; false when memory ran out.
+unsafe fn insert(t: &mut Table, name: ?*const u8, nameLength: usize, value: ?*const u8, valueLength: usize) -> bool {
+  let room = nameLength + valueLength + 32
+  if room > t.maximum { unsafe clear(&mut t.*) return true }
+  unsafe evict(&mut t.*, room)
+  if t.count == t.capacity {
+    let wanted = if t.capacity == 0 { 16 } else { t.capacity * 2 }
+    let grown = unsafe realloc(unsafe Intrinsic.pointerReinterpret<?*mut Entry, ?*mut u8>(t.entries), wanted * Layout.of<Entry>().bytes)
+    if Pointer.isNull<u8>(grown) { return false }
+    t.entries = unsafe Intrinsic.pointerReinterpret<?*mut u8, ?*mut Entry>(grown)
+    t.capacity = wanted
+  }
+  let mut n = emptyBuf() let mut v = emptyBuf()
+  if !unsafe n.append(name, nameLength) || !unsafe v.append(value, valueLength) { unsafe n.release() unsafe v.release() return false }
+  unsafe Pointer.put<Entry>(unsafe entryAt(&t.*, t.count), Entry { name: move n, value: move v })
+  t.count = t.count + 1
+  t.size = t.size + room
+  return true
+}
+// The name and value of index (1-61 static, then dynamic newest first), as pointers and lengths.
+struct View { name: ?*const u8, nameLength: usize, value: ?*const u8, valueLength: usize }
+unsafe fn lookup(t: &Table, index: usize) -> View {
+  if index <= 61 {
+    let field = Tables.field(index)
+    return View { name: textPointer(field.name), nameLength: field.name.length, value: textPointer(field.value), valueLength: field.value.length }
+  }
+  let anchor = ()
+  let entry = unsafe Pointer.borrow<(), Entry>(&anchor, unsafe entryAt(t, t.count - (index - 61)))
+  return View { name: entry.name.view(), nameLength: entry.name.length, value: entry.value.view(), valueLength: entry.value.length }
+}
+
+/// The receiving side.
+pub struct Inflater { pub table: Table, settingsMaximum: usize, expectSize: bool, minimum: usize }
+pub fn inflater() -> Inflater { return Inflater { table: table(4096), settingsMaximum: 4096, expectSize: false, minimum: 4096 } }
+/// Applies an acknowledged SETTINGS_HEADER_TABLE_SIZE.
+pub fn changeInflateSize(d: &mut Inflater, maximum: usize) -> () {
+  d.settingsMaximum = maximum
+  if d.table.maximum > maximum { d.expectSize = true d.minimum = maximum }
+}
+
+// Decodes an integer with an n-bit prefix; false when the block ends or it overflows.
+fn integer(input: ?*const u8, length: usize, cursor: &mut usize, prefix: u32, out: &mut usize) -> bool {
+  if cursor.* >= length { return false }
+  let mask = u32.toUsize(prefix)
+  let mut value = u8.toUsize(unsafe byte(input, cursor.*)) & mask
+  cursor.* = cursor.* + 1
+  if value < mask { out.* = value return true }
+  let mut shift: usize = 0
+  while true {
+    if cursor.* >= length { return false }
+    let b = unsafe byte(input, cursor.*)
+    cursor.* = cursor.* + 1
+    if shift > 28 { return false }
+    value = value + u8.toUsize(b & 127) * usize.shiftLeft(1, shift)
+    if value > 4294967295 { return false }
+    if b < 128 { out.* = value return true }
+    shift = shift + 7
+  }
+  return false
+}
+// Decodes a string onto `out`; false on a malformed or too long string.
+unsafe fn string(input: ?*const u8, length: usize, cursor: &mut usize, out: &mut Buf) -> bool {
+  if cursor.* >= length { return false }
+  let huffman = unsafe byte(input, cursor.*) >= 128
+  let mut count: usize = 0
+  if !integer(input, length, &mut cursor.*, 127, &mut count) { return false }
+  if count > length - cursor.* { return false }
+  let start = cursor.*
+  cursor.* = cursor.* + count
+  if !huffman {
+    if count > MAX_NV { return false }
+    return unsafe out.append(unsafe Intrinsic.pointerRequalify<*const u8, ?*const u8>(unsafe atConst(input, start)), count)
+  }
+  let begin = out.length
+  let mut state: usize = 0
+  let mut accept = true
+  let mut i: usize = 0
+  while i < count {
+    let b = u8.toUsize(unsafe byte(input, start + i))
+    let mut half: usize = 0
+    while half < 2 {
+      let nibble = if half == 0 { b / 16 } else { b % 16 }
+      let step = Tables.huffmanStep(state, nibble)
+      if u32.bitAnd(step, 131072) != 0 { return false }
+      if u32.bitAnd(step, 65536) != 0 {
+        if !unsafe out.push(u32.wrappingToU8(u32.shiftRight(step, 8))) { return false }
+        if out.length - begin > MAX_NV { return false }
+      }
+      state = u32.toUsize(u32.bitAnd(step, 255))
+      accept = u32.bitAnd(step, 262144) != 0
+      half = half + 1
+    }
+    i = i + 1
+  }
+  return accept
+}
+unsafe fn record(out: &mut Buf, name: ?*const u8, nameLength: usize, value: ?*const u8, valueLength: usize, flags: u8) -> bool {
+  return unsafe out.pushU32(usize.toU32(nameLength)) && unsafe out.pushU32(usize.toU32(valueLength)) && unsafe out.push(flags)
+    && unsafe out.append(name, nameLength) && unsafe out.append(value, valueLength)
+}
+/// Decodes one whole field block onto `out` as records: name length and value length (big-endian
+/// u32), flags (1: never indexed), name, value. Returns 0, -1 for a compression error, -2 when
+/// memory ran out.
+pub unsafe fn inflate(d: &mut Inflater, input: ?*const u8, length: usize, out: &mut Buf) -> i32 {
+  let mut cursor: usize = 0
+  let mut fields = false
+  while cursor < length {
+    let first = unsafe byte(input, cursor)
+    if first >= 32 && first < 64 {
+      // A dynamic table size update: only before the first field.
+      if fields { return -1 }
+      let mut size: usize = 0
+      if !integer(input, length, &mut cursor, 31, &mut size) { return -1 }
+      if size > d.settingsMaximum { return -1 }
+      if d.expectSize && size > d.minimum { return -1 }
+      d.expectSize = false
+      d.table.maximum = size
+      unsafe evict(&mut d.table, 0)
+      continue
+    }
+    if d.expectSize { return -1 }
+    fields = true
+    if first >= 128 {
+      let mut index: usize = 0
+      if !integer(input, length, &mut cursor, 127, &mut index) { return -1 }
+      if index == 0 || index > 61 + d.table.count { return -1 }
+      let view = unsafe lookup(&d.table, index)
+      if !unsafe record(&mut out.*, view.name, view.nameLength, view.value, view.valueLength, 0) { return -2 }
+      continue
+    }
+    let incremental = first >= 64
+    let prefix: u32 = if incremental { 63 } else { 15 }
+    let flags: u8 = if !incremental && first >= 16 { NO_INDEX } else { 0 }
+    let mut index: usize = 0
+    if !integer(input, length, &mut cursor, prefix, &mut index) { return -1 }
+    if index > 61 + d.table.count { return -1 }
+    // The record is built in place: header, then name, then value.
+    let start = out.length
+    if !unsafe out.pushU32(0) || !unsafe out.pushU32(0) || !unsafe out.push(flags) { return -2 }
+    let nameStart = out.length
+    if index == 0 {
+      if !unsafe string(input, length, &mut cursor, &mut out.*) { return -1 }
+    } else {
+      let view = unsafe lookup(&d.table, index)
+      if !unsafe out.append(view.name, view.nameLength) { return -2 }
+    }
+    let nameLength = out.length - nameStart
+    if !unsafe string(input, length, &mut cursor, &mut out.*) { return -1 }
+    let valueLength = out.length - nameStart - nameLength
+    let header = unsafe at(out.data, start)
+    let mut shift: usize = 0
+    while shift < 4 {
+      unsafe setByte(out.data, start + shift, u32.wrappingToU8(u32.shiftRight(usize.toU32(nameLength), usize.toU32(24 - shift * 8))))
+      unsafe setByte(out.data, start + 4 + shift, u32.wrappingToU8(u32.shiftRight(usize.toU32(valueLength), usize.toU32(24 - shift * 8))))
+      shift = shift + 1
+    }
+    let _unused = header
+    if incremental {
+      let base = unsafe constant(out.data)
+      if !unsafe insert(&mut d.table, unsafe Intrinsic.pointerRequalify<*const u8, ?*const u8>(unsafe atConst(base, nameStart)), nameLength,
+        unsafe Intrinsic.pointerRequalify<*const u8, ?*const u8>(unsafe atConst(base, nameStart + nameLength)), valueLength) { return -2 }
+    }
+  }
+  if d.expectSize && length > 0 { return -1 }
+  return 0
+}
+
+/// The sending side.
+pub struct Deflater { pub table: Table, deflateMaximum: usize, notify: bool, minimum: usize, codes: Buf }
+pub fn deflater(deflateMaximum: usize) -> Deflater {
+  if deflateMaximum < 4096 { return Deflater { table: table(deflateMaximum), deflateMaximum: deflateMaximum, notify: true, minimum: 4294967295, codes: emptyBuf() } }
+  return Deflater { table: table(4096), deflateMaximum: deflateMaximum, notify: false, minimum: 4294967295, codes: emptyBuf() }
+}
+/// Applies the peer's SETTINGS_HEADER_TABLE_SIZE.
+pub unsafe fn changeDeflateSize(e: &mut Deflater, settingsMaximum: usize) -> () {
+  let next = if settingsMaximum < e.deflateMaximum { settingsMaximum } else { e.deflateMaximum }
+  e.table.maximum = next
+  if next < e.minimum { e.minimum = next }
+  e.notify = true
+  unsafe evict(&mut e.table, 0)
+}
+unsafe fn writeInteger(out: &mut Buf, value: usize, prefix: u32, tag: u8) -> bool {
+  let mask = u32.toUsize(prefix)
+  if value < mask { return unsafe out.push(tag | usize.toU8(value)) }
+  if !unsafe out.push(tag | u32.wrappingToU8(prefix)) { return false }
+  let mut rest = value - mask
+  while rest >= 128 {
+    if !unsafe out.push(usize.toU8(rest % 128) | 128) { return false }
+    rest = rest / 128
+  }
+  return unsafe out.push(usize.toU8(rest))
+}
+// The Huffman code of each symbol (RFC 7541 Appendix B) as code and bit length, big-endian u32s,
+// found by walking silk.http's decoding trie once.
+unsafe fn huffmanCodes(e: &mut Deflater) -> bool {
+  if e.codes.length > 0 { return true }
+  if !unsafe e.codes.reserve(257 * 8) { return false }
+  let mut i: usize = 0
+  while i < 257 * 8 { let _ok = unsafe e.codes.push(0) i = i + 1 }
+  // A stack of (node, code, length).
+  let mut stack = emptyBuf()
+  if !unsafe stack.pushU32(0) || !unsafe stack.pushU32(0) || !unsafe stack.pushU32(0) { unsafe stack.release() return false }
+  while stack.length > 0 {
+    let at = stack.length - 12
+    let node = u32.toUsize(getU32(stack.view(), at)) let code = getU32(stack.view(), at + 4) let length = getU32(stack.view(), at + 8)
+    stack.length = at
+    let symbol = Tables.symbol(node)
+    if symbol <= 256 {
+      let slot = symbol * 8
+      let mut k: usize = 0
+      while k < 4 {
+        unsafe setByte(e.codes.data, slot + k, u32.wrappingToU8(u32.shiftRight(code, usize.toU32(24 - k * 8))))
+        unsafe setByte(e.codes.data, slot + 4 + k, u32.wrappingToU8(u32.shiftRight(length, usize.toU32(24 - k * 8))))
+        k = k + 1
+      }
+      continue
+    }
+    let left = Tables.next(node, false) let right = Tables.next(node, true)
+    if !unsafe stack.pushU32(usize.toU32(left)) || !unsafe stack.pushU32(u32.shiftLeft(code, 1)) || !unsafe stack.pushU32(length + 1) { unsafe stack.release() return false }
+    if !unsafe stack.pushU32(usize.toU32(right)) || !unsafe stack.pushU32(u32.bitOr(u32.shiftLeft(code, 1), 1)) || !unsafe stack.pushU32(length + 1) { unsafe stack.release() return false }
+  }
+  unsafe stack.release()
+  return true
+}
+fn huffmanLength(e: &Deflater, text: ?*const u8, length: usize) -> usize {
+  let mut bits: usize = 0
+  let mut i: usize = 0
+  while i < length { bits = bits + u32.toUsize(getU32(e.codes.view(), u8.toUsize(unsafe byte(text, i)) * 8 + 4)) i = i + 1 }
+  return (bits + 7) / 8
+}
+// A string, Huffman coded when that is shorter (nghttp2's emit_string).
+unsafe fn writeString(e: &mut Deflater, out: &mut Buf, text: ?*const u8, length: usize) -> bool {
+  if !unsafe huffmanCodes(&mut e.*) { return false }
+  let coded = huffmanLength(&e.*, text, length)
+  if coded >= length { return unsafe writeInteger(&mut out.*, length, 127, 0) && unsafe out.append(text, length) }
+  if !unsafe writeInteger(&mut out.*, coded, 127, 128) { return false }
+  let mut accumulator: u64 = 0
+  let mut pending: u32 = 0
+  let mut i: usize = 0
+  while i < length {
+    let slot = u8.toUsize(unsafe byte(text, i)) * 8
+    let code = getU32(e.codes.view(), slot) let bits = getU32(e.codes.view(), slot + 4)
+    accumulator = u64.bitOr(u64.shiftLeft(accumulator, u32.toU64(bits)), u32.toU64(code))
+    pending = pending + bits
+    while pending >= 8 {
+      pending = pending - 8
+      if !unsafe out.push(u64.wrappingToU8(u64.shiftRight(accumulator, u32.toU64(pending)))) { return false }
+    }
+    accumulator = u64.bitAnd(accumulator, u64.shiftLeft(1, u32.toU64(pending)) - 1)
+    i = i + 1
+  }
+  // The last byte is padded with the most significant bits of EOS (all ones).
+  if pending > 0 {
+    let padded = u64.bitOr(u64.shiftLeft(accumulator, u32.toU64(8 - pending)), u64.shiftLeft(1, u32.toU64(8 - pending)) - 1)
+    if !unsafe out.push(u64.wrappingToU8(padded)) { return false }
+  }
+  return true
+}
+fn neverIndexed(name: ?*const u8, nameLength: usize, valueLength: usize, flags: u8) -> bool {
+  if u8.bitAnd(flags, NO_INDEX) != 0 { return true }
+  if unsafe equals(name, nameLength, b"authorization") { return true }
+  return unsafe equals(name, nameLength, b"cookie") && valueLength < 20
+}
+fn notIndexed(e: &Deflater, name: ?*const u8, nameLength: usize, valueLength: usize) -> bool {
+  if nameLength + valueLength + 32 > e.table.maximum * 3 / 4 { return true }
+  let names: [&[u8]; 8] = [b":path", b"age", b"content-length", b"etag", b"if-modified-since", b"if-none-match", b"location", b"set-cookie"]
+  let mut i: usize = 0
+  while i < 8 { if unsafe equals(name, nameLength, names[i]) { return true } i = i + 1 }
+  return false
+}
+/// Encodes one field onto `out`; false when memory ran out.
+pub unsafe fn deflateField(e: &mut Deflater, out: &mut Buf, name: ?*const u8, nameLength: usize, value: ?*const u8, valueLength: usize, flags: u8) -> bool {
+  let never = neverIndexed(name, nameLength, valueLength, flags)
+  let index = !never && !notIndexed(&e.*, name, nameLength, valueLength)
+  // The lowest static index with this name, then an exact match among the static fields with that
+  // name, then the dynamic table newest first.
+  let anchor = ()
+  let nameSlice = unsafe Pointer.borrowMany<(), u8>(&anchor, unsafe Pointer.assumeMany<u8>(unsafe Intrinsic.pointerRequalify<?*const u8, *const u8>(if nameLength == 0 { textPointer(b" ") } else { name })), nameLength)
+  let mut nameIndex = Tables.nameIndex(nameSlice)
+  let mut exact: usize = 0
+  if !never {
+    let mut i = nameIndex
+    while i != 0 && i <= 61 {
+      let field = Tables.field(i)
+      if !unsafe equals(name, nameLength, field.name) { break }
+      if unsafe equals(value, valueLength, field.value) { exact = i break }
+      i = i + 1
+    }
+  }
+  if exact == 0 {
+    let mut offset: usize = 0
+    while offset < e.table.count {
+      let view = unsafe lookup(&e.table, 62 + offset)
+      if view.nameLength == nameLength && unsafe same(view.name, name, nameLength) {
+        if nameIndex == 0 { nameIndex = 62 + offset }
+        if !never && view.valueLength == valueLength && unsafe same(view.value, value, valueLength) { exact = 62 + offset break }
+      }
+      offset = offset + 1
+    }
+  }
+  if exact != 0 { return unsafe writeInteger(&mut out.*, exact, 127, 128) }
+  let ok = if index { unsafe writeInteger(&mut out.*, nameIndex, 63, 64) } else if never { unsafe writeInteger(&mut out.*, nameIndex, 15, 16) } else { unsafe writeInteger(&mut out.*, nameIndex, 15, 0) }
+  if !ok { return false }
+  if nameIndex == 0 && !unsafe writeString(&mut e.*, &mut out.*, name, nameLength) { return false }
+  if !unsafe writeString(&mut e.*, &mut out.*, value, valueLength) { return false }
+  if index { return unsafe insert(&mut e.table, name, nameLength, value, valueLength) }
+  return true
+}
+/// Starts a field block: the table size updates owed to the peer.
+pub unsafe fn deflateStart(e: &mut Deflater, out: &mut Buf) -> bool {
+  if !e.notify { return true }
+  let minimum = e.minimum
+  e.notify = false
+  e.minimum = 4294967295
+  if e.table.maximum > minimum && !unsafe writeInteger(&mut out.*, minimum, 31, 32) { return false }
+  return unsafe writeInteger(&mut out.*, e.table.maximum, 31, 32)
+}
+pub unsafe fn releaseCodes(e: &mut Deflater) -> () { unsafe e.codes.release() }

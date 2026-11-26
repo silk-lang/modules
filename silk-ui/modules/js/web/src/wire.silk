@@ -1,0 +1,295 @@
+//! The calls the page's `__ui` (browser/js-host.js) writes into one byte buffer, and how they
+//! become a ui-protocol batch. Each call is an opcode byte and its arguments: ids and other
+//! whole numbers as little-endian u32, other numbers as little-endian f64, strings as a u32
+//! UTF-8 length and the bytes. The opcodes are the `OP` table of js-host.js.
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.text.string { String, InvalidUtf8 }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.num.u8
+import silk.num.u32
+import silk.num.u64
+import silk.num.f64
+import ui_tree.legacy { Batch, Attribute, Mutation, Keyframe, Atom, VirtualItem, VirtualOptions }
+import ui_js_calls.stylesheets as stylesheets
+import ui_js_calls.lib { Arg, Applied, setAttribute, nodeKind, styleState, declarationsOf, applyStyle, unpackMarks, unpackAtoms }
+
+pub const CREATE: u8 = 1
+pub const APPEND: u8 = 2
+pub const INSERT_BEFORE: u8 = 3
+pub const ROOT: u8 = 4
+pub const SET_TEXT: u8 = 5
+pub const LISTEN: u8 = 6
+pub const STYLE: u8 = 7
+pub const CLEAR_STYLE: u8 = 8
+/// `attribute(id, name, value)`: the value is a tag byte (0 nothing, 1 number, 2 string,
+/// 3 false, 4 true) and the value.
+pub const ATTRIBUTE: u8 = 9
+/// `valueRange(id, set, min, max, now)`: `set` is a byte, 0 clears the range.
+pub const VALUE_RANGE: u8 = 10
+pub const FOCUS: u8 = 11
+pub const REMOVE: u8 = 12
+pub const DESTROY: u8 = 13
+pub const SCROLL_TO: u8 = 14
+pub const SELECT: u8 = 15
+pub const FONT_FAMILY: u8 = 16
+pub const DEFINE_ICON: u8 = 17
+pub const SOURCE: u8 = 18
+pub const RELEASE: u8 = 19
+pub const KEYFRAME: u8 = 20
+pub const KEYFRAMES: u8 = 21
+pub const RICH_TEXT: u8 = 22
+pub const MARK: u8 = 23
+pub const ATOM_STYLE: u8 = 24
+pub const FORMAT: u8 = 25
+pub const INSERT_ATOM: u8 = 26
+pub const STYLE_SHEET: u8 = 27
+/// `load(resource, url, icon)`: `icon` is a byte, 1 for an icon resource.
+pub const LOAD: u8 = 28
+/// `capture(id)`: `id` takes the pointer capture of the press; 0 releases it.
+pub const CAPTURE: u8 = 29
+/// `svgInsert(id, element, tag, parent, before)`: u32 element, text tag, u32 parent, u32 before
+/// (0xffffffff for last).
+pub const SVG_INSERT: u8 = 30
+/// `svgRemove(id, element)`: u32 element.
+pub const SVG_REMOVE: u8 = 31
+/// `svgAttribute(id, element, name, value)`: u32 element, text name, a byte (1 when there is a
+/// value) and the value text.
+pub const SVG_ATTRIBUTE: u8 = 32
+/// `surface(id, surface, width, height, opaque)`: canvas `id` shows the page's GPU canvas
+/// numbered `surface` (0xffffffff for none), `width` by `height` pixels; `opaque` is a byte.
+pub const SURFACE: u8 = 33
+/// `canvasFrame(id)`: the page drew canvas `id` again. Nothing in the tree changes: the call
+/// is there so the window draws a frame, which shows the canvas's new picture.
+pub const CANVAS_FRAME: u8 = 34
+pub const VIRTUAL_LIST: u8 = 35
+pub const VIRTUAL_ITEMS: u8 = 36
+pub const CLEAR_VIRTUAL_LIST: u8 = 37
+
+/// A place in the buffer.
+struct Reader<'b> {
+  bytes: &'b [u8],
+  at: usize,
+}
+
+impl<'b> Reader<'b> {
+  fn byte(self: &mut Self) -> u8 {
+    let value = self.bytes[self.at]
+    self.at = self.at + 1
+    return value
+  }
+
+  fn word(self: &mut Self) -> u32 {
+    let i = self.at
+    let b = self.bytes
+    self.at = i + 4
+    return u32.bitOr(
+      u32.bitOr(u8.toU32(b[i]), u32.shiftLeft(u8.toU32(b[i + 1]), 8)),
+      u32.bitOr(u32.shiftLeft(u8.toU32(b[i + 2]), 16), u32.shiftLeft(u8.toU32(b[i + 3]), 24)),
+    )
+  }
+
+  fn number(self: &mut Self) -> f64 {
+    let low = u32.toU64(self.word())
+    let high = u32.toU64(self.word())
+    return f64.fromBits(u64.bitOr(low, u64.shiftLeft(high, 32)))
+  }
+
+  effect fn text(self: &mut Self) -> String ! OutOfMemoryError ? &mut Allocator {
+    let length = u32.toUsize(self.word())
+    let start = self.at
+    self.at = start + length
+    return match run String.copyUtf8(Slice.view<u8>(self.bytes, start, length)) {
+      Result<String, InvalidUtf8>.Success { value } => move value
+      Result<String, InvalidUtf8>.Failure { .. } => String.make()
+    }
+  }
+
+  effect fn arg(self: &mut Self) -> Arg ! OutOfMemoryError ? &mut Allocator {
+    let tag = self.byte()
+    if tag == 1 { return Arg.Number { value: self.number() } }
+    if tag == 2 { return Arg.Text { value: run self.text() } }
+    if tag == 3 { return Arg.Flag { value: false } }
+    if tag == 4 { return Arg.Flag { value: true } }
+    return Arg.Nothing
+  }
+}
+
+/// A role or ARIA text the tree does not have, for the page's console: the browser's `__ui`
+/// cannot wait for the tree's answer, so the wire reports it instead of `attribute` returning
+/// false.
+pub struct Unknown {
+  pub name: String,
+  pub value: String,
+}
+
+/// Adds the calls in `bytes` to `batch`, with the frames of `@keyframes` rules not yet
+/// defined in `frames`. Returns the role and ARIA texts the tree did not have. A buffer cut
+/// short traps: the page writes whole calls only.
+pub effect fn decode(bytes: &[u8], batch: &mut Batch, frames: &mut List<Keyframe>) -> List<Unknown> ! OutOfMemoryError ? &mut Allocator {
+  let mut reader = Reader { bytes: bytes, at: 0 }
+  let mut unknown = List<Unknown>.make()
+  while reader.at < bytes.length {
+    let op = reader.byte()
+    if op == KEYFRAME {
+      let offset = f64.toF32(reader.number())
+      let css = run reader.text()
+      run frames.append(Keyframe { offset: offset, declarations: run declarationsOf(&css) })
+      continue
+    }
+    if op == KEYFRAMES {
+      let name = run reader.text()
+      let taken = Intrinsic.replace(frames.*, List<Keyframe>.make())
+      run batch.keyframes(String.view(&name), move taken)
+      continue
+    }
+    let id = reader.word()
+    if op == CREATE {
+      run batch.create(id, nodeKind(reader.word()))
+    } else if op == APPEND {
+      run batch.append(id, reader.word())
+    } else if op == INSERT_BEFORE {
+      let child = reader.word()
+      run batch.insertBefore(id, child, reader.word())
+    } else if op == ROOT {
+      run batch.root(id)
+    } else if op == SET_TEXT {
+      let value = run reader.text()
+      run batch.setText(id, String.view(&value))
+    } else if op == LISTEN {
+      run batch.listen(id, reader.word())
+    } else if op == STYLE_SHEET {
+      let sheet = reader.word()
+      let encoded = run reader.text()
+      drop run stylesheets.apply(&mut batch.*, id, sheet, String.view(&encoded))
+    } else if op == STYLE {
+      let state = styleState(reader.word())
+      let css = run reader.text()
+      run applyStyle(&mut batch.*, id, state, &css)
+    } else if op == CLEAR_STYLE {
+      run batch.push(Mutation.ClearStyle { id: id, state: styleState(reader.word()) })
+    } else if op == ATTRIBUTE {
+      let name = run reader.text()
+      let value = run reader.arg()
+      match run setAttribute(&mut batch, id, String.view(&name), &value) {
+        Applied.Known { value: known } => {
+          if !known {
+            run unknown.append(Unknown { name: move name, value: run value.text() })
+          }
+        }
+        Applied.Set => ()
+        Applied.Missing => ()
+      }
+    } else if op == VALUE_RANGE {
+      let set = reader.byte()
+      let min = f64.toF32(reader.number())
+      let max = f64.toF32(reader.number())
+      let now = f64.toF32(reader.number())
+      let range = if set != 0 { Attribute.ValueRange { min: min, max: max, value: now } } else { Attribute.ClearValueRange }
+      run batch.attribute(id, move range)
+    } else if op == FOCUS {
+      run batch.focus(id)
+    } else if op == REMOVE {
+      run batch.push(Mutation.Remove { id: id })
+    } else if op == DESTROY {
+      run batch.push(Mutation.Destroy { id: id })
+    } else if op == SCROLL_TO {
+      let x = f64.toF32(reader.number())
+      run batch.scrollTo(id, x, f64.toF32(reader.number()))
+    } else if op == VIRTUAL_LIST {
+      let count = u32.toUsize(reader.word())
+      let estimate = f64.toF32(reader.number())
+      let overscan = f64.toF32(reader.number())
+      let gap = f64.toF32(reader.number())
+      run batch.virtualList(id, count, VirtualOptions { estimatedHeight: estimate, overscan: overscan, gap: gap, revision: f64.toU64(reader.number()) })
+    } else if op == VIRTUAL_ITEMS {
+      let count = u32.toUsize(reader.word())
+      let mut rows = List<VirtualItem>.make()
+      while rows.length() < count {
+        let index = u32.toUsize(reader.word())
+        run rows.append(VirtualItem { index: index, id: reader.word() })
+      }
+      run batch.virtualItems(id, rows.asSlice())
+    } else if op == CLEAR_VIRTUAL_LIST {
+      run batch.clearVirtualList(id)
+    } else if op == SELECT {
+      let anchor = u32.toUsize(reader.word())
+      run batch.select(id, anchor, u32.toUsize(reader.word()))
+    } else if op == FONT_FAMILY {
+      let names = run reader.text()
+      run batch.fontFamily(id, String.view(&names))
+    } else if op == DEFINE_ICON {
+      let markup = run reader.text()
+      run batch.icon(id, String.utf8Bytes(String.view(&markup)))
+    } else if op == SOURCE {
+      run batch.source(id, reader.word())
+    } else if op == LOAD {
+      let url = run reader.text()
+      if reader.byte() != 0 {
+        run batch.loadIcon(id, String.view(&url))
+      } else {
+        run batch.loadImage(id, String.view(&url))
+      }
+    } else if op == CAPTURE {
+      run batch.push(if id == 0 { Mutation.ReleasePointerCapture } else { Mutation.SetPointerCapture { id: id } })
+    } else if op == SVG_INSERT {
+      let element = reader.word()
+      let tag = run reader.text()
+      let parent = reader.word()
+      let before = reader.word()
+      let at = if before == 4294967295 { Option<u32>.None } else { Option<u32>.some(before) }
+      run batch.svgInsert(id, element, String.view(&tag), parent, at)
+    } else if op == SVG_REMOVE {
+      run batch.svgRemove(id, reader.word())
+    } else if op == SVG_ATTRIBUTE {
+      let element = reader.word()
+      let name = run reader.text()
+      let present = reader.byte() != 0
+      let value = run reader.text()
+      if present {
+        run batch.svgAttribute(id, element, String.view(&name), Option<string>.some(String.view(&value)))
+      } else {
+        run batch.svgAttribute(id, element, String.view(&name), Option<string<'static>>.None)
+      }
+    } else if op == RELEASE {
+      run batch.releaseResource(id)
+    } else if op == SURFACE {
+      let surface = reader.word()
+      let width = reader.word()
+      let height = reader.word()
+      run batch.push(Mutation.SetCanvasSurface { id: id, surface: surface, width: width, height: height, opaque: reader.byte() != 0 })
+    } else if op == CANVAS_FRAME {
+    } else if op == RICH_TEXT {
+      let value = run reader.text()
+      let marks = run reader.text()
+      let atoms = run reader.text()
+      run batch.push(Mutation.SetRichText { id: id, value: move value, marks: run unpackMarks(String.view(&marks)), atoms: run unpackAtoms(String.view(&atoms)) })
+    } else if op == MARK || op == ATOM_STYLE {
+      let key = reader.word()
+      let css = run reader.text()
+      let declarations = run declarationsOf(&css)
+      if op == MARK {
+        run batch.push(Mutation.DefineMark { id: id, mark: key, declarations: move declarations })
+      } else {
+        run batch.push(Mutation.DefineAtom { id: id, kind: key, declarations: move declarations })
+      }
+    } else if op == FORMAT {
+      let mark = reader.word()
+      run batch.format(id, mark, reader.byte() != 0)
+    } else if op == INSERT_ATOM {
+      let start = u32.toUsize(reader.word())
+      let end = u32.toUsize(reader.word())
+      let packed = run reader.text()
+      let mut atoms = run unpackAtoms(String.view(&packed))
+      match atoms.pop() {
+        Option<Atom>.Some { value: atom } => { run batch.insertAtom(id, start, end, move atom) }
+        Option<Atom>.None => ()
+      }
+    } else {
+      Intrinsic.trap("ui-js-web: an opcode the page's __ui does not write")
+    }
+  }
+  return move unknown
+}

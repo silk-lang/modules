@@ -1,0 +1,763 @@
+//! `TextMeasure.analyze`: line break opportunities (UAX #14) and bidi levels (UAX #9) for one
+//! inline formatting context.
+//!
+//! The tokens are flattened twice. Line breaking sees the source text with U+FFFC for atomic
+//! inlines. Bidi sees the same text with the controls CSS Writing Modes 4 §2.4.2 assigns to
+//! `unicode-bidi` (closed before each segment break and reopened after it), so generated
+//! controls never move a break. Offsets map back to token cursors.
+import layout.lib {
+  TextToken,
+  TextTokenKind,
+  TextContext,
+  TextCursor,
+  TextBreak,
+  TextBreakKind,
+  TextAnalysis,
+  TextLevel,
+  TextParagraph,
+  TextError,
+  UnicodeBidi,
+  Direction,
+  WhiteSpaceCollapse
+}
+import silk.text.bidi { BidiAnalysis, BidiRun, BidiParagraph, ParagraphDirection }
+import silk.text.line_break
+import silk.text.line_break { BreakKind, BreakOpportunity, LineOptions, WordBreakMode, LineBreakMode, Hyphens }
+import silk.text.segmentation
+import silk.text.word_dictionary { IcuDictionary }
+import fonts { FontState, Treatment }
+import properties.computed { WordBreak, OverflowWrap, LineBreak, Hyphens as CssHyphens }
+import silk.text.string { String }
+import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+
+const OBJECT: string = "\u{fffc}"
+
+/// Reusable storage for [`analyze`].
+pub struct Analyzer {
+  lineText: String,
+  bidiText: String,
+  // Per unit, the byte offset where it starts in `lineText` / `bidiText`; one extra entry
+  // holds the ends.
+  lineStarts: List<usize>,
+  bidiStarts: List<usize>,
+  opportunities: List<BreakOpportunity>,
+  // `word-break` tailoring: one mode's opportunities, and the merge of all of them.
+  tailored: List<BreakOpportunity>,
+  merged: List<BreakOpportunity>,
+  bidi: BidiAnalysis,
+  scopes: List<usize>,
+}
+
+impl Analyzer {
+  pub fn make() -> Analyzer {
+    return Analyzer {
+      lineText: String.make(),
+      bidiText: String.make(),
+      lineStarts: List<usize>.make(),
+      bidiStarts: List<usize>.make(),
+      opportunities: List<BreakOpportunity>.make(),
+      tailored: List<BreakOpportunity>.make(),
+      merged: List<BreakOpportunity>.make(),
+      bidi: BidiAnalysis.make(),
+      scopes: List<usize>.make(),
+    }
+  }
+}
+
+/// The bytes a token contributes to the flattened text, as css-layout counts its length.
+pub fn tokenText<'text>(token: &TextToken<'text>) -> string<'text> {
+  return match token.kind {
+    TextTokenKind.Text => token.text
+    TextTokenKind.PreservedSpace => token.text
+    TextTokenKind.Space => " "
+    TextTokenKind.Tab => "\t"
+    TextTokenKind.SegmentBreak => "\n"
+    TextTokenKind.Atomic => OBJECT
+    _ => ""
+  }
+}
+
+/// The length of a token in cursor offsets: its text bytes, or 1 for spaces, tabs, segment
+/// breaks and atomic inlines, as in css-layout.
+pub fn tokenLength(token: &TextToken<'_>) -> usize {
+  if token.kind == TextTokenKind.Text || token.kind == TextTokenKind.PreservedSpace {
+    return String.byteLength(token.text)
+  }
+  if token.kind == TextTokenKind.Space || token.kind == TextTokenKind.Tab
+    || token.kind == TextTokenKind.SegmentBreak
+    || token.kind == TextTokenKind.Atomic {
+    return 1
+  }
+  return 0
+}
+
+// Atomic inlines are one cursor offset but three bytes of U+FFFC.
+fn flatLength(token: &TextToken<'_>) -> usize {
+  if token.kind == TextTokenKind.Atomic {
+    return 3
+  }
+  return tokenLength(token)
+}
+
+fn cursorOffset(token: &TextToken<'_>, flat: usize) -> usize {
+  if token.kind == TextTokenKind.Atomic {
+    if flat == 0 {
+      return 0
+    }
+    return 1
+  }
+  return flat
+}
+
+/// The cursor of byte `offset` in a flattened text whose units start at `starts`: inside the
+/// unit that contains it, or at the first unit starting there.
+fn cursorAt(tokens: &[TextToken<'_>], starts: &[usize], offset: usize) -> TextCursor {
+  let mut low: usize = 0
+  let mut high = tokens.length
+
+  // The first unit whose end is past `offset`.
+  while low < high {
+    let middle = low + (high - low) / 2
+    if starts[middle + 1] <= offset {
+      low = middle + 1
+    } else {
+      high = middle
+    }
+  }
+  if low >= tokens.length {
+    return TextCursor { unit: tokens.length, offset: 0 }
+  }
+  if starts[low] >= offset {
+    // `offset` is at or before the start of `low`; earlier zero-length units start there too.
+    let mut unit = low
+    while unit > 0 && starts[unit - 1] == offset && starts[unit] == offset {
+      unit = unit - 1
+    }
+    return TextCursor { unit: unit, offset: 0 }
+  }
+  return TextCursor { unit: low, offset: cursorOffset(&tokens[low], offset - starts[low]) }
+}
+
+/// The cursor just after byte `offset - 1`, which ends a paragraph or a level run.
+fn cursorAfter(tokens: &[TextToken<'_>], starts: &[usize], offset: usize) -> TextCursor {
+  if offset == 0 {
+    return TextCursor { unit: 0, offset: 0 }
+  }
+  let inner = cursorAt(tokens, starts, offset - 1)
+  if inner.unit >= tokens.length {
+    return inner
+  }
+  let length = flatLength(&tokens[inner.unit])
+  if starts[inner.unit] + length <= offset {
+    return TextCursor { unit: inner.unit + 1, offset: 0 }
+  }
+  return TextCursor {
+    unit: inner.unit,
+    offset: cursorOffset(&tokens[inner.unit], offset - starts[inner.unit]),
+  }
+}
+
+effect fn control(text: &mut String, policy: UnicodeBidi, direction: Direction, open: bool) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if policy == UnicodeBidi.Normal {
+    return
+  }
+  let rtl = direction == Direction.Rtl
+  if !open {
+    if policy == UnicodeBidi.Embed || policy == UnicodeBidi.BidiOverride
+      || policy == UnicodeBidi.IsolateOverride {
+      run text.append("\u{202c}")
+    }
+    if policy == UnicodeBidi.Isolate || policy == UnicodeBidi.Plaintext
+      || policy == UnicodeBidi.IsolateOverride {
+      run text.append("\u{2069}")
+    }
+    return
+  }
+  if policy == UnicodeBidi.Plaintext {
+    run text.append("\u{2068}")
+  }
+  if policy == UnicodeBidi.Isolate || policy == UnicodeBidi.IsolateOverride {
+    if rtl {
+      run text.append("\u{2067}")
+    } else {
+      run text.append("\u{2066}")
+    }
+  }
+  if policy == UnicodeBidi.Embed {
+    if rtl {
+      run text.append("\u{202b}")
+    } else {
+      run text.append("\u{202a}")
+    }
+  }
+  if policy == UnicodeBidi.BidiOverride || policy == UnicodeBidi.IsolateOverride {
+    if rtl {
+      run text.append("\u{202e}")
+    } else {
+      run text.append("\u{202d}")
+    }
+  }
+}
+
+fn rootOverride(context: &TextContext<'_, '_>) -> bool {
+  return context.unicodeBidi == UnicodeBidi.BidiOverride
+    || context.unicodeBidi == UnicodeBidi.IsolateOverride
+}
+
+effect fn flatten(state: &mut Analyzer, context: &TextContext<'_, '_>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let tokens = context.tokens
+  state.lineText.clear()
+  state.bidiText.clear()
+  state.lineStarts.clear()
+  state.bidiStarts.clear()
+  state.scopes.clear()
+  let root = rootOverride(context)
+  if root {
+    run control(&mut state.bidiText, UnicodeBidi.BidiOverride, context.direction, true)
+  }
+  let mut unit: usize = 0
+  while unit < tokens.length {
+    let token = &tokens[unit]
+    if token.kind == TextTokenKind.Close {
+      run control(&mut state.bidiText, token.unicodeBidi, token.direction, false)
+      if token.unicodeBidi != UnicodeBidi.Normal && state.scopes.length() > 0 {
+        let remaining = state.scopes.length() - 1
+        state.scopes.truncate(remaining)
+      }
+    }
+    if token.kind == TextTokenKind.SegmentBreak {
+      // Generated scopes end before B and are rebuilt for the next paragraph.
+      let mut nesting = state.scopes.length()
+      while nesting > 0 {
+        nesting = nesting - 1
+        let opener = &tokens[state.scopes.get(nesting)]
+        run control(&mut state.bidiText, opener.unicodeBidi, opener.direction, false)
+      }
+      if root {
+        run control(&mut state.bidiText, UnicodeBidi.BidiOverride, context.direction, false)
+      }
+    }
+
+    // An atomic inline is a neutral unless it embeds or overrides its own direction.
+    let directed = token.kind == TextTokenKind.Atomic && token.replacedInline
+      && (token.unicodeBidi == UnicodeBidi.Embed || token.unicodeBidi == UnicodeBidi.BidiOverride)
+    if directed {
+      if token.direction == Direction.Rtl {
+        run state.bidiText.append("\u{202e}")
+      } else {
+        run state.bidiText.append("\u{202d}")
+      }
+    }
+    run state.lineStarts.append(String.byteLength(state.lineText.view()))
+    run state.bidiStarts.append(String.byteLength(state.bidiText.view()))
+    let text = tokenText(token)
+    run state.lineText.append(text)
+    run state.bidiText.append(text)
+    if directed {
+      run state.bidiText.append("\u{202c}")
+    }
+    if token.kind == TextTokenKind.Open {
+      run control(&mut state.bidiText, token.unicodeBidi, token.direction, true)
+      if token.unicodeBidi != UnicodeBidi.Normal {
+        run state.scopes.append(unit)
+      }
+    }
+    if token.kind == TextTokenKind.SegmentBreak {
+      if root {
+        run control(&mut state.bidiText, UnicodeBidi.BidiOverride, context.direction, true)
+      }
+      let mut nesting: usize = 0
+      while nesting < state.scopes.length() {
+        let opener = &tokens[state.scopes.get(nesting)]
+        run control(&mut state.bidiText, opener.unicodeBidi, opener.direction, true)
+        nesting = nesting + 1
+      }
+    }
+    unit = unit + 1
+  }
+  if root {
+    run control(&mut state.bidiText, UnicodeBidi.BidiOverride, context.direction, false)
+  }
+  run state.lineStarts.append(String.byteLength(state.lineText.view()))
+  run state.bidiStarts.append(String.byteLength(state.bidiText.view()))
+}
+
+// Text 3 §5.2: with `white-space-collapse: break-spaces` a line may break after every
+// preserved space, which UAX #14 alone never allows between spaces.
+fn breakSpacesAfter(token: &TextToken<'_>) -> bool {
+  return token.kind == TextTokenKind.PreservedSpace
+    && token.whiteSpaceCollapse == WhiteSpaceCollapse.BreakSpaces
+}
+
+effect fn appendBreak(output: &mut List<TextBreak>, at: TextCursor, kind: TextBreakKind) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if output.length() > 0 {
+    let lastIndex = output.length() - 1
+    let last = output.get(lastIndex)
+    if last.at.equal(at) {
+      if kind == TextBreakKind.Forced {
+        output.set(lastIndex, TextBreak { at: at, kind: kind })
+      }
+      return
+    }
+    if at.before(last.at) {
+      return
+    }
+  }
+  run output.append(TextBreak { at: at, kind: kind })
+}
+
+fn modeOf(treatment: Treatment) -> WordBreakMode {
+  if treatment.wordBreak == WordBreak.BreakAll {
+    return WordBreakMode.BreakAll
+  }
+  if treatment.wordBreak == WordBreak.KeepAll {
+    return WordBreakMode.KeepAll
+  }
+  return WordBreakMode.Normal
+}
+
+// The overflow-wrap break kind of a style, or Soft when it has none. `word-break: break-word`
+// is `overflow-wrap: anywhere` (CSS Text 3 §5.2).
+fn wrapOf(treatment: Treatment) -> TextBreakKind {
+  if treatment.overflowWrap == OverflowWrap.Anywhere || treatment.wordBreak == WordBreak.BreakWord {
+    return TextBreakKind.Anywhere
+  }
+  if treatment.overflowWrap == OverflowWrap.BreakWord {
+    return TextBreakKind.Emergency
+  }
+  return TextBreakKind.Soft
+}
+
+// The line breaking rules of a style: its `word-break`, `line-break` and `hyphens`.
+fn rulesOf(treatment: Treatment) -> LineOptions {
+  let mut options = LineOptions.make()
+  options.wordBreak = modeOf(treatment)
+  options.lineBreak = match treatment.lineBreak {
+    LineBreak.Auto => LineBreakMode.Auto
+    LineBreak.Loose => LineBreakMode.Loose
+    LineBreak.Normal => LineBreakMode.Normal
+    LineBreak.Strict => LineBreakMode.Strict
+    LineBreak.Anywhere => LineBreakMode.Anywhere
+  }
+  // `hyphens: auto` needs a hyphenation dictionary; without one it breaks as `manual` does.
+  options.hyphens = if treatment.hyphens == CssHyphens.None { Hyphens.None } else { Hyphens.Manual }
+  return options
+}
+
+fn sameRules(left: LineOptions, right: LineOptions) -> bool {
+  return left.wordBreak == right.wordBreak && left.lineBreak == right.lineBreak && left.hyphens == right.hyphens
+}
+
+fn defaultRules(options: LineOptions) -> bool {
+  return sameRules(options, LineOptions.make())
+}
+
+// The line breaking rules of the character before flat offset `offset`.
+fn rulesAt(tokens: &[TextToken<'_>], starts: &[usize], fonts: &FontState<'_>, offset: usize) -> LineOptions {
+  if offset == 0 {
+    return LineOptions.make()
+  }
+  let at = cursorAt(tokens, starts, offset - 1)
+  if at.unit >= tokens.length {
+    return LineOptions.make()
+  }
+  return rulesOf(fonts.treatment(tokens[at.unit].fontKey))
+}
+
+// Opportunities where some text sets `word-break`, `line-break` or `hyphens`: each comes from
+// the rules of the character before it. Mandatory breaks hold under every rule. `rules` holds
+// the distinct rules other than the default that the text uses.
+effect fn tailor(state: &mut Analyzer, tokens: &[TextToken<'_>], fonts: &FontState<'_>, rules: &[LineOptions]) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let starts = state.lineStarts.asSlice()
+  state.merged.clear()
+  let mut index: usize = 0
+  while index < state.opportunities.length() {
+    let opportunity = state.opportunities.get(index)
+    if opportunity.kind == BreakKind.Mandatory || defaultRules(rulesAt(tokens, starts, fonts, opportunity.offset)) {
+      run state.merged.append(opportunity)
+    }
+    index = index + 1
+  }
+  let mut pass: usize = 0
+  while pass < rules.length {
+    let options = rules[pass]
+    state.tailored.clear()
+    run lineBreaks(state.lineText.view(), options, &mut state.tailored)
+    // Merge the ones of these rules into `merged`, in offset order.
+    state.opportunities.clear()
+    let mut left: usize = 0
+    let mut right: usize = 0
+    while left < state.merged.length() || right < state.tailored.length() {
+      if right < state.tailored.length() {
+        let candidate = state.tailored.get(right)
+        if candidate.kind == BreakKind.Mandatory || !sameRules(rulesAt(tokens, starts, fonts, candidate.offset), options) {
+          right = right + 1
+          continue
+        }
+        if left >= state.merged.length() || candidate.offset < state.merged.get(left).offset {
+          run state.opportunities.append(candidate)
+          right = right + 1
+          continue
+        }
+        if candidate.offset == state.merged.get(left).offset {
+          right = right + 1
+        }
+      }
+      run state.opportunities.append(state.merged.get(left))
+      left = left + 1
+    }
+    state.merged.clear()
+    run state.merged.appendSlice(state.opportunities.asSlice())
+    pass = pass + 1
+  }
+  state.opportunities.clear()
+  run state.opportunities.appendSlice(state.merged.asSlice())
+}
+
+// Thai, Lao, Khmer and Myanmar words have no spaces between them, so their breaks come from the
+// ICU dictionaries. A byte scan for those blocks keeps other text off the dictionary path.
+effect fn lineBreaks(text: string, options: LineOptions, output: &mut List<BreakOpportunity>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if mayNeedDictionary(String.utf8Bytes(text)) {
+    let dictionary = IcuDictionary.make()
+    run line_break.breaksWithDictionary(text, options, &dictionary, &mut output)
+    return
+  }
+  run line_break.breaks(text, options, &mut output)
+}
+
+// True when `bytes` holds a lead pair of Thai or Lao (U+0E00-0EFF), Myanmar (U+1000-10BF),
+// Khmer (U+1780-17FF) or Myanmar Extended-A/B (U+A9C0-A9FF, U+AA40-AA7F).
+fn mayNeedDictionary(bytes: &[u8]) -> bool {
+  let mut i: usize = 0
+  while i + 1 < bytes.length {
+    let lead = bytes[i]
+    if lead >= 0xe0 {
+      let next = bytes[i + 1]
+      if (lead == 0xe0 && next >= 0xb8 && next <= 0xbb)
+        || (lead == 0xe1 && (next <= 0x82 || next == 0x9e || next == 0x9f))
+        || (lead == 0xea && (next == 0xa7 || next == 0xa9)) {
+        return true
+      }
+    }
+    i = i + 1
+  }
+  return false
+}
+
+// Appends the overflow-wrap breaks at grapheme boundaries inside text tokens, from token
+// `wrap.unit` byte `wrap.offset` up to (not at) flat offset `limit`.
+effect fn wrapsBefore(tokens: &[TextToken<'_>], starts: &[usize], fonts: &FontState<'_>, limit: usize, wrap: &mut TextCursor, output: &mut List<TextBreak>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  while wrap.unit < tokens.length && starts[wrap.unit] < limit {
+    let token = &tokens[wrap.unit]
+    let kind = wrapOf(fonts.treatment(token.fontKey))
+    if token.kind != TextTokenKind.Text || kind == TextBreakKind.Soft {
+      wrap.unit = wrap.unit + 1
+      wrap.offset = 0
+      continue
+    }
+    let text = token.text
+    let length = String.byteLength(text)
+    let mut current = wrap.offset
+    let mut next = segmentation.nextGrapheme(text, current)
+    while next < length && starts[wrap.unit] + next < limit {
+      run appendBreak(&mut output, TextCursor { unit: wrap.unit, offset: next }, kind)
+      current = next
+      next = segmentation.nextGrapheme(text, next)
+    }
+    if next < length {
+      wrap.offset = current
+      return
+    }
+    wrap.unit = wrap.unit + 1
+    wrap.offset = 0
+  }
+}
+
+effect fn breaks(
+  state: &mut Analyzer,
+  context: &TextContext<'_, '_>,
+  fonts: &FontState<'_>,
+  output: &mut List<TextBreak>,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let tokens = context.tokens
+  state.opportunities.clear()
+  run lineBreaks(state.lineText.view(), LineOptions.make(), &mut state.opportunities)
+  let mut rules = List<LineOptions>.make()
+  let mut wraps = false
+  let mut scan: usize = 0
+  while scan < tokens.length {
+    if tokens[scan].kind == TextTokenKind.Text {
+      let treatment = fonts.treatment(tokens[scan].fontKey)
+      let options = rulesOf(treatment)
+      if !defaultRules(options) {
+        let mut known = false
+        let mut r: usize = 0
+        while r < rules.length() {
+          if sameRules(rules.get(r), options) {
+            known = true
+          }
+          r = r + 1
+        }
+        if !known {
+          run rules.append(options)
+        }
+      }
+      wraps = wraps || wrapOf(treatment) != TextBreakKind.Soft
+    }
+    scan = scan + 1
+  }
+  if rules.length() > 0 {
+    run tailor(&mut state, tokens, fonts, rules.asSlice())
+  }
+  let starts = state.lineStarts.asSlice()
+  let total = String.byteLength(state.lineText.view())
+  let mut wrap = TextCursor { unit: 0, offset: 0 }
+  let mut unit: usize = 0
+  let mut index: usize = 0
+  while index < state.opportunities.length() {
+    let opportunity = state.opportunities.get(index)
+    let at = cursorAt(tokens, starts, opportunity.offset)
+    if wraps {
+      run wrapsBefore(tokens, starts, fonts, opportunity.offset, &mut wrap, &mut output)
+    }
+
+    // Break-spaces opportunities before this one, in order.
+    while unit < tokens.length && starts[unit + 1] < opportunity.offset {
+      if breakSpacesAfter(&tokens[unit]) {
+        run appendBreak(&mut output, TextCursor { unit: unit + 1, offset: 0 }, TextBreakKind.Soft)
+      }
+      unit = unit + 1
+    }
+    let mut kind = TextBreakKind.Soft
+    if opportunity.kind == BreakKind.Hyphenated {
+      kind = TextBreakKind.Hyphenated
+    } else if opportunity.kind == BreakKind.Mandatory {
+      // The end of the text is not a forced break unless a segment break ends it.
+      let bytes = String.utf8Bytes(state.lineText.view())
+      if opportunity.offset < total || (total > 0 && bytes[total - 1] == 10) {
+        kind = TextBreakKind.Forced
+      }
+    }
+    if opportunity.offset >= total {
+      run appendBreak(&mut output, TextCursor { unit: tokens.length, offset: 0 }, kind)
+    } else {
+      run appendBreak(&mut output, at, kind)
+    }
+    index = index + 1
+  }
+  if total == 0 {
+    run appendBreak(&mut output, TextCursor { unit: tokens.length, offset: 0 }, TextBreakKind.Soft)
+  }
+}
+
+effect fn appendLevel(
+  analysis: &mut TextAnalysis,
+  start: TextCursor,
+  end: TextCursor,
+  level: u8,
+  unwrapped: u8,
+  removed: bool,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if !start.before(end) {
+    return
+  }
+  if level == analysis.level && unwrapped == analysis.level && !removed {
+    return
+  }
+  if analysis.levels.length() > 0 {
+    let lastIndex = analysis.levels.length() - 1
+    let mut last = analysis.levels.get(lastIndex)
+    if last.level == level && last.unwrappedLevel == unwrapped && last.removed == removed
+      && last.end.equal(start) {
+      last.end = end
+      analysis.levels.set(lastIndex, last)
+      return
+    }
+  }
+  run analysis.levels.append(
+    TextLevel { start: start, end: end, level: level, unwrappedLevel: unwrapped, removed: removed },
+  )
+}
+
+fn paragraphDirection(context: &TextContext<'_, '_>) -> ParagraphDirection {
+  if context.unicodeBidi == UnicodeBidi.Plaintext {
+    return ParagraphDirection.Auto
+  }
+  if context.direction == Direction.Rtl {
+    return ParagraphDirection.Rtl
+  }
+  return ParagraphDirection.Ltr
+}
+
+effect fn levels(state: &mut Analyzer, context: &TextContext<'_, '_>) -> TextAnalysis
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let tokens = context.tokens
+  run state.bidi.analyze(state.bidiText.view(), paragraphDirection(context))
+  let starts = state.bidiStarts.asSlice()
+  let paragraphs = state.bidi.paragraphs()
+  let runs = state.bidi.runs()
+  let first = paragraphs[0]
+  let mut uniform = paragraphs.length == 1 && first.level == 0
+  let mut index: usize = 0
+  while uniform && index < runs.length {
+    if runs[index].level != 0 || runs[index].unwrappedLevel != 0 {
+      uniform = false
+    }
+    index = index + 1
+  }
+  if uniform {
+    return TextAnalysis.uniform(tokens.length, 0, 0, first.hasStrong)
+  }
+  let mut analysis = TextAnalysis.uniform(tokens.length, first.level, first.level, first.hasStrong)
+  if paragraphs.length > 1 {
+    index = 0
+    while index < paragraphs.length {
+      let paragraph = paragraphs[index]
+      let mut end = cursorAfter(tokens, starts, paragraph.end)
+      if index + 1 == paragraphs.length {
+        end = TextCursor { unit: tokens.length, offset: 0 }
+      }
+      run analysis.paragraphs.append(
+        TextParagraph { end: end, level: paragraph.level, hasStrong: paragraph.hasStrong },
+      )
+      index = index + 1
+    }
+  }
+  let mut runIndex: usize = 0
+  let mut unit: usize = 0
+  while unit < tokens.length {
+    let start = starts[unit]
+    let length = flatLength(&tokens[unit])
+    if length == 0 {
+      // Empty structural units follow the next source character of their paragraph.
+      let mut probe = runIndex
+      while probe < runs.length && runs[probe].end <= start {
+        probe = probe + 1
+      }
+      let mut level = analysis.level
+      let mut unwrapped = analysis.level
+      if let Option<BidiParagraph>.Some { value: paragraph } = state.bidi.paragraphAt(start) {
+        level = paragraph.level
+        unwrapped = paragraph.level
+
+        // The first non-removed character at or after `start` inside a source unit.
+        let mut next = unit + 1
+        while next < tokens.length && flatLength(&tokens[next]) == 0 {
+          next = next + 1
+        }
+        if next < tokens.length && starts[next] < paragraph.end {
+          if let Option<BidiRun>.Some { value } = state.bidi.runAt(starts[next]) {
+            level = value.level
+            unwrapped = value.unwrappedLevel
+          }
+        }
+      }
+      run appendLevel(
+        &mut analysis,
+        TextCursor { unit: unit, offset: 0 },
+        TextCursor { unit: unit + 1, offset: 0 },
+        level,
+        unwrapped,
+        false,
+      )
+    } else {
+      let end = start + length
+      while runIndex < runs.length && runs[runIndex].end <= start {
+        runIndex = runIndex + 1
+      }
+      let mut probe = runIndex
+      while probe < runs.length && runs[probe].start < end {
+        let value = runs[probe]
+        let mut low = value.start
+        if low < start {
+          low = start
+        }
+        let mut high = value.end
+        if high > end {
+          high = end
+        }
+        let from = TextCursor { unit: unit, offset: cursorOffset(&tokens[unit], low - start) }
+        let mut to = TextCursor { unit: unit, offset: cursorOffset(&tokens[unit], high - start) }
+        if high == end {
+          to = TextCursor { unit: unit + 1, offset: 0 }
+        }
+        run appendLevel(&mut analysis, from, to, value.level, value.unwrappedLevel, value.removed)
+        probe = probe + 1
+      }
+    }
+    unit = unit + 1
+  }
+  return move analysis
+}
+
+fn simpleWords(context: &TextContext<'_, '_>, fonts: &FontState<'_>) -> bool {
+  let tokens = context.tokens
+  if context.direction != Direction.Ltr || context.unicodeBidi != UnicodeBidi.Normal
+    || tokens.length == 0 || tokens.length % 2 == 0 { return false }
+  let key = tokens[0].fontKey
+  let treatment = fonts.treatment(key)
+  if wrapOf(treatment) != TextBreakKind.Soft || !defaultRules(rulesOf(treatment)) { return false }
+  let mut unit: usize = 0
+  while unit < tokens.length {
+    let token = &tokens[unit]
+    if token.fontKey != key || token.whiteSpaceCollapse != WhiteSpaceCollapse.Collapse { return false }
+    if unit % 2 != 0 {
+      if token.kind != TextTokenKind.Space { return false }
+    } else {
+      if token.kind != TextTokenKind.Text { return false }
+      let bytes = String.utf8Bytes(token.text)
+      if bytes.length == 0 { return false }
+      let mut at: usize = 0
+      while at < bytes.length {
+        let value = bytes[at]
+        if !(value >= 65 && value <= 90) && !(value >= 97 && value <= 122)
+          && !(at != 0 && at + 1 == bytes.length && (value == 46 || value == 63)) { return false }
+        at = at + 1
+      }
+    }
+    unit = unit + 1
+  }
+  return true
+}
+
+/// Appends the break opportunities of `context` to `output` and returns its bidi analysis.
+pub effect fn analyze(
+  state: &mut Analyzer,
+  context: TextContext<'_, '_>,
+  fonts: &FontState<'_>,
+  output: &mut List<TextBreak>,
+) -> TextAnalysis
+  ! OutOfMemoryError | TextError
+  ? &mut Allocator {
+  if simpleWords(&context, fonts) {
+    let mut next: usize = 2
+    while next < context.tokens.length {
+      run appendBreak(&mut output, TextCursor { unit: next, offset: 0 }, TextBreakKind.Soft)
+      next = next + 2
+    }
+    run appendBreak(&mut output, TextCursor { unit: context.tokens.length, offset: 0 }, TextBreakKind.Soft)
+    return TextAnalysis.uniform(context.tokens.length, 0, 0, true)
+  }
+  run flatten(&mut state, &context)
+  run breaks(&mut state, &context, fonts, &mut output)
+  return run levels(&mut state, &context)
+}

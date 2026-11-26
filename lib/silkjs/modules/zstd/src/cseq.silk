@@ -1,0 +1,453 @@
+//! The sequences section of a compressed block: a port of
+//! `lib/compress/zstd_compress_sequences.c` and of the entropy stage of
+//! `lib/compress/zstd_compress.c` (`ZSTD_seqToCodes`, `ZSTD_buildSequencesStatistics`,
+//! `ZSTD_entropyCompressSeqStore`) of Zstandard 1.5.7.
+import mem
+import errors
+import hist
+import cstate
+import cstate { SeqStore }
+import cparams
+import clit
+import fse_compress as fse
+import silk.core.ownership { Copy }
+import silk.num.u8
+import silk.num.u16
+import silk.num.i16
+import silk.num.i32
+import silk.num.u32
+import silk.num.usize
+import silk.simd.cpu { CpuFeatures }
+import silk.core.target { Arch, Target }
+
+// ---- The default distributions, as arrays of `i16` in memory. ----
+/// The size in bytes of the area that [`initConsts`] fills.
+pub const CONSTS_SIZE: usize = 256
+/// The offset of `LL_defaultNorm` in the constants area.
+pub const K_LL_NORM: usize = 0
+/// The offset of `ML_defaultNorm` in the constants area.
+pub const K_ML_NORM: usize = 72
+/// The offset of `OF_defaultNorm` in the constants area.
+pub const K_OF_NORM: usize = 180
+
+/// Writes the default distributions of the format at `consts[0..CONSTS_SIZE]`. The functions of
+/// this module that take `consts` read them there.
+pub unsafe fn initConsts(consts: [*]mut u8) -> () {
+  let mut i: usize = 0
+  while i < 36 { unsafe mem.w16(consts, K_LL_NORM + i * 2, i16.wrappingToU16(cstate.LL_DEFAULT_NORM[i])) i = i + 1 }
+  i = 0
+  while i < 53 { unsafe mem.w16(consts, K_ML_NORM + i * 2, i16.wrappingToU16(cstate.ML_DEFAULT_NORM[i])) i = i + 1 }
+  i = 0
+  while i < 29 { unsafe mem.w16(consts, K_OF_NORM + i * 2, i16.wrappingToU16(cstate.OF_DEFAULT_NORM[i])) i = i + 1 }
+}
+
+const K_INVERSE_PROBABILITY_LOG256: [u32; 256] = [
+  0, 2048, 1792, 1642, 1536, 1453, 1386, 1329, 1280, 1236, 1197, 1162, 1130, 1100, 1073, 1047,
+  1024, 1001, 980, 960, 941, 923, 906, 889, 874, 859, 844, 830, 817, 804, 791, 779,
+  768, 756, 745, 734, 724, 714, 704, 694, 685, 676, 667, 658, 650, 642, 633, 626,
+  618, 610, 603, 595, 588, 581, 574, 567, 561, 554, 548, 542, 535, 529, 523, 517,
+  512, 506, 500, 495, 489, 484, 478, 473, 468, 463, 458, 453, 448, 443, 438, 434,
+  429, 424, 420, 415, 411, 407, 402, 398, 394, 390, 386, 382, 377, 373, 370, 366,
+  362, 358, 354, 350, 347, 343, 339, 336, 332, 329, 325, 322, 318, 315, 311, 308,
+  305, 302, 298, 295, 292, 289, 286, 282, 279, 276, 273, 270, 267, 264, 261, 258,
+  256, 253, 250, 247, 244, 241, 239, 236, 233, 230, 228, 225, 222, 220, 217, 215,
+  212, 209, 207, 204, 202, 199, 197, 194, 192, 190, 187, 185, 182, 180, 178, 175,
+  173, 171, 168, 166, 164, 162, 159, 157, 155, 153, 151, 149, 146, 144, 142, 140,
+  138, 136, 134, 132, 130, 128, 126, 123, 121, 119, 117, 115, 114, 112, 110, 108,
+  106, 104, 102, 100, 98, 96, 94, 93, 91, 89, 87, 85, 83, 82, 80, 78,
+  76, 74, 73, 71, 69, 67, 66, 64, 62, 61, 59, 57, 55, 54, 52, 50,
+  49, 47, 46, 44, 42, 41, 39, 37, 36, 34, 33, 31, 30, 28, 26, 25,
+  23, 22, 20, 19, 17, 16, 14, 13, 11, 10, 8, 7, 5, 4, 2, 1
+]
+
+@inlineAlways
+unsafe fn cnt(count: [*]const u8, s: usize) -> u32 { return unsafe mem.r32(count, usize.wrappingMultiply(s, 4)) }
+
+/// `ZSTD_useLowProbCount`.
+pub fn useLowProbCount(nbSeq: usize) -> bool { return nbSeq >= 2048 }
+
+/// `ZSTD_NCountCost`: the size of the description of the table of `count`. `wksp` has 620 bytes.
+pub unsafe fn ncountCost(count: [*]const u8, max: u32, nbSeq: usize, fseLog: u32, wksp: [*]mut u8) -> usize {
+  let nrm = unsafe mem.add(wksp, 512)
+  let tableLog = fse.optimalTableLog(fseLog, nbSeq, max)
+  let e = unsafe fse.normalizeCount(nrm, tableLog, count, nbSeq, max, useLowProbCount(nbSeq))
+  if errors.isError(e) { return e }
+  return unsafe fse.writeNCount(wksp, 512, unsafe mem.ro(nrm), max, tableLog)
+}
+
+/// `ZSTD_entropyCost`: the cost in bits of encoding the distribution of `count` with its entropy.
+pub unsafe fn entropyCost(count: [*]const u8, max: u32, total: usize) -> usize {
+  let mut cost: u32 = 0
+  let mut s: u32 = 0
+  while s <= max {
+    let c = unsafe cnt(count, mem.z(s))
+    let mut nrm = mem.t32(mem.z(mem.m32(256, c)) / total)
+    if c != 0 && nrm == 0 { nrm = 1 }
+    cost = mem.a32(cost, mem.m32(c, K_INVERSE_PROBABILITY_LOG256[mem.z(nrm) & 255]))
+    s = s + 1
+  }
+  return mem.z(u32.shiftRight(cost, 8))
+}
+
+/// `ZSTD_fseBitCost`: the cost in bits of encoding the distribution of `count` with `ctable`, or
+/// an error if `ctable` cannot represent it.
+pub unsafe fn fseBitCost(ctable: [*]const u8, count: [*]const u8, max: u32) -> usize {
+  let kAccuracyLog: u32 = 8
+  let mut cost: usize = 0
+  let mut s: u32 = 0
+  let cstate_ = unsafe fse.initCState(ctable)
+  if u16.toU32(unsafe mem.r16(ctable, 2)) < max { return errors.err(errors.E_GENERIC) }
+  while s <= max {
+    let tableLog = cstate_.stateLog
+    let badCost = mem.shl32(tableLog + 1, kAccuracyLog)
+    let bitCost = unsafe fse.bitCost(cstate_.symbolTT, tableLog, s, kAccuracyLog)
+    let c = unsafe cnt(count, mem.z(s))
+    if c != 0 {
+      if bitCost >= badCost { return errors.err(errors.E_GENERIC) }
+      cost = mem.ua(cost, usize.wrappingMultiply(mem.z(c), mem.z(bitCost)))
+    }
+    s = s + 1
+  }
+  return usize.shiftRight(cost, 8)
+}
+
+/// `ZSTD_crossEntropyCost`: the cost in bits of encoding the distribution of `count` with the
+/// table of `norm`.
+pub unsafe fn crossEntropyCost(nrm: [*]const u8, accuracyLog: u32, count: [*]const u8, max: u32) -> usize {
+  let shift = 8 - accuracyLog
+  let mut cost: usize = 0
+  let mut s: u32 = 0
+  while s <= max {
+    let n = unsafe fse.norm(nrm, mem.z(s))
+    let normAcc: u32 = if n != -1 { i32.wrappingToU32(n) } else { 1 }
+    let norm256 = mem.shl32(normAcc, shift)
+    cost = mem.ua(cost, mem.z(mem.m32(unsafe cnt(count, mem.z(s)), K_INVERSE_PROBABILITY_LOG256[mem.z(norm256) & 255])))
+    s = s + 1
+  }
+  return usize.shiftRight(cost, 8)
+}
+
+/// `ZSTD_selectEncodingType`: chooses how the table of one kind of code is sent. `wksp` has 620
+/// bytes of scratch.
+pub unsafe fn selectEncodingType(repeatMode: &mut u32, count: [*]const u8, max: u32, mostFrequent: usize, nbSeq: usize, fseLog: u32, prevCTable: [*]const u8, defaultNorm: [*]const u8, defaultNormLog: u32, isDefaultAllowed: bool, strategy: u32, wksp: [*]mut u8) -> u32 {
+  if mostFrequent == nbSeq {
+    repeatMode.* = cstate.FSE_REPEAT_NONE
+    if isDefaultAllowed && nbSeq <= 2 {
+      // Prefer set_basic over set_rle when there are 2 or fewer symbols: RLE costs 1 byte more.
+      return cstate.SET_BASIC
+    }
+    return cstate.SET_RLE
+  }
+  if strategy < cparams.LAZY {
+    if isDefaultAllowed {
+      let staticFseNbSeqMax: usize = 1000
+      let mult: usize = mem.z(10 - strategy)
+      let baseLog: u32 = 3
+      let dynamicFseNbSeqMin = mem.shrz(usize.wrappingMultiply(mem.shlz(1, defaultNormLog), mult), baseLog)
+      if repeatMode.* == cstate.FSE_REPEAT_VALID && nbSeq < staticFseNbSeqMax { return cstate.SET_REPEAT }
+      if nbSeq < dynamicFseNbSeqMin || mostFrequent < mem.shrz(nbSeq, defaultNormLog - 1) {
+        // The format allows default tables to be repeated, but it is not useful: when the default
+        // is chosen, it is chosen again with high probability.
+        repeatMode.* = cstate.FSE_REPEAT_NONE
+        return cstate.SET_BASIC
+      }
+    }
+  } else {
+    let generic = errors.err(errors.E_GENERIC)
+    let basicCost = if isDefaultAllowed { unsafe crossEntropyCost(defaultNorm, defaultNormLog, count, max) } else { generic }
+    let repeatCost = if repeatMode.* != cstate.FSE_REPEAT_NONE { unsafe fseBitCost(prevCTable, count, max) } else { generic }
+    let nCountCost = unsafe ncountCost(count, max, nbSeq, fseLog, wksp)
+    let compressedCost = mem.ua(usize.shiftLeft(nCountCost, 3), unsafe entropyCost(count, max, nbSeq))
+    if basicCost <= repeatCost && basicCost <= compressedCost {
+      repeatMode.* = cstate.FSE_REPEAT_NONE
+      return cstate.SET_BASIC
+    }
+    if repeatCost <= compressedCost { return cstate.SET_REPEAT }
+  }
+  repeatMode.* = cstate.FSE_REPEAT_CHECK
+  return cstate.SET_COMPRESSED
+}
+
+// Layout of `ZSTD_BuildCTableWksp`: `i16 norm[53]`, then `u32 wksp[285]`.
+const BW_WKSP: usize = 108
+const BW_WKSP_SIZE: usize = 1140
+
+/// `ZSTD_buildCTable`: builds `nextCTable` for `type_` and writes its description at `dst`.
+/// Returns the size of the description.
+pub unsafe fn buildCTable(dst: [*]mut u8, dstCapacity: usize, nextCTable: [*]mut u8, fseLog: u32, type_: u32, count: [*]mut u8, max: u32, codeTable: [*]const u8, nbSeq: usize, defaultNorm: [*]const u8, defaultNormLog: u32, defaultMax: u32, prevCTable: [*]const u8, prevCTableSize: usize, entropyWorkspace: [*]mut u8, entropyWorkspaceSize: usize) -> usize {
+  if type_ == cstate.SET_RLE {
+    let e = unsafe fse.buildCTableRle(nextCTable, u32.wrappingToU8(max))
+    if errors.isError(e) { return e }
+    if dstCapacity == 0 { return errors.err(errors.E_DSTSIZE_TOOSMALL) }
+    unsafe mem.w8(dst, 0, unsafe mem.r8(codeTable, 0))
+    return 1
+  }
+  if type_ == cstate.SET_REPEAT {
+    let _c = unsafe mem.memcpy(nextCTable, prevCTable, prevCTableSize)
+    return 0
+  }
+  if type_ == cstate.SET_BASIC {
+    let e = unsafe fse.buildCTable(nextCTable, defaultNorm, defaultMax, defaultNormLog, entropyWorkspace, entropyWorkspaceSize)
+    if errors.isError(e) { return e }
+    return 0
+  }
+  if type_ == cstate.SET_COMPRESSED {
+    let nrm = entropyWorkspace
+    let mut nbSeq1 = nbSeq
+    let tableLog = fse.optimalTableLog(fseLog, nbSeq, max)
+    let last = u8.toUsize(unsafe mem.r8(codeTable, nbSeq - 1))
+    let lastCount = unsafe cnt(unsafe mem.ro(count), last)
+    if lastCount > 1 {
+      unsafe mem.w32(count, last * 4, lastCount - 1)
+      nbSeq1 = nbSeq1 - 1
+    }
+    let e = unsafe fse.normalizeCount(nrm, tableLog, unsafe mem.ro(count), nbSeq1, max, useLowProbCount(nbSeq1))
+    if errors.isError(e) { return e }
+    let nCountSize = unsafe fse.writeNCount(dst, dstCapacity, unsafe mem.ro(nrm), max, tableLog)
+    if errors.isError(nCountSize) { return nCountSize }
+    let e2 = unsafe fse.buildCTable(nextCTable, unsafe mem.ro(nrm), max, tableLog, unsafe mem.add(entropyWorkspace, BW_WKSP), BW_WKSP_SIZE)
+    if errors.isError(e2) { return e2 }
+    return nCountSize
+  }
+  return errors.err(errors.E_GENERIC)
+}
+
+// `LL_bits` and `ML_bits` padded to 64 entries, so that an index masked with 63 needs no bounds
+// check in the sequence encoder's loop.
+const LL_BITS64: [u8; 64] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 3, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+const ML_BITS64: [u8; 64] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 3, 3, 4, 4, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+
+/// `ZSTD_encodeSequences`: writes the bitstream of the `nbSeq` sequences at `sequences`.
+// Where the CPU has BMI2 the body runs compiled for it, as `ZSTD_encodeSequences_bmi2` does in
+// the reference: the bit writer's variable shifts become single instructions.
+pub unsafe fn encodeSequences(dst: [*]mut u8, dstCapacity: usize, ctableMatchLength: [*]const u8, mlCodeTable: [*]const u8, ctableOffsetBits: [*]const u8, ofCodeTable: [*]const u8, ctableLitLength: [*]const u8, llCodeTable: [*]const u8, sequences: [*]const u8, nbSeq: usize, longOffsets: bool) -> usize {
+  static if Target.arch() == Arch.X86_64 {
+    if CpuFeatures.available("bmi2") { return unsafe encodeSequencesBmi2(dst, dstCapacity, ctableMatchLength, mlCodeTable, ctableOffsetBits, ofCodeTable, ctableLitLength, llCodeTable, sequences, nbSeq, longOffsets) }
+  }
+  return unsafe encodeSequencesBody(dst, dstCapacity, ctableMatchLength, mlCodeTable, ctableOffsetBits, ofCodeTable, ctableLitLength, llCodeTable, sequences, nbSeq, longOffsets)
+}
+
+static if Target.arch() == Arch.X86_64 {
+  @features("bmi2")
+  @inlineNever
+  unsafe fn encodeSequencesBmi2(dst: [*]mut u8, dstCapacity: usize, ctableMatchLength: [*]const u8, mlCodeTable: [*]const u8, ctableOffsetBits: [*]const u8, ofCodeTable: [*]const u8, ctableLitLength: [*]const u8, llCodeTable: [*]const u8, sequences: [*]const u8, nbSeq: usize, longOffsets: bool) -> usize { return unsafe encodeSequencesBody(dst, dstCapacity, ctableMatchLength, mlCodeTable, ctableOffsetBits, ofCodeTable, ctableLitLength, llCodeTable, sequences, nbSeq, longOffsets) }
+}
+
+@inlineAlways
+unsafe fn encodeSequencesBody(dst: [*]mut u8, dstCapacity: usize, ctableMatchLength: [*]const u8, mlCodeTable: [*]const u8, ctableOffsetBits: [*]const u8, ofCodeTable: [*]const u8, ctableLitLength: [*]const u8, llCodeTable: [*]const u8, sequences: [*]const u8, nbSeq: usize, longOffsets: bool) -> usize {
+  if dstCapacity <= 8 { return errors.err(errors.E_DSTSIZE_TOOSMALL) }
+  let mut blockStream = fse.bitInit(dst, dstCapacity)
+  let last = nbSeq - 1
+  // First symbols.
+  let mut stateMatchLength = unsafe fse.initCState2(ctableMatchLength, u8.toU32(unsafe mem.r8(mlCodeTable, last)))
+  let mut stateOffsetBits = unsafe fse.initCState2(ctableOffsetBits, u8.toU32(unsafe mem.r8(ofCodeTable, last)))
+  let mut stateLitLength = unsafe fse.initCState2(ctableLitLength, u8.toU32(unsafe mem.r8(llCodeTable, last)))
+  fse.bitAdd(&mut blockStream, u16.toU64(unsafe mem.r16(sequences, last * 8 + 4)), u8.toU32(LL_BITS64[u8.toUsize(unsafe mem.r8(llCodeTable, last)) & 63]))
+  fse.bitAdd(&mut blockStream, u16.toU64(unsafe mem.r16(sequences, last * 8 + 6)), u8.toU32(ML_BITS64[u8.toUsize(unsafe mem.r8(mlCodeTable, last)) & 63]))
+  let lastOffBase = u32.toU64(unsafe mem.r32(sequences, last * 8))
+  let lastOfBits = u8.toU32(unsafe mem.r8(ofCodeTable, last))
+  if longOffsets {
+    let extraBits = lastOfBits - (if lastOfBits < 56 { lastOfBits } else { 56 })
+    if extraBits != 0 {
+      fse.bitAdd(&mut blockStream, lastOffBase, extraBits)
+      unsafe fse.bitFlush(&mut blockStream)
+    }
+    fse.bitAdd(&mut blockStream, mem.shr64(lastOffBase, extraBits), lastOfBits - extraBits)
+  } else {
+    fse.bitAdd(&mut blockStream, lastOffBase, lastOfBits)
+  }
+  unsafe fse.bitFlush(&mut blockStream)
+  let mut n = last
+  while n > 0 {
+    n = n - 1
+    let llCode = u8.toU32(unsafe mem.r8(llCodeTable, n))
+    let ofCode = u8.toU32(unsafe mem.r8(ofCodeTable, n))
+    let mlCode = u8.toU32(unsafe mem.r8(mlCodeTable, n))
+    let llBits = u8.toU32(LL_BITS64[mem.z(llCode) & 63])
+    let ofBits = ofCode
+    let mlBits = u8.toU32(ML_BITS64[mem.z(mlCode) & 63])
+    let at = usize.wrappingMultiply(n, 8)
+    unsafe fse.encodeSymbol(&mut blockStream, &mut stateOffsetBits, ofCode)
+    unsafe fse.encodeSymbol(&mut blockStream, &mut stateMatchLength, mlCode)
+    unsafe fse.encodeSymbol(&mut blockStream, &mut stateLitLength, llCode)
+    let totalBits = u32.wrappingAdd(u32.wrappingAdd(ofBits, mlBits), llBits)
+    if totalBits >= 64 - 7 - (9 + 9 + 8) { unsafe fse.bitFlush(&mut blockStream) }
+    fse.bitAdd(&mut blockStream, u16.toU64(unsafe mem.r16(sequences, at + 4)), llBits)
+    fse.bitAdd(&mut blockStream, u16.toU64(unsafe mem.r16(sequences, at + 6)), mlBits)
+    if totalBits > 56 { unsafe fse.bitFlush(&mut blockStream) }
+    let offBase = u32.toU64(unsafe mem.r32(sequences, at))
+    if longOffsets {
+      let extraBits = ofBits - (if ofBits < 56 { ofBits } else { 56 })
+      if extraBits != 0 {
+        fse.bitAdd(&mut blockStream, offBase, extraBits)
+        unsafe fse.bitFlush(&mut blockStream)
+      }
+      fse.bitAdd(&mut blockStream, mem.shr64(offBase, extraBits), ofBits - extraBits)
+    } else {
+      fse.bitAdd(&mut blockStream, offBase, ofBits)
+    }
+    unsafe fse.bitFlush(&mut blockStream)
+  }
+  unsafe fse.flushCState(&mut blockStream, &stateMatchLength)
+  unsafe fse.flushCState(&mut blockStream, &stateOffsetBits)
+  unsafe fse.flushCState(&mut blockStream, &stateLitLength)
+  let streamSize = unsafe fse.bitClose(&mut blockStream)
+  if streamSize == 0 { return errors.err(errors.E_DSTSIZE_TOOSMALL) }
+  return streamSize
+}
+
+/// `ZSTD_seqToCodes`: fills the code tables of the store from its sequences. Returns whether
+/// long offsets are in use, which is never the case on a 64-bit target.
+pub unsafe fn seqToCodes(s: &SeqStore) -> bool {
+  let sequences = unsafe mem.ro(s.sequencesStart)
+  let nbSeq = s.nbSeq
+  let mut u: usize = 0
+  while u < nbSeq {
+    let at = usize.wrappingMultiply(u, 8)
+    let llv = u16.toU32(unsafe mem.r16(sequences, at + 4))
+    let ofCode = mem.highbit32(unsafe mem.r32(sequences, at))
+    let mlv = u16.toU32(unsafe mem.r16(sequences, at + 6))
+    unsafe mem.w8(s.llCode, u, u32.wrappingToU8(cstate.llCode(llv)))
+    unsafe mem.w8(s.ofCode, u, u32.wrappingToU8(ofCode))
+    unsafe mem.w8(s.mlCode, u, u32.wrappingToU8(cstate.mlCode(mlv)))
+    u = mem.ua(u, 1)
+  }
+  if s.longLengthType == cstate.LLT_LITERAL_LENGTH { unsafe mem.w8(s.llCode, mem.z(s.longLengthPos), 35) }
+  if s.longLengthType == cstate.LLT_MATCH_LENGTH { unsafe mem.w8(s.mlCode, mem.z(s.longLengthPos), 52) }
+  return false
+}
+
+/// `ZSTD_symbolEncodingTypeStats_t`.
+pub struct Stats {
+  pub llType: u32,
+  pub offType: u32,
+  pub mlType: u32,
+  /// The size of the table descriptions, or an error.
+  pub size: usize,
+  pub lastCountSize: usize,
+  pub longOffsets: bool,
+}
+impl Copy for Stats {}
+
+/// `ZSTD_buildSequencesStatistics`: chooses and builds the three tables of the block into
+/// `nextEntropy` (`ZSTD_fseCTables_t` at `CBS_OF_CTABLE` of a block state; here the pointers are
+/// to whole block states) and writes their descriptions at `dst`.
+pub unsafe fn buildSequencesStatistics(s: &SeqStore, nbSeq: usize, prevBlock: [*]const u8, nextBlock: [*]mut u8, dst: [*]mut u8, dstCapacity: usize, strategy: u32, countWorkspace: [*]mut u8, entropyWorkspace: [*]mut u8, entropyWkspSize: usize, consts: [*]const u8) -> Stats {
+  let mut op: usize = 0
+  let oend = dstCapacity
+  let ctableLitLength = unsafe mem.add(nextBlock, cstate.CBS_LL_CTABLE)
+  let ctableOffsetBits = unsafe mem.add(nextBlock, cstate.CBS_OF_CTABLE)
+  let ctableMatchLength = unsafe mem.add(nextBlock, cstate.CBS_ML_CTABLE)
+  let ofCodeTable = unsafe mem.ro(s.ofCode)
+  let llCodeTable = unsafe mem.ro(s.llCode)
+  let mlCodeTable = unsafe mem.ro(s.mlCode)
+  let count = unsafe mem.ro(countWorkspace)
+  let mut stats = Stats { llType: 0, offType: 0, mlType: 0, size: 0, lastCountSize: 0, longOffsets: false }
+  // Convert length and distances into codes.
+  stats.longOffsets = unsafe seqToCodes(&s)
+  // Build the CTable for literal lengths.
+  let mut max: u32 = cstate.MAX_LL
+  let mut mostFrequent = unsafe hist.countFast(countWorkspace, &mut max, llCodeTable, nbSeq, entropyWorkspace, entropyWkspSize)
+  let mut repeatMode = unsafe mem.r32(prevBlock, cstate.CBS_LL_REPEAT)
+  stats.llType = unsafe selectEncodingType(&mut repeatMode, count, max, mostFrequent, nbSeq, cstate.LL_FSE_LOG, unsafe mem.addc(prevBlock, cstate.CBS_LL_CTABLE), unsafe mem.addc(consts, K_LL_NORM), cstate.LL_DEFAULT_NORM_LOG, true, strategy, entropyWorkspace)
+  unsafe mem.w32(nextBlock, cstate.CBS_LL_REPEAT, repeatMode)
+  let mut countSize = unsafe buildCTable(unsafe mem.add(dst, op), oend - op, ctableLitLength, cstate.LL_FSE_LOG, stats.llType, countWorkspace, max, llCodeTable, nbSeq, unsafe mem.addc(consts, K_LL_NORM), cstate.LL_DEFAULT_NORM_LOG, cstate.MAX_LL, unsafe mem.addc(prevBlock, cstate.CBS_LL_CTABLE), cstate.LL_CTABLE_BYTES, entropyWorkspace, entropyWkspSize)
+  if errors.isError(countSize) { stats.size = countSize return stats }
+  if stats.llType == cstate.SET_COMPRESSED { stats.lastCountSize = countSize }
+  op = op + countSize
+  // Build the CTable for offsets.
+  max = cstate.MAX_OFF
+  mostFrequent = unsafe hist.countFast(countWorkspace, &mut max, ofCodeTable, nbSeq, entropyWorkspace, entropyWkspSize)
+  // We can only use the basic table if max <= DefaultMaxOff, otherwise the offsets are too large.
+  let defaultAllowed = max <= cstate.DEFAULT_MAX_OFF
+  repeatMode = unsafe mem.r32(prevBlock, cstate.CBS_OF_REPEAT)
+  stats.offType = unsafe selectEncodingType(&mut repeatMode, count, max, mostFrequent, nbSeq, cstate.OFF_FSE_LOG, unsafe mem.addc(prevBlock, cstate.CBS_OF_CTABLE), unsafe mem.addc(consts, K_OF_NORM), cstate.OF_DEFAULT_NORM_LOG, defaultAllowed, strategy, entropyWorkspace)
+  unsafe mem.w32(nextBlock, cstate.CBS_OF_REPEAT, repeatMode)
+  countSize = unsafe buildCTable(unsafe mem.add(dst, op), oend - op, ctableOffsetBits, cstate.OFF_FSE_LOG, stats.offType, countWorkspace, max, ofCodeTable, nbSeq, unsafe mem.addc(consts, K_OF_NORM), cstate.OF_DEFAULT_NORM_LOG, cstate.DEFAULT_MAX_OFF, unsafe mem.addc(prevBlock, cstate.CBS_OF_CTABLE), cstate.OF_CTABLE_BYTES, entropyWorkspace, entropyWkspSize)
+  if errors.isError(countSize) { stats.size = countSize return stats }
+  if stats.offType == cstate.SET_COMPRESSED { stats.lastCountSize = countSize }
+  op = op + countSize
+  // Build the CTable for match lengths.
+  max = cstate.MAX_ML
+  mostFrequent = unsafe hist.countFast(countWorkspace, &mut max, mlCodeTable, nbSeq, entropyWorkspace, entropyWkspSize)
+  repeatMode = unsafe mem.r32(prevBlock, cstate.CBS_ML_REPEAT)
+  stats.mlType = unsafe selectEncodingType(&mut repeatMode, count, max, mostFrequent, nbSeq, cstate.ML_FSE_LOG, unsafe mem.addc(prevBlock, cstate.CBS_ML_CTABLE), unsafe mem.addc(consts, K_ML_NORM), cstate.ML_DEFAULT_NORM_LOG, true, strategy, entropyWorkspace)
+  unsafe mem.w32(nextBlock, cstate.CBS_ML_REPEAT, repeatMode)
+  countSize = unsafe buildCTable(unsafe mem.add(dst, op), oend - op, ctableMatchLength, cstate.ML_FSE_LOG, stats.mlType, countWorkspace, max, mlCodeTable, nbSeq, unsafe mem.addc(consts, K_ML_NORM), cstate.ML_DEFAULT_NORM_LOG, cstate.MAX_ML, unsafe mem.addc(prevBlock, cstate.CBS_ML_CTABLE), cstate.ML_CTABLE_BYTES, entropyWorkspace, entropyWkspSize)
+  if errors.isError(countSize) { stats.size = countSize return stats }
+  if stats.mlType == cstate.SET_COMPRESSED { stats.lastCountSize = countSize }
+  op = op + countSize
+  stats.size = op
+  return stats
+}
+
+/// `COMPRESS_SEQUENCES_WORKSPACE_SIZE`: the bytes of the count table before the entropy workspace.
+const COUNT_WORKSPACE_SIZE: usize = 212
+
+// `ZSTD_entropyCompressSeqStore_internal`.
+unsafe fn entropyCompressSeqStoreInternal(dst: [*]mut u8, dstCapacity: usize, literals: [*]const u8, litSize: usize, s: &SeqStore, prevBlock: [*]const u8, nextBlock: [*]mut u8, strategy: u32, disableLiteralCompression: bool, workspace: [*]mut u8, wkspSize: usize, consts: [*]const u8) -> usize {
+  let count = workspace
+  let nbSeq = s.nbSeq
+  let oend = dstCapacity
+  let mut op: usize = 0
+  let entropyWorkspace = unsafe mem.add(workspace, COUNT_WORKSPACE_SIZE)
+  let entropyWkspSize = wkspSize - COUNT_WORKSPACE_SIZE
+  // Compress the literals.
+  let suspectUncompressible = nbSeq == 0 || (litSize / nbSeq >= 20)
+  let cSize = unsafe clit.compressLiterals(dst, dstCapacity, literals, litSize, entropyWorkspace, entropyWkspSize, prevBlock, nextBlock, strategy, disableLiteralCompression, suspectUncompressible)
+  if errors.isError(cSize) { return cSize }
+  op = op + cSize
+  // Sequences header.
+  if oend - op < 3 + 1 { return errors.err(errors.E_DSTSIZE_TOOSMALL) }
+  if nbSeq < 128 {
+    unsafe mem.w8(dst, op, usize.wrappingToU8(nbSeq))
+    op = op + 1
+  } else if nbSeq < cstate.LONGNBSEQ {
+    unsafe mem.w8(dst, op, usize.wrappingToU8(usize.shiftRight(nbSeq, 8) + 0x80))
+    unsafe mem.w8(dst, op + 1, usize.wrappingToU8(nbSeq))
+    op = op + 2
+  } else {
+    unsafe mem.w8(dst, op, 0xFF)
+    unsafe mem.w16(dst, op + 1, usize.wrappingToU16(nbSeq - cstate.LONGNBSEQ))
+    op = op + 3
+  }
+  if nbSeq == 0 {
+    // Copy the entropy tables.
+    let _c = unsafe mem.memcpy(unsafe mem.add(nextBlock, cstate.CBS_OF_CTABLE), unsafe mem.addc(prevBlock, cstate.CBS_OF_CTABLE), cstate.CBS_FSE_SIZE)
+    return op
+  }
+  let seqHead = op
+  op = op + 1
+  // Build stats for the sequences.
+  let stats = unsafe buildSequencesStatistics(&s, nbSeq, prevBlock, nextBlock, unsafe mem.add(dst, op), oend - op, strategy, count, entropyWorkspace, entropyWkspSize, consts)
+  if errors.isError(stats.size) { return stats.size }
+  unsafe mem.w8(dst, seqHead, u32.wrappingToU8(u32.shiftLeft(stats.llType, 6) + u32.shiftLeft(stats.offType, 4) + u32.shiftLeft(stats.mlType, 2)))
+  let lastCountSize = stats.lastCountSize
+  op = op + stats.size
+  let bitstreamSize = unsafe encodeSequences(unsafe mem.add(dst, op), oend - op,
+    unsafe mem.addc(unsafe mem.ro(nextBlock), cstate.CBS_ML_CTABLE), unsafe mem.ro(s.mlCode),
+    unsafe mem.addc(unsafe mem.ro(nextBlock), cstate.CBS_OF_CTABLE), unsafe mem.ro(s.ofCode),
+    unsafe mem.addc(unsafe mem.ro(nextBlock), cstate.CBS_LL_CTABLE), unsafe mem.ro(s.llCode),
+    unsafe mem.ro(s.sequencesStart), nbSeq, stats.longOffsets)
+  if errors.isError(bitstreamSize) { return bitstreamSize }
+  op = op + bitstreamSize
+  // zstd versions <= 1.3.4 mistakenly report corruption when FSE_readNCount() receives a buffer
+  // of fewer than 4 bytes: emit an uncompressed block in that case.
+  if lastCountSize != 0 && lastCountSize + bitstreamSize < 4 { return 0 }
+  return op
+}
+
+/// `ZSTD_entropyCompressSeqStore`: compresses the literals and sequences of the store into `dst`.
+/// Returns 0 if the block is not compressible. `prevBlock` and `nextBlock` are block states
+/// (`cstate.CBS_*`); `workspace` is the `tmpWorkspace` of the context.
+pub unsafe fn entropyCompressSeqStore(s: &SeqStore, prevBlock: [*]const u8, nextBlock: [*]mut u8, strategy: u32, disableLiteralCompression: bool, dst: [*]mut u8, dstCapacity: usize, srcSize: usize, workspace: [*]mut u8, wkspSize: usize, consts: [*]const u8) -> usize {
+  let cSize = unsafe entropyCompressSeqStoreInternal(dst, dstCapacity, unsafe mem.ro(s.litStart), s.litSize, &s, prevBlock, nextBlock, strategy, disableLiteralCompression, workspace, wkspSize, consts)
+  if cSize == 0 { return 0 }
+  // When the block does not fit although `dstCapacity >= srcSize`, the block is not compressible.
+  if cSize == errors.err(errors.E_DSTSIZE_TOOSMALL) && srcSize <= dstCapacity { return 0 }
+  if errors.isError(cSize) { return cSize }
+  // Check compressibility.
+  let maxCSize = srcSize - clit.minGain(srcSize, strategy)
+  if cSize >= maxCSize { return 0 }
+  return cSize
+}

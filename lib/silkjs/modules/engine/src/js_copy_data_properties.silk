@@ -1,0 +1,340 @@
+//! JS_CopyDataProperties, pinned quickjs.c:17200-17273. All inputs are borrowed
+//! roots through callbacks; only the enumerator's atoms and fetched values are owned.
+//! Ordinary sources snapshot enumerability. Exotic ownKeys sources recheck each
+//! descriptor AFTER exclusion, preserving observable proxy/getter ordering.
+import js_realm { Realm }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.num.u32
+import silk.mem.pointer { Pointer }
+import js_heap { HeapCell, HeapHeader }
+import js_value { ValueBits }
+import js_owned_value { ValueRef }
+import js_core_types { RuntimeState, ObjectData, ExoticCallbacks, PropertyDescriptor, ShapeData, ShapeProperty, SlotBits,
+  PropertyEnum, EXOTIC_GET_OWN_PROPERTY_NAMES, JS_PROP_ENUMERABLE, JS_PROP_C_W_E, JS_PROP_TMASK, JS_PROP_WRITABLE }
+import js_shapes as shapes
+import js_shapes { AddResult }
+import js_class_data as classes
+import js_gc as gc
+import silk.num.u8
+import js_gc { HeapHooks }
+import js_runtime as runtime
+import js_coercion_host { CoercionHooks, getPropertyOwned }
+import js_property_host { OwnKeysHooks, OwnPropertyHooks }
+import js_property_write_host { PropertyWriteHooks }
+import js_property_names as names
+import js_property_names { OwnKeysError, JS_GPN_STRING_MASK, JS_GPN_SYMBOL_MASK, JS_GPN_ENUM_ONLY }
+import js_property_descriptors as descriptors
+import js_property_mutations as mutations
+import js_string_types { StringLengthError }
+import js_bigint { BigIntError }
+import js_exceptions { JsException }
+import js_invariant { invariant }
+
+fn enumerationFlags<'a, 'b>(realm: Realm<'a>, source: ValueRef<'b>) -> u32 {
+  let node = match source.view() { ValueBits.Object { reference } => reference _ => invariant() }
+  let anchor = () let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, node)
+  let flags = JS_GPN_STRING_MASK | JS_GPN_SYMBOL_MASK | JS_GPN_ENUM_ONLY
+  if !object.isExotic() { return flags }
+  let state = realm.runtimeState(&anchor)
+  match &state.classes.asSlice()[u32.toUsize(object.classId())].exotic {
+    Option<ExoticCallbacks>.Some { value } => {
+      if (value.methodMask & EXOTIC_GET_OWN_PROPERTY_NAMES) != 0 { return flags & ~JS_GPN_ENUM_ONLY }
+    }
+    Option<ExoticCallbacks>.None => ()
+  }
+  return flags
+}
+fn plainObject(value: ValueBits) -> Option<*mut HeapHeader> {
+  let node = match value { ValueBits.Object { reference } => reference _ => { return Option<*mut HeapHeader>.none() } }
+  let anchor = () let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, node)
+  if data.classId() != classes.JS_CLASS_OBJECT || data.isExotic() { return Option<*mut HeapHeader>.none() }
+  return Option<*mut HeapHeader>.some(node)
+}
+// The value of source's own plain data property atom, retained, or Uninitialized
+// when it has no such property or it is an accessor or other special slot.
+unsafe fn ownDataValue(source: *mut HeapHeader, atom: u32) -> ValueBits {
+  let anchor = () let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, source)
+  return match unsafe shapes.lookup(data.shape, atom) {
+    Option<usize>.Some { value: index } => {
+      let shape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, data.shape)
+      let flags = u8.toU32(shape.properties.get(index).flags) drop shape
+      if (flags & JS_PROP_TMASK) != 0 { return ValueBits.Uninitialized }
+      unsafe data.slot(index).valueBits().retained()
+    }
+    Option<usize>.None => ValueBits.Uninitialized
+  }
+}
+/// Whether no object on the chain from prototype has a property named atom, so
+/// [[Set]] of atom on an ordinary object without it only defines a data
+/// property: no setter to call, no read-only property to refuse it. Only
+/// ordinary objects are looked through (an exotic one may hold names its shape
+/// does not).
+unsafe fn chainLacks(prototype: ?*mut HeapHeader, atom: u32) -> bool {
+  let mut cursor = prototype
+  let mut depth: usize = 0
+  while true {
+    let node = match Pointer.nonNullMut<HeapHeader>(cursor) { Option<*mut HeapHeader>.Some { value } => value Option<*mut HeapHeader>.None => { return true } }
+    depth = depth + 1
+    if depth > 8 { return false }
+    let anchor = () let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, node)
+    if data.isExotic() || data.fastArray() { return false }
+    if let Option<usize>.Some { .. } = unsafe shapes.lookup(data.shape, atom) { return false }
+    cursor = (unsafe HeapCell.payload<ShapeData, ()>(&anchor, data.shape)).prototype
+  }
+  return true
+}
+/// [[Set]] of a data value on target, an ordinary object that is not a
+/// prototype, when it runs no code: target holds atom as a writable plain data
+/// property (the slot is replaced), or it and its chain lack atom (a data
+/// property is added). Takes value only when it returns true.
+unsafe effect fn assignDataProperty<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, target: *mut HeapHeader, atom: u32, value: ValueBits) -> bool
+  ? &mut Allocator {
+  let mut anchor = () let data = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, target)
+  if data.isPrototype() { return false }
+  match unsafe shapes.lookup(data.shape, atom) {
+    Option<usize>.Some { value: index } => {
+      let flags = u8.toU32(unsafe shapes.slotFlags(data.shape, index))
+      if (flags & JS_PROP_TMASK) != 0 || (flags & JS_PROP_WRITABLE) == 0 { return false }
+      let old = (unsafe data.slotUnchecked(index)).valueBits()
+      unsafe data.setSlotUnchecked(index, SlotBits.value(value))
+      drop data
+      unsafe gc.release(&mut hooks, runtime, old)
+      return true
+    }
+    Option<usize>.None => ()
+  }
+  let shapeAnchor = ()
+  let prototype = (unsafe HeapCell.payload<ShapeData, ()>(&shapeAnchor, data.shape)).prototype
+  drop data
+  if !unsafe chainLacks(prototype, atom) { return false }
+  return run unsafe addDataProperty(&mut hooks, runtime, target, atom, value)
+}
+struct AddFailed { error: OutOfMemoryError }
+effect fn addFailed(error: OutOfMemoryError) -> AddFailed { return AddFailed { error: move error } }
+// CreateDataProperty of a key target does not have yet on an ordinary extensible
+// object: the same shape transition an object literal takes. Takes ownership of
+// value only when it returns true; anything else is left to the generic define.
+unsafe effect fn addDataProperty<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, target: *mut HeapHeader, atom: u32, value: ValueBits) -> bool
+  ? &mut Allocator {
+  let mut anchor = () let data = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, target)
+  if !data.extensible() || data.isStandardArrayPrototype() { return false }
+  match unsafe shapes.lookup(data.shape, atom) { Option<usize>.Some { .. } => { return false } Option<usize>.None => () }
+  let added = match run Intrinsic.catchFailure<OutOfMemoryError>(unsafe shapes.addProperty(runtime, &mut data, atom, u32.toU8(JS_PROP_C_W_E)), addFailed) {
+    AddResult result => move result
+    AddFailed { .. } => { return false }
+  }
+  data.setSlot(added.index, SlotBits.value(value)) drop data
+  unsafe gc.releaseOptional(&mut hooks, runtime, added.retiredShape)
+  return true
+}
+/// The shape a spread of source ({...source}) can give its result: source is an
+/// ordinary object whose own properties are all plain enumerable data properties
+/// of an interned shape, so defining each one in order on an empty ordinary
+/// object with the same prototype walks the same transitions to that shape.
+/// Null when it does not apply. Borrowed: the caller takes its own reference.
+pub unsafe fn plainCloneShape(runtime: *mut HeapHeader, source: ValueBits) -> ?*mut HeapHeader {
+  let from = match plainObject(source) { Option<*mut HeapHeader>.Some { value } => value Option<*mut HeapHeader>.None => { return Pointer.null<HeapHeader>() } }
+  let sourceAnchor = ()
+  let sourceData = unsafe HeapCell.payload<ObjectData, ()>(&sourceAnchor, from)
+  let shape = sourceData.shape
+  let shapeAnchor = ()
+  let shapeData = unsafe HeapCell.payload<ShapeData, ()>(&shapeAnchor, shape)
+  let count = shapeData.properties.length()
+  if !shapeData.isHashed || shapeData.deletedPropertyCount != 0 || count == 0 || sourceData.slotCount() != count { return Pointer.null<HeapHeader>() }
+  let version = shapeData.version
+  let stateAnchor = ()
+  let known = (unsafe HeapCell.payload<RuntimeState, ()>(&stateAnchor, runtime)).plainCloneVersion == version
+  if !known {
+    let mut i: usize = 0
+    while i < count {
+      let property = unsafe shapes.unchecked<ShapeProperty>(&shapeData.properties, i)
+      if u8.toU32(property.flags) != JS_PROP_C_W_E || property.atom == 0 { return Pointer.null<HeapHeader>() }
+      i = i + 1
+    }
+    let mut noteAnchor = ()
+    let note = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut noteAnchor, runtime)
+    note.plainCloneVersion = version
+    drop note
+  }
+  return unsafe Intrinsic.pointerRequalify<*mut HeapHeader, ?*mut HeapHeader>(shape)
+}
+// One block copy of the plain value slots, then a retain pass over the heap ones.
+// Every record is plain data, so each slot is a ValueBits: copy and scan for
+// heap values in one pass. target has room for count slots and holds none.
+@inlineAlways
+unsafe fn copyPlainSlots(target: &mut ObjectData, source: &ObjectData, count: usize) -> () {
+  let first = unsafe Intrinsic.pointerRequalify<?[*]const SlotBits, [*]const SlotBits>(Pointer.fromSlice<SlotBits>(source.slotView()))
+  let spare = unsafe Intrinsic.pointerReinterpret<[*]mut SlotBits, [*]mut ValueBits>(unsafe target.slotListMut().spareFor(count))
+  let heap = unsafe ValueBits.copyScan(spare, unsafe Intrinsic.pointerReinterpret<[*]const SlotBits, [*]const ValueBits>(first), count)
+  unsafe target.slotListMut().extendFilled(count)
+  let mut i: usize = 0
+  if !heap { i = count }
+  while i < count {
+    let slot = unsafe target.slotUnchecked(i) let value = slot.valueBits()
+    if let Option<*mut HeapHeader>.Some { value: cell } = ValueBits.heapReference(&value) { unsafe HeapCell.retain(cell) }
+    i = i + 1
+  }
+}
+/// {...source} into fresh, an unpublished plain object just made from
+/// plainCloneShape(source)'s shape, whose slots are all still Undefined.
+pub unsafe fn fillClone(fresh: *mut HeapHeader, source: ValueBits) -> () {
+  let from = match plainObject(source) { Option<*mut HeapHeader>.Some { value } => value Option<*mut HeapHeader>.None => { return () } }
+  let sourceAnchor = ()
+  let sourceData = unsafe HeapCell.payload<ObjectData, ()>(&sourceAnchor, from)
+  let mut targetAnchor = ()
+  let targetData = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut targetAnchor, fresh)
+  let count = targetData.slotCount()
+  targetData.slotListMut().clear()
+  unsafe copyPlainSlots(&mut targetData, &sourceData, count)
+}
+/// fillClone when from is already verified plain and fresh was allocated with
+/// ordinaryFromShapeWritten(..., count) so its slot length is already count.
+@inlineAlways
+pub unsafe fn fillCloneWritten(fresh: *mut HeapHeader, from: *mut HeapHeader, count: usize) -> () {
+  if count == 0 { return () }
+  let sourceAnchor = ()
+  let sourceData = unsafe HeapCell.payload<ObjectData, ()>(&sourceAnchor, from)
+  let mut targetAnchor = ()
+  let targetData = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut targetAnchor, fresh)
+  let first = unsafe Intrinsic.pointerRequalify<?[*]const SlotBits, [*]const SlotBits>(Pointer.fromSlice<SlotBits>(sourceData.slotView()))
+  let dest = unsafe Intrinsic.pointerReinterpret<[*]mut SlotBits, [*]mut ValueBits>(unsafe targetData.slotListMut().dataMut())
+  let heap = unsafe ValueBits.copyScan(dest, unsafe Intrinsic.pointerReinterpret<[*]const SlotBits, [*]const ValueBits>(first), count)
+  if heap {
+    let mut i: usize = 0
+    while i < count {
+      let value = unsafe Pointer.read<ValueBits>(unsafe Pointer.atMut<ValueBits>(dest, i))
+      if let Option<*mut HeapHeader>.Some { value: cell } = ValueBits.heapReference(&value) { unsafe HeapCell.retain(cell) }
+      i = i + 1
+    }
+  }
+}
+// Spread into an empty ordinary object with the same prototype: the target
+// shares plainCloneShape's shape and copies the slots. Nothing is observable
+// in between. Returns false, before any change, when it does not apply.
+pub unsafe effect fn cloneInto<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, target: ValueBits, source: ValueBits) -> bool
+  ! OutOfMemoryError ? &mut Allocator {
+  let into = match plainObject(target) { Option<*mut HeapHeader>.Some { value } => value Option<*mut HeapHeader>.None => { return false } }
+  let shape = match Pointer.nonNullMut<HeapHeader>(unsafe plainCloneShape(runtime, source)) { Option<*mut HeapHeader>.Some { value } => value Option<*mut HeapHeader>.None => { return false } }
+  let from = match plainObject(source) { Option<*mut HeapHeader>.Some { value } => value Option<*mut HeapHeader>.None => { return false } }
+  if Pointer.address<HeapHeader>(from) == Pointer.address<HeapHeader>(into) { return false }
+  let sourceAnchor = ()
+  let sourceData = unsafe HeapCell.payload<ObjectData, ()>(&sourceAnchor, from)
+  let shapeAnchor = ()
+  let shapeData = unsafe HeapCell.payload<ShapeData, ()>(&shapeAnchor, shape)
+  let count = shapeData.properties.length()
+  let prototype = shapeData.prototype
+  let capacity = shapeData.properties.capacity()
+  drop shapeData
+  let mut targetAnchor = ()
+  let targetData = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut targetAnchor, into)
+  if !targetData.extensible() || targetData.slotCount() != 0 { return false }
+  let old = targetData.shape
+  let oldAnchor = ()
+  let oldData = unsafe HeapCell.payload<ShapeData, ()>(&oldAnchor, old)
+  let fits = oldData.properties.length() == 0 && Pointer.address<HeapHeader>(oldData.prototype) == Pointer.address<HeapHeader>(prototype)
+  drop oldData
+  if !fits { return false }
+  // Reserving first: once it succeeds, the appends cannot fail.
+  // Through the shapes' growth policy, which hands out a parked list when one fits.
+  if targetData.slotCapacity() < capacity { run unsafe shapes.reserveSlots(runtime, &mut targetData, capacity) }
+  unsafe copyPlainSlots(&mut targetData, &sourceData, count)
+  unsafe shapes.take(runtime, shape)
+  targetData.shape = shape
+  unsafe shapes.noteShapeChange(runtime, &targetData)
+  drop targetData
+  drop sourceData
+  unsafe gc.releaseOptional(&mut hooks, runtime, old)
+  return true
+}
+/// Whether Object.assign(target, source) may take cloneInto: target is an
+/// ordinary object that is not a prototype, and no name of source's is on
+/// target's prototype chain, so each [[Set]] would only define a data property.
+/// cloneInto checks the rest (empty target, same prototype, plain source).
+unsafe fn assignable(target: ValueBits, source: ValueBits) -> bool {
+  let into = match plainObject(target) { Option<*mut HeapHeader>.Some { value } => value Option<*mut HeapHeader>.None => { return false } }
+  let from = match plainObject(source) { Option<*mut HeapHeader>.Some { value } => value Option<*mut HeapHeader>.None => { return false } }
+  let anchor = ()
+  let targetData = unsafe HeapCell.payload<ObjectData, ()>(&anchor, into)
+  if targetData.isPrototype() { return false }
+  let prototype = (unsafe HeapCell.payload<ShapeData, ()>(&anchor, targetData.shape)).prototype
+  let sourceData = unsafe HeapCell.payload<ObjectData, ()>(&anchor, from)
+  let shape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, sourceData.shape)
+  let count = shape.properties.length()
+  let mut i: usize = 0
+  while i < count {
+    let atom = (unsafe shape.properties.getUnchecked(i)).atom
+    if atom != 0 && !unsafe chainLacks(prototype, atom) { return false }
+    i = i + 1
+  }
+  return true
+}
+effect fn copy<'a, 'b, H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks>(
+  hooks: &mut H, realm: Realm<'a>, target: ValueRef<'b>, source: ValueRef<'b>, excluded: ValueRef<'b>,
+  keys: &[PropertyEnum], recheck: bool, assignment: bool) -> ()
+  ! OutOfMemoryError | StringLengthError | BigIntError | JsException ? &mut Allocator {
+  let rt = realm.runtime()
+  // Object spread from an ordinary object into an ordinary one: reading a data
+  // property and defining a new one on the target run no code, so both go
+  // straight to the shapes. A key either side cannot take that way falls back.
+  let mut direct = Option<*mut HeapHeader>.none()
+  let mut destination = Option<*mut HeapHeader>.none()
+  if !recheck && !excluded.view().isObject() {
+    direct = plainObject(source.view())
+    destination = plainObject(target.view())
+  }
+  let mut index: usize = 0
+  while index < keys.length {
+    let atom = keys[index].atom
+    index = index + 1
+    if let Option<*mut HeapHeader>.Some { value: from } = direct {
+      if let Option<*mut HeapHeader>.Some { value: into } = destination {
+        let value = unsafe ownDataValue(from, atom)
+        if value.tag() != 4 {
+          if assignment { if run unsafe assignDataProperty(&mut hooks, rt, into, atom, value) { continue } }
+          else if run unsafe addDataProperty(&mut hooks, rt, into, atom, value) { continue }
+          unsafe gc.release(&mut hooks, rt, value)
+        }
+      }
+    }
+    if excluded.view().isObject() && run descriptors.hasOwnProperty(&mut hooks, realm, excluded, atom) { continue }
+    if recheck {
+      let found = run descriptors.getOwnProperty(&mut hooks, realm, source, atom)
+      let mut enumerable = false
+      match move found {
+        Option<PropertyDescriptor>.None => ()
+        Option<PropertyDescriptor>.Some { value } => {
+          enumerable = (value.flags & JS_PROP_ENUMERABLE) != 0
+          drop value
+        }
+      }
+      if !enumerable { continue }
+    }
+    let value = run getPropertyOwned(&mut hooks, realm, source.borrow(), atom)
+    if assignment {
+      let _accepted = run mutations.setProperty(&mut hooks, realm, target.borrow(), atom, move value)
+    } else {
+      // A nonthrowing false result is intentionally ignored, just like the source.
+      let _accepted = run mutations.definePropertyValue(&mut hooks, realm, target.borrow(), atom, move value, JS_PROP_C_W_E)
+    }
+  }
+}
+pub effect fn copyDataProperties<'a, 'b, H: HeapHooks + OwnKeysHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks>(
+  hooks: &mut H, realm: Realm<'a>, target: ValueRef<'b>, source: ValueRef<'b>, excluded: ValueRef<'b>, assignment: bool) -> ()
+  ! OutOfMemoryError | OwnKeysError | StringLengthError | BigIntError | JsException ? &mut Allocator {
+  // Boxing, where required by the caller, happens before this internal operation.
+  if !source.view().isObject() { return () }
+  if !excluded.view().isObject() && (!assignment || unsafe assignable(target.view(), source.view()))
+    && run unsafe cloneInto(&mut hooks, realm.runtime(), target.view(), source.view()) { return () }
+  let flags = enumerationFlags(realm, source)
+  let keys = run names.getOwnPropertyNames(&mut hooks, realm, source, flags)
+  let copied = run Effect.result(copy(&mut hooks, realm, target, source, excluded,
+    keys.asSlice(), (flags & JS_GPN_ENUM_ONLY) == 0, assignment))
+  realm.releaseNames(move keys)
+  match move copied {
+    Result<(), OutOfMemoryError | StringLengthError | BigIntError | JsException>.Success { .. } => ()
+    Result<(), OutOfMemoryError | StringLengthError | BigIntError | JsException>.Failure { error } => { fail move error }
+  }
+}

@@ -1,0 +1,645 @@
+//! Constructor realm/prototype and species selection, quickjs.c:21163-21234,
+//! 41687-41715. Inputs and returned realms are borrowed; returned Values are owned.
+import js_realm { lendRealmFor, Realm }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.effect { Effect }
+import silk.core.ownership { Copy }
+import silk.mem.pointer { Pointer }
+import silk.num.i32
+import silk.num.u32
+import silk.num.usize
+import runtime_memory { AllocationObserver }
+import js_heap { HeapCell, HeapHeader }
+import js_value { ValueBits }
+import js_owned_value { Value, lendBits, ValueRef, lendFor }
+import js_core_types { RuntimeState, ObjectData, ObjectPayload, FunctionBytecode, FrameSlots, PropertySlot, ShapeData, SlotBits, JS_PROP_TMASK, ForwardEntry }
+import js_shapes as shapes
+import silk.core.option { Option }
+import silk.num.u8
+import js_gc { HeapHooks }
+import js_gc as gc
+import js_runtime as runtime
+import js_coercion_host { CoercionHooks }
+import js_exceptions { JsException }
+import js_proxy_core as core
+import js_proxy_core { Proxy }
+import js_bound_functions as bound
+import js_object_allocate as objects
+import js_boxing as boxing
+import js_class_data as classes
+import js_atom_data as atoms
+import js_opcode_data as op
+import js_bytecode { CONSTRUCT_GENERIC, CONSTRUCT_FORWARD, STORE_SIZE }
+import js_invariant { invariant, present }
+import js_shadow_realm as shadowRealm
+import js_caught { FailedOom, failedOom, FailedOomJs, failedOomJs }
+
+
+/// The function remains rooted by the caller throughout traversal. No retain is
+/// performed on the borrowed realm, including proxy and bound-function targets.
+/// GetFunctionRealm: the realm of function, or of the function it wraps. A function
+/// keeps its realm alive, so the result is lent for as long as function is borrowed.
+pub effect fn getFunctionRealm<'a, 'b, H: CoercionHooks>(hooks: &mut H,realm: Realm<'a>, function: ValueRef<'b>) -> Realm<'b> ! JsException ? &mut Allocator {
+  let context = unsafe lendRealmFor<'b>(realm.context())
+  let mut cursor = function.view()
+  while cursor.isObject() {
+    let anchor = ()
+    let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, core.reference(cursor))
+    let classId = object.classId()
+    if classId == classes.JS_CLASS_C_FUNCTION {
+      let owner = match &object.payload {
+        ObjectPayload.NativeFunction { function: native } => native.realm()
+        _ => invariant()
+      }
+      return unsafe lendRealmFor<'b>(present(owner))
+    }
+    if classId == classes.JS_CLASS_BYTECODE_FUNCTION || classId == classes.JS_CLASS_GENERATOR_FUNCTION ||
+      classId == classes.JS_CLASS_ASYNC_FUNCTION || classId == classes.JS_CLASS_ASYNC_GENERATOR_FUNCTION {
+      let bytecode = match &object.payload {
+        ObjectPayload.BytecodeFunction { function: closure } => closure.bytecode
+        _ => invariant()
+      }
+      drop object
+      let code = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, bytecode)
+      return unsafe lendRealmFor<'b>(code.realm)
+    }
+    if classId == classes.JS_CLASS_C_FUNCTION_DATA {
+      // A ShadowRealm wrapped function's realm is its captured Function.prototype's.
+      let anchor = match &object.payload {
+        ObjectPayload.NativeFunction { function: native } => if shadowRealm.isWrapped(native.function) { unsafe native.capturedGet(1) } else { ValueBits.Undefined }
+        _ => ValueBits.Undefined
+      }
+      drop object
+      if !anchor.isObject() { return context }
+      cursor = anchor
+      continue
+    }
+    drop object
+    if classId == classes.JS_CLASS_PROXY {
+      let held = unsafe lendFor(cursor)
+      if !Proxy.attached(held) { return context }
+      let proxy = Proxy.of(held)
+      if proxy.isRevoked() { return run core.error(&mut hooks, realm, b"revoked proxy") }
+      cursor = proxy.target().view()
+    } else if classId == classes.JS_CLASS_BOUND_FUNCTION { cursor = bound.target(unsafe lendFor(cursor)).view() }
+    else { return context }
+  }
+  return context
+}
+/// The realm a promise job for handler runs in, as V8's ExtractHandlerContext
+/// finds it: a function's own, through bound functions; null for anything else
+/// (a proxy or a non-callable), where the job takes the current realm.
+pub fn handlerRealm(handler: ValueBits) -> ?*mut HeapHeader {
+  let mut cursor = handler
+  let mut depth: usize = 0
+  while cursor.isObject() && depth < 64 {
+    let anchor = ()
+    let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, core.reference(cursor))
+    let classId = object.classId()
+    if classId == classes.JS_CLASS_C_FUNCTION || classId == classes.JS_CLASS_C_FUNCTION_DATA {
+      return match &object.payload { ObjectPayload.NativeFunction { function: native } => native.realm() _ => Pointer.null<HeapHeader>() }
+    }
+    if classId == classes.JS_CLASS_BYTECODE_FUNCTION || classId == classes.JS_CLASS_GENERATOR_FUNCTION ||
+      classId == classes.JS_CLASS_ASYNC_FUNCTION || classId == classes.JS_CLASS_ASYNC_GENERATOR_FUNCTION {
+      let bytecode = match &object.payload { ObjectPayload.BytecodeFunction { function: closure } => closure.bytecode _ => invariant() }
+      drop object
+      let code = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, bytecode)
+      return code.realm
+    }
+    drop object
+    if classId != classes.JS_CLASS_BOUND_FUNCTION { return Pointer.null<HeapHeader>() }
+    cursor = bound.target(unsafe lendFor(cursor)).view()
+    depth = depth + 1
+  }
+  return Pointer.null<HeapHeader>()
+}
+fn classPrototype<'a>(realm: Realm<'a>, classId: u32) -> ValueBits { return realm.classPrototype(classId).dup().intoBits() }
+/// newTarget's own plain data `prototype`, retained, or Uninitialized when newTarget
+/// is exotic or that property is missing or not a data property; the caller then
+/// takes the generic getter, which observes the same value for ordinary objects.
+@inlineAlways
+unsafe fn ownPrototype(newTarget: ValueBits) -> ValueBits {
+  let node = match newTarget { ValueBits.Object { reference } => reference _ => { return ValueBits.Uninitialized } }
+  let anchor = ()
+  let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, node)
+  if data.isExotic() { return ValueBits.Uninitialized }
+  match unsafe shapes.lookup(data.shape, atoms.JS_ATOM_prototype) {
+    Option<usize>.Some { value: index } => {
+      let shape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, data.shape)
+      if (u8.toU32(shape.properties.get(index).flags) & JS_PROP_TMASK) != 0 { return ValueBits.Uninitialized }
+      return match data.slot(index).view(shape.properties.get(index).flags) {
+        PropertySlot.Value { value } => unsafe value.retained()
+        _ => ValueBits.Uninitialized
+      }
+    }
+    Option<usize>.None => { return ValueBits.Uninitialized }
+  }
+}
+/// A new object of `classId` whose prototype comes from `newTarget` (undefined: the realm's class prototype).
+@inlineAlways
+pub effect fn create<'a, 'b, H: HeapHooks + CoercionHooks>(hooks: &mut H, memory: &AllocationObserver, realm: Realm<'a>,
+  newTarget: ValueRef<'b>, classId: u32) -> Value ! JsException ? &mut Allocator {
+  return unsafe Value.adoptBits(run unsafe createFromConstructor(&mut hooks, memory, realm, newTarget.view(), classId))
+}
+@inlineNever
+unsafe effect fn materializeReceiverOom<'a, H: HeapHooks + CoercionHooks>(hooks: &mut H, realm: Realm<'a>) -> ValueBits ! JsException ? &mut Allocator {
+  drop run Effect.catch<JsException>(core.materialize(&mut hooks, realm, OutOfMemoryError {}), core.exceptionValue)
+  fail JsException {}
+}
+/// createFromConstructor for an ordinary object (OP_call_constructor's receiver):
+/// a constructor the receiver cache knows allocates over its cached empty shape.
+@inlineAlways
+pub unsafe effect fn createReceiver<'a, H: HeapHooks + CoercionHooks>(hooks: &mut H,
+  memory: &AllocationObserver, realm: Realm<'a>, newTarget: ValueBits) -> ValueBits ! JsException ? &mut Allocator {
+  match newTarget {
+    ValueBits.Object { reference } => {
+      match Pointer.nonNullMut<HeapHeader>(unsafe gc.receiverShape(&mut hooks, realm.runtime(), reference)) {
+        Option<*mut HeapHeader>.Some { value: shape } => {
+          let result = run unsafe objects.ordinaryFromEmptyShapeOrUninit(&mut hooks, memory, realm, shape)
+          if result.isObject() { return result }
+          return run unsafe materializeReceiverOom(&mut hooks, realm)
+        }
+        Option<*mut HeapHeader>.None => ()
+      }
+    }
+    _ => ()
+  }
+  return run unsafe createFromConstructor(&mut hooks, memory, realm, newTarget, classes.JS_CLASS_OBJECT)
+}
+/// The most stores simpleConstruct performs.
+const SIMPLE_STORES: usize = 8
+@inlineAlways
+unsafe fn codeByte(bytes: *const u8, index: usize) -> u8 {
+  return unsafe Pointer.read<u8>(unsafe Pointer.at<u8>(unsafe Pointer.assumeMany<u8>(bytes), index))
+}
+/// new F(...) for a base constructor whose whole body stores arguments into
+/// `this` (push_this put_loc0, then get_loc0 get_argK put_field per store, then
+/// return_undef) when a verified memo entry covers every add: performs the
+/// stores on receiver without a frame, as the bytecode would. False, before any
+/// change, when anything differs, leaving the call to the frame.
+pub unsafe fn simpleConstruct<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, function: ValueBits, receiver: ValueBits, argv: &FrameSlots) -> bool {
+  let node = match receiver { ValueBits.Object { reference } => reference _ => { return false } }
+  let callee = match function { ValueBits.Object { reference } => reference _ => { return false } }
+  let mut anchor = ()
+  let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, callee)
+  let bytecode = match &object.payload { ObjectPayload.BytecodeFunction { function: closure } => closure.bytecode _ => { return false } }
+  drop object
+  let code = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, bytecode)
+  let length = code.code.length()
+  if length < 3 + STORE_SIZE || length > 3 + STORE_SIZE * SIMPLE_STORES { return false }
+  let bytes = unsafe code.code.pointerAt(0)
+  drop code
+  let stores = (length - 3) / STORE_SIZE
+  if stores * STORE_SIZE + 3 != length { return false }
+  if unsafe codeByte(bytes, 0) != op.OP_push_this || unsafe codeByte(bytes, 1) != op.OP_put_loc0 || unsafe codeByte(bytes, length - 1) != op.OP_return_undef { return false }
+  let data = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, node)
+  if data.classId() != classes.JS_CLASS_OBJECT || data.isExotic() || !data.extensible() || data.isStandardArrayPrototype() { return false }
+  if data.slotCapacity() - data.slotCount() < stores { return false }
+  let mut shape = data.shape
+  let empty = shape
+  if unsafe shapeCount(shape) <= 1 { return false }
+  let mut targets: [?*mut HeapHeader; 8] = [Pointer.null<HeapHeader>(); 8]
+  let mut sources: [usize; 8] = [0; 8]
+  let mut index: usize = 0
+  while index < stores {
+    let at = 2 + index * STORE_SIZE
+    let argument = unsafe codeByte(bytes, at + 1)
+    if unsafe codeByte(bytes, at) != op.OP_get_loc0 || argument < op.OP_get_arg0 || argument > op.OP_get_arg3 || unsafe codeByte(bytes, at + 2) != op.OP_put_field { return false }
+    let atom = u8.toU32(unsafe codeByte(bytes, at + 3)) | u32.shiftLeft(u8.toU32(unsafe codeByte(bytes, at + 4)), 8)
+      | u32.shiftLeft(u8.toU32(unsafe codeByte(bytes, at + 5)), 16) | u32.shiftLeft(u8.toU32(unsafe codeByte(bytes, at + 6)), 24)
+    let found = unsafe shapes.verifiedAdd(runtime, shape, atom)
+    if Pointer.isNull<HeapHeader>(found) { return false }
+    let target = unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(found)
+    if unsafe shapeCount(target) == 0 { return false }
+    targets[index] = found
+    sources[index] = u8.toUsize(argument - op.OP_get_arg0)
+    shape = target
+    index = index + 1
+  }
+  index = 0
+  while index < stores {
+    let source = sources[index]
+    let mut value = ValueBits.Undefined
+    if source < argv.count { let lent = unsafe argv.get(source) value = unsafe lent.retained() }
+    let added = unsafe shapes.swapAdd(&mut data, unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(targets[index]), value)
+    if !added { invariant() }
+    index = index + 1
+  }
+  let final = data.shape
+  drop data
+  let mut planned: [u8; 8] = [0; 8]
+  index = 0
+  // A source stored more than once carries PLAN_SHARED: plannedConstruct
+  // retains it. A source stored once is moved out of its operand.
+  while index < stores {
+    let mut flag: u8 = 0
+    let mut other: usize = 0
+    while other < stores { if other != index && sources[other] == sources[index] { flag = PLAN_SHARED } other = other + 1 }
+    planned[index] = usize.toU8(sources[index]) | flag
+    index = index + 1
+  }
+  // PLAN_COVERS: the stores read arguments 0..stores-1 once each, so a call
+  // passing exactly that many moves every argument into the object.
+  let mut seen: u32 = 0
+  index = 0
+  while index < stores { if sources[index] < stores { seen = seen | u32.shiftLeft(1, usize.toU32(sources[index])) } index = index + 1 }
+  if seen == u32.shiftLeft(1, usize.toU32(stores)) - 1 { planned[0] = planned[0] | PLAN_COVERS }
+  unsafe gc.notePlan(&mut hooks, runtime, callee, empty, final, Pointer.address<HeapHeader>(bytecode), stores, planned)
+  return true
+}
+/// The js_bytecode.constructForm of function, a bytecode function.
+@inlineAlways
+pub unsafe fn formOf(function: ValueBits) -> u8 {
+  let callee = match function { ValueBits.Object { reference } => reference _ => { return CONSTRUCT_GENERIC } }
+  let anchor = ()
+  let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, callee)
+  let bytecode = match &object.payload { ObjectPayload.BytecodeFunction { function: closure } => closure.bytecode _ => { return CONSTRUCT_GENERIC } }
+  drop object
+  return (unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, bytecode)).constructForm
+}
+/// The atom name of a CONSTRUCT_FORWARD function, whose whole body is
+/// `this[name].apply(this, arguments)` (the Class.create wrapper of
+/// Prototype-style code): constructing it runs this[name] as a construct frame
+/// whose result is ignored.
+pub unsafe fn forwardedAtom(function: ValueBits) -> u32 {
+  let callee = match function { ValueBits.Object { reference } => reference _ => { return 0 } }
+  let anchor = ()
+  let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, callee)
+  let bytecode = match &object.payload { ObjectPayload.BytecodeFunction { function: closure } => closure.bytecode _ => { return 0 } }
+  drop object
+  let code = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, bytecode)
+  if code.constructForm != CONSTRUCT_FORWARD { return 0 }
+  return unsafe atomAt(unsafe code.code.pointerAt(0), 6)
+}
+@inlineAlways
+unsafe fn atomAt(bytes: *const u8, at: usize) -> u32 {
+  return u8.toU32(unsafe codeByte(bytes, at)) | u32.shiftLeft(u8.toU32(unsafe codeByte(bytes, at + 1)), 8)
+    | u32.shiftLeft(u8.toU32(unsafe codeByte(bytes, at + 2)), 16) | u32.shiftLeft(u8.toU32(unsafe codeByte(bytes, at + 3)), 24)
+}
+/// A forwarded construct's target and the apply its prototype holds, as the
+/// receiver cache vouches for them (cachedForward).
+pub struct Forwarded { pub target: ValueBits, pub method: ValueBits }
+impl Copy for Forwarded {}
+/// The prototype of receiver's shape, the holder of a forwarded target.
+@inlineAlways
+unsafe fn shapePrototype(object: *mut HeapHeader) -> ?*mut HeapHeader {
+  let anchor = ()
+  let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, object)
+  return (unsafe HeapCell.payload<ShapeData, ()>(&anchor, data.shape)).prototype
+}
+@inlineAlways
+unsafe fn shapeVersion(object: *mut HeapHeader) -> u64 {
+  let anchor = ()
+  let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, object)
+  return (unsafe HeapCell.payload<ShapeData, ()>(&anchor, data.shape)).version
+}
+@inlineAlways
+unsafe fn slotValue(object: *mut HeapHeader, index: u32) -> ValueBits {
+  let anchor = ()
+  let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, object)
+  return (unsafe data.slotUnchecked(u32.toUsize(index))).valueBits()
+}
+/// receiver[name] and its apply for `new wrapper(...)` when wrapper's receiver
+/// cache entry recorded where they live (noteForward) and the shape versions
+/// still match: then both are the data properties a full lookup finds. The
+/// target is Undefined otherwise. Neither is retained.
+@inlineAlways
+pub unsafe fn cachedForward(runtime: *mut HeapHeader, wrapper: *mut HeapHeader, receiver: *mut HeapHeader, name: u32) -> Forwarded {
+  return unsafe cachedForwardFrom(runtime, wrapper, unsafe shapePrototype(receiver), name)
+}
+/// cachedForward for a receiver whose prototype is prototype.
+pub unsafe fn cachedForwardFrom(runtime: *mut HeapHeader, wrapper: *mut HeapHeader, prototype: ?*mut HeapHeader, name: u32) -> Forwarded {
+  let missed = Forwarded { target: ValueBits.Undefined, method: ValueBits.Undefined }
+  let entry = unsafe gc.forwardEntry(runtime, wrapper)
+  if entry.atom != name { return missed }
+  let holder = match Pointer.nonNullMut<HeapHeader>(prototype) { Option<*mut HeapHeader>.Some { value } => value Option<*mut HeapHeader>.None => { return missed } }
+  let anchor = ()
+  let holderData = unsafe HeapCell.payload<ObjectData, ()>(&anchor, holder)
+  if (unsafe HeapCell.payload<ShapeData, ()>(&anchor, holderData.shape)).version != entry.holderVersion { return missed }
+  let target = (unsafe holderData.slotUnchecked(u32.toUsize(entry.holderIndex))).valueBits()
+  drop holderData
+  let function = match target { ValueBits.Object { reference } => reference _ => { return missed } }
+  let fnData = unsafe HeapCell.payload<ObjectData, ()>(&anchor, function)
+  let fnShape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, fnData.shape)
+  if fnShape.version != entry.targetVersion { return missed }
+  let methodsOpt = fnShape.prototype
+  drop fnShape drop fnData
+  let methods = match Pointer.nonNullMut<HeapHeader>(methodsOpt) { Option<*mut HeapHeader>.Some { value } => value Option<*mut HeapHeader>.None => { return missed } }
+  let methodsData = unsafe HeapCell.payload<ObjectData, ()>(&anchor, methods)
+  if (unsafe HeapCell.payload<ShapeData, ()>(&anchor, methodsData.shape)).version != entry.applyVersion { return missed }
+  let method = (unsafe methodsData.slotUnchecked(u32.toUsize(entry.applyIndex))).valueBits()
+  return Forwarded { target: target, method: method }
+}
+/// The slot of an own data property atom of object, else u32.MAX.
+unsafe fn ownDataSlot(object: *mut HeapHeader, atom: u32) -> u32 {
+  let anchor = ()
+  let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, object)
+  if data.isExotic() { return u32.MAX }
+  return match unsafe shapes.lookup(data.shape, atom) {
+    Option<usize>.Some { value: index } => {
+      let shape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, data.shape)
+      if (u8.toU32(shape.properties.get(index).flags) & JS_PROP_TMASK) != 0 { u32.MAX } else { usize.toU32(index) }
+    }
+    Option<usize>.None => u32.MAX
+  }
+}
+/// Records on wrapper's receiver cache entry where a full lookup found target,
+/// receiver[name], and its apply (a data property of target's prototype), when
+/// both sit one link up: target an own property of receiver's prototype, apply
+/// not an own property of target. Otherwise the entry is left as it was.
+pub unsafe fn noteForward(runtime: *mut HeapHeader, wrapper: *mut HeapHeader, receiver: *mut HeapHeader, name: u32, target: *mut HeapHeader) -> () {
+  let holder = match Pointer.nonNullMut<HeapHeader>(unsafe shapePrototype(receiver)) { Option<*mut HeapHeader>.Some { value } => value Option<*mut HeapHeader>.None => { return () } }
+  let holderIndex = unsafe ownDataSlot(holder, name)
+  if holderIndex == u32.MAX { return () }
+  match unsafe slotValue(holder, holderIndex) {
+    ValueBits.Object { reference } => { if Pointer.address<HeapHeader>(reference) != Pointer.address<HeapHeader>(target) { return () } }
+    _ => { return () }
+  }
+  let anchor = ()
+  let own = unsafe HeapCell.payload<ObjectData, ()>(&anchor, target)
+  let present = unsafe shapes.lookup(own.shape, atoms.JS_ATOM_apply)
+  drop own
+  if let Option<usize>.Some { .. } = present { return () }
+  let methods = match Pointer.nonNullMut<HeapHeader>(unsafe shapePrototype(target)) { Option<*mut HeapHeader>.Some { value } => value Option<*mut HeapHeader>.None => { return () } }
+  let applyIndex = unsafe ownDataSlot(methods, atoms.JS_ATOM_apply)
+  if applyIndex == u32.MAX { return () }
+  unsafe gc.noteForward(runtime, wrapper, ForwardEntry { atom: name, holderIndex: holderIndex, applyIndex: applyIndex,
+    holderVersion: unsafe shapeVersion(holder), targetVersion: unsafe shapeVersion(target), applyVersion: unsafe shapeVersion(methods) })
+}
+/// Construct plan source bits: the argument index, whether another store reads it
+/// too, and (on the first source) whether the stores cover every argument (PLAN_COVERS).
+const PLAN_SOURCE: u8 = 0x3F
+const PLAN_COVERS: u8 = 0x40
+const PLAN_SHARED: u8 = 0x80
+/// new function(...) from function's construct plan (gc.plannedShape): the object
+/// gets the plan's final shape and its argument values directly. Uninitialized
+/// when no plan applies; nothing has changed then.
+@inlineAlways
+pub unsafe effect fn plannedConstruct<'a, H: HeapHooks>(hooks: &mut H, memory: &AllocationObserver, realm: Realm<'a>,
+  function: *mut HeapHeader, argv: &FrameSlots, consumed: &mut bool) -> ValueBits ! OutOfMemoryError ? &mut Allocator {
+  let anchor = ()
+  let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, function)
+  let bytecode = match &object.payload { ObjectPayload.BytecodeFunction { function: closure } => closure.bytecode _ => { return ValueBits.Uninitialized } }
+  drop object
+  let plan = unsafe gc.plannedShape(realm.runtime(), function, Pointer.address<HeapHeader>(bytecode))
+  let final = match Pointer.nonNullMut<HeapHeader>(plan.final) {
+    Option<*mut HeapHeader>.Some { value } => value
+    Option<*mut HeapHeader>.None => { return ValueBits.Uninitialized }
+  }
+  let stores = plan.stores
+  // Every one of the first stores slots is written below.
+  let created = run unsafe objects.ordinaryFromPlan(&mut hooks, memory, realm, final, unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(plan.empty), stores)
+  let node = match created { ValueBits.Object { reference } => reference _ => invariant() }
+  let mut nodeAnchor = ()
+  let data = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut nodeAnchor, node)
+  // The plan's final shape has a slot per store (ordinaryFromPlan built them).
+  if stores > data.slotCount() || stores > 8 { invariant() }
+  let mut slots = FrameSlots { data: argv.data, count: argv.count }
+  let mut index: usize = 0
+  if (plan.sources[0] & PLAN_COVERS) != 0 && argv.count == stores {
+    let operands = unsafe Pointer.assumeManyMut<ValueBits>(argv.data)
+    if stores == 2 {
+      // A cons cell's `this.car = car; this.cdr = cdr`, unrolled.
+      let first = u8.toUsize(plan.sources[0] & PLAN_SOURCE) let second = u8.toUsize(plan.sources[1] & PLAN_SOURCE)
+      unsafe data.setSlotUnchecked(0, SlotBits.value(unsafe Pointer.read<ValueBits>(unsafe Pointer.atMut<ValueBits>(operands, first))))
+      unsafe data.setSlotUnchecked(1, SlotBits.value(unsafe Pointer.read<ValueBits>(unsafe Pointer.atMut<ValueBits>(operands, second))))
+      consumed.* = true
+      return created
+    }
+    // Every argument moves into the object and none is left to release: the
+    // operands are bitwise moved, and consumed tells the caller to drop them unread.
+    while index < stores {
+      let source = u8.toUsize(plan.sources[index] & PLAN_SOURCE)
+      unsafe data.setSlotUnchecked(index, SlotBits.value(unsafe Pointer.read<ValueBits>(unsafe Pointer.atMut<ValueBits>(operands, source))))
+      index = index + 1
+    }
+    consumed.* = true
+    return created
+  }
+  while index < stores {
+    let raw = plan.sources[index]
+    let source = u8.toUsize(raw & PLAN_SOURCE)
+    if source < argv.count {
+      // A once-stored argument moves into the object; the caller's release of
+      // the operand range then finds Undefined there.
+      if (raw & PLAN_SHARED) == 0 { unsafe data.setSlotUnchecked(index, SlotBits.value(unsafe slots.replace(source, ValueBits.Undefined))) }
+      else { let lent = unsafe argv.get(source) unsafe data.setSlotUnchecked(index, SlotBits.value(unsafe lent.retained())) }
+    } else { unsafe data.setSlotUnchecked(index, SlotBits.value(ValueBits.Undefined)) }
+    index = index + 1
+  }
+  return created
+}
+/// In-place fast path of plannedConstructFast: probes RuntimeState.receiverCache
+/// in place (no vacantWay, no 40-byte PlannedShape stack copy), validates settled
+/// tail (PAIR_SLOTS or INLINE_SLOTS) and current shapeEpoch, pops a spare cell on
+/// the same RuntimeState borrow, or calls @inlineNever objects.allocatePlanCell
+/// directly on a spare-bin miss without re-probing receiverCache. Returns
+/// Uninitialized without side effects on plan/tail/epoch misses or OOM.
+@inlineAlways
+pub unsafe effect fn plannedConstructInPlace<H: HeapHooks>(hooks: &mut H, memory: &AllocationObserver,
+  runtime: *mut HeapHeader, function: *mut HeapHeader, argv: &FrameSlots) -> ValueBits ? &mut Allocator {
+  let anchor = ()
+  let fnData = unsafe HeapCell.payload<ObjectData, ()>(&anchor, function)
+  if fnData.isExotic() { return ValueBits.Uninitialized }
+  let bytecode = match &fnData.payload {
+    ObjectPayload.BytecodeFunction { function: closure } => Pointer.address<HeapHeader>(closure.bytecode)
+    _ => { return ValueBits.Uninitialized }
+  }
+  let version = (unsafe HeapCell.payload<ShapeData, ()>(&anchor, fnData.shape)).version
+  let address = Pointer.address<HeapHeader>(function)
+  let mut stateAnchor = ()
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut stateAnchor, runtime)
+  if state.observeFresh { return ValueBits.Uninitialized }
+  let slot = gc.findReceiverWay(&state.*, address)
+  if slot >= 64 { return ValueBits.Uninitialized }
+  let entry = &state.receiverCache[slot]
+  let stores = u8.toUsize(entry.stores)
+  if entry.version != version || entry.bytecode != bytecode || stores == 0
+    || (entry.sources[0] & PLAN_COVERS) == 0 || argv.count != stores || stores > 8 {
+    return ValueBits.Uninitialized
+  }
+  let tail = u8.toUsize(entry.tail)
+  if tail != shapes.PAIR_SLOTS && tail != shapes.INLINE_SLOTS { return ValueBits.Uninitialized }
+  if entry.epoch != state.shapeEpoch { return ValueBits.Uninitialized }
+  let final = match Pointer.nonNullMut<HeapHeader>(entry.final) {
+    Option<*mut HeapHeader>.Some { value } => value
+    Option<*mut HeapHeader>.None => { return ValueBits.Uninitialized }
+  }
+  let finalShape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, final)
+  let expectedProto = match Pointer.nonNullMut<HeapHeader>(finalShape.prototype) {
+    Option<*mut HeapHeader>.Some { value } => value
+    Option<*mut HeapHeader>.None => { return ValueBits.Uninitialized }
+  }
+  drop finalShape
+  match (unsafe fnData.slotUnchecked(entry.index)).valueBits() {
+    ValueBits.Object { reference } => {
+      if Pointer.address<HeapHeader>(reference) != Pointer.address<HeapHeader>(expectedProto) { return ValueBits.Uninitialized }
+    }
+    _ => { return ValueBits.Uninitialized }
+  }
+  drop fnData
+  let mut finalHeaderAnchor = ()
+  let finalHeader = unsafe Pointer.borrowMut<(), HeapHeader>(&mut finalHeaderAnchor, final)
+  let refCount = finalHeader.referenceCount
+  if refCount <= 0 { return ValueBits.Uninitialized }
+  let sources = entry.sources
+  drop entry
+  let bin: usize = if tail == shapes.PAIR_SLOTS { 3 } else { 2 }
+  let spareCount = state.spareCellCounts[bin]
+  let mut rawOpt = Pointer.null<HeapHeader>()
+  if spareCount != 0 {
+    let left = usize.wrappingSubtract(spareCount, 1)
+    state.spareCellCounts[bin] = left
+    rawOpt = unsafe state.spareCells.getUnchecked(usize.wrappingAdd(usize.wrappingMultiply(bin, gc.SPARE_CELLS), left))
+  }
+  drop state
+  finalHeader.referenceCount = i32.wrappingAdd(refCount, 1)
+  drop finalHeader
+  let raw = match Pointer.nonNullMut<HeapHeader>(rawOpt) {
+    Option<*mut HeapHeader>.Some { value } => value
+    Option<*mut HeapHeader>.None => match Pointer.nonNullMut<HeapHeader>(run unsafe objects.allocatePlanCell(&mut hooks, memory, runtime, tail)) {
+      Option<*mut HeapHeader>.Some { value } => value
+      Option<*mut HeapHeader>.None => {
+        unsafe gc.releaseHeader(&mut hooks, runtime, final)
+        return ValueBits.Uninitialized
+      }
+    }
+  }
+  let node = unsafe objects.initPlanSpareCell(runtime, raw, final, stores, tail)
+  let mut nodeAnchor = ()
+  let data = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut nodeAnchor, node)
+  let operands = unsafe Pointer.assumeManyMut<ValueBits>(argv.data)
+  if stores == 2 {
+    let first = u8.toUsize(sources[0] & PLAN_SOURCE)
+    let second = u8.toUsize(sources[1] & PLAN_SOURCE)
+    unsafe data.setSlotUnchecked(0, SlotBits.value(unsafe Pointer.read<ValueBits>(unsafe Pointer.atMut<ValueBits>(operands, first))))
+    unsafe data.setSlotUnchecked(1, SlotBits.value(unsafe Pointer.read<ValueBits>(unsafe Pointer.atMut<ValueBits>(operands, second))))
+    return ValueBits.Object { reference: node }
+  }
+  let mut index: usize = 0
+  while index < stores {
+    let source = u8.toUsize(sources[index] & PLAN_SOURCE)
+    unsafe data.setSlotUnchecked(index, SlotBits.value(unsafe Pointer.read<ValueBits>(unsafe Pointer.atMut<ValueBits>(operands, source))))
+    index = usize.wrappingAdd(index, 1)
+  }
+  return ValueBits.Object { reference: node }
+}
+/// Fast path of plannedConstruct when every argument moves into the object
+/// (PLAN_COVERS && argv.count == stores): takes a spare cell inline or calls
+/// the out-of-line cell allocator directly without re-probing receiverCache.
+/// Returns Uninitialized without changing anything on any miss or OOM.
+@inlineAlways
+pub unsafe effect fn plannedConstructFast<H: HeapHooks>(hooks: &mut H, memory: &AllocationObserver,
+  runtime: *mut HeapHeader, function: *mut HeapHeader, argv: &FrameSlots) -> ValueBits ? &mut Allocator {
+  let anchor = ()
+  let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, function)
+  let bytecode = match &object.payload { ObjectPayload.BytecodeFunction { function: closure } => closure.bytecode _ => { return ValueBits.Uninitialized } }
+  drop object
+  let plan = unsafe gc.plannedShapeUnretained(runtime, function, Pointer.address<HeapHeader>(bytecode))
+  let final = match Pointer.nonNullMut<HeapHeader>(plan.final) {
+    Option<*mut HeapHeader>.Some { value } => value
+    Option<*mut HeapHeader>.None => { return ValueBits.Uninitialized }
+  }
+  let stores = plan.stores
+  if (plan.sources[0] & PLAN_COVERS) == 0 || argv.count != stores || stores > 8 { return ValueBits.Uninitialized }
+  let created = run unsafe objects.ordinaryFromPlanFast(&mut hooks, memory, runtime, final, unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(plan.empty), stores, plan.tail)
+  let node = match Pointer.nonNullMut<HeapHeader>(created) {
+    Option<*mut HeapHeader>.Some { value } => value
+    Option<*mut HeapHeader>.None => { return ValueBits.Uninitialized }
+  }
+  let mut nodeAnchor = ()
+  let data = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut nodeAnchor, node)
+  let operands = unsafe Pointer.assumeManyMut<ValueBits>(argv.data)
+  if stores == 2 {
+    let first = u8.toUsize(plan.sources[0] & PLAN_SOURCE) let second = u8.toUsize(plan.sources[1] & PLAN_SOURCE)
+    unsafe data.setSlotUnchecked(0, SlotBits.value(unsafe Pointer.read<ValueBits>(unsafe Pointer.atMut<ValueBits>(operands, first))))
+    unsafe data.setSlotUnchecked(1, SlotBits.value(unsafe Pointer.read<ValueBits>(unsafe Pointer.atMut<ValueBits>(operands, second))))
+    return ValueBits.Object { reference: node }
+  }
+  let mut index: usize = 0
+  while index < stores {
+    let source = u8.toUsize(plan.sources[index] & PLAN_SOURCE)
+    unsafe data.setSlotUnchecked(index, SlotBits.value(unsafe Pointer.read<ValueBits>(unsafe Pointer.atMut<ValueBits>(operands, source))))
+    index = usize.wrappingAdd(index, 1)
+  }
+  return ValueBits.Object { reference: node }
+}
+@inlineAlways
+unsafe fn shapeCount(shape: *mut HeapHeader) -> i32 {
+  let mut anchor = ()
+  let header = unsafe Pointer.borrowMut<(), HeapHeader>(&mut anchor, shape)
+  return header.referenceCount
+}
+@inlineNever
+pub unsafe effect fn createFromConstructor<'a, H: HeapHooks + CoercionHooks>(hooks: &mut H,
+  memory: &AllocationObserver, realm: Realm<'a>, newTarget: ValueBits,
+  classId: u32) -> ValueBits ! JsException ? &mut Allocator {
+  let mut prototype = ValueBits.Undefined
+  if core.undefined(newTarget) { prototype = classPrototype(realm, classId) }
+  else {
+    prototype = unsafe ownPrototype(newTarget)
+    match prototype {
+      ValueBits.Uninitialized => {
+        let got = run Intrinsic.catchFailure<OutOfMemoryError | JsException>(hooks.getProperty(realm, unsafe lendBits(&newTarget, newTarget), atoms.JS_ATOM_prototype), failedOomJs)
+        prototype = match move got {
+          ValueBits value => value
+          FailedOomJs { error } => run core.materialize(&mut hooks, realm, move error)
+        }
+      }
+      _ => ()
+    }
+    if !prototype.isObject() {
+      unsafe gc.release(&mut hooks, realm.runtime(), prototype)
+      let functionRealm = run getFunctionRealm(&mut hooks, realm, unsafe lendBits(&newTarget, newTarget))
+      prototype = classPrototype(functionRealm, classId)
+    }
+  }
+  let created = run Intrinsic.catchFailure<OutOfMemoryError>(objects.withPrototypeClass(&mut hooks, memory, realm, unsafe lendBits(&prototype, prototype), classId), failedOom)
+  // Materialize before release, so finalizers observe the source pending error.
+  let result = match move created {
+    ValueBits value => value
+    FailedOom { error } => run Effect.catch<JsException>(core.materialize(&mut hooks, realm, move error), core.exceptionValue)
+  }
+  unsafe gc.release(&mut hooks, realm.runtime(), prototype)
+  if result.isException() { fail JsException {} }
+  return result
+}
+
+/// A new object of classId whose prototype is the given object (borrowed). For values
+/// made later on behalf of an earlier realm, such as a lazy typed array's ArrayBuffer.
+pub effect fn createWithPrototype<'a, 'b, H: HeapHooks + CoercionHooks>(hooks: &mut H,
+  memory: &AllocationObserver, realm: Realm<'a>, prototype: ValueRef<'b>, classId: u32) -> ValueBits ! JsException ? &mut Allocator {
+  let created = run Intrinsic.catchFailure<OutOfMemoryError>(objects.withPrototypeClass(&mut hooks, memory, realm, prototype, classId), failedOom)
+  return match move created {
+    ValueBits value => value
+    FailedOom { error } => run core.materialize(&mut hooks, realm, move error)
+  }
+}
+
+/// Reads constructor and Symbol.species in order, preserving accessor exceptions.
+/// Neither the object nor the default constructor is consumed.
+pub effect fn speciesConstructor<'a, 'b, H: HeapHooks + CoercionHooks>(hooks: &mut H,realm: Realm<'a>, object: ValueRef<'b>, defaultConstructor: ValueRef<'b>) -> Value
+  ! JsException ? &mut Allocator {
+  if !object.view().isObject() { return run core.error(&mut hooks, realm, b"not an object") }
+  let gotConstructor = run Intrinsic.catchFailure<OutOfMemoryError | JsException>(hooks.getProperty(realm, object, atoms.JS_ATOM_constructor), failedOomJs)
+  let constructor = match move gotConstructor {
+    ValueBits value => unsafe Value.adoptBits(value)
+    FailedOomJs { error } => run core.materialize(&mut hooks, realm, move error)
+  }
+  if core.undefined(constructor.view()) { return defaultConstructor.dup() }
+  if !constructor.view().isObject() {
+    drop constructor
+    return run core.error(&mut hooks, realm, b"not an object")
+  }
+  let gotSpecies = run Intrinsic.catchFailure<OutOfMemoryError | JsException>(hooks.getProperty(realm, constructor.borrow(), atoms.JS_ATOM_Symbol_species), failedOomJs)
+  drop constructor
+  let species = match move gotSpecies {
+    ValueBits value => unsafe Value.adoptBits(value)
+    FailedOomJs { error } => run core.materialize(&mut hooks, realm, move error)
+  }
+  if species.view().tag() == 2 || core.undefined(species.view()) { return defaultConstructor.dup() }
+  if !boxing.isConstructor(species.borrow()) {
+    return run core.throwNotConstructor(&mut hooks, realm, species.borrow())
+  }
+  return move species
+}

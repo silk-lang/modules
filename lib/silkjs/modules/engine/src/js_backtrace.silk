@@ -1,0 +1,570 @@
+//! Non-executing inspection and stack text from quickjs.c:7613-7739,7771-7782.
+//! Every frame/function/debug atom must stay alive and address-stable throughout
+//! formatting. This layer does not define Error properties or invoke JavaScript.
+import js_function_invoke as invoke
+import thin_list { ThinBox }
+import byte_buffer { ByteBuffer }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.option { Option }
+import silk.mem.pointer { Pointer }
+import silk.collections.slice { Slice }
+import silk.num.u8
+import silk.num.i32
+import silk.num.u32
+import silk.num.usize
+import dtoa { Dtoa }
+import js_heap { HeapCell, HeapHeader }
+import js_value { ValueBits }
+import js_core_types { LineTables }
+import js_core_types { NO_PC, RuntimeState, ObjectData, ObjectPayload, ShapeData, PropertySlot,
+  StackFrame, FunctionBytecode, FunctionDebugInfo, ByteStorage, SourceText, JS_PROP_TMASK, JS_PROP_NORMAL, JS_MODE_BACKTRACE_BARRIER, JS_PROP_WRITABLE, JS_PROP_CONFIGURABLE }
+import js_strings { Strings, StringBuilder }
+import js_string_types { StringOwner, StringLengthError }
+import js_atoms { AtomTable }
+import js_shapes as shapes
+import js_atom_data as atoms
+import js_class_data as classes
+import js_debug_positions { Pc2LineResume, SourceLocation, decodePc2Line, decodePc2LineRaw, FUNCTION_DEFINITION_PC, PendingLines, pendingLocation, encodePending, pendingForward, decodePc2LineResuming }
+import js_invariant { present }
+import js_primitives { EqualityMode, equal }
+
+pub const SKIP_FIRST_LEVEL: u32 = 1
+/// buildBacktrace's object is an ordinary Error without a stack whose frames
+/// may be captured now and formatted when its stack is first observed.
+pub const LAZY_STACK: u32 = 2
+
+/// Borrowed flat string, checking an own data slot and at most one prototype.
+/// An own accessor, varref, auto-init, rope or non-string blocks prototype lookup.
+pub unsafe fn propertyString(object: ValueBits, atom: u32) -> Option<ValueBits> {
+  let mut pointer = match object {
+    ValueBits.Object { reference } => reference
+    _ => { return Option<ValueBits>.none() }
+  }
+  let anchor = ()
+  let mut level: usize = 0
+  while level < 2 {
+    let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, pointer)
+    let shape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, data.shape)
+    match unsafe shapes.lookup(data.shape, atom) {
+      Option<usize>.Some { value: index } => {
+        if (u8.toU32(shape.properties.get(index).flags) & JS_PROP_TMASK) != JS_PROP_NORMAL {
+          return Option<ValueBits>.none()
+        }
+        return match data.slot(index).view(unsafe shapes.slotFlags(data.shape, index)) {
+          PropertySlot.Value { value: ValueBits.String { reference } } => Option<ValueBits>.some(ValueBits.String { reference: reference })
+          _ => Option<ValueBits>.none()
+        }
+      }
+      Option<usize>.None => ()
+    }
+    if Pointer.isNull<HeapHeader>(shape.prototype) { return Option<ValueBits>.none() }
+    pointer = present(shape.prototype)
+    level = level + 1
+  }
+  return Option<ValueBits>.none()
+}
+
+/// Borrowed object in an own data slot of object (no prototype walk, no getter).
+pub unsafe fn ownObject(object: ValueBits, atom: u32) -> Option<ValueBits> {
+  let pointer = match object {
+    ValueBits.Object { reference } => reference
+    _ => { return Option<ValueBits>.none() }
+  }
+  let anchor = ()
+  let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, pointer)
+  let shape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, data.shape)
+  return match unsafe shapes.lookup(data.shape, atom) {
+    Option<usize>.Some { value: index } => {
+      if (u8.toU32(shape.properties.get(index).flags) & JS_PROP_TMASK) != JS_PROP_NORMAL { return Option<ValueBits>.none() }
+      match data.slot(index).view(unsafe shapes.slotFlags(data.shape, index)) {
+        PropertySlot.Value { value: ValueBits.Object { reference } } => Option<ValueBits>.some(ValueBits.Object { reference: reference })
+        _ => Option<ValueBits>.none()
+      }
+    }
+    Option<usize>.None => Option<ValueBits>.none()
+  }
+}
+
+/// The name a frame running function shows, borrowed: its name property, or a
+/// known local function's (KnownCall) bytecode name.
+pub unsafe fn frameName(runtime: *mut HeapHeader, function: ValueBits) -> Option<ValueBits> {
+  let reference = match function { ValueBits.FunctionBytecode { reference } => reference _ => { return unsafe propertyString(function, atoms.JS_ATOM_name) } }
+  let anchor = ()
+  let name = (unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, reference)).name
+  if name == 0 { return Option<ValueBits>.none() }
+  let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
+  return match state.atoms.borrowedString(name) {
+    ValueBits.String { reference: text } => Option<ValueBits>.some(ValueBits.String { reference: text })
+    _ => Option<ValueBits>.none()
+  }
+}
+/// Even a non-enumerable/accessor own stack suppresses backtrace attachment,
+/// except the undefined data stack a Node-style error reserves before its
+/// message (js_errors.reserveNodeStack) until it has frames.
+pub unsafe fn isNeeded(value: ValueBits) -> bool {
+  let pointer = match value { ValueBits.Object { reference } => reference _ => { return false } }
+  let anchor = ()
+  let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, pointer)
+  if data.classId() != classes.JS_CLASS_ERROR { return false }
+  return match unsafe shapes.lookup(data.shape, atoms.JS_ATOM_stack) {
+    Option<usize>.Some { value: index } => {
+      // Reserved: the first property, writable and configurable, not enumerable.
+      let flags = unsafe shapes.slotFlags(data.shape, index)
+      if index != 0 || u8.toU32(flags) != (JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE) { return false }
+      match data.slot(index).view(flags) {
+        PropertySlot.Value { value: ValueBits.Undefined } => true
+        _ => false
+      }
+    }
+    Option<usize>.None => true
+  }
+}
+pub unsafe fn bytecode(function: ValueBits) -> Option<*mut HeapHeader> {
+  // A known local function's frame runs its bytecode itself (KnownCall).
+  let pointer = match function { ValueBits.Object { reference } => reference ValueBits.FunctionBytecode { reference } => { return Option<*mut HeapHeader>.some(reference) } _ => { return Option<*mut HeapHeader>.none() } }
+  let anchor = ()
+  let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, pointer)
+  return match &data.payload {
+    ObjectPayload.BytecodeFunction { function: closure } => Option<*mut HeapHeader>.some(closure.bytecode)
+    _ => Option<*mut HeapHeader>.none()
+  }
+}
+
+/// Bytecode errors defer attachment until the VM has recorded the throwing PC.
+pub unsafe fn shouldAttachImmediately(runtime: *mut HeapHeader) -> bool {
+  let anchor = ()
+  let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
+  if state.inOutOfMemory { return false }
+  if Pointer.isNull<StackFrame>(state.currentStackFrame) { return true }
+  let frame = unsafe Pointer.borrow<(), StackFrame>(&anchor, present(state.currentStackFrame))
+  return match unsafe bytecode(frame.currentFunction) {
+    Option<*mut HeapHeader>.Some { .. } => false
+    Option<*mut HeapHeader>.None => true
+  }
+}
+
+effect fn appendCString(builder: &mut StringBuilder, value: ValueBits) -> ()
+  ! OutOfMemoryError | StringLengthError ? &mut Allocator {
+  let mut length: usize = 0
+  let total = Strings.length(value)
+  while length < total && Strings.codeUnit(value, length) != 0 { length = length + 1 }
+  run builder.appendRange(value, 0, length)
+}
+effect fn appendInteger(builder: &mut StringBuilder, value: i32) -> ()
+  ! OutOfMemoryError | StringLengthError ? &mut Allocator {
+  let mut buffer: [u8; 12] = [0; 12]
+  let length = Dtoa.i32toa(&mut buffer, value)
+  run builder.appendLatin1(Slice.view<u8>(&buffer, 0, length))
+}
+pub unsafe fn location(storage: &ByteStorage, pc: u32) -> SourceLocation {
+  return match &storage.* {
+    ByteStorage.Owned { bytes } => decodePc2Line(bytes.asSlice(), pc)
+    ByteStorage.Borrowed { data, length } => unsafe decodePc2LineRaw(unsafe Pointer.assumeMany<u8>(data), length, pc)
+  }
+}
+pub fn vmLocation(debug: &FunctionDebugInfo, position: SourceLocation) -> SourceLocation {
+  if !debug.nodeVm { return position }
+  let column = if position.line == 1 {
+    i32.wrappingAdd(i32.wrappingSubtract(position.column, debug.sourceColumnOffset), debug.columnOffset)
+  } else { position.column }
+  return SourceLocation { line: i32.wrappingAdd(position.line, debug.lineOffset), column: column }
+}
+/// Spans longer than this stay pending through their first backtrace.
+const PENDING_ENCODE_MAX_SPAN: usize = 0x4000
+/// Encodes function's line tables if compile left them pending, so the lookups
+/// of a backtrace decode a table instead of rescanning the source each time.
+pub unsafe effect fn ensureLines(function: *mut HeapHeader) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut anchor = ()
+  let code = unsafe HeapCell.payloadMut<FunctionBytecode, ()>(&mut anchor, function)
+  let mut lines = ByteBuffer.make() let mut calls = ByteBuffer.make()
+  let mut firstLong = false
+  match &code.debug {
+    Option<FunctionDebugInfo>.Some { value: info } => {
+      if info.pendingLines.isNone() { return () }
+      let pending = info.pendingLines.get()
+      match &info.source {
+        Option<SourceText>.Some { value: source } => {
+          // A long span answers its first backtrace by scanning: encoding would
+          // index the whole span first. A second backtrace encodes it, as each
+          // scan can cost the whole span again (a module body that builds Errors
+          // at load would rescan megabytes per Error). A span whose entries go back
+          // in the source (loops, hoisted declarations) encodes at once: a scan
+          // rescans from a mark for each of those.
+          if source.bytes().length > PENDING_ENCODE_MAX_SPAN && pending.lookups == 0 && pendingForward(pending) { firstLong = true }
+          else {
+          lines = run encodePending(pending, source.bytes(), false)
+          calls = run encodePending(pending, source.bytes(), true)
+          }
+        }
+        _ => { return () }
+      }
+    }
+    _ => { return () }
+  }
+  if firstLong {
+    match &mut code.debug {
+      Option<FunctionDebugInfo>.Some { value: debug } => { let marked = debug.pendingLines.getMut() marked.lookups = 1 }
+      _ => ()
+    }
+    return ()
+  }
+  drop code
+  let tables = run LineTables.boxed(run ByteStorage.copy(lines.asSlice()),
+    Option<ByteStorage>.some(run ByteStorage.copy(calls.asSlice())))
+  let target = unsafe HeapCell.payloadMut<FunctionBytecode, ()>(&mut anchor, function)
+  match &mut target.debug {
+    Option<FunctionDebugInfo>.Some { value: debug } => {
+      debug.lines = move tables
+      debug.pendingLines = ThinBox<PendingLines>.none()
+    }
+    _ => ()
+  }
+}
+/// The pc's location in debug's legacy line table.
+pub unsafe fn lineLocation(debug: &FunctionDebugInfo, pc: u32) -> SourceLocation {
+  if debug.definition.line != 0 { return debug.definition }
+  if debug.pendingLines.isSome() { let pending = debug.pendingLines.get() return pendingAt(&debug, pending, pc, false) }
+  return unsafe lineTable(&debug, pc)
+}
+/// The pc's location in debug's encoded legacy table; no table reads as (0,0).
+unsafe fn lineTable(debug: &FunctionDebugInfo, pc: u32) -> SourceLocation {
+  if debug.lines.isSome() { let tables = debug.lines.get() return unsafe location(&tables.pcToLine, pc) }
+  return SourceLocation { line: 0, column: 0 }
+}
+/// lineLocation that remembers where it stopped in debug's encoded table.
+pub unsafe fn lineLocationResuming(debug: &mut FunctionDebugInfo, pc: u32) -> SourceLocation {
+  if debug.definition.line != 0 { return debug.definition }
+  if debug.pendingLines.isSome() { let pending = debug.pendingLines.get() return pendingAt(&debug, pending, pc, false) }
+  if debug.lines.isNone() { return SourceLocation { line: 0, column: 0 } }
+  let tables = debug.lines.getMut()
+  let mut resume = tables.resume
+  let position = match &tables.pcToLine {
+    ByteStorage.Owned { bytes } => {
+      let table = bytes.asSlice()
+      unsafe decodePc2LineResuming(Pointer.fromSlice<u8>(table), table.length, pc, &mut resume)
+    }
+    ByteStorage.Borrowed { data, length } => unsafe decodePc2LineResuming(unsafe Pointer.assumeMany<u8>(data), length, pc, &mut resume)
+  }
+  tables.resume = resume
+  return position
+}
+/// A captured frame's locations: its call position (callLocation), its statement
+/// (lineLocation) and the enclosing function's definition (when asked).
+pub struct FramePositions { pub call: SourceLocation, pub line: SourceLocation, pub enclosing: SourceLocation }
+/// The locations a stack capture records for function at pc, decoded with each
+/// table's resume point: an Error made in a loop captures the same frames each
+/// time, and Node's loader frames sit deep in long tables, so decoding from the
+/// start was most of new Error's cost.
+pub unsafe fn framePositions(function: *mut HeapHeader, pc: u32, enclosing: bool) -> FramePositions {
+  let zero = SourceLocation { line: 0, column: 0 }
+  let mut anchor = ()
+  let code = unsafe HeapCell.payloadMut<FunctionBytecode, ()>(&mut anchor, function)
+  return match &mut code.debug {
+    Option<FunctionDebugInfo>.Some { value: debug } => {
+      let definition = if enclosing { unsafe callLocation(&debug, FUNCTION_DEFINITION_PC) } else { zero }
+      let line = unsafe lineLocationResuming(&mut debug, pc)
+      let source = unsafe sourceCallLocationResuming(&mut debug, pc)
+      let call = vmLocation(&debug, source)
+      FramePositions { call: call, line: line, enclosing: definition }
+    }
+    Option<FunctionDebugInfo>.None => FramePositions { call: zero, line: zero, enclosing: zero }
+  }
+}
+/// sourceCallLocation that remembers where it stopped in the call table.
+unsafe fn sourceCallLocationResuming(debug: &mut FunctionDebugInfo, pc: u32) -> SourceLocation {
+  if debug.definition.line != 0 { return debug.definition }
+  if debug.pendingLines.isSome() { let pending = debug.pendingLines.get() return pendingAt(&debug, pending, pc, true) }
+  if debug.lines.isNone() { return SourceLocation { line: 0, column: 0 } }
+  let tables = debug.lines.getMut()
+  return match &tables.callSitePcToLine {
+    Option<ByteStorage>.Some { value } => {
+      let mut resume = tables.callResume
+      let position = unsafe decodeResuming(&value, pc, &mut resume)
+      tables.callResume = resume
+      position
+    }
+    Option<ByteStorage>.None => {
+      let mut resume = tables.resume
+      let position = unsafe decodeResuming(&tables.pcToLine, pc, &mut resume)
+      tables.resume = resume
+      position
+    }
+  }
+}
+unsafe fn decodeResuming(storage: &ByteStorage, pc: u32, resume: &mut Pc2LineResume) -> SourceLocation {
+  return match &storage.* {
+    ByteStorage.Owned { bytes } => {
+      let table = bytes.asSlice()
+      unsafe decodePc2LineResuming(Pointer.fromSlice<u8>(table), table.length, pc, &mut resume)
+    }
+    ByteStorage.Borrowed { data, length } => unsafe decodePc2LineResuming(unsafe Pointer.assumeMany<u8>(data), length, pc, &mut resume)
+  }
+}
+// A frame's location, for appendFrames.
+unsafe fn framePosition(function: *mut HeapHeader, pc: u32) -> SourceLocation {
+  let mut anchor = ()
+  let code = unsafe HeapCell.payloadMut<FunctionBytecode, ()>(&mut anchor, function)
+  return match &mut code.debug {
+    Option<FunctionDebugInfo>.Some { value: debug } => {
+      if debug.nodeVm { unsafe callLocation(&debug, pc) } else { unsafe lineLocationResuming(&mut debug, pc) }
+    }
+    Option<FunctionDebugInfo>.None => SourceLocation { line: 0, column: 0 }
+  }
+}
+fn pendingAt(debug: &FunctionDebugInfo, pending: &PendingLines, pc: u32, calls: bool) -> SourceLocation {
+  return match &debug.source {
+    Option<SourceText>.Some { value } => pendingLocation(&pending, value.bytes(), pc, calls)
+    _ => SourceLocation { line: 0, column: 0 }
+  }
+}
+pub unsafe fn callLocation(debug: &FunctionDebugInfo, pc: u32) -> SourceLocation {
+  return vmLocation(debug, unsafe sourceCallLocation(debug, pc))
+}
+/// callLocation in the compiled source's own coordinates, before vm offsets.
+pub unsafe fn sourceCallLocation(debug: &FunctionDebugInfo, pc: u32) -> SourceLocation {
+  if debug.definition.line != 0 { return debug.definition }
+  if debug.pendingLines.isSome() { let pending = debug.pendingLines.get() return pendingAt(&debug, pending, pc, true) }
+  if debug.lines.isNone() { return SourceLocation { line: 0, column: 0 } }
+  let tables = debug.lines.get()
+  return match &tables.callSitePcToLine {
+    Option<ByteStorage>.Some { value } => unsafe location(&value, pc)
+    Option<ByteStorage>.None => unsafe location(&tables.pcToLine, pc)
+  }
+}
+unsafe effect fn appendAtom(builder: &mut StringBuilder, runtime: *mut HeapHeader, atom: u32) -> ()
+  ! OutOfMemoryError | StringLengthError ? &mut Allocator {
+  if AtomTable.isInteger(atom) {
+    let mut buffer: [u8; 11] = [0; 11]
+    let length = Dtoa.u32toa(&mut buffer, AtomTable.integer(atom))
+    run builder.appendLatin1(Slice.view<u8>(&buffer, 0, length))
+  } else {
+    let anchor = ()
+    let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
+    let text = StringOwner.adopt(run state.atoms.toValue(atom, true))
+    run appendCString(&mut builder, text.get())
+  }
+}
+
+/// Append the optional source prefix separately so Error attachment can define
+/// fileName/lineNumber/columnNumber before inspecting frames, as build_backtrace.
+pub effect fn appendOrigin(builder: &mut StringBuilder, filename: Option<ValueBits>,
+  line: i32, column: i32) -> ()
+  ! OutOfMemoryError | StringLengthError ? &mut Allocator {
+  match move filename {
+    Option<ValueBits>.Some { value } => {
+      run builder.appendLatin1(b"    at ")
+      run appendCString(&mut builder, value)
+      if line != -1 {
+        run builder.appendUnit(58) run appendInteger(&mut builder, line)
+        run builder.appendUnit(58) run appendInteger(&mut builder, column)
+      }
+      run builder.appendUnit(10)
+    }
+    Option<ValueBits>.None => ()
+  }
+}
+
+/// Append borrowed live frames without allocating the final JavaScript string.
+/// V8 leaves Reflect.apply, Function.prototype.call and Function.prototype.apply
+/// out of stack traces: the function they call shows as called by their caller.
+pub unsafe fn hiddenFrame(function: ValueBits) -> bool {
+  return unsafe invoke.isCall(function) || unsafe invoke.isApply(function) || unsafe invoke.isReflectApply(function)
+}
+/// Buffer failures are distinct from StringBuilder.finish failures for Error.stack.
+pub unsafe effect fn appendFrames(runtime: *mut HeapHeader, builder: &mut StringBuilder,
+  flags: u32) -> () ! OutOfMemoryError | StringLengthError ? &mut Allocator {
+  let anchor = ()
+  let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
+  let mut pointer = state.currentStackFrame
+  drop state
+  let mut skip = (flags & SKIP_FIRST_LEVEL) != 0
+  while !Pointer.isNull<StackFrame>(pointer) {
+    let frame = unsafe Pointer.borrow<(), StackFrame>(&anchor, present(pointer))
+    if (frame.mode & u8.toU32(JS_MODE_BACKTRACE_BARRIER)) != 0 { break }
+    pointer = frame.previous
+    if skip { skip = false continue }
+    if unsafe hiddenFrame(frame.currentFunction) { continue }
+    let name = match unsafe frameName(runtime, frame.currentFunction) {
+      Option<ValueBits>.Some { value } => value
+      Option<ValueBits>.None => ValueBits.Undefined
+    }
+    run unsafe appendFrame(runtime, &mut builder, name, unsafe bytecode(frame.currentFunction), frame.currentPc)
+  }
+}
+/// One backtrace line: the function named name (a borrowed string, or not
+/// one for none) running code (none for a native function) at currentPc
+/// (NO_PC when it has none).
+unsafe effect fn appendFrame(runtime: *mut HeapHeader, builder: &mut StringBuilder, name: ValueBits,
+  function: Option<*mut HeapHeader>, currentPc: usize) -> () ! OutOfMemoryError | StringLengthError ? &mut Allocator {
+  let anchor = ()
+  run builder.appendLatin1(b"    at ")
+  let mut named = false
+  if name.isString() {
+    if Strings.length(name) != 0 && Strings.codeUnit(name, 0) != 0 {
+      run appendCString(&mut builder, name)
+      named = true
+    }
+  }
+  if !named { run builder.appendLatin1(b"<anonymous>") }
+  match function {
+    Option<*mut HeapHeader>.Some { value: code } => {
+      run unsafe ensureLines(code)
+      let mut pc = FUNCTION_DEFINITION_PC
+      if currentPc != NO_PC { pc = u32.wrappingSubtract(usize.toU32(currentPc), 1) }
+      let position = unsafe framePosition(code, pc)
+      let code = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, code)
+      match &code.debug {
+        Option<FunctionDebugInfo>.Some { value: debug } => {
+          run builder.appendLatin1(b" (")
+          if debug.nodeVm && debug.filename == atoms.JS_ATOM_empty_string { run builder.appendLatin1(b"<anonymous>") }
+          else { run unsafe appendAtom(&mut builder, runtime, debug.filename) }
+          if position.line != 0 {
+            run builder.appendUnit(58) run appendInteger(&mut builder, position.line)
+            if !debug.nodeVm || position.column != 0 {
+              run builder.appendUnit(58) run appendInteger(&mut builder, position.column)
+            }
+          }
+          run builder.appendUnit(41)
+        }
+        Option<FunctionDebugInfo>.None => ()
+      }
+    }
+    Option<*mut HeapHeader>.None => { run builder.appendLatin1(b" (native)") }
+  }
+  run builder.appendUnit(10)
+}
+/// Frames captureFrames keeps for a later appendCaptured; deeper stacks format at once.
+pub const MAX_CAPTURED_FRAMES: usize = 64
+/// The frames appendFrames(runtime, _, flags) would print, as borrowed
+/// (name, code, pc) triples in out: the name string (undefined for none), the
+/// FunctionBytecode (undefined for a native function) and an Int pc (-1 for
+/// none). None when there are more than MAX_CAPTURED_FRAMES of them. Keeping
+/// code rather than the function leaves closures and their scopes free to go.
+pub unsafe fn captureFrames(runtime: *mut HeapHeader, flags: u32, out: &mut [ValueBits; 192]) -> Option<usize> {
+  let anchor = ()
+  let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
+  let mut pointer = state.currentStackFrame
+  drop state
+  let mut skip = (flags & SKIP_FIRST_LEVEL) != 0
+  let mut count: usize = 0
+  while !Pointer.isNull<StackFrame>(pointer) {
+    let frame = unsafe Pointer.borrow<(), StackFrame>(&anchor, present(pointer))
+    if (frame.mode & u8.toU32(JS_MODE_BACKTRACE_BARRIER)) != 0 { break }
+    pointer = frame.previous
+    if skip { skip = false continue }
+    if unsafe hiddenFrame(frame.currentFunction) { continue }
+    if count == MAX_CAPTURED_FRAMES { return Option<usize>.none() }
+    out[3 * count] = match unsafe frameName(runtime, frame.currentFunction) {
+      Option<ValueBits>.Some { value } => value
+      Option<ValueBits>.None => ValueBits.Undefined
+    }
+    out[3 * count + 1] = match unsafe bytecode(frame.currentFunction) {
+      Option<*mut HeapHeader>.Some { value } => ValueBits.FunctionBytecode { reference: value }
+      Option<*mut HeapHeader>.None => ValueBits.Undefined
+    }
+    out[3 * count + 2] = ValueBits.Int { value: if frame.currentPc == NO_PC { -1 } else { usize.toI32(frame.currentPc) } }
+    count = count + 1
+  }
+  return Option<usize>.some(count)
+}
+/// appendFrames for frames captureFrames recorded.
+pub unsafe effect fn appendCaptured(runtime: *mut HeapHeader, builder: &mut StringBuilder, values: &[ValueBits]) -> ()
+  ! OutOfMemoryError | StringLengthError ? &mut Allocator {
+  let mut i: usize = 0
+  while i + 2 < values.length {
+    let code = match values[i + 1] {
+      ValueBits.FunctionBytecode { reference } => Option<*mut HeapHeader>.some(reference)
+      _ => Option<*mut HeapHeader>.none()
+    }
+    let pc = match values[i + 2] { ValueBits.Int { value } => if value < 0 { NO_PC } else { i32.toUsize(value) } _ => NO_PC }
+    run unsafe appendFrame(runtime, &mut builder, values[i], code, pc)
+    i = i + 3
+  }
+}
+
+/// Returns an owned string. Optional filename is a borrowed decoded string;
+/// both it and function/atom names use C-string truncation at the first NUL.
+/// UTF16 preserves the source's WTF8 roundtrip, including lone surrogates.
+pub unsafe effect fn format(runtime: *mut HeapHeader, filename: Option<ValueBits>,
+  line: i32, column: i32, flags: u32) -> ValueBits
+  ! OutOfMemoryError | StringLengthError ? &mut Allocator {
+  let mut builder = StringBuilder.make()
+  run appendOrigin(&mut builder, move filename, line, column)
+  run unsafe appendFrames(runtime, &mut builder, flags)
+  if builder.length() == 0 {
+    run builder.reserve(0, false)
+    let anchor = ()
+    let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
+    return state.atoms.emptyString()
+  }
+  return run builder.finish()
+}
+
+/// The function and the pc just past the `throw` that last threw value, when
+/// that is the last value thrown (RuntimeState.thrownValue). A nonzero at.line
+/// is the site's 1-based source location instead of the pc's, with the length
+/// of the source span there. native: a native threw it (noteFirstFrame).
+pub struct ThrowSite { pub code: *mut HeapHeader, pub pc: u32, pub native: bool, pub at: SourceLocation, pub length: u32 }
+pub unsafe fn throwSite(runtime: *mut HeapHeader, value: ValueBits) -> Option<ThrowSite> {
+  let anchor = ()
+  let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
+  let code = match state.thrownCode { ValueBits.FunctionBytecode { reference } => reference _ => { return Option<ThrowSite>.none() } }
+  if !unsafe equal(state.thrownValue, value, EqualityMode.Strict) { return Option<ThrowSite>.none() }
+  let at = SourceLocation { line: u32.toI32(state.thrownLine), column: u32.toI32(state.thrownColumn) }
+  return Option<ThrowSite>.some(ThrowSite { code: code, pc: state.thrownPc, native: state.thrownNative, at: at, length: state.thrownLength })
+}
+/// Where a pc just past an instruction of code is (or, when at.line is not 0,
+/// that source location): its script name atom, its line in the script's
+/// coordinates, and the text of that source line (an owned string, or undefined
+/// when the function kept no whole source) with the 1-based column in it.
+pub struct SiteText { pub filename: u32, pub line: i32, pub column: i32, pub text: ValueBits }
+pub unsafe effect fn siteText(code: *mut HeapHeader, pc: u32, native: bool, at: SourceLocation) -> Option<SiteText>
+  ! OutOfMemoryError | StringLengthError ? &mut Allocator {
+  let anchor = ()
+  let function = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, code)
+  return match &function.debug {
+    Option<FunctionDebugInfo>.Some { value: debug } => {
+      // A native's throw is where the top frame shows it, as V8's message location
+      // is (stack_frames.capture); a throw statement's is the statement.
+      let mut raw = at
+      if at.line == 0 {
+        let before = u32.wrappingSubtract(pc, 1)
+        raw = if native && debug.nodeVm { unsafe sourceCallLocation(&debug, before) } else { unsafe lineLocation(&debug, before) }
+      }
+      if raw.line <= 0 { return Option<SiteText>.none() }
+      let shown = vmLocation(&debug, raw)
+      let mut text = ValueBits.Undefined
+      let mut skip: usize = 0
+      match &debug.source {
+        Option<SourceText>.Some { value: source } => match source.input() {
+          Option<&[u8]>.Some { value: input } => {
+            let mut line: i32 = 1
+            let mut start: usize = 0
+            while line < raw.line && start < input.length {
+              if input[start] == 10 { line = line + 1 }
+              start = start + 1
+            }
+            // A node:vm wrapper (the CommonJS function head) leads line 1; the
+            // script's own text starts after it.
+            if debug.nodeVm && raw.line == 1 && debug.sourceColumnOffset > 0 {
+              skip = i32.toUsize(debug.sourceColumnOffset)
+            }
+            if line == raw.line && start + skip <= input.length {
+              start = start + skip
+              // Compiled source keeps the parser's NUL terminator; it is not text.
+              let mut limit = input.length
+              if limit > 0 && input[limit - 1] == 0 { limit = limit - 1 }
+              let mut end = start
+              while end < limit && input[end] != 10 && input[end] != 13 { end = end + 1 }
+              text = run Strings.fromUtf8(Slice.view<u8>(input, start, end - start))
+            }
+          }
+          _ => ()
+        }
+        _ => ()
+      }
+      Option<SiteText>.some(SiteText { filename: debug.filename, line: shown.line, column: i32.wrappingSubtract(raw.column, usize.toI32(skip)), text: text })
+    }
+    _ => Option<SiteText>.none()
+  }
+}

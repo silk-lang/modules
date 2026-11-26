@@ -1,0 +1,605 @@
+//! The JavaScript side of SilkTls: the named operations of native function 2500 (`host.tls(name,
+//! [args])`) that internal/tls/context.js and internal/tls/transport.js call, with the contract of
+//! ../../openssl's ext/tls_native, over ext/tls_engine's contexts and sessions. Operations that
+//! need what silk.tls does not do (session resumption and tickets, PSK, OCSP stapling, keylog,
+//! keying material export, renegotiation, PKCS #12) answer as OpenSSL does when the feature is not
+//! in use, or fail with OpenSSL's reason.
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silkjs.js_owned_value { lendFor }
+import silkjs.js_realm { lendRealm }
+import silk.core.effect { Effect }
+import silk.core.result { Result }
+import silk.collections.list { List }
+import silk.mem.pointer { Pointer }
+import silk.mem.layout { Layout }
+import silk.num.i32
+import silk.num.i64
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+import silk.num.u8
+import silk.num.f64
+import silkjs.js_engine { Engine }
+import silkjs.js_engine_host { EngineServices }
+import silkjs.js_heap { HeapHeader }
+import silkjs.js_value { ValueBits }
+import silkjs.js_core_types { FrameSlots }
+import silkjs.js_exceptions { JsException }
+import silkjs.js_errors as errors
+import silkjs.js_runtime as runtime
+import silkjs.js_exceptions as exceptions
+import silkjsruntime.libs.core.owners as owners
+import silkjsruntime.libs.core.common as common
+import silkjs.js_buffer_storage as buffers
+import silkjs.js_class_data as classes
+import silkjs.js_proxy_core as core
+import silkjsruntime.libs.core.capabilities { Composition }
+import silkjsruntime.libs.core.host as host
+import silkjsruntime.ext.library_hooks { SecureOps }
+import silkjsruntime.ext.diagnostics_fatal { RuntimeHeap }
+import ext.tls_engine as engine
+import ext.tls_engine { Material, Connection, Queue }
+
+unsafe extern "C" fn calloc(count: usize, size: usize) -> ?*mut u8
+unsafe extern "C" fn free(pointer: ?*mut u8) -> ()
+
+// `blocked`: the SPKI digests addBlockedSPKIForTesting added, 32 bytes each.
+pub struct State { first: ?*mut Handle, next: i32, allocator: *mut RuntimeHeap, failure: &'static [u8], blocked: Queue }
+// A context (kind 1) holds material; a session (kind 2) its session and its context's id.
+struct Handle {
+  next: ?*mut Handle, id: i32, kind: i32, material: ?*mut Material, session: ?*mut Connection, context: i32,
+  attached: bool, releasePending: bool, attachedCounts: i64, nativeFailure: bool, owner: *mut State,
+}
+struct Call { data: [?*mut u8; 6], lengths: [usize; 6], numbers: [i64; 6], output: ?*mut u8, length: usize, number: i64, kind: i32 }
+fn nil() -> ?*mut u8 { return Pointer.null<u8>() }
+unsafe fn nonnull<T>(p: ?*mut T) -> *mut T { return unsafe Intrinsic.pointerRequalify<?*mut T, *mut T>(p) }
+unsafe fn raw<T>(p: *mut T) -> *mut u8 { return unsafe Intrinsic.pointerReinterpret<*mut T, *mut u8>(p) }
+fn equal(a: &[u8], b: &[u8]) -> bool { if a.length != b.length { return false } let mut i: usize = 0 while i < a.length { if a[i] != b[i] { return false } i = i + 1 } return true }
+unsafe fn copyRaw(destination: ?*mut u8, source: ?*mut u8, n: usize) -> () {
+  let mut i: usize = 0
+  while i < n { unsafe Pointer.put<u8>(unsafe buffers.dataAt(destination, usize.toU64(i)), unsafe Pointer.read<u8>(unsafe buffers.dataAt(source, usize.toU64(i)))) i = i + 1 }
+}
+// The bytes of argument `i`.
+unsafe fn arg<'a>(anchor: &'a (), c: &Call, i: usize) -> &'a [u8] {
+  if c.lengths[i] == 0 || Pointer.isNull<u8>(c.data[i]) { return engine.item(b"", 0) }
+  return unsafe Pointer.borrowMany<(), u8>(anchor, unsafe Pointer.assumeMany<u8>(unsafe Intrinsic.pointerRequalify<?*mut u8, *const u8>(c.data[i])), c.lengths[i])
+}
+
+unsafe effect fn throwError<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, message: &[u8]) -> ValueBits ! JsException ? &mut Allocator {
+  let memory = engine.memory let error = run errors.newError(&mut engine, memory, unsafe lendRealm(&context, context))
+  let created = run Effect.result(unsafe host.string(&mut engine, context, message))
+  let value = match move created { Result<ValueBits, JsException>.Success { value } => value Result<ValueBits, JsException>.Failure { error: failure } => { unsafe owners.release(&mut engine, context, error) fail move failure } }
+  let defined = run Effect.result(unsafe common.define(&mut engine, context, error, b"message", value, 7))
+  match move defined { Result<(), JsException>.Success { .. } => () Result<(), JsException>.Failure { error: failure } => { unsafe owners.release(&mut engine, context, error) fail move failure } }
+  return run unsafe exceptions.throwValue<ValueBits, Engine<'m, S>>(&mut engine, unsafe runtime.contextRuntime(context), error)
+}
+pub effect fn open(allocator: *mut RuntimeHeap) -> *mut State ! OutOfMemoryError {
+  let p = unsafe calloc(1, Layout.of<State>().bytes) if Pointer.isNull<u8>(p) { fail OutOfMemoryError {} }
+  let state = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut State>(unsafe nonnull(p))
+  unsafe Pointer.put<State>(state, State { first: Pointer.null<Handle>(), next: 1, allocator: allocator, failure: b"", blocked: engine.emptyQueue() })
+  return state
+}
+unsafe fn locate(state: *mut State, id: i32) -> ?*mut Handle {
+  let anchor = () let s = unsafe Pointer.borrow<(), State>(&anchor, state) let mut cursor = s.first drop s
+  while !Pointer.isNull<Handle>(cursor) { let h = unsafe Pointer.borrow<(), Handle>(&anchor, unsafe nonnull(cursor)) if h.id == id { return cursor } cursor = h.next }
+  return Pointer.null<Handle>()
+}
+unsafe fn add(state: *mut State, kind: i32) -> ?*mut Handle {
+  let p = unsafe calloc(1, Layout.of<Handle>().bytes) if Pointer.isNull<u8>(p) { return Pointer.null<Handle>() }
+  let h = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut Handle>(unsafe nonnull(p))
+  let mut material = Pointer.null<Material>()
+  let mut session = Pointer.null<Connection>()
+  if kind == 1 {
+    let m = unsafe calloc(1, Layout.of<Material>().bytes) if Pointer.isNull<u8>(m) { unsafe free(p) return Pointer.null<Handle>() }
+    let typed = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut Material>(unsafe nonnull(m))
+    unsafe Pointer.put<Material>(typed, engine.emptyMaterial())
+    material = unsafe Intrinsic.pointerRequalify<*mut Material, ?*mut Material>(typed)
+  }
+  let mut anchor = () let s = unsafe Pointer.borrowMut<(), State>(&mut anchor, state)
+  if s.next == 2147483647 { drop s unsafe free(p) return Pointer.null<Handle>() }
+  unsafe Pointer.put<Handle>(h, Handle { next: s.first, id: s.next, kind: kind, material: material, session: session, context: 0, attached: false, releasePending: false, attachedCounts: 0, nativeFailure: false, owner: state })
+  s.first = unsafe Intrinsic.pointerRequalify<*mut Handle, ?*mut Handle>(h) s.next = s.next + 1
+  return unsafe Intrinsic.pointerRequalify<*mut Handle, ?*mut Handle>(h)
+}
+unsafe fn newSession(h: &mut Handle, server: bool) -> bool {
+  let m = unsafe calloc(1, Layout.of<Connection>().bytes) if Pointer.isNull<u8>(m) { return false }
+  let typed = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut Connection>(unsafe nonnull(m))
+  unsafe Pointer.put<Connection>(typed, engine.newConnection(server))
+  h.session = unsafe Intrinsic.pointerRequalify<*mut Connection, ?*mut Connection>(typed)
+  return true
+}
+unsafe fn dispose(h: &mut Handle) -> () {
+  if !Pointer.isNull<Material>(h.material) {
+    let mut anchor = () let m = unsafe Pointer.borrowMut<(), Material>(&mut anchor, unsafe nonnull(h.material))
+    unsafe engine.releaseMaterial(&mut m) drop m
+    unsafe free(unsafe Intrinsic.pointerReinterpret<?*mut Material, ?*mut u8>(h.material)) h.material = Pointer.null<Material>()
+  }
+  if !Pointer.isNull<Connection>(h.session) {
+    let mut anchor = () let s = unsafe Pointer.borrowMut<(), Connection>(&mut anchor, unsafe nonnull(h.session))
+    unsafe engine.releaseConnection(&mut s) drop s
+    unsafe free(unsafe Intrinsic.pointerReinterpret<?*mut Connection, ?*mut u8>(h.session)) h.session = Pointer.null<Connection>()
+  }
+}
+unsafe fn release(state: *mut State, target: *mut Handle) -> () {
+  let mut anchor = () let targetHandle = unsafe Pointer.borrow<(), Handle>(&anchor, target) let id = targetHandle.id drop targetHandle
+  let s = unsafe Pointer.borrowMut<(), State>(&mut anchor, state)
+  let mut link = Pointer.fromMutRef<?*mut Handle>(&mut s.first) drop s
+  while !Pointer.isNull<Handle>(unsafe Pointer.read<?*mut Handle>(link)) {
+    let p = unsafe nonnull(unsafe Pointer.read<?*mut Handle>(link))
+    let h = unsafe Pointer.borrowMut<(), Handle>(&mut anchor, p)
+    if h.id == id {
+      unsafe Pointer.put<?*mut Handle>(link, h.next)
+      // A carrier that runs this session's records (secureAttach) frees it when it lets go.
+      if h.attached { h.releasePending = true h.next = Pointer.null<Handle>() return () }
+      unsafe dispose(&mut h) drop h unsafe free(unsafe raw(p)) return ()
+    }
+    link = Pointer.fromMutRef<?*mut Handle>(&mut h.next) drop h
+  }
+}
+pub unsafe fn close<'m, C: Composition>(e: &mut Engine<'m, host.Services<C>>, context: *mut HeapHeader, state: *mut State) -> () {
+  let anchor = () let s = unsafe Pointer.borrow<(), State>(&anchor, state) let mut cursor = s.first drop s
+  while !Pointer.isNull<Handle>(cursor) {
+    let p = unsafe nonnull(cursor) let mut held = () let h = unsafe Pointer.borrowMut<(), Handle>(&mut held, p) cursor = h.next
+    if h.attached { h.releasePending = true continue }
+    unsafe dispose(&mut h) drop h unsafe free(unsafe raw(p))
+  }
+  let mut held = () let owned = unsafe Pointer.borrowMut<(), State>(&mut held, state) unsafe engine.release(&mut owned.blocked) drop owned
+  unsafe free(unsafe raw(state))
+}
+pub unsafe fn openHandles(state: *mut State) -> usize {
+  let anchor = () let s = unsafe Pointer.borrow<(), State>(&anchor, state) let mut cursor = s.first drop s
+  let mut count: usize = 0
+  while !Pointer.isNull<Handle>(cursor) { let h = unsafe Pointer.borrow<(), Handle>(&anchor, unsafe nonnull(cursor)) count = count + 1 cursor = h.next }
+  return count
+}
+
+// ---- Call output ----
+
+unsafe fn reserve(c: &mut Call, n: usize) -> bool { c.output = unsafe calloc(1, n + 1) c.length = n return !Pointer.isNull<u8>(c.output) }
+unsafe fn bytes(c: &mut Call, value: &[u8]) -> bool {
+  if !unsafe reserve(&mut c, value.length) { return false }
+  let mut i: usize = 0
+  while i < value.length { unsafe Pointer.put<u8>(unsafe buffers.dataAt(c.output, usize.toU64(i)), value[i]) i = i + 1 }
+  return true
+}
+unsafe fn text(c: &mut Call, value: &[u8]) -> bool { c.kind = 2 return unsafe bytes(&mut c, value) }
+unsafe fn queued(c: &mut Call, q: &mut Queue) -> bool {
+  let n = engine.queueLength(&q.*)
+  if !unsafe reserve(&mut c, n) { return false }
+  let _taken = unsafe engine.take(&mut q.*, unsafe nonnull(c.output), n)
+  return true
+}
+unsafe fn failWith(state: *mut State, reason: &'static [u8]) -> bool {
+  let mut anchor = () let s = unsafe Pointer.borrowMut<(), State>(&mut anchor, state) s.failure = reason return false
+}
+
+// The issuer of `leaf` among `list`'s certificates: its index, or -1.
+fn issuerIn(leaf: &[u8], list: &[u8]) -> i64 {
+  let issuer = engine.nameOf(leaf, 0)
+  if issuer.length == 0 { return -1 }
+  let count = engine.itemCount(list)
+  let mut i: usize = 0
+  while i < count {
+    let candidate = engine.item(list, i)
+    if !equal(candidate, leaf) && equal(engine.nameOf(candidate, 1), issuer) { return usize.toI64(i) }
+    i = i + 1
+  }
+  return -1
+}
+
+unsafe fn contextOp(state: *mut State, name: &[u8], c: &mut Call, m: &mut Material, hp: *mut Handle) -> bool {
+  let anchor = ()
+  if equal(name, b"trustFlags") { m.partial = i64.bitAnd(c.numbers[1], 0x80000) != 0 return true }
+  if equal(name, b"sigalgs") || equal(name, b"dhAuto") || equal(name, b"enableTicketKeyCallback") || equal(name, b"groups") || equal(name, b"sessionId") { return true }
+  // SSL_OP_NO_TICKET
+  if equal(name, b"options") { if i64.bitAnd(c.numbers[1], 0x4000) != 0 { m.tickets = false } return true }
+  if equal(name, b"sessionTimeout") { if c.numbers[1] > 0 { m.lifetime = i64.toUsize(c.numbers[1]) } return true }
+  if equal(name, b"suites") {
+    if engine.knownSuites(unsafe arg(&anchor, &c, 1)) { return true }
+    return unsafe failWith(state, b"error:0A0000B9:SSL routines::no cipher match")
+  }
+  if equal(name, b"ticketKeys") {
+    if c.lengths[1] != 48 { return false }
+    let key = unsafe arg(&anchor, &c, 1)
+    let mut i: usize = 0
+    while i < 48 { m.ticketKey[i] = key[i] i = i + 1 }
+    return true
+  }
+  if equal(name, b"crl") { return unsafe failWith(state, b"error:0480006C:PEM routines::no start line") }
+  if equal(name, b"dhparam") { c.number = 2048 return true }
+  if equal(name, b"ciphers") {
+    // A list that names no suite silk.tls has fails as SSL_CTX_set_cipher_list does.
+    let list = unsafe arg(&anchor, &c, 1)
+    if engine.knownCiphers(list) { return true }
+    return unsafe failWith(state, b"error:0A0000B9:SSL routines::no cipher match")
+  }
+  if equal(name, b"cipherNames") { return unsafe text(&mut c, engine.CIPHER_NAMES) }
+  if equal(name, b"trustLike") {
+    let from = unsafe locate(state, i64.toI32(c.numbers[1])) if Pointer.isNull<Handle>(from) { return false }
+    let other = unsafe Pointer.borrow<(), Handle>(&anchor, unsafe nonnull(from))
+    if other.kind != 1 || Pointer.isNull<Material>(other.material) { return false }
+    let source = unsafe Pointer.borrow<(), Material>(&anchor, unsafe nonnull(other.material))
+    return unsafe engine.push(&mut m.trust, unsafe engine.view(&anchor, &source.trust))
+  }
+  if equal(name, b"ca") {
+    let reason = unsafe engine.addCertificates(unsafe arg(&anchor, &c, 1), &mut m.trust)
+    if reason.length == 0 { return true } return unsafe failWith(state, reason)
+  }
+  if equal(name, b"clientCa") { let _ignored = unsafe engine.addCertificates(unsafe arg(&anchor, &c, 1), &mut m.trust) return true }
+  // A context may have several keys and chains (Node's arrays of them); as OpenSSL checks a key
+  // against the certificate already set, a key and chains of which none match fail.
+  if equal(name, b"cert") || equal(name, b"key") {
+    let reason = if equal(name, b"cert") { unsafe engine.addChain(&mut m.*, unsafe arg(&anchor, &c, 1)) } else { unsafe engine.addKey(&mut m.*, unsafe arg(&anchor, &c, 1), unsafe arg(&anchor, &c, 2)) }
+    if reason.length != 0 { return unsafe failWith(state, reason) }
+    if engine.queueLength(&m.chains) > 0 && engine.queueLength(&m.keys) > 0 && !unsafe engine.keyMatches(&m.*) { return unsafe failWith(state, b"error:05800074:x509 certificate routines::key values mismatch") }
+    return true
+  }
+  if equal(name, b"pfx") { return unsafe failWith(state, b"error:0308010C:digital envelope routines::unsupported") }
+  if equal(name, b"contextCertificate") { c.kind = 0 return unsafe bytes(&mut c, unsafe engine.firstLeaf(&anchor, &m.*)) }
+  if equal(name, b"contextIssuer") {
+    c.kind = 0
+    let chain = unsafe engine.firstChain(&anchor, &m.*)
+    let leaf = engine.item(chain, 0)
+    if leaf.length == 0 { return unsafe reserve(&mut c, 0) }
+    let inChain = issuerIn(leaf, chain)
+    if inChain >= 0 { return unsafe bytes(&mut c, engine.item(chain, i64.toUsize(inChain))) }
+    let trust = unsafe engine.view(&anchor, &m.trust)
+    let inTrust = issuerIn(leaf, trust)
+    if inTrust >= 0 { return unsafe bytes(&mut c, engine.item(trust, i64.toUsize(inTrust))) }
+    return unsafe reserve(&mut c, 0)
+  }
+  if equal(name, b"checkKey") {
+    if unsafe engine.keyMatches(&m.*) { return true }
+    return unsafe failWith(state, b"error:0A000177:SSL routines::no private key assigned")
+  }
+  if equal(name, b"versions") {
+    // TLS 1.0 and 1.1 are not in silk.tls: a range of only those has no protocol.
+    m.minVersion = c.numbers[1] m.maxVersion = c.numbers[2]
+    return true
+  }
+  if equal(name, b"contextALPN") {
+    unsafe engine.clear(&mut m.alpn)
+    return unsafe engine.push(&mut m.alpn, unsafe arg(&anchor, &c, 1))
+  }
+  if equal(name, b"create") {
+    let own = unsafe Pointer.borrow<(), Handle>(&anchor, hp) let contextId = own.id drop own
+    let p = unsafe add(state, 2) if Pointer.isNull<Handle>(p) { return false }
+    let mut held = () let h2 = unsafe Pointer.borrowMut<(), Handle>(&mut held, unsafe nonnull(p))
+    if !unsafe newSession(&mut h2, c.numbers[1] != 0) { drop h2 unsafe release(state, unsafe nonnull(p)) return false }
+    h2.context = contextId c.number = i32.toI64(h2.id) return true
+  }
+  return false
+}
+
+// Runs the handshake of a session with the material of its context.
+unsafe fn handshake(state: *mut State, h: &Handle, s: &mut Connection) -> i32 {
+  let context = unsafe locate(state, h.context)
+  let anchor = ()
+  let st = unsafe Pointer.borrow<(), State>(&anchor, state)
+  let blocked = unsafe engine.view(&anchor, &st.blocked)
+  if Pointer.isNull<Handle>(context) { return unsafe engine.advance(&mut s.*, &engine.emptyMaterial(), blocked) }
+  let other = unsafe Pointer.borrow<(), Handle>(&anchor, unsafe nonnull(context))
+  if Pointer.isNull<Material>(other.material) { return unsafe engine.advance(&mut s.*, &engine.emptyMaterial(), blocked) }
+  let m = unsafe Pointer.borrow<(), Material>(&anchor, unsafe nonnull(other.material))
+  return unsafe engine.advance(&mut s.*, &m, blocked)
+}
+unsafe fn contextMaterial<'a>(anchor: &'a (), state: *mut State, id: i32) -> ?*mut Material {
+  let context = unsafe locate(state, id)
+  if Pointer.isNull<Handle>(context) { return Pointer.null<Material>() }
+  let other = unsafe Pointer.borrow<(), Handle>(anchor, unsafe nonnull(context))
+  return other.material
+}
+
+unsafe fn sessionOp(state: *mut State, name: &[u8], c: &mut Call, h: &mut Handle, s: &mut Connection) -> bool {
+  let anchor = ()
+  // A record failure the carrier met while it ran the session (native mode) is the next
+  // read, write or handshake's error.
+  if (equal(name, b"read") || equal(name, b"write") || equal(name, b"handshake")) && h.nativeFailure {
+    h.nativeFailure = false return unsafe failWith(state, s.failure)
+  }
+  if equal(name, b"feed") { return unsafe engine.push(&mut s.input, unsafe arg(&anchor, &c, 1)) }
+  if equal(name, b"drain") { c.kind = 0 return unsafe queued(&mut c, &mut s.output) }
+  if equal(name, b"read") {
+    c.kind = 0
+    if s.failed { return unsafe failWith(state, s.failure) }
+    if s.complete && !unsafe engine.drive(&mut s.*) { return unsafe failWith(state, s.failure) }
+    let ready = unsafe engine.plainReady(&s.*)
+    let n = if ready < 16384 { ready } else { 16384 }
+    if !unsafe reserve(&mut c, n) { return false }
+    let _taken = unsafe engine.takePlain(&mut s.*, unsafe nonnull(c.output), n)
+    return true
+  }
+  if equal(name, b"write") {
+    if s.failed { return unsafe failWith(state, s.failure) }
+    if !s.complete { c.number = 0 return true }
+    let n = unsafe engine.write(&mut s.*, unsafe arg(&anchor, &c, 1))
+    if n < 0 { return unsafe failWith(state, s.failure) }
+    c.number = n return true
+  }
+  if equal(name, b"receivedShutdown") { let received: i64 = if s.peerClosed { 2 } else { 0 } let sent: i64 = if s.sentClose { 1 } else { 0 } c.number = received + sent return true }
+  if equal(name, b"handshakeCounts") { c.number = s.starts * 67108864 + s.completions return true }
+  if equal(name, b"handshakeStarts") { c.number = s.starts return true }
+  if equal(name, b"handshakeCompletions") { c.number = s.completions return true }
+  if equal(name, b"handshake") {
+    let result = unsafe handshake(state, &h.*, &mut s.*)
+    if result < 0 { return unsafe failWith(state, s.failure) }
+    c.number = i32.toI64(result) return true
+  }
+  if equal(name, b"shutdown") { c.number = unsafe engine.shutdown(&mut s.*) return true }
+  if equal(name, b"renegotiate") { return unsafe failWith(state, b"error:0A00010A:SSL routines::wrong ssl version") }
+  // Node's TLSWrap::SetVerifyMode: only a server that requests a certificate verifies.
+  if equal(name, b"verifyMode") { s.verifyRequest = s.server && c.numbers[1] != 0 s.verifyRequire = s.verifyRequest && c.numbers[2] != 0 return true }
+  if equal(name, b"fragment") { s.fragment = i64.toUsize(c.numbers[1]) return true }
+  if equal(name, b"trace") || equal(name, b"enableALPNCallback") || equal(name, b"enablePsk") || equal(name, b"pskHint") || equal(name, b"requestOCSP") || equal(name, b"setOCSPResponse") || equal(name, b"enableKeylog") || equal(name, b"clientHelloDone") || equal(name, b"loadSession") || equal(name, b"newSessionDone") { return true }
+  if equal(name, b"enableSessionCallbacks") { s.sessionCallbacks = true return true }
+  if equal(name, b"setSession") { unsafe engine.clear(&mut s.resumeFrom) return unsafe engine.push(&mut s.resumeFrom, unsafe arg(&anchor, &c, 1)) }
+  if equal(name, b"session") { c.kind = 0 return unsafe bytes(&mut c, unsafe engine.currentSession(&anchor, &mut s.*)) }
+  if equal(name, b"newSessions") { c.kind = 0 return unsafe queued(&mut c, &mut s.fresh) }
+  if equal(name, b"ticket") || equal(name, b"sessionTicket") {
+    c.kind = 0
+    let mut ticket = engine.emptyQueue()
+    let source = if equal(name, b"ticket") { unsafe engine.currentSession(&anchor, &mut s.*) } else { unsafe arg(&anchor, &c, 1) }
+    unsafe engine.ticketBytes(source, &mut ticket)
+    let ok = unsafe bytes(&mut c, unsafe engine.view(&anchor, &ticket))
+    unsafe engine.release(&mut ticket) return ok
+  }
+  if equal(name, b"sessionReused") { c.number = if s.resumed { 1 } else { 0 } return true }
+  if equal(name, b"sharedSigalg") { return unsafe text(&mut c, b"") }
+  // The client's ephemeral key: its EVP_PKEY type, bits and curve name, and the group's name.
+  if equal(name, b"ephemeralType") { c.number = if s.group == 1 { 1034 } else if s.group > 1 { 408 } else { 0 } return true }
+  if equal(name, b"ephemeralBits") { c.number = if s.group == 1 { 253 } else if s.group == 2 { 256 } else if s.group == 3 { 384 } else { 0 } return true }
+  if equal(name, b"ephemeralName") { return unsafe text(&mut c, if s.group == 1 { b"X25519" } else if s.group == 2 { b"prime256v1" } else if s.group == 3 { b"secp384r1" } else { b"" }) }
+  if equal(name, b"negotiatedGroup") { return unsafe text(&mut c, if s.group == 1 { b"x25519" } else if s.group == 2 { b"secp256r1" } else if s.group == 3 { b"secp384r1" } else { b"" }) }
+  if equal(name, b"helloALPN") || equal(name, b"helloTicket") || equal(name, b"ocspRequested") { c.number = 0 return true }
+  if equal(name, b"ocspResponse") || equal(name, b"helloSessionId") || equal(name, b"keylogLines") || equal(name, b"finished") || equal(name, b"peerFinished") { c.kind = 0 return unsafe reserve(&mut c, 0) }
+  if equal(name, b"verifiedCertificate") {
+    c.kind = 0
+    if c.numbers[1] < 0 { return unsafe reserve(&mut c, 0) }
+    let index = i64.toUsize(c.numbers[1])
+    return unsafe bytes(&mut c, unsafe engine.verifiedAt(&anchor, &s.*, index))
+  }
+  if equal(name, b"servername") { return unsafe text(&mut c, unsafe engine.view(&anchor, &s.servername)) }
+  if equal(name, b"setServername") { unsafe engine.clear(&mut s.servername) return unsafe engine.push(&mut s.servername, unsafe arg(&anchor, &c, 1)) }
+  if equal(name, b"alpn") { return unsafe text(&mut c, unsafe engine.view(&anchor, &s.selectedAlpn)) }
+  if equal(name, b"setALPN") || equal(name, b"serverALPN") { unsafe engine.clear(&mut s.alpn) return unsafe engine.push(&mut s.alpn, unsafe arg(&anchor, &c, 1)) }
+  if equal(name, b"offeredALPN") { c.kind = 0 return unsafe bytes(&mut c, unsafe engine.view(&anchor, &s.offered)) }
+  if equal(name, b"rejectALPN") { s.rejectAlpn = true return true }
+  if equal(name, b"select") {
+    if c.numbers[1] != 0 {
+      let next = unsafe locate(state, i64.toI32(c.numbers[1])) if Pointer.isNull<Handle>(next) { return false }
+      let other = unsafe Pointer.borrow<(), Handle>(&anchor, unsafe nonnull(next)) let valid = other.kind == 1 let id = other.id drop other
+      if !valid { return false }
+      h.context = id
+    }
+    s.selected = true return true
+  }
+  if equal(name, b"export") { return unsafe failWith(state, b"error:0A000066:SSL routines::bad length") }
+  // ncrypto verifyPeerCertificate: the handshake's result; without a peer certificate,
+  // UNABLE_TO_GET_ISSUER_CERT.
+  if equal(name, b"verify") { c.number = if s.hasPeerCertificate { s.verifyCode } else { 2 } return true }
+  if equal(name, b"peerCertificate") { c.kind = 0 return unsafe bytes(&mut c, engine.item(unsafe engine.view(&anchor, &s.peerChain), 0)) }
+  if equal(name, b"chainCertificate") {
+    c.kind = 0
+    if c.numbers[1] < 0 { return unsafe reserve(&mut c, 0) }
+    let index = i64.toUsize(c.numbers[1])
+    return unsafe bytes(&mut c, engine.item(unsafe engine.view(&anchor, &s.peerChain), index))
+  }
+  if equal(name, b"certificate") {
+    c.kind = 0
+    let m = unsafe contextMaterial(&anchor, state, h.context)
+    if Pointer.isNull<Material>(m) { return unsafe reserve(&mut c, 0) }
+    let material = unsafe Pointer.borrow<(), Material>(&anchor, unsafe nonnull(m))
+    return unsafe bytes(&mut c, unsafe engine.firstLeaf(&anchor, &material.*))
+  }
+  if equal(name, b"protocol") {
+    if s.version == 0x0304 { return unsafe text(&mut c, b"TLSv1.3") }
+    if s.version == 0x0303 { return unsafe text(&mut c, b"TLSv1.2") }
+    return unsafe text(&mut c, b"TLSv1.3")
+  }
+  if equal(name, b"cipher") { return unsafe text(&mut c, engine.suiteName(s.suite, 0)) }
+  if equal(name, b"cipherStandard") { return unsafe text(&mut c, engine.suiteName(s.suite, 1)) }
+  if equal(name, b"cipherVersion") { return unsafe text(&mut c, engine.suiteName(s.suite, 2)) }
+  return false
+}
+
+unsafe fn execute(state: *mut State, name: &[u8], c: &mut Call) -> bool {
+  c.kind = 1
+  let anchor = ()
+  let mut cleared = () let st = unsafe Pointer.borrowMut<(), State>(&mut cleared, state) st.failure = b"" drop st
+  if equal(name, b"context") {
+    let p = unsafe add(state, 1) if Pointer.isNull<Handle>(p) { return false }
+    let h = unsafe Pointer.borrow<(), Handle>(&anchor, unsafe nonnull(p)) c.number = i32.toI64(h.id)
+    let mut held = () let m = unsafe Pointer.borrowMut<(), Material>(&mut held, unsafe nonnull(h.material))
+    unsafe engine.randomTicketKey(&mut m) return true
+  }
+  // Node's blocked public keys only matter to OpenSSL's chain building; silk.tls has its own.
+  // Node's SecureContext::AddBlockedSPKIForTesting / ClearBlockedSPKIsForTesting.
+  if equal(name, b"blockSPKI") {
+    if c.lengths[1] != 32 { return false }
+    let digest = unsafe arg(&anchor, &c, 1)
+    let mut held = () let st = unsafe Pointer.borrowMut<(), State>(&mut held, state)
+    return unsafe engine.push(&mut st.blocked, digest)
+  }
+  if equal(name, b"clearBlockedSPKIs") { let mut held = () let st = unsafe Pointer.borrowMut<(), State>(&mut held, state) unsafe engine.clear(&mut st.blocked) return true }
+  if equal(name, b"verifyMessage") { let code = c.numbers[0] return unsafe text(&mut c, engine.verifyMessage(code)) }
+  if equal(name, b"defaultCertPaths") { return unsafe text(&mut c, b"SSL_CERT_FILE\n/usr/local/ssl/cert.pem\nSSL_CERT_DIR\n/usr/local/ssl/certs") }
+  let optional = unsafe locate(state, i64.toI32(c.numbers[0])) if Pointer.isNull<Handle>(optional) { return false }
+  let hp = unsafe nonnull(optional)
+  if equal(name, b"release") { unsafe release(state, hp) return true }
+  let mut held = () let h = unsafe Pointer.borrowMut<(), Handle>(&mut held, hp)
+  if h.kind == 1 {
+    let material = h.material drop h
+    if Pointer.isNull<Material>(material) { return false }
+    let mut materialAnchor = () let m = unsafe Pointer.borrowMut<(), Material>(&mut materialAnchor, unsafe nonnull(material))
+    return unsafe contextOp(state, name, &mut c, &mut m, hp)
+  }
+  let session = h.session
+  if Pointer.isNull<Connection>(session) { return false }
+  let mut sessionAnchor = () let s = unsafe Pointer.borrowMut<(), Connection>(&mut sessionAnchor, unsafe nonnull(session))
+  return unsafe sessionOp(state, name, &mut c, &mut h, &mut s)
+}
+
+unsafe effect fn argument<'m, S: EngineServices>(e: &mut Engine<'m, S>, context: *mut HeapHeader, c: &mut Call, i: usize, value: ValueBits) -> () ! OutOfMemoryError | JsException ? &mut Allocator {
+  if value.isNumber() {
+    let number = value.numericValue()
+    if !f64.isFinite(number) || number < -2147483648.0 || number > 9007199254740991.0 || f64.trunc(number) != number {
+      let _ignored = run unsafe throwError(&mut e, context, b"ERR_OUT_OF_RANGE: invalid TLS integer") return ()
+    }
+    c.numbers[i] = f64.toI64(number) return ()
+  }
+  match value { ValueBits.Undefined => { return () } ValueBits.Null => { return () } _ => () }
+  if value.isString() {
+    let text = run unsafe host.text(&mut e, context, value) c.lengths[i] = text.length() c.data[i] = unsafe calloc(1, c.lengths[i] + 1)
+    if Pointer.isNull<u8>(c.data[i]) { fail OutOfMemoryError {} } let mut n: usize = 0
+    while n < c.lengths[i] { unsafe Pointer.put<u8>(unsafe buffers.dataAt(c.data[i], usize.toU64(n)), text.asSlice()[n]) n = n + 1 } return ()
+  }
+  // A view's bytes (a Buffer write's subarray) copy straight from its backing.
+  let classId = unsafe buffers.classId(value)
+  if classId >= classes.JS_CLASS_UINT8C_ARRAY && classId <= classes.JS_CLASS_DATAVIEW {
+    let object = core.reference(value)
+    let view = unsafe buffers.span(object)
+    let mut offset: u64 = 0 let mut length: u64 = 0
+    if !unsafe buffers.isOutOfBounds(object) {
+      offset = view.offset length = view.byteLength
+      if view.tracking {
+        let tracked = view.bytes
+        length = tracked.byteLength - offset
+        if classId != classes.JS_CLASS_DATAVIEW {
+          let width = u64.shiftLeft(1, u32.toU64(buffers.sizeLog2(classId)))
+          length = length - length % width
+        }
+      }
+    }
+    let source = view.bytes
+    if length > usize.toU64(usize.MAX - 1) { fail OutOfMemoryError {} }
+    c.lengths[i] = u64.toUsize(length)
+    c.data[i] = unsafe calloc(1, c.lengths[i] + 1) if Pointer.isNull<u8>(c.data[i]) { fail OutOfMemoryError {} }
+    if source.physicalCapacity == 0 { if length != 0 { unsafe copyRaw(c.data[i], unsafe Intrinsic.pointerRequalify<*mut u8, ?*mut u8>(unsafe buffers.dataAt(source.data, offset)), c.lengths[i]) } return () }
+    let mut k: u64 = 0 while k < length { unsafe Pointer.put<u8>(unsafe buffers.dataAt(c.data[i], k), u64.toU8(unsafe buffers.loadScalar(source, offset + k, 0))) k = k + 1 }
+    return ()
+  }
+  let backing = run buffers.getArrayBuffer(&mut e, unsafe lendRealm(&context, context), unsafe lendFor(value))
+  if backing.byteLength > usize.toU64(usize.MAX - 1) { fail OutOfMemoryError {} }
+  c.lengths[i] = u64.toUsize(backing.byteLength)
+  c.data[i] = unsafe calloc(1, c.lengths[i] + 1) if Pointer.isNull<u8>(c.data[i]) { fail OutOfMemoryError {} }
+  if backing.physicalCapacity == 0 { unsafe copyRaw(c.data[i], backing.data, c.lengths[i]) return () }
+  let mut n: u64 = 0 while n < backing.byteLength { unsafe Pointer.put<u8>(unsafe buffers.dataAt(c.data[i], n), u64.toU8(unsafe buffers.loadScalar(backing, n, 0))) n = n + 1 }
+}
+unsafe effect fn dispatchCall<'m, C: Composition>(e: &mut Engine<'m, host.Services<C>>, context: *mut HeapHeader, state: *mut State, argv: &FrameSlots, c: &mut Call) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
+  let name = run unsafe host.text(&mut e, context, unsafe common.argument(argv, 0)) let args = unsafe common.argument(argv, 1) let mut i: u32 = 0
+  // No OpenSSL callback calls JavaScript here: the callback is not kept.
+  if equal(name.asSlice(), b"setCallback") { return ValueBits.Undefined }
+  while i < 6 {
+    let value = run unsafe owners.getIndex(&mut e, context, args, i)
+    let result = run Effect.result(unsafe argument(&mut e, context, &mut c, u32.toUsize(i), value)) unsafe owners.release(&mut e, context, value)
+    match move result { Result<(), OutOfMemoryError | JsException>.Success { .. } => () Result<(), OutOfMemoryError | JsException>.Failure { error } => { fail move error } } i = i + 1
+  }
+  let ok = unsafe execute(state, name.asSlice(), &mut c)
+  if !ok {
+    let anchor = () let s = unsafe Pointer.borrow<(), State>(&anchor, state) let reason = s.failure drop s
+    let mut message = List<u8>.make()
+    let prefix = b"ERR_SSL_TLS_OPERATION_FAILED: "
+    let mut k: usize = 0 while k < prefix.length { run message.append(prefix[k]) k = k + 1 }
+    let detail = if reason.length == 0 { b"error:0A000126:SSL routines::unexpected eof while reading" } else { reason }
+    k = 0 while k < detail.length { run message.append(detail[k]) k = k + 1 }
+    return run unsafe throwError(&mut e, context, message.asSlice())
+  }
+  if c.kind == 1 { return ValueBits.Float64 { value: i64.toF64(c.number) } }
+  if c.kind == 2 { let mut text = List<u8>.make() let mut n: usize = 0 while n < c.length { run text.append(unsafe Pointer.read<u8>(unsafe buffers.dataAt(c.output, usize.toU64(n)))) n = n + 1 } return run unsafe host.string(&mut e, context, text.asSlice()) }
+  let memory = e.memory return run unsafe buffers.newArrayBufferCopy(&mut e, memory, unsafe lendRealm(&context, context), c.output, usize.toU64(c.length))
+}
+pub unsafe effect fn dispatch<'m, C: Composition>(e: &mut Engine<'m, host.Services<C>>, context: *mut HeapHeader, state: *mut State, argc: i32, argv: &FrameSlots) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
+  let mut c = Call { data: [nil(); 6], lengths: [0; 6], numbers: [0; 6], output: nil(), length: 0, number: 0, kind: 0 }
+  let result = run Effect.result(unsafe dispatchCall(&mut e, context, state, argv, &mut c))
+  let mut i: usize = 0
+  while i < 6 {
+    if !Pointer.isNull<u8>(c.data[i]) { let mut k: usize = 0 while k < c.lengths[i] { unsafe Pointer.put<u8>(unsafe buffers.dataAt(c.data[i], usize.toU64(k)), 0) k = k + 1 } }
+    unsafe free(c.data[i]) i = i + 1
+  }
+  unsafe free(c.output)
+  return match move result { Result<ValueBits, OutOfMemoryError | JsException>.Success { value } => value Result<ValueBits, OutOfMemoryError | JsException>.Failure { error } => { fail move error } }
+}
+
+// ---- Native record mode ----
+// Once a handshake is done, a carrier socket in net_native runs the session's records itself
+// (library_hooks.SecureOps). `session` is the Handle.
+
+unsafe fn attached(session: *mut u8) -> *mut Handle { return unsafe Intrinsic.pointerReinterpret<*mut u8, *mut Handle>(session) }
+unsafe fn sessionOf(h: &Handle) -> *mut Connection { return unsafe nonnull(h.session) }
+/// The session `id` for a carrier to run, or null when it cannot.
+pub unsafe fn secureAttach(state: *mut State, id: i32) -> ?*mut u8 {
+  let optional = unsafe locate(state, id) if Pointer.isNull<Handle>(optional) { return nil() }
+  let mut anchor = () let h = unsafe Pointer.borrowMut<(), Handle>(&mut anchor, unsafe nonnull(optional))
+  if h.kind == 1 || h.attached || h.nativeFailure || Pointer.isNull<Connection>(h.session) { return nil() }
+  let sessionAnchor = () let s = unsafe Pointer.borrow<(), Connection>(&sessionAnchor, unsafe sessionOf(&h.*))
+  if !s.complete || s.failed { return nil() }
+  h.attached = true h.attachedCounts = s.starts * 67108864 + s.completions
+  return unsafe Intrinsic.pointerRequalify<*mut u8, ?*mut u8>(unsafe raw(unsafe nonnull(optional)))
+}
+pub unsafe fn secureDetach(session: *mut u8) -> () {
+  let p = unsafe attached(session)
+  let mut anchor = () let h = unsafe Pointer.borrowMut<(), Handle>(&mut anchor, p)
+  h.attached = false
+  if !h.releasePending { return () }
+  unsafe dispose(&mut h) drop h unsafe free(unsafe raw(p))
+}
+pub unsafe fn secureQuiet(session: *mut u8) -> bool {
+  let anchor = () let h = unsafe Pointer.borrow<(), Handle>(&anchor, unsafe attached(session))
+  let s = unsafe Pointer.borrow<(), Connection>(&anchor, unsafe sessionOf(&h.*))
+  // A 'session' JavaScript has not seen yet is for JavaScript to handle.
+  return s.starts * 67108864 + s.completions == h.attachedCounts && engine.queueLength(&s.fresh) == 0
+}
+pub unsafe fn secureFeed(session: *mut u8, data: *mut u8, count: usize) -> bool {
+  let anchor = () let h = unsafe Pointer.borrow<(), Handle>(&anchor, unsafe attached(session))
+  let mut held = () let s = unsafe Pointer.borrowMut<(), Connection>(&mut held, unsafe sessionOf(&h.*))
+  let bytes = unsafe Pointer.borrowMany<(), u8>(&anchor, unsafe Pointer.assumeMany<u8>(unsafe Intrinsic.pointerRequalify<*mut u8, *const u8>(data)), count)
+  return unsafe engine.push(&mut s.input, bytes)
+}
+/// Plaintext into `out`: the count, 0 when it needs more records, -1 at the peer's close_notify,
+/// or -2 after a failure, which the session's next read, write or handshake reports.
+pub unsafe fn secureRead(session: *mut u8, out: *mut u8, room: usize) -> i32 {
+  let mut hold = () let h = unsafe Pointer.borrowMut<(), Handle>(&mut hold, unsafe attached(session))
+  let mut held = () let s = unsafe Pointer.borrowMut<(), Connection>(&mut held, unsafe sessionOf(&h.*))
+  if engine.queueLength(&s.plain) == 0 {
+    if !unsafe engine.drive(&mut s.*) { h.nativeFailure = true return -2 }
+  }
+  let limit = if room > 16384 { 16384 } else { room }
+  let n = unsafe engine.takePlain(&mut s.*, out, limit)
+  if n > 0 { return usize.toI32(n) }
+  if s.peerClosed { return -1 }
+  return 0
+}
+pub unsafe fn secureWrite(session: *mut u8, data: *mut u8, count: usize) -> bool {
+  let anchor = () let mut hold = () let h = unsafe Pointer.borrowMut<(), Handle>(&mut hold, unsafe attached(session))
+  let mut held = () let s = unsafe Pointer.borrowMut<(), Connection>(&mut held, unsafe sessionOf(&h.*))
+  let bytes = unsafe Pointer.borrowMany<(), u8>(&anchor, unsafe Pointer.assumeMany<u8>(unsafe Intrinsic.pointerRequalify<*mut u8, *const u8>(data)), count)
+  if unsafe engine.write(&mut s.*, bytes) == usize.toI64(count) { return true }
+  h.nativeFailure = true return false
+}
+pub unsafe fn securePending(session: *mut u8) -> usize {
+  let anchor = () let h = unsafe Pointer.borrow<(), Handle>(&anchor, unsafe attached(session))
+  let s = unsafe Pointer.borrow<(), Connection>(&anchor, unsafe sessionOf(&h.*))
+  return engine.queueLength(&s.output)
+}
+pub unsafe fn secureTake(session: *mut u8, out: *mut u8, room: usize) -> usize {
+  let anchor = () let h = unsafe Pointer.borrow<(), Handle>(&anchor, unsafe attached(session))
+  let mut held = () let s = unsafe Pointer.borrowMut<(), Connection>(&mut held, unsafe sessionOf(&h.*))
+  return unsafe engine.take(&mut s.output, out, room)
+}
+
+export "C" fn silkSilkTlsSecureAttach(sessions: ?*mut u8, id: i32) -> ?*mut u8 {
+  if Pointer.isNull<u8>(sessions) { return nil() }
+  return unsafe secureAttach(unsafe Intrinsic.pointerReinterpret<*mut u8, *mut State>(unsafe nonnull(sessions)), id)
+}
+export "C" fn silkSilkTlsSecureDetach(session: *mut u8) -> () { unsafe secureDetach(session) }
+export "C" fn silkSilkTlsSecureQuiet(session: *mut u8) -> i32 { if unsafe secureQuiet(session) { return 1 } return 0 }
+export "C" fn silkSilkTlsSecureFeed(session: *mut u8, data: *mut u8, count: usize) -> i32 { if unsafe secureFeed(session, data, count) { return 1 } return 0 }
+export "C" fn silkSilkTlsSecureRead(session: *mut u8, out: *mut u8, room: usize) -> i32 { return unsafe secureRead(session, out, room) }
+export "C" fn silkSilkTlsSecureWrite(session: *mut u8, data: *mut u8, count: usize) -> i32 { if unsafe secureWrite(session, data, count) { return 1 } return 0 }
+export "C" fn silkSilkTlsSecurePending(session: *mut u8) -> usize { return unsafe securePending(session) }
+export "C" fn silkSilkTlsSecureTake(session: *mut u8, out: *mut u8, room: usize) -> usize { return unsafe secureTake(session, out, room) }
+/// The table of those operations.
+pub fn secureOps() -> SecureOps {
+  return SecureOps { attach: silkSilkTlsSecureAttach, detach: silkSilkTlsSecureDetach, quiet: silkSilkTlsSecureQuiet, feed: silkSilkTlsSecureFeed,
+    read: silkSilkTlsSecureRead, write: silkSilkTlsSecureWrite, pending: silkSilkTlsSecurePending, take: silkSilkTlsSecureTake }
+}

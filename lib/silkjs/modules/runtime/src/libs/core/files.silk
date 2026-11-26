@@ -1,0 +1,668 @@
+//! The [`Files`] implementations the core ships: `OsFiles`, the operating system's file system,
+//! `RootedFiles`, the same under one directory, `EmptyFiles`, none, and `MemoryFiles`, a file system in memory that the embedder creates and every thread of the
+//! runtime shares.
+//!
+//! An implementation runs one `fs` operation (`ext/fs_ops.silk`'s `Call`) and writes its
+//! `Outcome`: 0 or a negated errno in `code`, as libuv does on Unix.
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.mem.pointer { Pointer }
+import silk.mem.layout { Layout }
+import silk.core.effect { Effect }
+import silk.core.result { Result }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.concurrency.sync { Mutex }
+import silk.num.f64
+import silk.num.i32
+import silk.num.i64
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+import silk.platform.native.file {
+  FileStatus, Timestamp, OPEN_WRITE_ONLY, OPEN_READ_WRITE, OPEN_APPEND, OPEN_CREATE, OPEN_TRUNCATE, OPEN_EXCLUSIVE, OPEN_DIRECTORY,
+}
+import ext.fs_ops as ops
+import ext.fs_ops { Call, Outcome }
+import ext.os_abi as osabi
+import libs.core.capabilities { Files }
+
+/// The operating system's file system, as Node has it.
+pub struct OsFiles {}
+impl Copy for OsFiles {}
+impl Files for OsFiles {
+  static fn present() -> bool { return true }
+  static fn native() -> bool { return true }
+  static fn direct() -> bool { return true }
+  fn forWorker(self: &Self) -> Self { return OsFiles {} }
+  unsafe fn execute(self: &Self, call: &Call, out: &mut Outcome) -> () { unsafe ops.execute(&call, &mut out) }
+}
+
+const ENOENT: i32 = 2
+const EBADF: i32 = 9
+const EBUSY: i32 = 16
+const EEXIST: i32 = 17
+const ENOTDIR: i32 = 20
+const EISDIR: i32 = 21
+const EINVAL: i32 = 22
+fn enotempty() -> i32 { static if Intrinsic.targetOperatingSystem() == "darwin" { return 66 } else { return 39 } }
+fn enosys() -> i32 { static if Intrinsic.targetOperatingSystem() == "darwin" { return 78 } else { return 38 } }
+
+/// Descriptors of `MemoryFiles` start here; lower ones are the operating system's, and only the
+/// standard streams (0 to 2) reach it.
+pub const MEMORY_DESCRIPTOR_FIRST: i32 = 1000
+
+const TYPE_FILE: u32 = 0o100000
+const TYPE_DIRECTORY: u32 = 0o040000
+
+/// A file or directory: its normalized absolute path, without a final `/` (the root is `/`).
+struct Node { path: List<u8>, directory: bool, data: List<u8>, mode: u32, inode: u64, accessed: Timestamp, modified: Timestamp, changed: Timestamp, born: Timestamp }
+/// An open descriptor of a node.
+struct Open { fd: i32, inode: u64, offset: u64, append: bool, readable: bool, writable: bool }
+impl Copy for Open {}
+struct Tree { nodes: List<Node>, opens: List<Open>, nextInode: u64, nextFd: i32, temporary: u64, now: u64 }
+
+/// A file system in memory. `make` creates an empty one with the root directory; the files it
+/// holds live as long as the program. It has no links, and owners are not kept. A relative path
+/// is taken from `/`.
+pub struct MemoryFiles { tree: *mut Mutex<Tree> }
+impl Copy for MemoryFiles {}
+
+fn zero() -> Timestamp { return Timestamp { seconds: 0, nanoseconds: 0 } }
+
+impl MemoryFiles {
+  pub effect fn make() -> Self ! OutOfMemoryError ? &mut Allocator {
+    let mut tree = Tree { nodes: List<Node>.make(), opens: List<Open>.make(), nextInode: 2, nextFd: MEMORY_DESCRIPTOR_FIRST, temporary: 0, now: 1 }
+    let mut root = List<u8>.make()
+    run root.append(47)
+    run tree.nodes.append(Node { path: move root, directory: true, data: List<u8>.make(), mode: TYPE_DIRECTORY | 0o755, inode: 1, accessed: zero(), modified: zero(), changed: zero(), born: zero() })
+    let mutex = run Mutex<Tree>.make(move tree)
+    let allocation = unsafe osabi.calloc(1, Layout.of<Mutex<Tree>>().bytes)
+    if Pointer.isNull<u8>(allocation) { fail OutOfMemoryError {} }
+    let pointer = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut Mutex<Tree>>(unsafe Intrinsic.pointerRequalify<?*mut u8, *mut u8>(allocation))
+    unsafe Pointer.put<Mutex<Tree>>(pointer, move mutex)
+    return MemoryFiles { tree: pointer }
+  }
+
+  /// Adds the file `path` with `contents` (and the directories above it), as an embedder seeds
+  /// the file system before the runtime starts.
+  pub effect fn addFile(self: &Self, path: &[u8], contents: &[u8]) -> () ! OutOfMemoryError ? &mut Allocator {
+    let anchor = () let mutex = unsafe Pointer.borrow<(), Mutex<Tree>>(&anchor, self.tree)
+    let mut guard = mutex.lock() let tree = guard.getMut()
+    let normal = run normalize(path)
+    let mut at: usize = 1
+    while at < normal.length() {
+      if normal.asSlice()[at] == 47 {
+        let directory = Slice.view(normal.asSlice(), 0, at)
+        if find(&tree.*, directory) < 0 { run create(&mut tree.*, directory, true, 0o755) }
+      }
+      at = at + 1
+    }
+    let index = find(&tree.*, normal.asSlice())
+    if index < 0 { run create(&mut tree.*, normal.asSlice(), false, 0o644) }
+    let found = find(&tree.*, normal.asSlice())
+    let node = &mut tree.nodes.asMutSlice()[i32.toUsize(found)]
+    node.data.clear()
+    run node.data.appendBytes(contents)
+  }
+}
+
+/// `path` made absolute (from `/`) with `.`, `..` and repeated or final `/` taken out.
+effect fn normalize(path: &[u8]) -> List<u8> ! OutOfMemoryError ? &mut Allocator {
+  let mut out = List<u8>.make()
+  run out.append(47)
+  let mut at: usize = 0
+  while at < path.length {
+    while at < path.length && path[at] == 47 { at = at + 1 }
+    let start = at
+    while at < path.length && path[at] != 47 { at = at + 1 }
+    let length = at - start
+    if length == 0 { continue }
+    if length == 1 && path[start] == 46 { continue }
+    if length == 2 && path[start] == 46 && path[start + 1] == 46 {
+      // Back to the previous separator; the root stays.
+      let mut end = out.length()
+      while end > 1 && out.asSlice()[end - 1] != 47 { end = end - 1 }
+      if end > 1 { end = end - 1 }
+      out.truncate(end)
+      continue
+    }
+    if out.length() > 1 { run out.append(47) }
+    run out.appendBytes(Slice.view(path, start, length))
+  }
+  return move out
+}
+
+fn same(a: &[u8], b: &[u8]) -> bool {
+  if a.length != b.length { return false }
+  let mut at: usize = 0
+  while at < a.length { if a[at] != b[at] { return false } at = at + 1 }
+  return true
+}
+/// Whether `path` is directly inside `directory`, or anywhere below it when `deep`.
+fn inside(path: &[u8], directory: &[u8], deep: bool) -> bool {
+  let root = directory.length == 1
+  let prefix = if root { 0 } else { directory.length }
+  if path.length <= prefix + 1 { return false }
+  if !root {
+    let mut at: usize = 0
+    while at < directory.length { if path[at] != directory[at] { return false } at = at + 1 }
+    if path[prefix] != 47 { return false }
+  }
+  if deep { return true }
+  let mut at = prefix + 1
+  while at < path.length { if path[at] == 47 { return false } at = at + 1 }
+  return true
+}
+fn parentOf(path: &[u8]) -> &[u8] {
+  let mut end = path.length
+  while end > 1 && path[end - 1] != 47 { end = end - 1 }
+  if end > 1 { end = end - 1 }
+  return Slice.view(path, 0, end)
+}
+
+fn find(tree: &Tree, path: &[u8]) -> i32 {
+  let mut index: usize = 0
+  while index < tree.nodes.length() {
+    if same(tree.nodes.asSlice()[index].path.asSlice(), path) { return usize.toI32(index) }
+    index = index + 1
+  }
+  return -1
+}
+fn findInode(tree: &Tree, inode: u64) -> i32 {
+  let mut index: usize = 0
+  while index < tree.nodes.length() { if tree.nodes.asSlice()[index].inode == inode { return usize.toI32(index) } index = index + 1 }
+  return -1
+}
+fn findOpen(tree: &Tree, fd: i32) -> i32 {
+  let mut index: usize = 0
+  while index < tree.opens.length() { if tree.opens.asSlice()[index].fd == fd { return usize.toI32(index) } index = index + 1 }
+  return -1
+}
+/// 0 when the directory that would hold `path` is there, or the negated errno of creating in it.
+fn parentCheck(tree: &Tree, path: &[u8]) -> i32 {
+  if path.length == 1 { return -EEXIST }
+  let parent = find(&tree.*, parentOf(path))
+  if parent < 0 { return -ENOENT }
+  if !tree.nodes.asSlice()[i32.toUsize(parent)].directory { return -ENOTDIR }
+  return 0
+}
+fn tick(tree: &mut Tree) -> Timestamp {
+  tree.now = tree.now + 1
+  return Timestamp { seconds: u64.toI64(tree.now), nanoseconds: 0 }
+}
+effect fn create(tree: &mut Tree, path: &[u8], directory: bool, mode: u32) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut name = List<u8>.make()
+  run name.appendBytes(path)
+  let time = tick(&mut tree.*)
+  let inode = tree.nextInode
+  tree.nextInode = inode + 1
+  let kind = if directory { TYPE_DIRECTORY } else { TYPE_FILE }
+  run tree.nodes.append(Node { path: move name, directory: directory, data: List<u8>.make(), mode: kind | (mode & 0o7777), inode: inode, accessed: time, modified: time, changed: time, born: time })
+}
+fn status(node: &Node) -> FileStatus {
+  let size = usize.toU64(node.data.length())
+  return FileStatus {
+    device: 1, inode: node.inode, mode: node.mode, links: 1, user: 0, group: 0, specialDevice: 0, size: size, blockSize: 4096, blocks: (size + 511) / 512,
+    flags: 0, generation: 0, accessed: node.accessed, modified: node.modified, changed: node.changed, born: node.born,
+  }
+}
+fn timestamp(seconds: f64) -> Timestamp {
+  let whole = f64.floor(seconds)
+  let mut nanoseconds = f64.toI64((seconds - whole) * 1000000000.0)
+  if nanoseconds < 0 { nanoseconds = 0 } if nanoseconds > 999999999 { nanoseconds = 999999999 }
+  return Timestamp { seconds: f64.toI64(whole), nanoseconds: i64.toU32(nanoseconds) }
+}
+
+impl Files for MemoryFiles {
+  static fn present() -> bool { return true }
+  static fn native() -> bool { return false }
+  static fn direct() -> bool { return false }
+  fn forWorker(self: &Self) -> Self { return MemoryFiles { tree: self.tree } }
+  unsafe fn execute(self: &Self, call: &Call, out: &mut Outcome) -> () {
+    // The standard streams are the process's.
+    if ops.takesDescriptor(call.op) && call.fd >= 0 && call.fd < 3 { return unsafe ops.execute(&call, &mut out) }
+    let mut allocator = Allocator.systemAllocatorProvider()
+    let anchor = () let mutex = unsafe Pointer.borrow<(), Mutex<Tree>>(&anchor, self.tree)
+    let mut guard = mutex.lock()
+    let result = run Effect.result(unsafe perform(guard.getMut(), &call, &mut out)) |> Effect.provideMut<Allocator>(&mut allocator)
+    match move result {
+      Result<i32, OutOfMemoryError>.Success { value } => { out.code = value }
+      Result<i32, OutOfMemoryError>.Failure { .. } => { out.code = -12 }
+    }
+  }
+}
+
+/// Runs `call` on `tree`: 0, or a negated errno.
+unsafe effect fn perform(tree: &mut Tree, call: &Call, out: &mut Outcome) -> i32 ! OutOfMemoryError ? &mut Allocator {
+  let op = call.op
+  if op == ops.STATFS || op == ops.LINK || op == ops.SYMLINK { return -enosys() }
+  if ops.takesDescriptor(op) {
+    let opened = findOpen(&tree.*, call.fd)
+    if opened < 0 { return -EBADF }
+    let open = tree.opens.asSlice()[i32.toUsize(opened)]
+    if op == ops.CLOSE { let _closed = tree.opens.remove(i32.toUsize(opened)) return 0 }
+    let index = findInode(&tree.*, open.inode)
+    // The file was removed while it was open.
+    if index < 0 { return -EBADF }
+    let at = i32.toUsize(index)
+    if op == ops.FSTAT { out.status = status(&tree.nodes.asSlice()[at]) return 0 }
+    if op == ops.FSYNC || op == ops.FDATASYNC || op == ops.FCHOWN { return 0 }
+    if op == ops.FCHMOD { let node = &mut tree.nodes.asMutSlice()[at] node.mode = (node.mode & 0o170000) | (i64.toU32(call.a) & 0o7777) return 0 }
+    if op == ops.FUTIMES { let node = &mut tree.nodes.asMutSlice()[at] node.accessed = timestamp(call.atime) node.modified = timestamp(call.mtime) return 0 }
+    if op == ops.FTRUNCATE {
+      if !open.writable { return -EINVAL }
+      run resize(&mut tree.nodes.asMutSlice()[at].data, i64.toUsize(call.a)) return 0
+    }
+    if op == ops.READ {
+      if !open.readable { return -EBADF }
+      if tree.nodes.asSlice()[at].directory { return -EISDIR }
+      let position = if call.position < 0 { open.offset } else { i64.toU64(call.position) }
+      let data = tree.nodes.asSlice()[at].data.asSlice()
+      let mut count: usize = 0
+      if position < usize.toU64(data.length) && call.length > 0 {
+        let start = u64.toUsize(position)
+        count = data.length - start
+        if count > call.length { count = call.length }
+        let mut borrow = ()
+        let bytes = unsafe Pointer.borrowManyMut<(), u8>(&mut borrow, unsafe Pointer.assumeManyMut<u8>(unsafe Intrinsic.pointerRequalify<?*mut u8, *mut u8>(call.buffer)), count)
+        let mut copied: usize = 0
+        while copied < count { bytes[copied] = data[start + copied] copied = copied + 1 }
+      }
+      if call.position < 0 { let entry = &mut tree.opens.asMutSlice()[i32.toUsize(opened)] entry.offset = position + usize.toU64(count) }
+      out.count = usize.toI64(count)
+      return 0
+    }
+    if op == ops.WRITE {
+      if !open.writable { return -EBADF }
+      let time = tick(&mut tree.*)
+      let node = &mut tree.nodes.asMutSlice()[at]
+      let position = if open.append { usize.toU64(node.data.length()) } else if call.position < 0 { open.offset } else { i64.toU64(call.position) }
+      let start = u64.toUsize(position)
+      if start > node.data.length() { run resize(&mut node.data, start) }
+      if call.length > 0 {
+        let borrow = ()
+        let bytes = unsafe Pointer.borrowMany<(), u8>(&borrow, unsafe Pointer.assumeMany<u8>(unsafe Intrinsic.pointerRequalify<?*mut u8, *mut u8>(call.buffer)), call.length)
+        let mut written: usize = 0
+        while written < call.length {
+          if start + written < node.data.length() { node.data.set(start + written, bytes[written]) } else { run node.data.append(bytes[written]) }
+          written = written + 1
+        }
+      }
+      node.modified = time node.changed = time
+      if call.position < 0 || open.append { let entry = &mut tree.opens.asMutSlice()[i32.toUsize(opened)] entry.offset = position + usize.toU64(call.length) }
+      out.count = usize.toI64(call.length)
+      return 0
+    }
+    return -enosys()
+  }
+  let path = run normalize(call.path.asSlice())
+  let name = path.asSlice()
+  let index = find(&tree.*, name)
+  if op == ops.STAT || op == ops.LSTAT {
+    if index < 0 { return -ENOENT }
+    out.status = status(&tree.nodes.asSlice()[i32.toUsize(index)]) return 0
+  }
+  if op == ops.ACCESS { return if index < 0 { -ENOENT } else { 0 } }
+  if op == ops.REALPATH {
+    if index < 0 { return -ENOENT }
+    run out.text.appendBytes(name) return 0
+  }
+  if op == ops.READLINK { return if index < 0 { -ENOENT } else { -EINVAL } }
+  if op == ops.CHOWN || op == ops.LCHOWN { return if index < 0 { -ENOENT } else { 0 } }
+  if op == ops.CHMOD || op == ops.LCHMOD {
+    if index < 0 { return -ENOENT }
+    let node = &mut tree.nodes.asMutSlice()[i32.toUsize(index)] node.mode = (node.mode & 0o170000) | (i64.toU32(call.a) & 0o7777) return 0
+  }
+  if op == ops.UTIMES || op == ops.LUTIMES {
+    if index < 0 { return -ENOENT }
+    let node = &mut tree.nodes.asMutSlice()[i32.toUsize(index)] node.accessed = timestamp(call.atime) node.modified = timestamp(call.mtime) return 0
+  }
+  if op == ops.MKDIR {
+    if index >= 0 { return -EEXIST }
+    let checked = parentCheck(&tree.*, name) if checked < 0 { return checked }
+    run create(&mut tree.*, name, true, i64.toU32(call.a)) return 0
+  }
+  if op == ops.MKDTEMP {
+    // fs_native appended XXXXXX; the counter takes their place.
+    let stem = Slice.view(name, 0, name.length - 6)
+    while true {
+      tree.temporary = tree.temporary + 1
+      let mut candidate = List<u8>.make()
+      run candidate.appendBytes(stem)
+      let mut value = tree.temporary let mut digits: usize = 0
+      let mut suffix: [u8; 6] = [48; 6]
+      while digits < 6 { let digit = u64.toU8(value % 36) suffix[5 - digits] = if digit < 10 { 48 + digit } else { 87 + digit } value = value / 36 digits = digits + 1 }
+      run candidate.appendBytes(&suffix)
+      if find(&tree.*, candidate.asSlice()) >= 0 { continue }
+      let checked = parentCheck(&tree.*, candidate.asSlice()) if checked < 0 { return checked }
+      run create(&mut tree.*, candidate.asSlice(), true, 0o700)
+      run out.text.appendBytes(candidate.asSlice())
+      return 0
+    }
+    return 0
+  }
+  if op == ops.SCANDIR {
+    if index < 0 { return -ENOENT }
+    if !tree.nodes.asSlice()[i32.toUsize(index)].directory { return -ENOTDIR }
+    let mut child: usize = 0
+    while child < tree.nodes.length() {
+      let other = tree.nodes.asSlice()[child].path.asSlice()
+      if inside(other, name, false) {
+        let start = if name.length == 1 { 1 } else { name.length + 1 }
+        run ops.appendName(&mut out, Slice.view(other, start, other.length - start))
+      }
+      child = child + 1
+    }
+    run ops.sortNames(&mut out)
+    return 0
+  }
+  if op == ops.UNLINK {
+    if index < 0 { return -ENOENT }
+    if tree.nodes.asSlice()[i32.toUsize(index)].directory { static if Intrinsic.targetOperatingSystem() == "darwin" { return -1 } else { return -EISDIR } }
+    let _removed = tree.nodes.remove(i32.toUsize(index)) return 0
+  }
+  if op == ops.RMDIR {
+    if index < 0 { return -ENOENT }
+    if name.length == 1 { return -EBUSY }
+    if !tree.nodes.asSlice()[i32.toUsize(index)].directory { return -ENOTDIR }
+    if hasChildren(&tree.*, name) { return -enotempty() }
+    let _removed = tree.nodes.remove(i32.toUsize(index)) return 0
+  }
+  if op == ops.TRUNCATE {
+    if index < 0 { return -ENOENT }
+    if tree.nodes.asSlice()[i32.toUsize(index)].directory { return -EISDIR }
+    run resize(&mut tree.nodes.asMutSlice()[i32.toUsize(index)].data, i64.toUsize(call.a)) return 0
+  }
+  if op == ops.OPEN { return run open(&mut tree.*, name, index, call, &mut out) }
+  let destination = run normalize(call.dest.asSlice())
+  let target = destination.asSlice()
+  if op == ops.COPYFILE {
+    if index < 0 { return -ENOENT }
+    if tree.nodes.asSlice()[i32.toUsize(index)].directory { return -EISDIR }
+    let existing = find(&tree.*, target)
+    if existing >= 0 && (call.b & 1) != 0 { return -EEXIST }
+    if existing >= 0 && tree.nodes.asSlice()[i32.toUsize(existing)].directory { return -EISDIR }
+    let sourceMode = tree.nodes.asSlice()[i32.toUsize(index)].mode
+    if existing < 0 { let checked = parentCheck(&tree.*, target) if checked < 0 { return checked } run create(&mut tree.*, target, false, sourceMode) }
+    let mut copy = List<u8>.make()
+    run copy.appendBytes(tree.nodes.asSlice()[i32.toUsize(index)].data.asSlice())
+    let destinationIndex = find(&tree.*, target)
+    let destinationNode = &mut tree.nodes.asMutSlice()[i32.toUsize(destinationIndex)]
+    destinationNode.data = move copy
+    return 0
+  }
+  if op == ops.RENAME {
+    if index < 0 { return -ENOENT }
+    if same(name, target) { return 0 }
+    let directory = tree.nodes.asSlice()[i32.toUsize(index)].directory
+    if directory && inside(target, name, true) { return -EINVAL }
+    let checked = parentCheck(&tree.*, target) if checked < 0 { return checked }
+    let existing = find(&tree.*, target)
+    if existing >= 0 {
+      let other = tree.nodes.asSlice()[i32.toUsize(existing)].directory
+      if other && !directory { return -EISDIR }
+      if !other && directory { return -ENOTDIR }
+      if other && hasChildren(&tree.*, target) { return -enotempty() }
+      let _replaced = tree.nodes.remove(i32.toUsize(existing))
+    }
+    // The node, and for a directory everything below it, moves to the new name.
+    let mut at: usize = 0
+    while at < tree.nodes.length() {
+      let current = tree.nodes.asSlice()[at].path.asSlice()
+      if same(current, name) || (directory && inside(current, name, true)) {
+        let mut renamed = List<u8>.make()
+        run renamed.appendBytes(target)
+        run renamed.appendBytes(Slice.view(current, name.length, current.length - name.length))
+        let moved = &mut tree.nodes.asMutSlice()[at]
+        moved.path = move renamed
+      }
+      at = at + 1
+    }
+    return 0
+  }
+  return -enosys()
+}
+
+fn hasChildren(tree: &Tree, directory: &[u8]) -> bool {
+  let mut at: usize = 0
+  while at < tree.nodes.length() { if inside(tree.nodes.asSlice()[at].path.asSlice(), directory, false) { return true } at = at + 1 }
+  return false
+}
+
+effect fn resize(data: &mut List<u8>, length: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  if length < data.length() { data.truncate(length) return () }
+  let current = data.length()
+  run data.appendRepeated(0, length - current)
+}
+
+effect fn open(tree: &mut Tree, name: &[u8], found: i32, call: &Call, out: &mut Outcome) -> i32 ! OutOfMemoryError ? &mut Allocator {
+  let flags = i64.toI32(call.a)
+  let access = flags & 3
+  let writable = access == OPEN_WRITE_ONLY || access == OPEN_READ_WRITE
+  let mut index = found
+  if index >= 0 {
+    if (flags & OPEN_CREATE) != 0 && (flags & OPEN_EXCLUSIVE) != 0 { return -EEXIST }
+    let directory = tree.nodes.asSlice()[i32.toUsize(index)].directory
+    if directory && writable { return -EISDIR }
+    if !directory && (flags & OPEN_DIRECTORY) != 0 { return -ENOTDIR }
+    if !directory && writable && (flags & OPEN_TRUNCATE) != 0 {
+      let time = tick(&mut tree.*)
+      let node = &mut tree.nodes.asMutSlice()[i32.toUsize(index)]
+      node.data.clear() node.modified = time node.changed = time
+    }
+  } else {
+    if (flags & OPEN_CREATE) == 0 { return -ENOENT }
+    let checked = parentCheck(&tree.*, name) if checked < 0 { return checked }
+    run create(&mut tree.*, name, false, i64.toU32(call.b))
+    index = find(&tree.*, name)
+  }
+  let fd = tree.nextFd
+  tree.nextFd = fd + 1
+  run tree.opens.append(Open { fd: fd, inode: tree.nodes.asSlice()[i32.toUsize(index)].inode, offset: 0, append: (flags & OPEN_APPEND) != 0, readable: access != OPEN_WRITE_ONLY, writable: writable })
+  out.count = i32.toI64(fd)
+  return 0
+}
+
+/// No file system: `node:fs` and the built-ins that stand on it are not there, and the natives
+/// of `fs` are not compiled. The runtime's own reads of files fail with `ENOSYS`. Its
+/// operation is never called, because `present` is false.
+pub struct EmptyFiles {}
+impl Copy for EmptyFiles {}
+impl Files for EmptyFiles {
+  static fn present() -> bool { return false }
+  static fn native() -> bool { return false }
+  static fn direct() -> bool { return false }
+  fn forWorker(self: &Self) -> Self { return EmptyFiles {} }
+  unsafe fn execute(self: &Self, call: &Call, out: &mut Outcome) -> () { out.code = -enosys() }
+}
+
+/// The operating system's files under one directory: a path is taken from `root` (`/` is the
+/// root itself, and `..` stops there), and a path that comes back (`realpath`, `mkdtemp`) loses
+/// the root again. The rooting is lexical: a symbolic link inside the tree that points outside
+/// it is followed, so the tree must not hold links the runtime may not leave by.
+pub struct RootedFiles { root: &'static [u8] }
+impl Copy for RootedFiles {}
+impl RootedFiles {
+  /// `root` is an absolute directory path without a final `/`.
+  pub fn make(root: &'static [u8]) -> Self { return RootedFiles { root: root } }
+  effect fn place(self: &Self, path: &[u8]) -> List<u8> ! OutOfMemoryError ? &mut Allocator {
+    let normal = run normalize(path)
+    let mut placed = List<u8>.make()
+    run placed.appendBytes(self.root)
+    if normal.length() > 1 { run placed.appendBytes(normal.asSlice()) }
+    return move placed
+  }
+}
+impl Files for RootedFiles {
+  static fn present() -> bool { return true }
+  static fn native() -> bool { return true }
+  static fn direct() -> bool { return false }
+  fn forWorker(self: &Self) -> Self { return RootedFiles { root: self.root } }
+  unsafe fn execute(self: &Self, call: &Call, out: &mut Outcome) -> () {
+    if ops.takesDescriptor(call.op) { return unsafe ops.execute(&call, &mut out) }
+    let mut allocator = Allocator.systemAllocatorProvider()
+    let placed = run Effect.result(unsafe self.placed(&call)) |> Effect.provideMut<Allocator>(&mut allocator)
+    match move placed {
+      Result<Call, OutOfMemoryError>.Success { value } => {
+        unsafe ops.execute(&value, &mut out)
+        if out.code == 0 && (call.op == ops.REALPATH || call.op == ops.MKDTEMP) { unsafe self.unplace(&mut out) }
+      }
+      Result<Call, OutOfMemoryError>.Failure { .. } => { out.code = -12 }
+    }
+  }
+}
+impl RootedFiles {
+  unsafe effect fn placed(self: &Self, call: &Call) -> Call ! OutOfMemoryError ? &mut Allocator {
+    let mut copy = ops.call(call.op)
+    copy.fd = call.fd copy.a = call.a copy.b = call.b copy.atime = call.atime copy.mtime = call.mtime
+    copy.buffer = call.buffer copy.length = call.length copy.position = call.position
+    // A symbolic link's target (its `path`) is kept as given, and the link itself (`dest`) is
+    // placed; every other path is placed.
+    if call.op == ops.SYMLINK { run copy.path.appendBytes(call.path.asSlice()) }
+    else { copy.path = run self.place(call.path.asSlice()) }
+    if ops.takesDestination(call.op) { copy.dest = run self.place(call.dest.asSlice()) }
+    if call.op == ops.MKDTEMP { run copy.path.appendBytes(b"XXXXXX") }
+    return move copy
+  }
+  /// Takes the root off a path result; one outside the tree (through a link) becomes `/`.
+  unsafe fn unplace(self: &Self, out: &mut Outcome) -> () {
+    let text = out.text.asSlice()
+    let root = self.root
+    let inside = text.length >= root.length && same(Slice.view(text, 0, root.length), root) && (text.length == root.length || text[root.length] == 47)
+    let mut kept = List<u8>.make()
+    let mut allocator = Allocator.systemAllocatorProvider()
+    let rest = if inside && text.length > root.length { Slice.view(text, root.length, text.length - root.length) } else { b"/" }
+    let _appended = run Effect.result(kept.appendBytes(rest)) |> Effect.provideMut<Allocator>(&mut allocator)
+    out.text = move kept
+  }
+}
+
+/// The operating system's file system, limited to the paths the embedder grants while the program
+/// runs: a granted file, or a granted directory and everything below it. A user's choice in a
+/// file dialog is the usual grant. Every other path fails with `EACCES`, so with no grant nothing
+/// is reachable. Symbolic links are resolved before the check, so a link inside a granted
+/// directory does not reach outside it. Relative paths are refused. Every thread of the runtime
+/// shares the grants.
+pub struct GrantedFiles { grants: *mut Mutex<List<List<u8>>> }
+impl Copy for GrantedFiles {}
+
+const EACCES: i32 = 13
+
+impl GrantedFiles {
+  pub effect fn make() -> Self ! OutOfMemoryError ? &mut Allocator {
+    let mutex = run Mutex<List<List<u8>>>.make(List<List<u8>>.make())
+    let allocation = unsafe osabi.calloc(1, Layout.of<Mutex<List<List<u8>>>>().bytes)
+    if Pointer.isNull<u8>(allocation) { fail OutOfMemoryError {} }
+    let pointer = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut Mutex<List<List<u8>>>>(unsafe Intrinsic.pointerRequalify<?*mut u8, *mut u8>(allocation))
+    unsafe Pointer.put<Mutex<List<List<u8>>>>(pointer, move mutex)
+    return GrantedFiles { grants: pointer }
+  }
+
+  /// Grants `path`, an absolute path, and everything below it when it is a directory. A path
+  /// that does not exist yet (a save dialog's choice) is granted as its directory resolves.
+  pub effect fn grant(self: &Self, path: &[u8]) -> () ! OutOfMemoryError ? &mut Allocator {
+    if path.length == 0 || path[0] != 47 { return () }
+    let resolved = run resolvedName(path)
+    let anchor = () let mutex = unsafe Pointer.borrow<(), Mutex<List<List<u8>>>>(&anchor, self.grants)
+    let mut guard = mutex.lock() let grants = guard.getMut()
+    let mut index: usize = 0
+    while index < grants.length() {
+      if same(grants.asSlice()[index].asSlice(), resolved.asSlice()) { return () }
+      index = index + 1
+    }
+    run grants.append(move resolved)
+  }
+
+  /// Whether `path` is granted now.
+  pub effect fn granted(self: &Self, path: &[u8], follow: bool) -> bool ! OutOfMemoryError ? &mut Allocator {
+    if path.length == 0 || path[0] != 47 { return false }
+    let name = run resolvedName(path)
+    if !self.covers(name.asSlice()) { return false }
+    if !follow { return true }
+    // The object a path names, through a final link: it must be granted too.
+    let full = run realPath(name.asSlice())
+    match move full {
+      Option<List<u8>>.Some { value } => { return self.covers(value.asSlice()) }
+      Option<List<u8>>.None => { return true }
+    }
+  }
+
+  fn covers(self: &Self, path: &[u8]) -> bool {
+    let anchor = () let mutex = unsafe Pointer.borrow<(), Mutex<List<List<u8>>>>(&anchor, self.grants)
+    let guard = mutex.lock() let grants = guard.get()
+    let mut index: usize = 0
+    while index < grants.length() {
+      let grant = grants.asSlice()[index].asSlice()
+      if same(grant, path) || inside(path, grant, true) { return true }
+      index = index + 1
+    }
+    return false
+  }
+}
+
+/// `path` normalized, with its directory resolved through links and its last name kept as given:
+/// what the path names, whether or not it exists.
+effect fn resolvedName(path: &[u8]) -> List<u8> ! OutOfMemoryError ? &mut Allocator {
+  let normal = run normalize(path)
+  if normal.length() == 1 { return move normal }
+  let parent = parentOf(normal.asSlice())
+  let base = Slice.view(normal.asSlice(), parent.length + 1, normal.length() - parent.length - 1)
+  let mut out = match move run realPath(parent) {
+    Option<List<u8>>.Some { value } => move value
+    Option<List<u8>>.None => { return move normal }
+  }
+  if out.length() > 1 { run out.append(47) }
+  run out.appendBytes(base)
+  return move out
+}
+
+effect fn realPath(path: &[u8]) -> Option<List<u8>> ! OutOfMemoryError ? &mut Allocator {
+  let mut call = ops.call(ops.REALPATH)
+  run call.path.appendBytes(path)
+  let mut out = ops.outcome()
+  unsafe ops.execute(&call, &mut out)
+  if out.code != 0 { return Option<List<u8>>.None }
+  let mut text = List<u8>.make()
+  run text.appendBytes(out.text.asSlice())
+  return Option<List<u8>>.Some { value: move text }
+}
+
+/// Whether `op` acts on a final symbolic link itself rather than what it points to.
+fn onLink(op: i32) -> bool {
+  return op == ops.LSTAT || op == ops.LCHMOD || op == ops.LCHOWN || op == ops.UNLINK || op == ops.RMDIR || op == ops.RENAME || op == ops.READLINK || op == ops.LUTIMES || op == ops.SYMLINK || op == ops.MKDIR || op == ops.MKDTEMP
+}
+
+impl Files for GrantedFiles {
+  static fn present() -> bool { return true }
+  static fn native() -> bool { return true }
+  static fn direct() -> bool { return false }
+  fn forWorker(self: &Self) -> Self { return GrantedFiles { grants: self.grants } }
+  unsafe fn execute(self: &Self, call: &Call, out: &mut Outcome) -> () {
+    if ops.takesDescriptor(call.op) { return unsafe ops.execute(&call, &mut out) }
+    let mut allocator = Allocator.systemAllocatorProvider()
+    let follow = !onLink(call.op)
+    let mut path = call.path.asSlice()
+    let mut prefix = List<u8>.make()
+    if call.op == ops.MKDTEMP {
+      // The directory it makes is the prefix plus six characters; the prefix's directory decides.
+      drop run Effect.result(prefix.appendBytes(path)) |> Effect.provideMut<Allocator>(&mut allocator)
+      drop run Effect.result(prefix.appendBytes(b"XXXXXX")) |> Effect.provideMut<Allocator>(&mut allocator)
+      path = prefix.asSlice()
+    }
+    // A symbolic link's `path` is its target, which making the link does not reach: only where
+    // the link goes, `dest`, is checked, and reading through the link is checked then.
+    if call.op == ops.SYMLINK { path = call.dest.asSlice() }
+    let first = run Effect.result(self.granted(path, follow)) |> Effect.provideMut<Allocator>(&mut allocator)
+    let mut allowed = match move first { Result<bool, OutOfMemoryError>.Success { value } => value
+      Result<bool, OutOfMemoryError>.Failure { .. } => { out.code = -12 return () } }
+    if allowed && ops.takesDestination(call.op) && call.op != ops.SYMLINK {
+      let second = run Effect.result(self.granted(call.dest.asSlice(), call.op == ops.COPYFILE)) |> Effect.provideMut<Allocator>(&mut allocator)
+      allowed = match move second { Result<bool, OutOfMemoryError>.Success { value } => value
+        Result<bool, OutOfMemoryError>.Failure { .. } => { out.code = -12 return () } }
+    }
+    if !allowed { out.code = -EACCES return () }
+    unsafe ops.execute(&call, &mut out)
+  }
+}

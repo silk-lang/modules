@@ -474,6 +474,49 @@ that yield -0, compared through `1 / x`.
   otherwise), the element still holds that number at the store: nothing in between
   writes memory. The store then has no test of the old value and no cold piece
   (`elementNumber`): two instructions a turn.
+- **A plain store reads no index and has no exit.** Such a store through an Array's
+  elements, of a number boxed right before it, into an element whose read went on with
+  an Int, writes through R11 and nothing else: its index is not read, and it cannot
+  leave. `x64_regalloc.plainStores` says which stores these are before registers are
+  given (the same test on the instructions that the lowering makes on its own state: a
+  trusted read of the same elements and index earlier in the block, its result read by
+  the unbox after it alone, only `r11Kept` instructions between, the box right before
+  the store read by the store alone), and the allocator then counts neither the store's
+  index nor its exit's values as read there. In `w[j++] = l & 0xfffffff` the index ends
+  at `j + 1`, which is computed in `j`'s register, and the back edge moves nothing for
+  it: two instructions a turn of `am3`. A store of an Int also leaves the tag where it
+  is, as the read found an Int's: one more. Should the lowering find such a store with
+  R11 or the Int gone (its own state disagrees with the test), it marks the code faulty
+  and the function stays in baseline code (`Emitter.fault`); a stress run, whose stores
+  do leave, has no plain stores.
+- **A loop's branch goes straight back to its top.** A counted loop's latch holds only
+  its jump back (and, in an inlined body, an `inline.frame`, which emits nothing). The
+  branch that reaches it jumps to the loop's header itself (`through`), also when the
+  jump back has moves to make: they run in front of the conditional jump, as moves keep
+  the flags the compare set, when no move writes where a value that lives past the block
+  is (`movesAbove`, by the allocator's intervals), so the loop's other way out still
+  reads what it needs. One jump a turn where there were two.
+- **A number is added from its element.** `l + w[j]`: an Int a trusted read found, read
+  by its unbox alone and then only by the add or subtraction right after (as the term
+  that is not the result's place), stays in the element: the unbox tests the tag and the
+  operation takes the payload from memory (`add r15d, [r9 + r11 * 8 + 8]`). The number
+  has no register and no slot's store (`x64_regalloc.foldedUnbox`, in `Shortcuts.folds`;
+  `Emitter.memFor`). Where the operation overflows, a piece after the blocks writes the
+  number to its slot for the exit, and undoes the operation when it ran in place. Not
+  with a constant as the other term, whose slot the operation would read.
+- **What a loop carries around stays in a register.** A loop header's parameter in its
+  slot is stored on every turn and loaded on the next, and that load waits for the
+  store; a value the loop only reads costs a load nothing waits for. `am3`'s carry `c`
+  was in its slot. `x64_regalloc.weigh` counts a header's parameter 12 where it counted
+  4, so the value that goes to its slot is one the loop only reads. An Array's elements, loaded to R9 for an access and mostly
+  still there at the next one in the block (`preservesArrCache`, which bit operations
+  and products without a zero test now keep), count once a block. Of values whose
+  weights are within a quarter of each other the one that ends last goes, so a
+  temporary a little lighter than a long value does not go first and the long value at
+  the next temporary all the same.
+- **Bit operations run in place.** `l & 0xfffffff`, `m >> 14`: a bit operation or a
+  shift by a constant whose operand ends there takes the operand's register
+  (`scan`'s `operand`), with no move in front.
 - **Spill weights count what a slot costs.** A value read from its slot by an operation
   that takes a memory operand (`imul esi, [slot]`, `add`, `and`, a compare) costs one
   micro-operation more; one that must be loaded first, or stored when it is defined,

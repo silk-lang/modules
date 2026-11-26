@@ -3,13 +3,15 @@
 //! `return this.state == RUNNING` or `this.state = this.state | HELD`. The
 //! callee's code runs here on scratch cells above the call-frame region instead
 //! of in a frame of its own. Every opcode a
-//! leaf may hold reads without side effects on its fast path (a setter's one
-//! put_field comes last, right before its return_undef), so nothing the
-//! run looks at can change or die before it ends: the scratch cells borrow
-//! their values and the run touches no reference count until its result. When
-//! an opcode would need its slow path the run just stops, and the caller makes
-//! the ordinary call as if nothing ran. A completed run replaces the call's
-//! operands with the result, as returning from the call would.
+//! leaf may hold reads without side effects on its fast path, except a store to
+//! an existing own field (`this.pos++; this.ch = this.peekChar()`), which never
+//! drops a value's last reference, so nothing the run looks at can die before
+//! it ends: the scratch cells borrow their values. When an opcode would need
+//! its slow path the run just stops, its field stores are put back from the
+//! run's undo log (Undo), and the caller makes the ordinary call as if nothing
+//! ran. A store right before return_undef is the run's last step and needs no
+//! log. A completed run replaces the call's operands with the result, as
+//! returning from the call would.
 import silk.core.ownership { Copy }
 import silk.core.option { Option }
 import silk.mem.pointer { Pointer }
@@ -38,6 +40,14 @@ import js_bytecode { LEAF_PREFILL, LEAF_CELLS, LEAF_CREDIT_MASK, LEAF_ACCESSOR }
 
 /// Runs live at once: the outermost and one leaf it calls (Nesting).
 const LEAF_DEPTH: usize = 2
+/// Field stores an outermost run may make before its last step; one more declines.
+const LEAF_UNDO: usize = 8
+/// A logged store: node's slot index held old.
+struct Undo { node: *mut HeapHeader, index: usize, old: ValueBits }
+impl Copy for Undo {}
+/// The scratch bytes a run needs above the call-frame region: the cells of
+/// LEAF_DEPTH runs, then the outermost run's undo log.
+const LEAF_ROOM: usize = LEAF_DEPTH * LEAF_CELLS * 16 + LEAF_UNDO * 32
 
 fn invariant() -> never { return Intrinsic.trap("QuickJS invariant violated") }
 
@@ -99,8 +109,8 @@ pub unsafe fn attempt<H: HeapHooks>(hooks: &mut H, caller: *mut Machine, functio
   let top = unsafe Intrinsic.pointerRequalify<?*mut ValueBits, *mut ValueBits>(state.callFramesTop)
   let room = usize.wrappingSubtract(Pointer.address<ValueBits>(unsafe Intrinsic.pointerRequalify<?*mut ValueBits, *mut ValueBits>(state.callFramesEnd)), Pointer.address<ValueBits>(top))
   drop state
-  if LEAF_DEPTH * LEAF_CELLS * 16 > room { return false }
-  let mut nesting = Outer<H> { hooks: Pointer.fromMutRef<H>(&mut hooks), caller: caller, first: first }
+  if LEAF_ROOM > room { return false }
+  let mut nesting = Outer<H> { hooks: Pointer.fromMutRef<H>(&mut hooks), caller: caller, first: first, undo: unsafe undoLog(top), stores: 0 }
   return unsafe evaluate<Outer<H>>(&mut nesting, runtime, frame, unsafe captures(function, top), code, argv.data, argv.count, receiver, top)
 }
 /// attempt for a plain call of a known local function (js_compiler_known): its
@@ -117,9 +127,9 @@ pub unsafe fn attemptKnown<H: HeapHooks>(hooks: &mut H, caller: *mut Machine, co
   let top = unsafe Intrinsic.pointerRequalify<?*mut ValueBits, *mut ValueBits>(state.callFramesTop)
   let room = usize.wrappingSubtract(Pointer.address<ValueBits>(unsafe Intrinsic.pointerRequalify<?*mut ValueBits, *mut ValueBits>(state.callFramesEnd)), Pointer.address<ValueBits>(top))
   drop state
-  if LEAF_DEPTH * LEAF_CELLS * 16 > room { return false }
+  if LEAF_ROOM > room { return false }
   let mut absent = ValueBits.Undefined
-  let mut nesting = Outer<H> { hooks: Pointer.fromMutRef<H>(&mut hooks), caller: caller, first: first }
+  let mut nesting = Outer<H> { hooks: Pointer.fromMutRef<H>(&mut hooks), caller: caller, first: first, undo: unsafe undoLog(top), stores: 0 }
   return unsafe evaluate<Outer<H>>(&mut nesting, runtime, frame, Captures { references: references, scope: scope }, code, argv.data, argv.count,
     Pointer.fromMutRef<ValueBits>(&mut absent), top)
 }
@@ -145,10 +155,18 @@ pub unsafe fn attemptGetter(runtime: *mut HeapHeader, frame: *mut StackFrame, ge
 }
 /// Runs the leaf code for function with count arguments at arguments and this
 /// receiver, on scratch cells from top. True once nesting completed the call
-/// with its result, borrowed from wherever the run read it; false when an opcode
-/// needs its slow path.
-@inlineNever
+/// with its result, borrowed from wherever the run read it; false, with the
+/// run's field stores put back, when an opcode needs its slow path.
+@inlineAlways
 unsafe fn evaluate<N: Nesting>(nesting: &mut N, runtime: *mut HeapHeader, frame: *mut StackFrame, captured: Captures,
+  code: *mut HeapHeader, arguments: *mut ValueBits, count: usize, receiver: *mut ValueBits, top: *mut ValueBits) -> bool {
+  if unsafe interpret<N>(&mut nesting, runtime, frame, captured, code, arguments, count, receiver, top) { return true }
+  unsafe nesting.rollback()
+  return false
+}
+/// evaluate's run; a false return leaves the stores nesting logged in place.
+@inlineNever
+unsafe fn interpret<N: Nesting>(nesting: &mut N, runtime: *mut HeapHeader, frame: *mut StackFrame, captured: Captures,
   code: *mut HeapHeader, arguments: *mut ValueBits, count: usize, receiver: *mut ValueBits, top: *mut ValueBits) -> bool {
   let anchor = () let bytecode = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, code)
   let localCount = u16.toUsize(bytecode.variableCount)
@@ -358,25 +376,37 @@ unsafe fn evaluate<N: Nesting>(nesting: &mut N, runtime: *mut HeapHeader, frame:
         let slot6 = u8.toUsize(unsafe s.readU8()) unsafe copyCell(unsafe s.localCell(slot6), s.stackTop) unsafe s.advance(1)
         if !unsafe arrayElement(&mut s) { return false }
       }
-      63 => { // OP_put_field: only when immediately followed by return_undef
+      63 => { // OP_put_field: the run's last step right before return_undef, else logged
         let site = s.ip let atom = unsafe s.readU32() unsafe s.skip(u8.toUsize(op.FIELD_KEY_BYTES))
-        if !nesting.outermost() || !unsafe endsWithReturnUndef(&s) { return false }
-        if !unsafe storeKeyed(site, unsafe s.top(2), atom, unsafe s.top(1)) { return false }
-        unsafe nesting.complete(ValueBits.Undefined) return true
+        if !nesting.outermost() { return false }
+        if unsafe endsWithReturnUndef(&s) {
+          if !unsafe storeKeyed(site, unsafe s.top(2), atom, unsafe s.top(1)) { return false }
+          unsafe nesting.complete(ValueBits.Undefined) return true
+        }
+        if !unsafe nesting.store(site, unsafe s.top(2), atom, unsafe s.top(1)) { return false }
+        unsafe s.discard(2)
       }
       235 => { // OP_put_loc_field_loc8: the object's local, then the value's
         let site = s.ip let atom = unsafe s.readU32() unsafe s.skip(u8.toUsize(op.FIELD_KEY_BYTES))
         let objectSlot = u8.toUsize(unsafe s.readU8()) let valueSlot = u8.toUsize(unsafe s.readU8())
-        if !nesting.outermost() || !unsafe endsWithReturnUndef(&s) { return false }
-        if !unsafe storeKeyed(site, unsafe Pointer.read<ValueBits>(unsafe s.localCell(objectSlot)), atom, unsafe Pointer.read<ValueBits>(unsafe s.localCell(valueSlot))) { return false }
-        unsafe nesting.complete(ValueBits.Undefined) return true
+        if !nesting.outermost() { return false }
+        let target = unsafe Pointer.read<ValueBits>(unsafe s.localCell(objectSlot)) let value = unsafe Pointer.read<ValueBits>(unsafe s.localCell(valueSlot))
+        if unsafe endsWithReturnUndef(&s) {
+          if !unsafe storeKeyed(site, target, atom, value) { return false }
+          unsafe nesting.complete(ValueBits.Undefined) return true
+        }
+        if !unsafe nesting.store(site, target, atom, value) { return false }
       }
       236 => { // OP_put_loc_field_arg8: the object's local, then the value's argument
         let site = s.ip let atom = unsafe s.readU32() unsafe s.skip(u8.toUsize(op.FIELD_KEY_BYTES))
         let objectSlot = u8.toUsize(unsafe s.readU8()) let valueSlot = u8.toUsize(unsafe s.readU8())
-        if !nesting.outermost() || !unsafe endsWithReturnUndef(&s) { return false }
-        if !unsafe storeKeyed(site, unsafe Pointer.read<ValueBits>(unsafe s.localCell(objectSlot)), atom, unsafe Pointer.read<ValueBits>(unsafe s.argumentCell(valueSlot))) { return false }
-        unsafe nesting.complete(ValueBits.Undefined) return true
+        if !nesting.outermost() { return false }
+        let target = unsafe Pointer.read<ValueBits>(unsafe s.localCell(objectSlot)) let value = unsafe Pointer.read<ValueBits>(unsafe s.argumentCell(valueSlot))
+        if unsafe endsWithReturnUndef(&s) {
+          if !unsafe storeKeyed(site, target, atom, value) { return false }
+          unsafe nesting.complete(ValueBits.Undefined) return true
+        }
+        if !unsafe nesting.store(site, target, atom, value) { return false }
       }
       62 => { // OP_get_field2: the method above its receiver, as get_field (or String.prototype method)
         if !unsafe properties.peekField2Operand(&mut s) {
@@ -1147,12 +1177,50 @@ unsafe fn storeKeyed(site: *const u8, object: ValueBits, atom: u32, value: Value
   }
   return true
 }
-/// How a run treats the leaf calls it makes and its result: the outermost run
-/// (Outer) may call other leaves and store, and completes the call; a nested one
-/// (Inner) declines both, so a declined run never leaves a store behind and
-/// nesting stops at one level, and hands its result to the run that called it.
+/// storeKeyed for a store that is not the run's last step: entry gets what
+/// undoStores needs to take it back. false leaves everything unchanged.
+@inlineNever
+unsafe fn storeLogged(site: *const u8, object: ValueBits, atom: u32, value: ValueBits, entry: *mut Undo) -> bool {
+  let node = match object { ValueBits.Object { reference } => reference _ => { return false } }
+  let mut stored = unsafe value.retained()
+  let mut index: usize = 0 let mut old = ValueBits.Undefined
+  if !unsafe properties.writeOwnFieldKeeping(site, node, atom, Pointer.fromMutRef<ValueBits>(&mut stored), Pointer.fromMutRef<usize>(&mut index), Pointer.fromMutRef<ValueBits>(&mut old)) {
+    if !unsafe gc.releaseIfShared(stored) { invariant() }
+    return false
+  }
+  unsafe Pointer.write<Undo>(entry, Undo { node: node, index: index, old: old })
+  return true
+}
+/// A run's undo log: the scratch above the cells of LEAF_DEPTH runs from top.
+@inlineAlways
+unsafe fn undoLog(top: *mut ValueBits) -> *mut Undo {
+  return unsafe Pointer.castMut<ValueBits, Undo>(unsafe cellAt(top, LEAF_DEPTH * LEAF_CELLS))
+}
+@inlineAlways
+unsafe fn undoAt(log: *mut Undo, index: usize) -> *mut Undo { return unsafe Pointer.atMut<Undo>(unsafe Pointer.assumeManyMut<Undo>(log), index) }
+/// Takes back a declined run's count logged stores, last first, so each slot
+/// and reference count is what it was before the run.
+@cold
+unsafe fn undoStores(log: *mut Undo, count: usize) -> () {
+  let mut index = count
+  while index != 0 {
+    index = index - 1
+    let entry = unsafe Pointer.read<Undo>(unsafe undoAt(log, index))
+    let mut old = entry.old
+    unsafe properties.restoreOwnSlot(entry.node, entry.index, Pointer.fromMutRef<ValueBits>(&mut old))
+  }
+}
+/// How a run treats the leaf calls it makes, its stores and its result: the
+/// outermost run (Outer) may call other leaves and store, and completes the
+/// call; a nested one (Inner) declines both, so nesting stops at one level and
+/// only the outermost run has stores to take back, and hands its result to the
+/// run that called it.
 interface Nesting {
   fn outermost(self: &Self) -> bool
+  /// Stores value in object's field atom, keyed at site, logged for rollback; false changed nothing.
+  unsafe fn store(self: &mut Self, site: *const u8, object: ValueBits, atom: u32, value: ValueBits) -> bool
+  /// Takes back the stores of a run that declined.
+  unsafe fn rollback(self: &mut Self) -> ()
   unsafe fn complete(self: &mut Self, value: ValueBits) -> ()
   /// complete with the value in cell, moved as one 16-byte copy: the caller's
   /// next instruction may load it whole, which two 8-byte stores would stall.
@@ -1163,11 +1231,28 @@ interface Nesting {
   unsafe fn call(self: &mut Self, runtime: *mut HeapHeader, frame: *mut StackFrame, captured: Captures, code: *mut HeapHeader,
     arguments: *mut ValueBits, count: usize, receiver: *mut ValueBits, top: *mut ValueBits, result: *mut ValueBits) -> bool
 }
-struct Outer<H: HeapHooks> { hooks: *mut H, caller: *mut Machine, first: *mut ValueBits }
+struct Outer<H: HeapHooks> { hooks: *mut H, caller: *mut Machine, first: *mut ValueBits, undo: *mut Undo, stores: usize }
 struct Inner { result: *mut ValueBits }
 impl<H: HeapHooks> Nesting for Outer<H> {
   @inlineAlways
   fn outermost(self: &Self) -> bool { return true }
+  @inlineAlways
+  unsafe fn store(self: &mut Self, site: *const u8, object: ValueBits, atom: u32, value: ValueBits) -> bool {
+    if self.stores >= LEAF_UNDO { return false }
+    let entry = unsafe undoAt(self.undo, self.stores)
+    let node = match object { ValueBits.Object { reference } => reference _ => { return false } }
+    // The site's key names the object's shape nearly every time: that store sits here.
+    let mut source = value let mut old = ValueBits.Undefined
+    let slot = unsafe properties.writeOwnFieldKeyedKeeping(site, node, Pointer.fromMutRef<ValueBits>(&mut source), Pointer.fromMutRef<ValueBits>(&mut old))
+    if slot != usize.MAX {
+      drop unsafe value.retained()
+      unsafe Pointer.write<Undo>(entry, Undo { node: node, index: slot, old: old })
+    } else if !unsafe storeLogged(site, object, atom, value, entry) { return false }
+    self.stores = self.stores + 1
+    return true
+  }
+  @inlineAlways
+  unsafe fn rollback(self: &mut Self) -> () { if self.stores != 0 { unsafe undoStores(self.undo, self.stores) } }
   @inlineAlways
   unsafe fn complete(self: &mut Self, value: ValueBits) -> () {
     let mut anchor = () let hooks = unsafe Pointer.borrowMut<(), H>(&mut anchor, self.hooks)
@@ -1194,6 +1279,10 @@ impl<H: HeapHooks> Nesting for Outer<H> {
 impl Nesting for Inner {
   @inlineAlways
   fn outermost(self: &Self) -> bool { return false }
+  @inlineAlways
+  unsafe fn store(self: &mut Self, site: *const u8, object: ValueBits, atom: u32, value: ValueBits) -> bool { return false }
+  @inlineAlways
+  unsafe fn rollback(self: &mut Self) -> () { return () }
   @inlineAlways
   unsafe fn complete(self: &mut Self, value: ValueBits) -> () { unsafe Pointer.write<ValueBits>(self.result, value) }
   @inlineAlways

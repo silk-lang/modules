@@ -4,6 +4,9 @@ const host = require('internal/host');
 const { protocolError } = require('internal/inspector_values');
 const states = new WeakMap();
 const profilerSessions = new Set();
+// The recorder's largest sample store: observations past it are dropped
+// (profile.silk.droppedObservations), which at 16,384 was 3 s of a 200 us profile.
+const CPU_SAMPLES = 262144;
 let nextConsoleId = 1;
 let cpuOwner;
 let allocationOwner;
@@ -189,7 +192,7 @@ function consoleProfile(title = '', notify, skipThrough = consoleProfile) {
   if (cpuOwner && cpuOwner.console && cpuOwner.title === title) return;
   if (cpuOwner) throw protocolError(-32000, 'A CPU profile is already active');
   const location = consoleLocation(skipThrough);
-  if (!host.cpuProfileStart(1000, 16384)) throw protocolError(-32000, 'A CPU profile is already active');
+  if (!host.cpuProfileStart(1000, CPU_SAMPLES)) throw protocolError(-32000, 'A CPU profile is already active');
   const id = String(nextConsoleId++);
   cpuOwner = { console: true, title, id, notify };
   notify('Profiler.consoleProfileStarted', { id, location, title });
@@ -224,7 +227,7 @@ function dispatch(session, method, params = {}) {
     case 'Profiler.start':
       if (!current.cpuEnabled) throw protocolError(-32000, 'Profiler is not enabled');
       if (cpuOwner === session) return {};
-      if (cpuOwner || !host.cpuProfileStart(current.interval, 16384)) throw protocolError(-32000, 'A CPU profile is already active');
+      if (cpuOwner || !host.cpuProfileStart(current.interval, CPU_SAMPLES)) throw protocolError(-32000, 'A CPU profile is already active');
       cpuOwner = session; current.cpu = true; return {};
     case 'Profiler.stop': {
       if (cpuOwner !== session) throw protocolError(-32000, 'No CPU profile is active for this session');

@@ -1,0 +1,614 @@
+//! Exits name the unboxed number (docs/jit/code-quality.md).
+//!
+//! After `u = unbox.i32 v` passed, `v` is an Int and `u` is its number, so an exit later in
+//! the block that writes `v` to the interpreter's frame can write `int u` instead: the same
+//! value. `v` then has no reader past its unbox, and when `v` is an element read the backend
+//! loads the number straight from the array (x64_backend: get.elem followed by its unbox),
+//! without copying the element to a frame slot first.
+//!
+//! Only a borrowed `v` (an owned one is moved by the exit, which the ownership rules count),
+//! and only exits one instruction uses: an exit shared with an instruction in front of the
+//! unbox (ssa_opt_hoist's front block) runs before `u` exists.
+import silk.collections.list { List }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.i32
+import silk.num.u8
+import silk.num.u32
+import silk.num.usize
+import silkjs.js_class_data as classes
+import silkjs.js_feedback as feedback
+import ssa { Function, Exit, Inst, Own, Op, RootKind, Slot, SlotMode, Type, NONE, readsK, isNumberOp }
+import ssa_ownership { Forward }
+import ssa_verify { readsA, readsB }
+
+/// Whether `inst` has no exit, no observable JS side effects, and leaves ownership state
+/// unchanged (neither producing nor consuming an Own.Owned value).
+fn pureNoExit(f: &Function, inst: Inst) -> bool {
+  let op = inst.op
+  if op == Op.Retain { return inst.result != NONE && f.value(inst.result).own == Own.Borrowed }
+  return op == Op.ConstI32 || op == Op.ConstF64 || op == Op.Imm || op == Op.Arg || op == Op.This
+    || op == Op.BoxI32 || op == Op.BoxBool || op == Op.BoxF64
+    || op == Op.ToF64 || op == Op.ToInt32
+    || op == Op.AddF64 || op == Op.SubF64 || op == Op.MulF64 || op == Op.DivF64 || op == Op.ModF64
+    || op == Op.CmpF64 || op == Op.NegF64 || op == Op.SqrtF64 || op == Op.AbsF64 || op == Op.FloorF64
+    || op == Op.Cmp || op == Op.NotBool || op == Op.Imul
+    || op == Op.BitAnd || op == Op.BitOr || op == Op.BitXor || op == Op.Shl || op == Op.Sar || op == Op.BitNot
+    || op == Op.TagIn || op == Op.TagIs || op == Op.Truthy || op == Op.IsCallee
+    || op == Op.Removed
+}
+
+/// Whether `inst` is an expression-level instruction safe to hoist an `Op.UnboxF64` across.
+fn safeBetweenUnboxF64(f: &Function, inst: Inst) -> bool {
+  if pureNoExit(f, inst) { return true }
+  let op = inst.op
+  if op == Op.GetElem { return inst.trusted && inst.k == 0 }
+  if op == Op.GetField { return inst.k == 0 }
+  return op == Op.Add || op == Op.Sub || op == Op.Mul || op == Op.Mod || op == Op.Neg || op == Op.Shr
+    || op == Op.Unbox || op == Op.UnboxF64 || op == Op.UnboxBool || op == Op.ExactI32
+    || op == Op.CheckTag || op == Op.CheckArray || op == Op.CheckBound || op == Op.CheckShape || op == Op.CheckWatched
+    || op == Op.GetLength
+}
+
+/// Whether `v` is defined in a dominating block, as a parameter of `b`, or in `b` at `order <= maxOrder`.
+fn definedByOrder(f: &Function, v: u32, b: u32, maxOrder: u32) -> bool {
+  if v == NONE || u32.toUsize(v) >= f.values.length() { return false }
+  let info = f.value(v)
+  if info.block != b || info.def == NONE { return true }
+  return f.inst(info.def).order <= maxOrder
+}
+
+/// Hoists a single-use `Op.UnboxF64` immediately after its same-block borrowed `Op.GetField`
+/// (keyed, non-stepping) or trusted `Op.GetElem` producer so `x64_backend.fusedUnboxF64` can
+/// load the double directly from the slot. Clones the first exit after the producer (preserving
+/// exact post-read state and getter ordering) and rewrites later exits from `Dup(v)` to `F64(u)`.
+effect fn hoistUnboxF64(f: &mut Function) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let values = f.values.length()
+  let mut hasUnbox = false
+  let mut i: usize = 0
+  while i < f.insts.length() {
+    if f.insts.get(i).op == Op.UnboxF64 { hasUnbox = true break }
+    i = i + 1
+  }
+  if !hasUnbox { return false }
+  let multiple = NONE - 1
+  let mut user = List<u32>.make()
+  run user.appendRepeated(NONE, values)
+  i = 0
+  while i < f.insts.length() {
+    let inst = f.insts.get(i)
+    if inst.op != Op.Removed {
+      if readsA(inst.op) { noteUse(&mut user, inst.a, usize.toU32(i)) }
+      if readsB(inst.op) { noteUse(&mut user, inst.b, usize.toU32(i)) }
+      if readsK(inst.op) { noteUse(&mut user, i32.wrappingToU32(inst.k), usize.toU32(i)) }
+    }
+    i = i + 1
+  }
+  i = 0
+  while i < f.edgeArgs.length() {
+    let v = u32.toUsize(f.edgeArgs.get(i))
+    if v < values { user.set(v, multiple) }
+    i = i + 1
+  }
+  i = 0
+  while i < f.virtualObjs.length() {
+    let vo = f.virtualObjs.get(i)
+    let mut fk: u32 = 0
+    while fk < vo.slotCount && fk < 8 {
+      let fv = u32.toUsize(vo.fields[u32.toUsize(fk)])
+      if fv < values { user.set(fv, multiple) }
+      fk = fk + 1
+    }
+    i = i + 1
+  }
+  i = 0
+  while i < values {
+    let info = f.values.get(i)
+    if info.rootKind == RootKind.Value && u32.toUsize(info.root) < values { user.set(u32.toUsize(info.root), multiple) }
+    i = i + 1
+  }
+  let mut hoisted = List<u32>.make()
+  run hoisted.appendRepeated(NONE, values)
+  let mut keepExit = List<u32>.make()
+  run keepExit.appendRepeated(NONE, values)
+  let mut moved = false
+  let mut b: u32 = 0
+  while b < f.blockCount() {
+    let block = f.blocks.get(u32.toUsize(b))
+    let end = block.firstInst + block.instCount
+    let mut at = block.firstInst
+    while at < end {
+      let mut u = f.inst(at)
+      if u.op == Op.UnboxF64 && u.result != NONE && u.exit != NONE && u32.toUsize(u.a) < values {
+        let v = u.a
+        let vInfo = f.value(v)
+        if vInfo.block == b && vInfo.def != NONE && vInfo.own == Own.Borrowed && user.get(u32.toUsize(v)) == at {
+          let defIdx = vInfo.def
+          let vInst = f.inst(defIdx)
+          let producerOk = vInst.exit != NONE
+            && ((vInst.op == Op.GetField && vInst.k == 0) || (vInst.op == Op.GetElem && vInst.trusted && vInst.k == 0))
+          if producerOk && defIdx < at {
+            let mut between: u32 = 0
+            let mut safe = true
+            let mut firstExit = NONE
+            let mut j = defIdx + 1
+            while j < at && safe {
+              let mid = f.inst(j)
+              if mid.op != Op.Removed && mid.order > vInst.order {
+                between = between + 1
+                if !safeBetweenUnboxF64(&f.*, mid) { safe = false break }
+                if firstExit == NONE {
+                  if mid.exit != NONE { firstExit = mid.exit }
+                  else if !pureNoExit(&f.*, mid) { safe = false break }
+                }
+              }
+              j = j + 1
+            }
+            if firstExit == NONE { firstExit = u.exit }
+            if safe && between > 0 && firstExit != NONE {
+              let src = f.exit(firstExit)
+              let srcFirst = src.firstSlot
+              let srcCount = f.slotCount(src)
+              let mut exitOk = true
+              let mut s: u32 = 0
+              while s < srcCount && exitOk {
+                let slot = f.slots.get(u32.toUsize(srcFirst + s))
+                if slot.mode == SlotMode.Virtual {
+                  let vo = f.virtualObjs.get(u32.toUsize(slot.value))
+                  let mut fk: u32 = 0
+                  while fk < vo.slotCount && fk < 8 {
+                    if !definedByOrder(&f.*, vo.fields[u32.toUsize(fk)], b, vInst.order) { exitOk = false break }
+                    fk = fk + 1
+                  }
+                } else {
+                  let mut eff = slot.value
+                  if u32.toUsize(eff) < values && hoisted.get(u32.toUsize(eff)) != NONE { eff = hoisted.get(u32.toUsize(eff)) }
+                  if !definedByOrder(&f.*, eff, b, vInst.order) { exitOk = false }
+                }
+                s = s + 1
+              }
+              if exitOk {
+                let newFirst = usize.toU32(f.slots.length())
+                s = 0
+                while s < srcCount {
+                  let mut slot = f.slots.get(u32.toUsize(srcFirst + s))
+                  if slot.mode != SlotMode.Virtual && u32.toUsize(slot.value) < values {
+                    let hv = hoisted.get(u32.toUsize(slot.value))
+                    if hv != NONE { slot = Slot { value: hv, mode: SlotMode.F64, root: NONE } }
+                  }
+                  run f.slots.append(slot)
+                  s = s + 1
+                }
+                let newExit = usize.toU32(f.exits.length())
+                run f.exits.append(Exit { pc: src.pc, stackDepth: src.stackDepth, firstSlot: newFirst, drops: src.drops, inner: src.inner, firstFrame: src.firstFrame, frames: src.frames })
+                u.exit = newExit
+                u.order = vInst.order + 1
+                f.setInst(at, u)
+                hoisted.set(u32.toUsize(v), u.result)
+                keepExit.set(u32.toUsize(v), newExit)
+                moved = true
+              }
+            }
+          }
+        }
+      }
+      at = at + 1
+    }
+    b = b + 1
+  }
+  if !moved { return false }
+  // Rewrite every exit slot referencing a hoisted `v` (except its own unbox exit) to F64(u).
+  let mut e: usize = 0
+  while e < f.exits.length() {
+    let exit = f.exits.get(e)
+    let count = f.slotCount(exit)
+    let mut s: u32 = 0
+    while s < count {
+      let idx = exit.firstSlot + s
+      let slot = f.slots.get(u32.toUsize(idx))
+      if slot.mode != SlotMode.Virtual && u32.toUsize(slot.value) < values {
+        let uVal = hoisted.get(u32.toUsize(slot.value))
+        if uVal != NONE && keepExit.get(u32.toUsize(slot.value)) != usize.toU32(e) {
+          f.setSlot(idx, Slot { value: uVal, mode: SlotMode.F64, root: NONE })
+        }
+      }
+      s = s + 1
+    }
+    e = e + 1
+  }
+  run f.compact()
+  return true
+}
+
+/// Rewrites the exit slots described above (and hoists non-adjacent `Op.UnboxF64` next to
+/// their same-block field/element producers); answers whether any changed.
+pub effect fn unboxedSlots(f: &mut Function) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let mut changed = run hoistUnboxF64(&mut f)
+  let values = f.values.length()
+  // How many instructions use each exit.
+  let mut users = List<u32>.make()
+  run users.appendRepeated(0, f.exits.length())
+  let mut any = false
+  let mut i: usize = 0
+  while i < f.insts.length() {
+    let inst = f.insts.get(i)
+    if inst.op != Op.Removed && inst.exit != NONE { let at = u32.toUsize(inst.exit) let before = users.get(at) users.set(at, before + 1) }
+    if inst.op == Op.Unbox || inst.op == Op.UnboxF64 { any = true }
+    i = i + 1
+  }
+  f.work = f.work + usize.toU64(f.insts.length())
+  if !any { return changed }
+  // unboxed[v]: the number of v, valid while stamp[v] is the block being walked (plus one).
+  let mut unboxed = List<u32>.make() let mut stamp = List<u32>.make()
+  run unboxed.appendRepeated(NONE, values) run stamp.appendRepeated(0, values)
+  let mut b: u32 = 0
+  while b < f.blockCount() {
+    let block = f.blocks.get(u32.toUsize(b))
+    let mut seen = false
+    let mut at = block.firstInst
+    while at < block.firstInst + block.instCount {
+      let inst = f.inst(at)
+      if inst.block == b && inst.op != Op.Removed {
+        if seen && inst.exit != NONE && users.get(u32.toUsize(inst.exit)) == 1 {
+          let exit = f.exit(inst.exit)
+          let count = f.slotCount(exit)
+          let mut s: u32 = 0
+          while s < count {
+            let slot = f.slot(exit, s)
+            if slot.mode != SlotMode.Virtual {
+              let v = slot.value
+              if u32.toUsize(v) < values && stamp.get(u32.toUsize(v)) == b + 1 {
+                let target = unboxed.get(u32.toUsize(v))
+                let mode = if f.value(target).ty == Type.F64 { SlotMode.F64 } else { SlotMode.Int }
+                f.setSlot(exit.firstSlot + s, Slot { value: target, mode: mode, root: NONE })
+                changed = true
+              }
+            }
+            s = s + 1
+          }
+          f.work = f.work + u32.toU64(count)
+        }
+        if (inst.op == Op.Unbox || inst.op == Op.UnboxF64) && inst.result != NONE && u32.toUsize(inst.a) < values && f.value(inst.a).own == Own.Borrowed {
+          unboxed.set(u32.toUsize(inst.a), inst.result)
+          stamp.set(u32.toUsize(inst.a), b + 1)
+          seen = true
+        }
+      }
+      at = at + 1
+    }
+    b = b + 1
+  }
+  return changed
+}
+
+/// Specialize monomorphic Float64Array element sites used by double arithmetic. The new
+/// read produces the original unbox's SSA result at the read itself. Intermediate exits
+/// can therefore restore that double before the former unbox, even across another guard.
+/// Skip sites that have previously exited, so a changing receiver can regain its generic arm.
+pub effect fn float64Elements(f: &mut Function, sites: &List<u32>) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let kind = u8.toU32(feedback.ELEMENT_TYPED) + classes.JS_CLASS_FLOAT64_ARRAY - classes.JS_CLASS_UINT8C_ARRAY
+  let mut any = false
+  let mut i: usize = 0
+  while i < f.elementKinds.length() {
+    if (f.elementKinds.get(i) & 255) == kind { any = true break }
+    i = i + 1
+  }
+  if !any { return false }
+
+  // Record the sole instruction reading each value, excluding edge arguments and roots.
+  // Exit slots can be materialized from the unboxed value.
+  let multiple = NONE - 1
+  let mut user = List<u32>.make()
+  run user.appendRepeated(NONE, f.values.length())
+  i = 0
+  while i < f.insts.length() {
+    let inst = f.insts.get(i)
+    if readsA(inst.op) { noteUse(&mut user, inst.a, usize.toU32(i)) }
+    if readsB(inst.op) { noteUse(&mut user, inst.b, usize.toU32(i)) }
+    if readsK(inst.op) { noteUse(&mut user, i32.wrappingToU32(inst.k), usize.toU32(i)) }
+    i = i + 1
+  }
+  i = 0
+  while i < f.edgeArgs.length() {
+    let v = u32.toUsize(f.edgeArgs.get(i))
+    if v < user.length() { user.set(v, multiple) }
+    i = i + 1
+  }
+  i = 0
+  while i < f.values.length() {
+    let info = f.values.get(i)
+    if info.rootKind == RootKind.Value { user.set(u32.toUsize(info.root), multiple) }
+    i = i + 1
+  }
+
+  let mut numbers = List<u32>.make()
+  run numbers.appendRepeated(NONE, f.values.length())
+  let mut changed = false
+  i = 0
+  while i < f.insts.length() {
+    let mut inst = f.insts.get(i)
+    if (inst.op == Op.GetElem || inst.op == Op.PutElem) && f.elementKind(&inst) == kind && !previousExit(sites, inst.pc) {
+      if inst.op == Op.GetElem && inst.k == 0 && f.value(inst.result).own == Own.Borrowed {
+        let only = user.get(u32.toUsize(inst.result))
+        if only < multiple {
+          let mut unbox = f.inst(only)
+          if unbox.op == Op.UnboxF64 {
+            numbers.set(u32.toUsize(inst.result), unbox.result)
+            inst.op = Op.GetElemF64 inst.result = unbox.result
+            unbox.op = Op.Removed
+            f.insts.set(u32.toUsize(only), unbox) f.insts.set(i, inst)
+            changed = true
+          }
+        }
+      } else if inst.op == Op.PutElem {
+        let def = f.value(inst.b).def
+        if def != NONE && user.get(u32.toUsize(inst.b)) == usize.toU32(i) {
+          let mut box = f.inst(def)
+          if box.op == Op.BoxF64 {
+            numbers.set(u32.toUsize(inst.b), box.a)
+            inst.op = Op.PutElemF64 inst.b = box.a
+            box.op = Op.Removed
+            f.insts.set(u32.toUsize(def), box) f.insts.set(i, inst)
+            changed = true
+          }
+        }
+      }
+    }
+    i = i + 1
+  }
+  if changed {
+    i = 0
+    while i < f.slots.length() {
+      let slot = f.slots.get(i)
+      if slot.mode != SlotMode.Virtual {
+        let old = u32.toUsize(slot.value)
+        if old < numbers.length() {
+          let v = numbers.get(old)
+          if v != NONE { f.slots.set(i, Slot { value: v, mode: SlotMode.F64, root: NONE }) }
+        }
+      }
+      i = i + 1
+    }
+  }
+  return changed
+}
+
+fn noteUse(users: &mut List<u32>, v: u32, index: u32) -> () {
+  let at = u32.toUsize(v)
+  if users.get(at) == NONE { users.set(at, index) } else { users.set(at, NONE - 1) }
+}
+
+fn previousExit(sites: &List<u32>, pc: u32) -> bool {
+  let mut i: usize = 0
+  while i < sites.length() { if sites.get(i) == pc { return true } i = i + 1 }
+  return false
+}
+
+// ---- repeated element reads ----
+//
+// `a[i]` read twice in one block with nothing between that could change an array (no store,
+// call, step, poll or release) reads the same element: the second read, and its unbox,
+// take the first's. A plain element read (k 0) exits where it would need the engine (not a
+// fast element, a getter), so it has no effect of its own to repeat. The array is matched
+// through borrowed copies of it (an inlined `this_array` and the local it came from), the
+// index as a value. Crypto's am3 reads `this_array[i]` twice per turn.
+
+/// Instructions that change no array and run no code (repeatedReads keeps its reads over
+/// them).
+fn keepsElements(op: Op) -> bool {
+  return isNumberOp(op) || op == Op.ConstI32 || op == Op.Imm || op == Op.Unbox || op == Op.UnboxBool || op == Op.BoxI32 || op == Op.BoxBool
+    || op == Op.Add || op == Op.Sub || op == Op.Mul || op == Op.Cmp || op == Op.CheckTag || op == Op.CheckArray || op == Op.CheckBound || op == Op.Elements || op == Op.TagIs || op == Op.TagIn || op == Op.Removed
+}
+/// The value whose bits `v` borrows, through borrowed copies (RootKind.Value), or v.
+fn arrayRoot(f: &Function, v: u32) -> u32 {
+  let mut x = v
+  let mut steps = 0
+  while steps < 8 {
+    let info = f.value(x)
+    if info.own != Own.Borrowed || info.rootKind != RootKind.Value || info.root == NONE || u32.toUsize(info.root) >= f.values.length() { return x }
+    let def = info.def
+    if def == NONE || f.inst(def).op != Op.Retain { return x }
+    x = info.root
+    steps = steps + 1
+  }
+  return x
+}
+/// Replaces repeated element reads as described above; answers whether any went. The caller
+/// compacts.
+pub effect fn repeatedReads(f: &mut Function) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let mut forward = run Forward.make(&f.*)
+  let mut changed = false
+  // The reads kept since the block's start or its last barrier: array, index, result, and
+  // the result's i32 unbox (NONE until one is seen).
+  let mut arrays = List<u32>.make() let mut indexes = List<u32>.make()
+  let mut results = List<u32>.make() let mut unboxes = List<u32>.make()
+  let mut b: u32 = 0
+  while b < f.blockCount() {
+    arrays.clear() indexes.clear() results.clear() unboxes.clear()
+    let block = f.blocks.get(u32.toUsize(b))
+    let mut i = block.firstInst
+    while i < block.firstInst + block.instCount {
+      let inst = f.inst(i)
+      if inst.op == Op.GetElem && inst.k == 0 && inst.result != NONE && f.value(inst.result).own == Own.Borrowed {
+        let array = arrayRoot(&f.*, forward.resolve(inst.a))
+        let index = forward.resolve(inst.b)
+        let mut j: usize = 0
+        while j < arrays.length() && !(arrays.get(j) == array && indexes.get(j) == index) { j = j + 1 }
+        if j < arrays.length() {
+          run forward.replace(inst.result, results.get(j))
+          let mut gone = inst gone.op = Op.Removed f.setInst(i, gone)
+          changed = true
+        } else {
+          run arrays.append(array) run indexes.append(index) run results.append(inst.result) run unboxes.append(NONE)
+        }
+      } else if inst.op == Op.Unbox && inst.k == 0 && inst.result != NONE {
+        let read = forward.resolve(inst.a)
+        let mut j: usize = 0
+        while j < results.length() && results.get(j) != read { j = j + 1 }
+        if j < results.length() {
+          if unboxes.get(j) != NONE {
+            run forward.replace(inst.result, unboxes.get(j))
+            let mut gone = inst gone.op = Op.Removed f.setInst(i, gone)
+            changed = true
+          } else { unboxes.set(j, inst.result) }
+        }
+      } else if !keepsElements(inst.op) {
+        arrays.clear() indexes.clear() results.clear() unboxes.clear()
+      }
+      i = i + 1
+    }
+    f.work = f.work + u32.toU64(block.instCount)
+    b = b + 1
+  }
+  forward.apply(&mut f)
+  return changed
+}
+
+/// Whether `op` reads its operands through ToInt32 or only compares them: a zero operand and
+/// -0 are one to it, whatever the other operand is.
+fn blindToSign(op: Op) -> bool {
+  return op == Op.BitAnd || op == Op.BitOr || op == Op.BitXor || op == Op.Shl || op == Op.Sar || op == Op.Shr || op == Op.Imul || op == Op.Cmp
+}
+
+/// Whether slot `s` of `exit` is an operand on a stack (the frame's own or an inlined
+/// body's): a temporary one instruction takes, where a local or an argument may be read by
+/// whatever the interpreter runs next.
+fn operandSlot(f: &Function, exit: Exit, s: u32) -> bool {
+  if s < f.localCount { return false }
+  if s < f.localCount + exit.stackDepth { return true }
+  let mut at = f.localCount + exit.stackDepth + f.argumentSlots
+  if s < at { return false }
+  let mut k: u32 = 0
+  while k < exit.frames {
+    let frame = f.exitFrame(exit, k)
+    if s < at + frame.locals { return false }
+    at = at + frame.locals
+    if s < at + frame.depth { return true }
+    at = at + frame.depth
+    k = k + 1
+  }
+  return false
+}
+
+/// Marks the products whose zero need not be told from -0 (Inst.proven on a `mul.i32`;
+/// docs/jit/code-quality.md, "Products that need no sign of zero"). `0 * -5` is -0, which
+/// no i32 holds, so a `mul.i32` leaves when its product is zero and a factor negative. It
+/// need not when nothing can tell: the product has one reader, in its block and its frame,
+/// which is
+///
+/// - a bit operation, a shift, `imul` or a compare (ToInt32 of -0 is 0, and -0 compares as 0);
+/// - an `add.i32` or `sub.i32` that takes it second: `x + -0` and `x - -0` are `x` for an
+///   i32 `x`, which is never -0;
+/// - an `add.i32` that takes it first, when the second operand is no product (two products
+///   that are both -0 add up to -0).
+///
+/// For a sum or a difference no instruction between the product and its reader may leave:
+/// the other operand is an i32 only at the reader (an element still boxed is unboxed
+/// there, and may be -0), so only the reader's own exit, which has both as i32s, may hand
+/// the product to the interpreter. Any exit may name the product only as the one operand
+/// of a stack that this reader takes, so the interpreter that resumes there reads it by
+/// the same instruction. One that names it as a local or an argument, twice, after the
+/// reader, or on an edge, keeps the test.
+/// Requires compacted blocks; changes no exit.
+pub effect fn zeroProducts(f: &mut Function) -> () ! OutOfMemoryError ? &mut Allocator {
+  let values = f.values.length()
+  let mut any = false
+  let mut i: usize = 0
+  while i < f.insts.length() {
+    let inst = f.insts.get(i)
+    if inst.op == Op.Mul && inst.result != NONE && u32.toUsize(inst.result) < values { any = true }
+    i = i + 1
+  }
+  f.work = f.work + usize.toU64(f.insts.length())
+  if !any { return () }
+  // Per product: its readers, the last instruction whose exit names it (plus one), and
+  // whether anything names it in a way that keeps the test.
+  let mut product = List<bool>.make() run product.appendRepeated(false, values)
+  let mut readers = List<u32>.make() run readers.appendRepeated(0, values)
+  let mut named = List<u32>.make() run named.appendRepeated(0, values)
+  let mut kept = List<bool>.make() run kept.appendRepeated(false, values)
+  i = 0
+  while i < f.insts.length() {
+    let inst = f.insts.get(i)
+    if inst.op == Op.Mul && inst.result != NONE && u32.toUsize(inst.result) < values { product.set(u32.toUsize(inst.result), true) }
+    i = i + 1
+  }
+  i = 0
+  while i < f.insts.length() {
+    let inst = f.insts.get(i)
+    if inst.op != Op.Removed {
+      if inst.a != NONE && u32.toUsize(inst.a) < values && product.get(u32.toUsize(inst.a)) { let n = readers.get(u32.toUsize(inst.a)) readers.set(u32.toUsize(inst.a), n + 1) }
+      if inst.b != NONE && u32.toUsize(inst.b) < values && product.get(u32.toUsize(inst.b)) { let n = readers.get(u32.toUsize(inst.b)) readers.set(u32.toUsize(inst.b), n + 1) }
+      if readsK(inst.op) {
+        let k = i32.wrappingToU32(inst.k)
+        if u32.toUsize(k) < values && product.get(u32.toUsize(k)) { let n = readers.get(u32.toUsize(k)) readers.set(u32.toUsize(k), n + 1) }
+      }
+      if inst.exit != NONE {
+        let exit = f.exit(inst.exit)
+        // The drops after these are released or ignored, never handed to the interpreter.
+        let count = f.localCount + exit.stackDepth + f.argumentSlots + exit.inner
+        let stamp = usize.toU32(i) + 1
+        let mut s: u32 = 0
+        while s < count {
+          let slot = f.slot(exit, s)
+          if slot.mode != SlotMode.Virtual && u32.toUsize(slot.value) < values && product.get(u32.toUsize(slot.value)) {
+            let v = u32.toUsize(slot.value)
+            // Twice in one exit, or where the interpreter may read it again.
+            if named.get(v) == stamp || !operandSlot(&f.*, exit, s) { kept.set(v, true) }
+            named.set(v, stamp)
+          }
+          s = s + 1
+        }
+        f.work = f.work + u32.toU64(count)
+      }
+    }
+    i = i + 1
+  }
+  i = 0
+  while i < f.edgeArgs.length() { let e = f.edgeArgs.get(i) if u32.toUsize(e) < values && product.get(u32.toUsize(e)) { kept.set(u32.toUsize(e), true) } i = i + 1 }
+  i = 0
+  while i < f.virtualObjs.length() {
+    let object = f.virtualObjs.get(i)
+    let mut k: u32 = 0
+    while k < object.slotCount && k < 8 {
+      let field = object.fields[u32.toUsize(k)]
+      if u32.toUsize(field) < values && product.get(u32.toUsize(field)) { kept.set(u32.toUsize(field), true) }
+      k = k + 1
+    }
+    i = i + 1
+  }
+  let mut b: u32 = 0
+  while b < f.blockCount() {
+    let block = f.blocks.get(u32.toUsize(b))
+    let end = block.firstInst + block.instCount
+    let mut at = block.firstInst
+    while at < end {
+      let mut inst = f.inst(at)
+      at = at + 1
+      if inst.block != b || inst.op != Op.Mul || inst.result == NONE || inst.proven { continue }
+      let v = inst.result
+      if u32.toUsize(v) >= values || readers.get(u32.toUsize(v)) != 1 || kept.get(u32.toUsize(v)) { continue }
+      // The reader, and whether anything between the two can leave.
+      let mut reader = at
+      let mut found = false
+      let mut leaves = false
+      while reader < end && !found {
+        let next = f.inst(reader)
+        if next.op != Op.Removed && next.block == b {
+          if next.a == v || next.b == v || (readsK(next.op) && i32.wrappingToU32(next.k) == v) { found = true continue }
+          if next.exit != NONE { leaves = true }
+        }
+        reader = reader + 1
+      }
+      if !found || named.get(u32.toUsize(v)) > reader + 1 { continue }
+      let by = f.inst(reader)
+      if by.frame != inst.frame { continue }
+      let mut blind = blindToSign(by.op) && (by.a == v || by.b == v)
+      if (by.op == Op.Add || by.op == Op.Sub) && by.b == v && by.a != v && !leaves { blind = true }
+      if by.op == Op.Add && by.a == v && by.b != v && !leaves && by.b != NONE && u32.toUsize(by.b) < values && !product.get(u32.toUsize(by.b)) { blind = true }
+      if !blind { continue }
+      inst.proven = true
+      f.setInst(at - 1, inst)
+    }
+    b = b + 1
+  }
+}

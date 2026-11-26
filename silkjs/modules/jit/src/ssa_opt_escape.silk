@@ -1,0 +1,1959 @@
+//! Escape analysis & SROA for fresh planned constructions:
+//! - Phase 1 (`forwardConstructFields`): own-slot field-load forwarding prior to any escaping use.
+//! - Phase 2 (`virtualizeConstructs`): full allocation elimination (SROA) of non-escaping planned
+//!   constructions, replacing `Op.NewObject` with `Op.CheckConstruct`, prototype-method reads with
+//!   `Op.KnownMethod`, and live exit slots with `SlotMode.Virtual` descriptors for cold-deopt
+//!   materialization.
+import silk.collections.list { List }
+import silk.core.ownership { Copy }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.i32
+import silk.num.u8
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+import silkjs.js_compiled as compiled
+import ssa { Function, Inst, Exit, Slot, SlotMode, VirtualObj, Type, Own, RootKind, Op, NONE, KNOWN_CHAIN, TARGET_EXACT, TARGET_KNOWN, FIELD_STEPS, ELEM_STEPS, edgeCount, readsK, steppedRead }
+import ssa_calls as calls
+import ssa_ownership { Forward, fixSlots, dropParams }
+import ssa_shapes { Shapes, FACT_HEDGED, analyzeSites, versionOf, knownTarget }
+import ssa_translate { FunctionInput, FIELD_CACHED }
+import ssa_verify { readsA, readsB, dominators }
+
+struct ConstructCand { joinBlock: u32, initPred: u32, obj: u32, joined: u32, ver: u64, stores: u32 }
+impl Copy for ConstructCand {}
+
+struct SlotState { alive: bool, anyVisited: bool, slots: [u32; 8] }
+impl Copy for SlotState {}
+
+/// Dominator tree in DFS preorder: `order[tin[b]..tout[b]]` enumerates every block
+/// dominated by `b`, and `a` dominates `b` iff `tin[a] <= tin[b] && tout[b] <= tout[a]`.
+struct DomTree { tin: List<u32>, tout: List<u32>, order: List<u32> }
+
+effect fn buildDomTree(idom: &List<u32>) -> DomTree ! OutOfMemoryError ? &mut Allocator {
+  let blocks = idom.length()
+  let mut tin = List<u32>.make()
+  run tin.appendRepeated(NONE, blocks)
+  let mut tout = List<u32>.make()
+  run tout.appendRepeated(0, blocks)
+  let mut order = List<u32>.make()
+  if blocks == 0 || idom.get(0) != 0 {
+    return DomTree { tin: move tin, tout: move tout, order: move order }
+  }
+  let mut childFirst = List<u32>.make()
+  run childFirst.appendRepeated(0, blocks + 1)
+  let mut b: usize = 1
+  while b < blocks {
+    let p = idom.get(b)
+    if p != NONE && u32.toUsize(p) < blocks && u32.toUsize(p) != b {
+      let c = childFirst.get(u32.toUsize(p) + 1) + 1
+      childFirst.set(u32.toUsize(p) + 1, c)
+    }
+    b = b + 1
+  }
+  b = 0
+  while b < blocks {
+    let c = childFirst.get(b + 1) + childFirst.get(b)
+    childFirst.set(b + 1, c)
+    b = b + 1
+  }
+  let mut childNext = List<u32>.make()
+  run childNext.appendSlice(childFirst.asSlice())
+  let mut children = List<u32>.make()
+  run children.appendRepeated(0, u32.toUsize(childFirst.get(blocks)))
+  b = 1
+  while b < blocks {
+    let p = idom.get(b)
+    if p != NONE && u32.toUsize(p) < blocks && u32.toUsize(p) != b {
+      let at = childNext.get(u32.toUsize(p))
+      children.set(u32.toUsize(at), usize.toU32(b))
+      childNext.set(u32.toUsize(p), at + 1)
+    }
+    b = b + 1
+  }
+  let mut stackNode = List<u32>.make()
+  let mut stackNext = List<u32>.make()
+  tin.set(0, 0)
+  run order.append(0)
+  run stackNode.append(0)
+  run stackNext.append(childFirst.get(0))
+  while stackNode.length() > 0 {
+    let top = stackNode.length() - 1
+    let u = stackNode.get(top)
+    let ci = stackNext.get(top)
+    let end = childFirst.get(u32.toUsize(u) + 1)
+    if ci < end {
+      stackNext.set(top, ci + 1)
+      let c = children.get(u32.toUsize(ci))
+      tin.set(u32.toUsize(c), usize.toU32(order.length()))
+      run order.append(c)
+      run stackNode.append(c)
+      run stackNext.append(childFirst.get(u32.toUsize(c)))
+    } else {
+      tout.set(u32.toUsize(u), usize.toU32(order.length()))
+      stackNode.truncate(top)
+      stackNext.truncate(top)
+    }
+  }
+  return DomTree { tin: move tin, tout: move tout, order: move order }
+}
+
+fn dominates(dom: &DomTree, a: u32, b: u32) -> bool {
+  if a == b { return true }
+  let au = u32.toUsize(a)
+  let bu = u32.toUsize(b)
+  if au >= dom.tin.length() || bu >= dom.tin.length() { return false }
+  let ta = dom.tin.get(au)
+  let tb = dom.tin.get(bu)
+  if ta == NONE || tb == NONE { return false }
+  return ta <= tb && dom.tout.get(bu) <= dom.tout.get(au)
+}
+
+fn definedAt(f: &Function, dom: &DomTree, v: u32, b: u32, idx: u32) -> bool {
+  if v == NONE || v >= f.valueCount() { return false }
+  let info = f.value(v)
+  if info.block == b { return info.def == NONE || info.def < idx }
+  return dominates(dom, info.block, b)
+}
+
+/// Returns `v` when it is unboxed (`F64`, `I32`, `Bool`), or the unboxed operand of
+/// `BoxF64` / `BoxI32` / `BoxBool`, or `NONE`.
+fn unboxedOf(f: &Function, v: u32) -> u32 {
+  if v == NONE || v >= f.valueCount() { return NONE }
+  let info = f.value(v)
+  if info.ty == Type.F64 || info.ty == Type.I32 || info.ty == Type.Bool { return v }
+  if info.ty == Type.Value && info.def != NONE {
+    let def = f.inst(info.def)
+    if def.op == Op.BoxF64 || def.op == Op.BoxI32 || def.op == Op.BoxBool { return def.a }
+  }
+  return NONE
+}
+
+/// Own data slot index for field instruction `idx` when receiver has shape `ver`, or `NONE`.
+/// Rejects prototype-chain keys (`protoKeys[m] != 0` or bit 63 set) and add-property writes.
+fn slotOfSite(shapes: &Shapes, idx: u32, ver: u64) -> u32 {
+  if shapes.add(idx) != 0 { return NONE }
+  let key = shapes.key(idx)
+  if key != 0 {
+    if u64.shiftRight(key, 63) == 0 && u64.shiftRight(key, 16) == ver {
+      return u64.wrappingToU32(u64.bitAnd(key, 65535))
+    }
+    return NONE
+  }
+  let r = shapes.read(idx)
+  if r != 0 {
+    let site = shapes.sites.get(u32.toUsize(r - 1))
+    let mut m: u32 = 0
+    while m < site.count {
+      let k = site.keys[u32.toUsize(m)]
+      if site.protoKeys[u32.toUsize(m)] == 0 && u64.shiftRight(k, 63) == 0 && versionOf(k) == ver {
+        return u64.wrappingToU32(u64.bitAnd(k, 65535))
+      }
+      m = m + 1
+    }
+  }
+  return NONE
+}
+
+/// Non-field operations that can read an alias of a fresh constructed object without
+/// escaping its reference or mutating its slots.
+fn safeReadOp(op: Op) -> bool {
+  return op == Op.Retain || op == Op.Release || op == Op.CheckTag || op == Op.CheckShape
+    || op == Op.CheckWatched || op == Op.CheckArray || op == Op.CheckBound || op == Op.CheckCallee || op == Op.IsCallee
+    || op == Op.TagIn || op == Op.TagIs || op == Op.Truthy || op == Op.TypeofAtom || op == Op.Typeof || op == Op.Equals
+}
+
+fn boxOpFor(ty: Type) -> Op {
+  if ty == Type.F64 { return Op.BoxF64 }
+  if ty == Type.I32 { return Op.BoxI32 }
+  return Op.BoxBool
+}
+
+fn isMarkedStamp(stamp: &List<u32>, epoch: u32, v: u32) -> bool {
+  return v != NONE && u32.toUsize(v) < stamp.length() && stamp.get(u32.toUsize(v)) == epoch
+}
+
+fn readsAnyAlias(inst: Inst, aliasStamp: &List<u32>, aliasEpoch: u32) -> bool {
+  if readsA(inst.op) && isMarkedStamp(aliasStamp, aliasEpoch, inst.a) { return true }
+  if readsB(inst.op) && isMarkedStamp(aliasStamp, aliasEpoch, inst.b) { return true }
+  if readsK(inst.op) && inst.k >= 0 && isMarkedStamp(aliasStamp, aliasEpoch, i32.wrappingToU32(inst.k)) { return true }
+  return false
+}
+
+/// Precomputes for each value `r` whether any non-`Retain` value borrows directly from `r`
+/// (`rootKind == RootKind.Value && root == r`), so `canChangeToImm` is O(1).
+effect fn buildNonRetainBorrows(f: &Function) -> List<bool> ! OutOfMemoryError ? &mut Allocator {
+  let values = f.values.length()
+  let mut out = List<bool>.make()
+  run out.appendRepeated(false, values)
+  let mut v: usize = 0
+  while v < values {
+    let u = f.values.get(v)
+    if u.own == Own.Borrowed && u.rootKind == RootKind.Value && u.root != NONE && u32.toUsize(u.root) < values {
+      let mut isDirectRetain = false
+      if u.def != NONE {
+        let d = f.inst(u.def)
+        if d.op == Op.Retain && d.a == u.root { isDirectRetain = true }
+      }
+      if !isDirectRetain { out.set(u32.toUsize(u.root), true) }
+    }
+    v = v + 1
+  }
+  return move out
+}
+
+/// Checks whether `GetField` result `r` can safely become `Own.Imm` (`Box*`).
+/// For `Own.Borrowed`, always true. For `Own.Owned`, true unless some non-`Retain` value
+/// borrows directly from `r` (`rootKind == RootKind.Value && root == r`).
+fn canChangeToImm(f: &Function, hasNonRetainBorrow: &List<bool>, r: u32) -> bool {
+  let info = f.value(r)
+  if info.own == Own.Borrowed || info.own == Own.Imm { return true }
+  if info.own != Own.Owned { return false }
+  if u32.toUsize(r) < hasNonRetainBorrow.length() && hasNonRetainBorrow.get(u32.toUsize(r)) { return false }
+  return true
+}
+
+/// Entry slot state for block `b` from all visited predecessors (meet of `outAlive` and `outSlot`).
+fn entryState(cand: ConstructCand, startSlots: [u32; 8], b: u32, inFirst: &List<u32>, inEdges: &List<u32>, source: &List<u32>, visitStamp: &List<u32>, visitEpoch: u32, outAlive: &List<bool>, outSlot: &List<u32>) -> SlotState {
+  if b == cand.joinBlock {
+    return SlotState { alive: true, anyVisited: true, slots: startSlots }
+  }
+  let mut curSlots: [u32; 8] = [NONE; 8]
+  let mut curAlive = true
+  let mut anyVisited = false
+  let mut firstPred = true
+  let mut k = inFirst.get(u32.toUsize(b))
+  let last = inFirst.get(u32.toUsize(b) + 1)
+  while k < last {
+    let pred = source.get(u32.toUsize(inEdges.get(u32.toUsize(k))))
+    if pred != NONE && visitStamp.get(u32.toUsize(pred)) == visitEpoch {
+      anyVisited = true
+      if !outAlive.get(u32.toUsize(pred)) {
+        curAlive = false
+      } else {
+        let base = u32.toUsize(pred) * 8
+        if firstPred {
+          let mut s: usize = 0
+          while s < 8 { curSlots[s] = outSlot.get(base + s) s = s + 1 }
+          firstPred = false
+        } else {
+          let mut s: usize = 0
+          while s < 8 {
+            if curSlots[s] != outSlot.get(base + s) { curSlots[s] = NONE }
+            s = s + 1
+          }
+        }
+      }
+    }
+    k = k + 1
+  }
+  if !curAlive {
+    let mut s: usize = 0
+    while s < 8 { curSlots[s] = NONE s = s + 1 }
+  }
+  return SlotState { alive: curAlive, anyVisited: anyVisited, slots: curSlots }
+}
+
+/// Forwards own-slot `Op.GetField` reads of freshly constructed planned objects to their
+/// dominating unboxed slot values (from `Op.InitSlot` or subsequent own-slot `Op.PutField`s)
+/// prior to any escaping use or unrecognized mutation. Compacts `f` and returns `true` when
+/// any load is rewritten.
+pub effect fn forwardConstructFields(f: &mut Function, input: &FunctionInput, sites: &List<u32>) -> bool ! OutOfMemoryError ? &mut Allocator {
+  if f.constructTargets.length() == 0 { return false }
+  let blocks = u32.toUsize(f.blockCount())
+  let values = u32.toUsize(f.valueCount())
+  if blocks < 2 || values == 0 { return false }
+
+  // Source block of each edge, and incoming edges per block.
+  let mut source = List<u32>.make()
+  run source.appendRepeated(NONE, f.edges.length())
+  let mut b: usize = 0
+  while b < blocks {
+    let blk = f.blocks.get(b)
+    if blk.instCount > 0 {
+      let term = f.inst(blk.firstInst + blk.instCount - 1)
+      let mut e: u32 = 0
+      while term.edge != NONE && e < edgeCount(term.op) {
+        source.set(u32.toUsize(term.edge + e), usize.toU32(b))
+        e = e + 1
+      }
+    }
+    b = b + 1
+  }
+  let mut inFirst = List<u32>.make()
+  run inFirst.appendRepeated(0, blocks + 1)
+  let mut e: usize = 0
+  while e < f.edges.length() {
+    let t = u32.toUsize(f.edges.get(e).target)
+    if t < blocks { let c = inFirst.get(t + 1) + 1 inFirst.set(t + 1, c) }
+    e = e + 1
+  }
+  b = 0
+  while b < blocks { let c = inFirst.get(b + 1) + inFirst.get(b) inFirst.set(b + 1, c) b = b + 1 }
+  let mut inNext = List<u32>.make()
+  run inNext.appendSlice(inFirst.asSlice())
+  let mut inEdges = List<u32>.make()
+  run inEdges.appendRepeated(0, f.edges.length())
+  e = 0
+  while e < f.edges.length() {
+    let t = u32.toUsize(f.edges.get(e).target)
+    if t < blocks {
+      let at = inNext.get(t)
+      inEdges.set(u32.toUsize(at), usize.toU32(e))
+      inNext.set(t, at + 1)
+    }
+    e = e + 1
+  }
+
+  // Discover planned construct-join candidates in RPO order.
+  let mut cands = List<ConstructCand>.make()
+  let mut jb: u32 = 1
+  while jb < f.blockCount() {
+    let s0 = inFirst.get(u32.toUsize(jb))
+    let s1 = inFirst.get(u32.toUsize(jb) + 1)
+    if s1 - s0 == 2 {
+      let blk = f.blocks.get(u32.toUsize(jb))
+      if blk.paramCount == 1 {
+        let e0Idx = inEdges.get(u32.toUsize(s0))
+        let e1Idx = inEdges.get(u32.toUsize(s0 + 1))
+        let e0 = f.edges.get(u32.toUsize(e0Idx))
+        let e1 = f.edges.get(u32.toUsize(e1Idx))
+        if e0.argCount == 1 && e1.argCount == 1 {
+          let a0 = f.edgeArg(e0, 0)
+          let a1 = f.edgeArg(e1, 0)
+          if u32.toUsize(a0) < values && u32.toUsize(a1) < values {
+            let d0 = f.value(a0).def
+            let d1 = f.value(a1).def
+            if d0 != NONE && d1 != NONE {
+              let i0 = f.inst(d0)
+              let i1 = f.inst(d1)
+              let mut obj = NONE
+              let mut objDef = NONE
+              let mut initPred = NONE
+              if i0.op == Op.NewObject && i1.op == Op.Call && (i1.k & calls.PLANNED) != 0 {
+                obj = a0 objDef = d0 initPred = source.get(u32.toUsize(e0Idx))
+              } else if i1.op == Op.NewObject && i0.op == Op.Call && (i0.k & calls.PLANNED) != 0 {
+                obj = a1 objDef = d1 initPred = source.get(u32.toUsize(e1Idx))
+              }
+              if obj != NONE && initPred != NONE {
+                let siteIdx = i32.toUsize(f.inst(objDef).k)
+                if siteIdx < f.constructShapes.length() {
+                  let ver = u32.toU64(f.constructShapes.get(siteIdx))
+                  if ver != 0 && inFirst.get(u32.toUsize(initPred) + 1) - inFirst.get(u32.toUsize(initPred)) == 1 {
+                    let initBlk = f.blocks.get(u32.toUsize(initPred))
+                    let mut stores: u32 = 0
+                    let mut seenMask: u32 = 0
+                    let mut ok = true
+                    let mut k = initBlk.firstInst
+                    while k < initBlk.firstInst + initBlk.instCount {
+                      let inst = f.inst(k)
+                      if inst.op == Op.InitSlot && inst.a == obj && inst.k >= 0 && inst.k < 8 {
+                        if inst.b == obj { ok = false }
+                        let slot = i32.wrappingToU32(inst.k)
+                        seenMask = u32.bitOr(seenMask, u32.shiftLeft(1, slot))
+                        if slot + 1 > stores { stores = slot + 1 }
+                      } else if inst.op == Op.PutField || inst.op == Op.Call || inst.op == Op.PutKey || inst.op == Op.PutElem {
+                        ok = false
+                      } else if (readsA(inst.op) && inst.a == obj) || (readsB(inst.op) && inst.b == obj) || (readsK(inst.op) && i32.wrappingToU32(inst.k) == obj) {
+                        ok = false
+                      }
+                      k = k + 1
+                    }
+                    if ok && stores > 0 && seenMask == u32.shiftLeft(1, stores) - 1 {
+                      run cands.append(ConstructCand { joinBlock: jb, initPred: initPred, obj: obj, joined: f.paramAt(blk, 0), ver: ver, stores: stores })
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    jb = jb + 1
+  }
+  if cands.length() == 0 { return false }
+
+  let shapes = run analyzeSites(&f.*, input, sites)
+  let idom = run dominators(&f.*)
+  let dom = run buildDomTree(&idom)
+  let hasNonRetainBorrow = run buildNonRetainBorrows(&f.*)
+
+  let mut aliasStamp = List<u32>.make() run aliasStamp.appendRepeated(0, values)
+  let mut curAliasEpoch: u32 = 0
+  let mut visitStamp = List<u32>.make() run visitStamp.appendRepeated(0, blocks)
+  let mut curVisitEpoch: u32 = 0
+  let mut outAlive = List<bool>.make() run outAlive.appendRepeated(false, blocks)
+  let mut outSlot = List<u32>.make() run outSlot.appendRepeated(NONE, blocks * 8)
+  let mut immStamp = List<u32>.make() run immStamp.appendRepeated(0, values)
+  let mut curImmEpoch: u32 = 0
+  let mut forward = run Forward.make(&f.*)
+  let mut anyChanged = false
+
+  let mut ci: usize = 0
+  while ci < cands.length() {
+    let cand = cands.get(ci)
+    let domStart = dom.tin.get(u32.toUsize(cand.joinBlock))
+    let domEnd = dom.tout.get(u32.toUsize(cand.joinBlock))
+    if domStart == NONE || domStart >= domEnd { ci = ci + 1 continue }
+
+    // Read initial unboxed slot values fresh from `initPred` (so earlier candidates' rewrites
+    // are visible to chained constructions).
+    let mut startSlots: [u32; 8] = [NONE; 8]
+    let initBlk = f.blocks.get(u32.toUsize(cand.initPred))
+    let mut k = initBlk.firstInst
+    while k < initBlk.firstInst + initBlk.instCount {
+      let inst = f.inst(k)
+      if inst.op == Op.InitSlot && inst.a == cand.obj && inst.k >= 0 && inst.k < 8 {
+        let u = unboxedOf(&f.*, inst.b)
+        if u != NONE && f.value(u).block != cand.joinBlock && dominates(&dom, f.value(u).block, cand.joinBlock) {
+          startSlots[i32.toUsize(inst.k)] = u
+        } else {
+          startSlots[i32.toUsize(inst.k)] = NONE
+        }
+      }
+      k = k + 1
+    }
+
+    // Collect `joined` and all transitive `Op.Retain` copies in blocks dominated by `joinBlock`
+    // (a single pass over dominator-tree DFS order finds every transitive Retain by SSA dominance).
+    curAliasEpoch = curAliasEpoch + 1
+    aliasStamp.set(u32.toUsize(cand.joined), curAliasEpoch)
+    let mut di = domStart
+    while di < domEnd {
+      let cb = dom.order.get(u32.toUsize(di))
+      let blk = f.blocks.get(u32.toUsize(cb))
+      let mut j = blk.firstInst
+      while j < blk.firstInst + blk.instCount {
+        let inst = f.inst(j)
+        if inst.op == Op.Retain && inst.result != NONE && isMarkedStamp(&aliasStamp, curAliasEpoch, inst.a) {
+          aliasStamp.set(u32.toUsize(inst.result), curAliasEpoch)
+        }
+        j = j + 1
+      }
+      di = di + 1
+    }
+
+    // Monotone forward dataflow fixpoint over blocks dominated by `joinBlock`.
+    curVisitEpoch = curVisitEpoch + 1
+    let mut iter: u32 = 0
+    let mut fpChanged = true
+    while fpChanged && iter < 16 {
+      fpChanged = false
+      di = domStart
+      while di < domEnd {
+        let cb = dom.order.get(u32.toUsize(di))
+        let st = entryState(cand, startSlots, cb, &inFirst, &inEdges, &source, &visitStamp, curVisitEpoch, &outAlive, &outSlot)
+        if st.anyVisited {
+          let mut curAlive = st.alive
+          let mut curSlots = st.slots
+          let blk = f.blocks.get(u32.toUsize(cb))
+          let mut j = blk.firstInst
+          while j < blk.firstInst + blk.instCount && curAlive {
+            let inst = f.inst(j)
+            if inst.op != Op.Removed {
+              if inst.op == Op.GetField && isMarkedStamp(&aliasStamp, curAliasEpoch, inst.a) {
+                let slot = slotOfSite(&shapes, j, cand.ver)
+                if slot == NONE || slot >= cand.stores { curAlive = false }
+              } else if inst.op == Op.PutField && isMarkedStamp(&aliasStamp, curAliasEpoch, inst.a) {
+                let slot = slotOfSite(&shapes, j, cand.ver)
+                if slot == NONE || slot >= cand.stores || isMarkedStamp(&aliasStamp, curAliasEpoch, inst.b) {
+                  curAlive = false
+                } else {
+                  curSlots[u32.toUsize(slot)] = unboxedOf(&f.*, inst.b)
+                }
+              } else if readsAnyAlias(inst, &aliasStamp, curAliasEpoch) {
+                if !safeReadOp(inst.op) { curAlive = false }
+              }
+            }
+            j = j + 1
+          }
+          if curAlive && blk.instCount > 0 {
+            let term = f.inst(blk.firstInst + blk.instCount - 1)
+            if term.edge != NONE {
+              let mut te: u32 = 0
+              while te < edgeCount(term.op) && curAlive {
+                let edge = f.edge(term.edge + te)
+                let mut g: u32 = 0
+                while g < edge.argCount {
+                  if isMarkedStamp(&aliasStamp, curAliasEpoch, f.edgeArg(edge, g)) { curAlive = false break }
+                  g = g + 1
+                }
+                te = te + 1
+              }
+            }
+          }
+          if !curAlive {
+            let mut s: usize = 0
+            while s < 8 { curSlots[s] = NONE s = s + 1 }
+          }
+          let bIdx = u32.toUsize(cb)
+          let base = bIdx * 8
+          let wasVisited = visitStamp.get(bIdx) == curVisitEpoch
+          let mut diff = !wasVisited || outAlive.get(bIdx) != curAlive
+          if !diff {
+            let mut s: usize = 0
+            while s < 8 {
+              if outSlot.get(base + s) != curSlots[s] { diff = true break }
+              s = s + 1
+            }
+          }
+          if diff {
+            visitStamp.set(bIdx, curVisitEpoch)
+            outAlive.set(bIdx, curAlive)
+            let mut s: usize = 0
+            while s < 8 { outSlot.set(base + s, curSlots[s]) s = s + 1 }
+            fpChanged = true
+          }
+        }
+        di = di + 1
+      }
+      iter = iter + 1
+    }
+
+    // Transform pass using the converged fixpoint state.
+    if !fpChanged {
+      let mut anyOwnedImm = false
+      di = domStart
+      while di < domEnd {
+        let cb = dom.order.get(u32.toUsize(di))
+        if visitStamp.get(u32.toUsize(cb)) == curVisitEpoch {
+          let st = entryState(cand, startSlots, cb, &inFirst, &inEdges, &source, &visitStamp, curVisitEpoch, &outAlive, &outSlot)
+          let mut curAlive = st.alive
+          let mut curSlots = st.slots
+          let blk = f.blocks.get(u32.toUsize(cb))
+          let mut j = blk.firstInst
+          while j < blk.firstInst + blk.instCount && curAlive {
+            let inst = f.inst(j)
+            if inst.op != Op.Removed {
+              if inst.op == Op.GetField && isMarkedStamp(&aliasStamp, curAliasEpoch, inst.a) {
+                let slot = slotOfSite(&shapes, j, cand.ver)
+                if slot == NONE || slot >= cand.stores {
+                  curAlive = false
+                } else {
+                  let val = curSlots[u32.toUsize(slot)]
+                  if val != NONE && inst.result != NONE && definedAt(&f.*, &dom, val, cb, j) && canChangeToImm(&f.*, &hasNonRetainBorrow, inst.result) {
+                    let valTy = f.value(val).ty
+                    if valTy == Type.F64 || valTy == Type.I32 || valTy == Type.Bool {
+                      let wasOwned = f.value(inst.result).own == Own.Owned
+                      let mut boxed = inst
+                      boxed.op = boxOpFor(valTy)
+                      boxed.a = val
+                      boxed.b = NONE
+                      boxed.k = 0
+                      boxed.exit = NONE
+                      f.setInst(j, boxed)
+                      f.setOwnership(inst.result, Own.Imm, RootKind.None, NONE)
+                      if wasOwned {
+                        if !anyOwnedImm {
+                          curImmEpoch = curImmEpoch + 1
+                          anyOwnedImm = true
+                        }
+                        immStamp.set(u32.toUsize(inst.result), curImmEpoch)
+                      }
+                      anyChanged = true
+                    }
+                  }
+                }
+              } else if inst.op == Op.PutField && isMarkedStamp(&aliasStamp, curAliasEpoch, inst.a) {
+                let slot = slotOfSite(&shapes, j, cand.ver)
+                if slot == NONE || slot >= cand.stores || isMarkedStamp(&aliasStamp, curAliasEpoch, inst.b) {
+                  curAlive = false
+                } else {
+                  curSlots[u32.toUsize(slot)] = unboxedOf(&f.*, inst.b)
+                }
+              } else if readsAnyAlias(inst, &aliasStamp, curAliasEpoch) {
+                if !safeReadOp(inst.op) { curAlive = false }
+              }
+            }
+            j = j + 1
+          }
+        }
+        di = di + 1
+      }
+      if anyOwnedImm {
+        di = domStart
+        while di < domEnd {
+          let cb = dom.order.get(u32.toUsize(di))
+          let blk = f.blocks.get(u32.toUsize(cb))
+          let mut j = blk.firstInst
+          while j < blk.firstInst + blk.instCount {
+            let mut inst = f.inst(j)
+            if inst.op == Op.Release && isMarkedStamp(&immStamp, curImmEpoch, inst.a) {
+              inst.op = Op.Removed
+              f.setInst(j, inst)
+            } else if inst.op == Op.Retain && inst.result != NONE {
+              let info = f.value(inst.result)
+              if info.own == Own.Borrowed && info.rootKind == RootKind.Value && isMarkedStamp(&immStamp, curImmEpoch, info.root) {
+                run forward.replace(inst.result, inst.a)
+                inst.op = Op.Removed
+                f.setInst(j, inst)
+              }
+            }
+            j = j + 1
+          }
+          di = di + 1
+        }
+        forward.apply(&mut f)
+      }
+    }
+    f.work = f.work + u32.toU64(domEnd - domStart)
+    ci = ci + 1
+  }
+
+  if anyChanged {
+    run fixSlots(&mut f)
+    run f.compact()
+  }
+  return anyChanged
+}
+
+struct VirtualCand {
+  joinBlock: u32,
+  initPred: u32,
+  slowPred: u32,
+  branchBlock: u32,
+  newObjInst: u32,
+  tagIsInst: u32,
+  obj: u32,
+  isUndef: u32,
+  joined: u32,
+  siteIdx: u32,
+  ver: u64,
+  stores: u32,
+}
+impl Copy for VirtualCand {}
+
+struct VirtSlotState { anyVisited: bool, slots: [u32; 8] }
+impl Copy for VirtSlotState {}
+
+/// Returns a value safe to hold in a virtualized object's field across exits:
+/// an unboxed scalar (`F64`/`I32`/`Bool`, unwrapping `Box*`), `Own.Imm`, or
+/// `Own.Borrowed` with `RootKind.Argument`; else `NONE`.
+fn safeFieldVal(f: &Function, v: u32) -> u32 {
+  let u = unboxedOf(f, v)
+  if u != NONE { return u }
+  if v == NONE || v >= f.valueCount() { return NONE }
+  let info = f.value(v)
+  if info.ty == Type.Value && (info.own == Own.Imm || (info.own == Own.Borrowed && info.rootKind == RootKind.Argument)) {
+    return v
+  }
+  return NONE
+}
+
+/// If `GetField` at `idx` is a non-stepped, non-hedged `FIELD_CACHED` prototype-method read
+/// whose `knownTarget` has `(TARGET_EXACT | TARGET_KNOWN)` and a shape pair `p in 0..4`
+/// matching `ver`, returns `(p << 24) | target`; else returns `-1`.
+fn knownMethodKey(f: &Function, shapes: &Shapes, idx: u32, ver: u64) -> i32 {
+  let inst = f.inst(idx)
+  if inst.op != Op.GetField || inst.result == NONE { return -1 }
+  if steppedRead(inst) || (inst.k & 1) != FIELD_CACHED { return -1 }
+  if u8.bitAnd(shapes.fact(idx), FACT_HEDGED) != 0 { return -1 }
+  let target = knownTarget(f, idx)
+  if target == NONE || u32.toUsize(target) >= f.inlineTargets.length() || u32.toUsize(target) >= f.inlineShapes.length() { return -1 }
+  if target >= 16777216 { return -1 }
+  let id = f.inlineTargets.get(u32.toUsize(target))
+  let need = u32.bitOr(TARGET_EXACT, TARGET_KNOWN)
+  if u32.bitAnd(id, need) != need { return -1 }
+  let ks = f.inlineShapes.get(u32.toUsize(target))
+  let mut p: u32 = 0
+  while p < 4 {
+    if ks.shapes[u32.toUsize(p)] != 0 && u32.toU64(ks.shapes[u32.toUsize(p)]) == ver
+      && ks.lengths[u32.toUsize(p)] > 0 && u8.toU32(ks.lengths[u32.toUsize(p)]) <= KNOWN_CHAIN {
+      return i32.shiftLeft(u32.wrappingToI32(p), 24) | u32.wrappingToI32(target)
+    }
+    p = p + 1
+  }
+  return -1
+}
+
+/// Whether `inst` can leave via `HOW_STEP` (where virtualized objects cannot be materialized).
+/// Mirrors `x64_backend.lowerOnFrame`, which only populates `steps` when `inst.frame == 0`.
+fn isHowStepCapable(inst: Inst) -> bool {
+  if inst.frame != 0 { return false }
+  if steppedRead(inst) { return true }
+  if inst.op == Op.GetLength && (inst.k & FIELD_STEPS) != 0 { return true }
+  if (inst.op == Op.GetElem || inst.op == Op.GetKey) && inst.k == ELEM_STEPS { return true }
+  if inst.op == Op.PutField || inst.op == Op.PutKey { return true }
+  if inst.op == Op.Call {
+    if (inst.k & calls.GENERIC) != 0 { return true }
+    if calls.kindOf(inst) != compiled.SITE_CALL { return true }
+  }
+  return false
+}
+
+/// Whether any `ExitFrame` closure slot read directly by `x64_backend.bodyRecords`
+/// references an `isAlias` value. (Method receiver slots may be `SlotMode.Virtual`:
+/// `x64_backend.bodyRecords` stores `undefined` for them, and `FRAME_BARE_INLINED`
+/// completion only inspects `currentFunction` and `currentPc`, while cold deopt
+/// materializes the real receiver into the rebuilt frame.)
+fn bodyRecordsUsesAlias(f: &Function, ex: Exit, aliasStamp: &List<u32>, aliasEpoch: u32) -> bool {
+  let mut stackAt = f.localCount
+  let mut depth = ex.stackDepth
+  let mut inner = f.exitSlots(ex)
+  let mut n: u32 = 0
+  while n < ex.frames {
+    let frame = f.exitFrame(ex, n)
+    if stackAt + depth < frame.argc + 1 { return true }
+    let cSlot = f.slot(ex, stackAt + depth - frame.argc - 1)
+    if cSlot.mode != SlotMode.Virtual && isMarkedStamp(aliasStamp, aliasEpoch, cSlot.value) { return true }
+    stackAt = inner + frame.locals
+    depth = frame.depth
+    inner = inner + frame.locals + frame.depth
+    n = n + 1
+  }
+  return false
+}
+
+/// Whether `v` will dominate `(b, idx)` once `cand.slowPred` is eliminated (making
+/// `cand.initPred` the sole predecessor of `cand.joinBlock`).
+fn definedAfterVirt(f: &Function, dom: &DomTree, cand: VirtualCand, v: u32, b: u32, idx: u32) -> bool {
+  if v == NONE || v >= f.valueCount() { return false }
+  if definedAt(f, dom, v, b, idx) { return true }
+  let info = f.value(v)
+  return info.block == cand.initPred && dominates(dom, cand.joinBlock, b)
+}
+
+/// Walks up at most 8 `Op.Retain` hops from `v` to check if it derives from a `GetField`
+/// on an `isAlias` receiver. Returns that `GetField`'s instruction index, or `NONE`.
+fn retainChainGetField(f: &Function, aliasStamp: &List<u32>, aliasEpoch: u32, v: u32) -> u32 {
+  let mut cur = v
+  let mut steps: u32 = 0
+  while steps < 8 {
+    if cur == NONE || cur >= f.valueCount() { return NONE }
+    let def = f.value(cur).def
+    if def == NONE { return NONE }
+    let inst = f.inst(def)
+    if inst.op == Op.GetField && isMarkedStamp(aliasStamp, aliasEpoch, inst.a) { return def }
+    if inst.op == Op.Retain { cur = inst.a steps = steps + 1 continue }
+    return NONE
+  }
+  return NONE
+}
+
+/// Finds or inserts an `Op.Imm(Undefined)` in block 0 for rewriting dead drop slots.
+effect fn ensureUndef(f: &mut Function, undefVal: &mut u32) -> u32 ! OutOfMemoryError ? &mut Allocator {
+  if undefVal.* != NONE { return undefVal.* }
+  let b0 = f.blocks.get(0)
+  let mut i = b0.firstInst
+  while i < b0.firstInst + b0.instCount {
+    let inst = f.inst(i)
+    if inst.op == Op.Imm && inst.k == 0 && inst.result != NONE {
+      undefVal.* = inst.result
+      return inst.result
+    }
+    i = i + 1
+  }
+  let termIdx = b0.firstInst + b0.instCount - 1
+  let v = run f.insertBefore(termIdx, Op.Imm, true, Type.Value, Own.Imm, NONE, NONE, 0)
+  undefVal.* = v
+  return v
+}
+
+/// Entry slot state for block `b` in `virtualizeConstructs` (meet across live visited predecessors).
+fn entryStateVirt(cand: VirtualCand, startSlots: [u32; 8], b: u32, inFirst: &List<u32>, inEdges: &List<u32>, source: &List<u32>, deadBlock: &List<bool>, visitStamp: &List<u32>, visitEpoch: u32, outSlot: &List<u32>) -> VirtSlotState {
+  if b == cand.joinBlock {
+    return VirtSlotState { anyVisited: true, slots: startSlots }
+  }
+  let mut curSlots: [u32; 8] = [NONE; 8]
+  let mut anyVisited = false
+  let mut firstPred = true
+  let mut k = inFirst.get(u32.toUsize(b))
+  let last = inFirst.get(u32.toUsize(b) + 1)
+  while k < last {
+    let pred = source.get(u32.toUsize(inEdges.get(u32.toUsize(k))))
+    if pred != NONE && !deadBlock.get(u32.toUsize(pred)) && visitStamp.get(u32.toUsize(pred)) == visitEpoch {
+      anyVisited = true
+      let base = u32.toUsize(pred) * 8
+      if firstPred {
+        let mut s: usize = 0
+        while s < 8 { curSlots[s] = outSlot.get(base + s) s = s + 1 }
+        firstPred = false
+      } else {
+        let mut s: usize = 0
+        while s < 8 {
+          if curSlots[s] != outSlot.get(base + s) { curSlots[s] = NONE }
+          s = s + 1
+        }
+      }
+    }
+    k = k + 1
+  }
+  return VirtSlotState { anyVisited: anyVisited, slots: curSlots }
+}
+
+/// Checks whether instruction `uIdx` is an allowed use of `cand.obj` or `cand.isUndef`.
+fn checkObjUse(f: &Function, deadBlock: &List<bool>, cand: VirtualCand, bTermIdx: u32, uIdx: u32) -> bool {
+  let inst = f.inst(uIdx)
+  if inst.op == Op.Removed || deadBlock.get(u32.toUsize(inst.block)) || inst.block == cand.slowPred { return true }
+  if uIdx == cand.tagIsInst { return true }
+  if uIdx == bTermIdx { return inst.a != cand.obj }
+  if inst.block == cand.initPred && inst.op == Op.InitSlot && inst.a == cand.obj {
+    return inst.b != cand.obj && inst.b != cand.isUndef
+  }
+  if (readsA(inst.op) && (inst.a == cand.obj || inst.a == cand.isUndef))
+    || (readsB(inst.op) && (inst.b == cand.obj || inst.b == cand.isUndef))
+    || (readsK(inst.op) && inst.k >= 0 && (i32.wrappingToU32(inst.k) == cand.obj || i32.wrappingToU32(inst.k) == cand.isUndef)) {
+    return false
+  }
+  return true
+}
+
+/// Whether `targetVal` appears in any non-virtual exit slot attached to a live instruction
+/// (outside `deadBlock` and `cand.slowPred`).
+fn hasLiveExitUse(f: &Function, deadBlock: &List<bool>, cand: VirtualCand, exitUseFirst: &List<u32>, exitUseExit: &List<u32>, exitUseSlot: &List<u32>, exitInstFirst: &List<u32>, exitInstList: &List<u32>, targetVal: u32) -> bool {
+  let mut k = exitUseFirst.get(u32.toUsize(targetVal))
+  let kEnd = exitUseFirst.get(u32.toUsize(targetVal) + 1)
+  while k < kEnd {
+    let sl = f.slots.get(u32.toUsize(exitUseSlot.get(u32.toUsize(k))))
+    if sl.mode != SlotMode.Virtual && sl.value == targetVal {
+      let exIdx = exitUseExit.get(u32.toUsize(k))
+      let mut m = exitInstFirst.get(u32.toUsize(exIdx))
+      let mEnd = exitInstFirst.get(u32.toUsize(exIdx) + 1)
+      while m < mEnd {
+        let inst = f.inst(exitInstList.get(u32.toUsize(m)))
+        if inst.op != Op.Removed && inst.exit == exIdx && !deadBlock.get(u32.toUsize(inst.block)) && inst.block != cand.slowPred {
+          return true
+        }
+        m = m + 1
+      }
+    }
+    k = k + 1
+  }
+  return false
+}
+
+/// Whether `targetVal` appears in any non-virtual exit slot attached to a live instruction
+/// NOT dominated by `cand.joinBlock` (outside `deadBlock` and `cand.slowPred`).
+fn hasNonDomExitUse(f: &Function, dom: &DomTree, deadBlock: &List<bool>, cand: VirtualCand, exitUseFirst: &List<u32>, exitUseExit: &List<u32>, exitUseSlot: &List<u32>, exitInstFirst: &List<u32>, exitInstList: &List<u32>, targetVal: u32) -> bool {
+  let mut k = exitUseFirst.get(u32.toUsize(targetVal))
+  let kEnd = exitUseFirst.get(u32.toUsize(targetVal) + 1)
+  while k < kEnd {
+    let sl = f.slots.get(u32.toUsize(exitUseSlot.get(u32.toUsize(k))))
+    if sl.mode != SlotMode.Virtual && sl.value == targetVal {
+      let exIdx = exitUseExit.get(u32.toUsize(k))
+      let mut m = exitInstFirst.get(u32.toUsize(exIdx))
+      let mEnd = exitInstFirst.get(u32.toUsize(exIdx) + 1)
+      while m < mEnd {
+        let inst = f.inst(exitInstList.get(u32.toUsize(m)))
+        if inst.op != Op.Removed && inst.exit == exIdx && !deadBlock.get(u32.toUsize(inst.block)) && inst.block != cand.slowPred && !dominates(dom, cand.joinBlock, inst.block) {
+          return true
+        }
+        m = m + 1
+      }
+    }
+    k = k + 1
+  }
+  return false
+}
+
+/// Whether `targetVal` appears as an argument on any live edge (outside `deadBlock`,
+/// `cand.slowPred`, and optionally `cand.initPred`).
+fn hasLiveEdgeUse(f: &Function, source: &List<u32>, deadBlock: &List<bool>, cand: VirtualCand, edgeUseFirst: &List<u32>, edgeUseEdge: &List<u32>, edgeUseArg: &List<u32>, targetVal: u32, allowInitPred: bool) -> bool {
+  let mut k = edgeUseFirst.get(u32.toUsize(targetVal))
+  let kEnd = edgeUseFirst.get(u32.toUsize(targetVal) + 1)
+  while k < kEnd {
+    let ei = edgeUseEdge.get(u32.toUsize(k))
+    let src = source.get(u32.toUsize(ei))
+    if src != NONE && !deadBlock.get(u32.toUsize(src)) && src != cand.slowPred && (!allowInitPred || src != cand.initPred) {
+      if f.edgeArgs.get(u32.toUsize(edgeUseArg.get(u32.toUsize(k)))) == targetVal {
+        return true
+      }
+    }
+    k = k + 1
+  }
+  return false
+}
+
+/// Eliminates heap allocations for non-escaping planned constructions (SROA Phase 2):
+/// replaces `Op.NewObject` with `Op.CheckConstruct`, eliminates the slow-path diamond and
+/// `Op.InitSlot`/`Op.PutField`/`Op.CheckTag`/`Op.CheckShape`/`Op.Retain`/`Op.Release` on the
+/// object, rewrites prototype-method `Op.GetField`s to `Op.KnownMethod`, and encodes live
+/// references in exits as `SlotMode.Virtual` for cold-deopt materialization. Returns `true`
+/// when any construction was virtualized.
+pub effect fn virtualizeConstructs(f: &mut Function, input: &FunctionInput, sites: &List<u32>) -> bool ! OutOfMemoryError ? &mut Allocator {
+  if f.constructTargets.length() == 0 { return false }
+  let blocks = u32.toUsize(f.blockCount())
+  let values = u32.toUsize(f.valueCount())
+  let instCount = f.insts.length()
+  let exitCount = f.exits.length()
+  if blocks < 2 || values == 0 { return false }
+
+  // Source block of each edge, and incoming edges per block.
+  let mut source = List<u32>.make()
+  run source.appendRepeated(NONE, f.edges.length())
+  let mut b: usize = 0
+  while b < blocks {
+    let blk = f.blocks.get(b)
+    if blk.instCount > 0 {
+      let term = f.inst(blk.firstInst + blk.instCount - 1)
+      let mut e: u32 = 0
+      while term.edge != NONE && e < edgeCount(term.op) {
+        source.set(u32.toUsize(term.edge + e), usize.toU32(b))
+        e = e + 1
+      }
+    }
+    b = b + 1
+  }
+  let mut inFirst = List<u32>.make()
+  run inFirst.appendRepeated(0, blocks + 1)
+  let mut e: usize = 0
+  while e < f.edges.length() {
+    let t = u32.toUsize(f.edges.get(e).target)
+    if t < blocks { let c = inFirst.get(t + 1) + 1 inFirst.set(t + 1, c) }
+    e = e + 1
+  }
+  b = 0
+  while b < blocks { let c = inFirst.get(b + 1) + inFirst.get(b) inFirst.set(b + 1, c) b = b + 1 }
+  let mut inNext = List<u32>.make()
+  run inNext.appendSlice(inFirst.asSlice())
+  let mut inEdges = List<u32>.make()
+  run inEdges.appendRepeated(0, f.edges.length())
+  e = 0
+  while e < f.edges.length() {
+    let t = u32.toUsize(f.edges.get(e).target)
+    if t < blocks {
+      let at = inNext.get(t)
+      inEdges.set(u32.toUsize(at), usize.toU32(e))
+      inNext.set(t, at + 1)
+    }
+    e = e + 1
+  }
+
+  // Discover planned construct diamonds in RPO order.
+  let mut cands = List<VirtualCand>.make()
+  let mut jb: u32 = 1
+  while jb < f.blockCount() {
+    let s0 = inFirst.get(u32.toUsize(jb))
+    let s1 = inFirst.get(u32.toUsize(jb) + 1)
+    if s1 - s0 == 2 {
+      let blk = f.blocks.get(u32.toUsize(jb))
+      if blk.paramCount == 1 {
+        let e0Idx = inEdges.get(u32.toUsize(s0))
+        let e1Idx = inEdges.get(u32.toUsize(s0 + 1))
+        let e0 = f.edges.get(u32.toUsize(e0Idx))
+        let e1 = f.edges.get(u32.toUsize(e1Idx))
+        if e0.argCount == 1 && e1.argCount == 1 {
+          let a0 = f.edgeArg(e0, 0)
+          let a1 = f.edgeArg(e1, 0)
+          if u32.toUsize(a0) < values && u32.toUsize(a1) < values {
+            let d0 = f.value(a0).def
+            let d1 = f.value(a1).def
+            if d0 != NONE && d1 != NONE {
+              let i0 = f.inst(d0)
+              let i1 = f.inst(d1)
+              let mut obj = NONE
+              let mut objDef = NONE
+              let mut initPred = NONE
+              let mut slowPred = NONE
+              if i0.op == Op.NewObject && i1.op == Op.Call && (i1.k & calls.PLANNED) != 0 {
+                obj = a0 objDef = d0 initPred = source.get(u32.toUsize(e0Idx)) slowPred = source.get(u32.toUsize(e1Idx))
+              } else if i1.op == Op.NewObject && i0.op == Op.Call && (i0.k & calls.PLANNED) != 0 {
+                obj = a1 objDef = d1 initPred = source.get(u32.toUsize(e1Idx)) slowPred = source.get(u32.toUsize(e0Idx))
+              }
+              if obj != NONE && initPred != NONE && slowPred != NONE && initPred != slowPred && initPred != jb && slowPred != jb {
+                let newObjInst = f.inst(objDef)
+                let siteIdx = i32.wrappingToU32(newObjInst.k)
+                if newObjInst.k >= 0 && u32.toUsize(siteIdx) < f.constructTargets.length() && u32.toUsize(siteIdx) < f.constructShapes.length() {
+                  let ver = u32.toU64(f.constructShapes.get(u32.toUsize(siteIdx)))
+                  let initIn0 = inFirst.get(u32.toUsize(initPred))
+                  let initIn1 = inFirst.get(u32.toUsize(initPred) + 1)
+                  let slowIn0 = inFirst.get(u32.toUsize(slowPred))
+                  let slowIn1 = inFirst.get(u32.toUsize(slowPred) + 1)
+                  if ver != 0 && initIn1 - initIn0 == 1 && slowIn1 - slowIn0 == 1 {
+                    let initInEdge = inEdges.get(u32.toUsize(initIn0))
+                    let slowInEdge = inEdges.get(u32.toUsize(slowIn0))
+                    let branchBlock = source.get(u32.toUsize(initInEdge))
+                    if branchBlock != NONE && branchBlock == source.get(u32.toUsize(slowInEdge))
+                      && branchBlock != initPred && branchBlock != slowPred && branchBlock != jb {
+                      let bBlk = f.blocks.get(u32.toUsize(branchBlock))
+                      let bTerm = f.terminator(bBlk)
+                      if bTerm.op == Op.Branch && bTerm.edge == slowInEdge && bTerm.edge + 1 == initInEdge
+                        && f.edge(slowInEdge).argCount == 0 && f.edge(initInEdge).argCount == 0
+                        && u32.toUsize(bTerm.a) < values {
+                        let isUndef = bTerm.a
+                        let tagDef = f.value(isUndef).def
+                        if tagDef != NONE {
+                          let tagInst = f.inst(tagDef)
+                          if tagInst.op == Op.TagIs && tagInst.a == obj && tagInst.k == 1 {
+                            let initBlk = f.blocks.get(u32.toUsize(initPred))
+                            let mut stores: u32 = 0
+                            let mut seenMask: u32 = 0
+                            let mut ok = true
+                            let mut k = initBlk.firstInst
+                            while k < initBlk.firstInst + initBlk.instCount {
+                              let inst = f.inst(k)
+                              if inst.exit != NONE { ok = false }
+                              if inst.op == Op.InitSlot && inst.a == obj && inst.k >= 0 && inst.k < 8 {
+                                if inst.b == obj || inst.b == isUndef { ok = false }
+                                let slot = i32.wrappingToU32(inst.k)
+                                let bit = u32.shiftLeft(1, slot)
+                                if u32.bitAnd(seenMask, bit) != 0 { ok = false }
+                                seenMask = u32.bitOr(seenMask, bit)
+                                if slot + 1 > stores { stores = slot + 1 }
+                              } else if inst.op == Op.PutField || inst.op == Op.Call || inst.op == Op.PutKey || inst.op == Op.PutElem || inst.op == Op.NewObject {
+                                ok = false
+                              } else if (readsA(inst.op) && (inst.a == obj || inst.a == isUndef))
+                                || (readsB(inst.op) && (inst.b == obj || inst.b == isUndef))
+                                || (readsK(inst.op) && (i32.wrappingToU32(inst.k) == obj || i32.wrappingToU32(inst.k) == isUndef)) {
+                                ok = false
+                              }
+                              k = k + 1
+                            }
+                            let initTerm = f.terminator(initBlk)
+                            if initTerm.op != Op.Jump || f.edge(initTerm.edge).target != jb || f.edge(initTerm.edge).argCount != 1 || f.edgeArg(f.edge(initTerm.edge), 0) != obj {
+                              ok = false
+                            }
+                            if ok && stores > 0 && stores <= 8 && seenMask == u32.shiftLeft(1, stores) - 1 {
+                              run cands.append(VirtualCand {
+                                joinBlock: jb,
+                                initPred: initPred,
+                                slowPred: slowPred,
+                                branchBlock: branchBlock,
+                                newObjInst: objDef,
+                                tagIsInst: tagDef,
+                                obj: obj,
+                                isUndef: isUndef,
+                                joined: f.paramAt(blk, 0),
+                                siteIdx: siteIdx,
+                                ver: ver,
+                                stores: stores,
+                              })
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    jb = jb + 1
+  }
+  if cands.length() == 0 { return false }
+
+  let shapes = run analyzeSites(&f.*, input, sites)
+  let idom = run dominators(&f.*)
+  let dom = run buildDomTree(&idom)
+
+  // Build CSR use-lists once in linear time:
+  // 1. Instruction operand uses per value (`instUseFirst`, `instUseList`).
+  let mut instUseFirst = List<u32>.make()
+  run instUseFirst.appendRepeated(0, values + 1)
+  let mut ii: usize = 0
+  while ii < instCount {
+    let inst = f.insts.get(ii)
+    if inst.op != Op.Removed {
+      let mut va = NONE
+      let mut vb = NONE
+      if readsA(inst.op) && inst.a != NONE && u32.toUsize(inst.a) < values {
+        va = inst.a
+        let c = instUseFirst.get(u32.toUsize(va) + 1) + 1
+        instUseFirst.set(u32.toUsize(va) + 1, c)
+      }
+      if readsB(inst.op) && inst.b != NONE && u32.toUsize(inst.b) < values && inst.b != va {
+        vb = inst.b
+        let c = instUseFirst.get(u32.toUsize(vb) + 1) + 1
+        instUseFirst.set(u32.toUsize(vb) + 1, c)
+      }
+      if readsK(inst.op) && inst.k >= 0 {
+        let vk = i32.wrappingToU32(inst.k)
+        if vk != NONE && u32.toUsize(vk) < values && vk != va && vk != vb {
+          let c = instUseFirst.get(u32.toUsize(vk) + 1) + 1
+          instUseFirst.set(u32.toUsize(vk) + 1, c)
+        }
+      }
+    }
+    ii = ii + 1
+  }
+  let mut vi: usize = 0
+  while vi < values {
+    let c = instUseFirst.get(vi + 1) + instUseFirst.get(vi)
+    instUseFirst.set(vi + 1, c)
+    vi = vi + 1
+  }
+  let mut instUseNext = List<u32>.make()
+  run instUseNext.appendSlice(instUseFirst.asSlice())
+  let mut instUseList = List<u32>.make()
+  run instUseList.appendRepeated(0, u32.toUsize(instUseFirst.get(values)))
+  ii = 0
+  while ii < instCount {
+    let inst = f.insts.get(ii)
+    if inst.op != Op.Removed {
+      let uIdx = usize.toU32(ii)
+      let mut va = NONE
+      let mut vb = NONE
+      if readsA(inst.op) && inst.a != NONE && u32.toUsize(inst.a) < values {
+        va = inst.a
+        let at = instUseNext.get(u32.toUsize(va))
+        instUseList.set(u32.toUsize(at), uIdx)
+        instUseNext.set(u32.toUsize(va), at + 1)
+      }
+      if readsB(inst.op) && inst.b != NONE && u32.toUsize(inst.b) < values && inst.b != va {
+        vb = inst.b
+        let at = instUseNext.get(u32.toUsize(vb))
+        instUseList.set(u32.toUsize(at), uIdx)
+        instUseNext.set(u32.toUsize(vb), at + 1)
+      }
+      if readsK(inst.op) && inst.k >= 0 {
+        let vk = i32.wrappingToU32(inst.k)
+        if vk != NONE && u32.toUsize(vk) < values && vk != va && vk != vb {
+          let at = instUseNext.get(u32.toUsize(vk))
+          instUseList.set(u32.toUsize(at), uIdx)
+          instUseNext.set(u32.toUsize(vk), at + 1)
+        }
+      }
+    }
+    ii = ii + 1
+  }
+
+  // 2. Edge argument uses per value (`edgeUseFirst`, `edgeUseEdge`, `edgeUseArg`).
+  let mut edgeUseFirst = List<u32>.make()
+  run edgeUseFirst.appendRepeated(0, values + 1)
+  e = 0
+  while e < f.edges.length() {
+    if source.get(e) != NONE {
+      let edge = f.edges.get(e)
+      let mut g: u32 = 0
+      while g < edge.argCount {
+        let arg = f.edgeArg(edge, g)
+        if arg != NONE && u32.toUsize(arg) < values {
+          let c = edgeUseFirst.get(u32.toUsize(arg) + 1) + 1
+          edgeUseFirst.set(u32.toUsize(arg) + 1, c)
+        }
+        g = g + 1
+      }
+    }
+    e = e + 1
+  }
+  vi = 0
+  while vi < values {
+    let c = edgeUseFirst.get(vi + 1) + edgeUseFirst.get(vi)
+    edgeUseFirst.set(vi + 1, c)
+    vi = vi + 1
+  }
+  let mut edgeUseNext = List<u32>.make()
+  run edgeUseNext.appendSlice(edgeUseFirst.asSlice())
+  let edgeUseTotal = u32.toUsize(edgeUseFirst.get(values))
+  let mut edgeUseEdge = List<u32>.make()
+  run edgeUseEdge.appendRepeated(0, edgeUseTotal)
+  let mut edgeUseArg = List<u32>.make()
+  run edgeUseArg.appendRepeated(0, edgeUseTotal)
+  e = 0
+  while e < f.edges.length() {
+    if source.get(e) != NONE {
+      let edge = f.edges.get(e)
+      let mut g: u32 = 0
+      while g < edge.argCount {
+        let arg = f.edgeArg(edge, g)
+        if arg != NONE && u32.toUsize(arg) < values {
+          let at = edgeUseNext.get(u32.toUsize(arg))
+          edgeUseEdge.set(u32.toUsize(at), usize.toU32(e))
+          edgeUseArg.set(u32.toUsize(at), edge.firstArg + g)
+          edgeUseNext.set(u32.toUsize(arg), at + 1)
+        }
+        g = g + 1
+      }
+    }
+    e = e + 1
+  }
+
+  // 3. Instructions per exit (`exitInstFirst`, `exitInstList`) and exit slot uses per value
+  //    (`exitUseFirst`, `exitUseExit`, `exitUseSlot`).
+  let mut exitInstFirst = List<u32>.make()
+  run exitInstFirst.appendRepeated(0, exitCount + 1)
+  ii = 0
+  while ii < instCount {
+    let inst = f.insts.get(ii)
+    if inst.op != Op.Removed && inst.exit != NONE && u32.toUsize(inst.exit) < exitCount {
+      let c = exitInstFirst.get(u32.toUsize(inst.exit) + 1) + 1
+      exitInstFirst.set(u32.toUsize(inst.exit) + 1, c)
+    }
+    ii = ii + 1
+  }
+  let mut xi: usize = 0
+  while xi < exitCount {
+    let c = exitInstFirst.get(xi + 1) + exitInstFirst.get(xi)
+    exitInstFirst.set(xi + 1, c)
+    xi = xi + 1
+  }
+  let mut exitInstNext = List<u32>.make()
+  run exitInstNext.appendSlice(exitInstFirst.asSlice())
+  let mut exitInstList = List<u32>.make()
+  run exitInstList.appendRepeated(0, u32.toUsize(exitInstFirst.get(exitCount)))
+  ii = 0
+  while ii < instCount {
+    let inst = f.insts.get(ii)
+    if inst.op != Op.Removed && inst.exit != NONE && u32.toUsize(inst.exit) < exitCount {
+      let exIdx = u32.toUsize(inst.exit)
+      let at = exitInstNext.get(exIdx)
+      exitInstList.set(u32.toUsize(at), usize.toU32(ii))
+      exitInstNext.set(exIdx, at + 1)
+    }
+    ii = ii + 1
+  }
+
+  let mut exitUseFirst = List<u32>.make()
+  run exitUseFirst.appendRepeated(0, values + 1)
+  xi = 0
+  while xi < exitCount {
+    if exitInstFirst.get(xi) < exitInstFirst.get(xi + 1) {
+      let ex = f.exits.get(xi)
+      let total = f.slotCount(ex)
+      let mut s: u32 = 0
+      while s < total {
+        let sl = f.slot(ex, s)
+        if sl.mode != SlotMode.Virtual && sl.value != NONE && u32.toUsize(sl.value) < values {
+          let c = exitUseFirst.get(u32.toUsize(sl.value) + 1) + 1
+          exitUseFirst.set(u32.toUsize(sl.value) + 1, c)
+        }
+        s = s + 1
+      }
+    }
+    xi = xi + 1
+  }
+  vi = 0
+  while vi < values {
+    let c = exitUseFirst.get(vi + 1) + exitUseFirst.get(vi)
+    exitUseFirst.set(vi + 1, c)
+    vi = vi + 1
+  }
+  let mut exitUseNext = List<u32>.make()
+  run exitUseNext.appendSlice(exitUseFirst.asSlice())
+  let exitUseTotal = u32.toUsize(exitUseFirst.get(values))
+  let mut exitUseExit = List<u32>.make()
+  run exitUseExit.appendRepeated(0, exitUseTotal)
+  let mut exitUseSlot = List<u32>.make()
+  run exitUseSlot.appendRepeated(0, exitUseTotal)
+  xi = 0
+  while xi < exitCount {
+    if exitInstFirst.get(xi) < exitInstFirst.get(xi + 1) {
+      let ex = f.exits.get(xi)
+      let total = f.slotCount(ex)
+      let mut s: u32 = 0
+      while s < total {
+        let sl = f.slot(ex, s)
+        if sl.mode != SlotMode.Virtual && sl.value != NONE && u32.toUsize(sl.value) < values {
+          let at = exitUseNext.get(u32.toUsize(sl.value))
+          exitUseExit.set(u32.toUsize(at), usize.toU32(xi))
+          exitUseSlot.set(u32.toUsize(at), ex.firstSlot + s)
+          exitUseNext.set(u32.toUsize(sl.value), at + 1)
+        }
+        s = s + 1
+      }
+    }
+    xi = xi + 1
+  }
+
+  // 4. Borrow children per RootKind.Value root (`borrowFirst`, `borrowList`) and
+  //    `hasNonRetainBorrow` for O(1) `canChangeToImm`.
+  let mut hasNonRetainBorrow = List<bool>.make()
+  run hasNonRetainBorrow.appendRepeated(false, values)
+  let mut borrowFirst = List<u32>.make()
+  run borrowFirst.appendRepeated(0, values + 1)
+  vi = 0
+  while vi < values {
+    let info = f.values.get(vi)
+    if info.own == Own.Borrowed && info.rootKind == RootKind.Value && info.root != NONE && u32.toUsize(info.root) < values {
+      let rIdx = u32.toUsize(info.root)
+      let c = borrowFirst.get(rIdx + 1) + 1
+      borrowFirst.set(rIdx + 1, c)
+      let mut isDirectRetain = false
+      if info.def != NONE {
+        let d = f.inst(info.def)
+        if d.op == Op.Retain && d.a == info.root { isDirectRetain = true }
+      }
+      if !isDirectRetain { hasNonRetainBorrow.set(rIdx, true) }
+    }
+    vi = vi + 1
+  }
+  vi = 0
+  while vi < values {
+    let c = borrowFirst.get(vi + 1) + borrowFirst.get(vi)
+    borrowFirst.set(vi + 1, c)
+    vi = vi + 1
+  }
+  let mut borrowNext = List<u32>.make()
+  run borrowNext.appendSlice(borrowFirst.asSlice())
+  let mut borrowList = List<u32>.make()
+  run borrowList.appendRepeated(0, u32.toUsize(borrowFirst.get(values)))
+  vi = 0
+  while vi < values {
+    let info = f.values.get(vi)
+    if info.own == Own.Borrowed && info.rootKind == RootKind.Value && info.root != NONE && u32.toUsize(info.root) < values {
+      let rIdx = u32.toUsize(info.root)
+      let at = borrowNext.get(rIdx)
+      borrowList.set(u32.toUsize(at), usize.toU32(vi))
+      borrowNext.set(rIdx, at + 1)
+    }
+    vi = vi + 1
+  }
+
+  let mut voExit = List<u32>.make()
+  run voExit.appendRepeated(NONE, f.virtualObjs.length())
+  let mut extraTagIsVal = List<u32>.make()
+  let mut extraTagIsInst = List<u32>.make()
+
+  let mut deadBlock = List<bool>.make() run deadBlock.appendRepeated(false, blocks)
+  let mut deadParams = List<bool>.make() run deadParams.appendRepeated(false, values)
+  let mut aliasStamp = List<u32>.make() run aliasStamp.appendRepeated(0, values)
+  let mut curAliasEpoch: u32 = 0
+  let mut aliasList = List<u32>.make()
+  let mut visitStamp = List<u32>.make() run visitStamp.appendRepeated(0, blocks)
+  let mut curVisitEpoch: u32 = 0
+  let mut outSlot = List<u32>.make() run outSlot.appendRepeated(NONE, blocks * 8)
+  let mut exitCheckStamp = List<u32>.make() run exitCheckStamp.appendRepeated(0, exitCount)
+  let mut curExitEpoch: u32 = 0
+  let mut exitSaved = List<u32>.make() run exitSaved.appendRepeated(NONE, exitCount * 8)
+  let mut exitVoStamp = List<u32>.make() run exitVoStamp.appendRepeated(0, exitCount)
+  let mut exitVoIdx = List<u32>.make() run exitVoIdx.appendRepeated(NONE, exitCount)
+  let mut becameImmList = List<u32>.make()
+  let mut forward = run Forward.make(&f.*)
+  let mut undefVal = NONE
+  let mut anyVirtualized = false
+
+  // Process candidates in reverse RPO order so inner/later constructs virtualize first
+  // (turning nested Op.NewObject into Op.CheckConstruct and killing nested slowPreds before
+  // outer constructs inspect their exits).
+  let mut ci = cands.length()
+  while ci > 0 {
+    ci = ci - 1
+    let cand = cands.get(ci)
+    if deadBlock.get(u32.toUsize(cand.joinBlock)) || deadBlock.get(u32.toUsize(cand.branchBlock)) || deadBlock.get(u32.toUsize(cand.initPred)) {
+      continue
+    }
+    if f.inst(cand.newObjInst).op != Op.NewObject { continue }
+    let domStart = dom.tin.get(u32.toUsize(cand.joinBlock))
+    let domEnd = dom.tout.get(u32.toUsize(cand.joinBlock))
+    if domStart == NONE || domStart >= domEnd { continue }
+
+    // 1. Read initial safe field values from `initPred` (must dominate `initPred` and thus `joinBlock`).
+    let mut startSlots: [u32; 8] = [NONE; 8]
+    let initBlk = f.blocks.get(u32.toUsize(cand.initPred))
+    let mut ik = initBlk.firstInst
+    while ik < initBlk.firstInst + initBlk.instCount {
+      let inst = f.inst(ik)
+      if inst.op == Op.InitSlot && inst.a == cand.obj && inst.k >= 0 && inst.k < 8 {
+        let fv = safeFieldVal(&f.*, inst.b)
+        if fv != NONE && fv != cand.obj && fv != cand.isUndef && dominates(&dom, f.value(fv).block, cand.initPred) {
+          startSlots[i32.toUsize(inst.k)] = fv
+        }
+      }
+      ik = ik + 1
+    }
+    let mut candOk = true
+    let mut ss: u32 = 0
+    while ss < cand.stores {
+      if startSlots[u32.toUsize(ss)] == NONE { candOk = false }
+      ss = ss + 1
+    }
+    if !candOk { continue }
+
+    // 2. Collect `isAlias` = `{ joined }` + transitive `Op.Retain` results in blocks dominated by `joinBlock`.
+    curAliasEpoch = curAliasEpoch + 1
+    aliasList.truncate(0)
+    aliasStamp.set(u32.toUsize(cand.joined), curAliasEpoch)
+    run aliasList.append(cand.joined)
+    let mut aq: usize = 0
+    while aq < aliasList.length() {
+      let aVal = aliasList.get(aq)
+      aq = aq + 1
+      let mut uk = instUseFirst.get(u32.toUsize(aVal))
+      let uEnd = instUseFirst.get(u32.toUsize(aVal) + 1)
+      while uk < uEnd {
+        let uIdx = instUseList.get(u32.toUsize(uk))
+        let inst = f.inst(uIdx)
+        if inst.op == Op.Retain && inst.a == aVal && inst.result != NONE
+          && !deadBlock.get(u32.toUsize(inst.block)) && dominates(&dom, cand.joinBlock, inst.block)
+          && !isMarkedStamp(&aliasStamp, curAliasEpoch, inst.result) {
+          aliasStamp.set(u32.toUsize(inst.result), curAliasEpoch)
+          run aliasList.append(inst.result)
+        }
+        uk = uk + 1
+      }
+    }
+
+    // 3. Verify `obj` and `isUndef` have no stray uses outside `{ tagIs, branchTerm, initPred InitSlots, initPred->joinBlock, slowPred }`,
+    //    and no surviving `SlotMode.Virtual` references `obj`, `isUndef`, or `isAlias`.
+    let bBlk = f.blocks.get(u32.toUsize(cand.branchBlock))
+    let bTermIdx = bBlk.firstInst + bBlk.instCount - 1
+    let mut uk = instUseFirst.get(u32.toUsize(cand.obj))
+    let objUseEnd = instUseFirst.get(u32.toUsize(cand.obj) + 1)
+    while uk < objUseEnd && candOk {
+      if !checkObjUse(&f.*, &deadBlock, cand, bTermIdx, instUseList.get(u32.toUsize(uk))) { candOk = false }
+      uk = uk + 1
+    }
+    uk = instUseFirst.get(u32.toUsize(cand.isUndef))
+    let undefUseEnd = instUseFirst.get(u32.toUsize(cand.isUndef) + 1)
+    while uk < undefUseEnd && candOk {
+      if !checkObjUse(&f.*, &deadBlock, cand, bTermIdx, instUseList.get(u32.toUsize(uk))) { candOk = false }
+      uk = uk + 1
+    }
+    let mut eti: usize = 0
+    while eti < extraTagIsVal.length() && candOk {
+      if extraTagIsVal.get(eti) == cand.isUndef {
+        if !checkObjUse(&f.*, &deadBlock, cand, bTermIdx, extraTagIsInst.get(eti)) { candOk = false }
+      }
+      eti = eti + 1
+    }
+    if candOk && hasLiveExitUse(&f.*, &deadBlock, cand, &exitUseFirst, &exitUseExit, &exitUseSlot, &exitInstFirst, &exitInstList, cand.obj) {
+      candOk = false
+    }
+    if candOk && hasLiveExitUse(&f.*, &deadBlock, cand, &exitUseFirst, &exitUseExit, &exitUseSlot, &exitInstFirst, &exitInstList, cand.isUndef) {
+      candOk = false
+    }
+    let mut voi: usize = 0
+    while voi < f.virtualObjs.length() && candOk {
+      let vo = f.virtualObjs.get(voi)
+      let mut hit = false
+      let mut fk: u32 = 0
+      while fk < vo.slotCount && fk < 8 {
+        let fv = vo.fields[u32.toUsize(fk)]
+        if fv == cand.obj || fv == cand.isUndef || isMarkedStamp(&aliasStamp, curAliasEpoch, fv) { hit = true break }
+        fk = fk + 1
+      }
+      if hit {
+        let exIdx = voExit.get(voi)
+        if exIdx == NONE {
+          candOk = false
+        } else {
+          let mut mk = exitInstFirst.get(u32.toUsize(exIdx))
+          let mEnd = exitInstFirst.get(u32.toUsize(exIdx) + 1)
+          while mk < mEnd {
+            let inst = f.inst(exitInstList.get(u32.toUsize(mk)))
+            if inst.op != Op.Removed && inst.exit == exIdx && !deadBlock.get(u32.toUsize(inst.block)) && inst.block != cand.slowPred {
+              candOk = false
+              break
+            }
+            mk = mk + 1
+          }
+        }
+      }
+      voi = voi + 1
+    }
+    if !candOk { continue }
+
+    // 4. Verify NO edge argument anywhere (outside dead blocks, slowPred, and initPred->joinBlock) references `obj`, `isUndef`, or `isAlias`.
+    if hasLiveEdgeUse(&f.*, &source, &deadBlock, cand, &edgeUseFirst, &edgeUseEdge, &edgeUseArg, cand.obj, true) {
+      candOk = false
+    }
+    if candOk && hasLiveEdgeUse(&f.*, &source, &deadBlock, cand, &edgeUseFirst, &edgeUseEdge, &edgeUseArg, cand.isUndef, false) {
+      candOk = false
+    }
+    let mut ai: usize = 0
+    while ai < aliasList.length() && candOk {
+      if hasLiveEdgeUse(&f.*, &source, &deadBlock, cand, &edgeUseFirst, &edgeUseEdge, &edgeUseArg, aliasList.get(ai), false) {
+        candOk = false
+      }
+      ai = ai + 1
+    }
+    if !candOk { continue }
+
+    // 5. Verify ALL instruction uses of `isAlias` across the entire function are non-escaping,
+    //    and no non-dominated block references `isAlias` in any exit.
+    ai = 0
+    while ai < aliasList.length() && candOk {
+      let aVal = aliasList.get(ai)
+      uk = instUseFirst.get(u32.toUsize(aVal))
+      let uEnd = instUseFirst.get(u32.toUsize(aVal) + 1)
+      while uk < uEnd && candOk {
+        let uIdx = instUseList.get(u32.toUsize(uk))
+        let inst = f.inst(uIdx)
+        if inst.op != Op.Removed && !deadBlock.get(u32.toUsize(inst.block)) && inst.block != cand.slowPred {
+          if readsAnyAlias(inst, &aliasStamp, curAliasEpoch) {
+            if !dominates(&dom, cand.joinBlock, inst.block) { candOk = false }
+            else if inst.op == Op.Retain {
+              if !isMarkedStamp(&aliasStamp, curAliasEpoch, inst.a) || inst.result == NONE || !isMarkedStamp(&aliasStamp, curAliasEpoch, inst.result) { candOk = false }
+            } else if inst.op == Op.Release {
+              if !isMarkedStamp(&aliasStamp, curAliasEpoch, inst.a) { candOk = false }
+            } else if inst.op == Op.CheckTag {
+              if !isMarkedStamp(&aliasStamp, curAliasEpoch, inst.a) || inst.k != -1 { candOk = false }
+            } else if inst.op == Op.CheckShape {
+              if !isMarkedStamp(&aliasStamp, curAliasEpoch, inst.a) || inst.k < 0 || u32.toU64(i32.wrappingToU32(inst.k)) != cand.ver { candOk = false }
+            } else if inst.op == Op.PutField {
+              if !isMarkedStamp(&aliasStamp, curAliasEpoch, inst.a) || isMarkedStamp(&aliasStamp, curAliasEpoch, inst.b) { candOk = false }
+              else {
+                let slot = slotOfSite(&shapes, uIdx, cand.ver)
+                if slot == NONE || slot >= cand.stores { candOk = false }
+              }
+            } else if inst.op == Op.GetField {
+              if !isMarkedStamp(&aliasStamp, curAliasEpoch, inst.a) || inst.result == NONE { candOk = false }
+              else {
+                let slot = slotOfSite(&shapes, uIdx, cand.ver)
+                if slot != NONE && slot < cand.stores {
+                  // own-slot read: validated against curSlots in step 8
+                } else if knownMethodKey(&f.*, &shapes, uIdx, cand.ver) >= 0 {
+                  // prototype-method read -> Op.KnownMethod
+                } else {
+                  candOk = false
+                }
+              }
+            } else {
+              candOk = false
+            }
+          }
+        }
+        uk = uk + 1
+      }
+      if candOk && hasNonDomExitUse(&f.*, &dom, &deadBlock, cand, &exitUseFirst, &exitUseExit, &exitUseSlot, &exitInstFirst, &exitInstList, aVal) {
+        candOk = false
+      }
+      ai = ai + 1
+    }
+    if !candOk { continue }
+
+    // 6. Verify no surviving `RootKind.Value` borrow points to `obj`, `isUndef`, or `isAlias`
+    //    (except `isAlias` itself or a `GetField`/`Retain`-of-`GetField` on `isAlias`).
+    let mut bk = borrowFirst.get(u32.toUsize(cand.obj))
+    let objBorrowEnd = borrowFirst.get(u32.toUsize(cand.obj) + 1)
+    while bk < objBorrowEnd && candOk {
+      let bv = borrowList.get(u32.toUsize(bk))
+      let info = f.value(bv)
+      if info.block < f.blockCount() && !deadBlock.get(u32.toUsize(info.block)) && info.block != cand.slowPred
+        && info.own == Own.Borrowed && info.rootKind == RootKind.Value && info.root == cand.obj {
+        candOk = false
+      }
+      bk = bk + 1
+    }
+    bk = borrowFirst.get(u32.toUsize(cand.isUndef))
+    let undefBorrowEnd = borrowFirst.get(u32.toUsize(cand.isUndef) + 1)
+    while bk < undefBorrowEnd && candOk {
+      let bv = borrowList.get(u32.toUsize(bk))
+      let info = f.value(bv)
+      if info.block < f.blockCount() && !deadBlock.get(u32.toUsize(info.block)) && info.block != cand.slowPred
+        && info.own == Own.Borrowed && info.rootKind == RootKind.Value && info.root == cand.isUndef {
+        candOk = false
+      }
+      bk = bk + 1
+    }
+    ai = 0
+    while ai < aliasList.length() && candOk {
+      let aVal = aliasList.get(ai)
+      bk = borrowFirst.get(u32.toUsize(aVal))
+      let bEnd = borrowFirst.get(u32.toUsize(aVal) + 1)
+      while bk < bEnd && candOk {
+        let bv = borrowList.get(u32.toUsize(bk))
+        let info = f.value(bv)
+        if info.block < f.blockCount() && !deadBlock.get(u32.toUsize(info.block)) && info.block != cand.slowPred
+          && info.own == Own.Borrowed && info.rootKind == RootKind.Value && info.root == aVal
+          && !isMarkedStamp(&aliasStamp, curAliasEpoch, bv) {
+          if retainChainGetField(&f.*, &aliasStamp, curAliasEpoch, bv) == NONE { candOk = false }
+        }
+        bk = bk + 1
+      }
+      ai = ai + 1
+    }
+    if !candOk { continue }
+
+    // 7. Forward dataflow fixpoint for `curSlots[0..stores]` over blocks dominated by `joinBlock`.
+    curVisitEpoch = curVisitEpoch + 1
+    let mut iter: u32 = 0
+    let mut fpChanged = true
+    while fpChanged && iter < 16 {
+      fpChanged = false
+      let mut di = domStart
+      while di < domEnd {
+        let cb = dom.order.get(u32.toUsize(di))
+        if !deadBlock.get(u32.toUsize(cb)) {
+          let st = entryStateVirt(cand, startSlots, cb, &inFirst, &inEdges, &source, &deadBlock, &visitStamp, curVisitEpoch, &outSlot)
+          if st.anyVisited {
+            let mut curSlots = st.slots
+            let blk = f.blocks.get(u32.toUsize(cb))
+            let mut j = blk.firstInst
+            while j < blk.firstInst + blk.instCount {
+              let inst = f.inst(j)
+              if inst.op == Op.PutField && isMarkedStamp(&aliasStamp, curAliasEpoch, inst.a) {
+                let slot = slotOfSite(&shapes, j, cand.ver)
+                if slot != NONE && slot < cand.stores {
+                  curSlots[u32.toUsize(slot)] = safeFieldVal(&f.*, inst.b)
+                }
+              }
+              j = j + 1
+            }
+            let bIdx = u32.toUsize(cb)
+            let base = bIdx * 8
+            let mut diff = visitStamp.get(bIdx) != curVisitEpoch
+            if !diff {
+              let mut s: usize = 0
+              while s < 8 {
+                if outSlot.get(base + s) != curSlots[s] { diff = true break }
+                s = s + 1
+              }
+            }
+            if diff {
+              visitStamp.set(bIdx, curVisitEpoch)
+              let mut s: usize = 0
+              while s < 8 { outSlot.set(base + s, curSlots[s]) s = s + 1 }
+              fpChanged = true
+            }
+          }
+        }
+        di = di + 1
+      }
+      iter = iter + 1
+    }
+    if fpChanged { continue }
+
+    // 8. Validate every own-slot `GetField` and every surviving exit referencing `isAlias`
+    //    BEFORE mutating anything.
+    curExitEpoch = curExitEpoch + 1
+    let mut di = domStart
+    while di < domEnd && candOk {
+      let cb = dom.order.get(u32.toUsize(di))
+      if !deadBlock.get(u32.toUsize(cb)) {
+        if visitStamp.get(u32.toUsize(cb)) != curVisitEpoch {
+          let blk = f.blocks.get(u32.toUsize(cb))
+          let mut j = blk.firstInst
+          while j < blk.firstInst + blk.instCount && candOk {
+            let inst = f.inst(j)
+            if inst.op != Op.Removed {
+              if readsAnyAlias(inst, &aliasStamp, curAliasEpoch) { candOk = false }
+              else if inst.exit != NONE {
+                let ex = f.exit(inst.exit)
+                let mut s: u32 = 0
+                while s < f.slotCount(ex) {
+                  let sl = f.slot(ex, s)
+                  if sl.mode != SlotMode.Virtual && isMarkedStamp(&aliasStamp, curAliasEpoch, sl.value) { candOk = false break }
+                  s = s + 1
+                }
+              }
+            }
+            j = j + 1
+          }
+        } else {
+          let st = entryStateVirt(cand, startSlots, cb, &inFirst, &inEdges, &source, &deadBlock, &visitStamp, curVisitEpoch, &outSlot)
+          let mut curSlots = st.slots
+          let blk = f.blocks.get(u32.toUsize(cb))
+          let mut j = blk.firstInst
+          while j < blk.firstInst + blk.instCount && candOk {
+            let inst = f.inst(j)
+            if inst.op != Op.Removed {
+              let mut survives = true
+              if inst.op == Op.GetField && isMarkedStamp(&aliasStamp, curAliasEpoch, inst.a) {
+                let slot = slotOfSite(&shapes, j, cand.ver)
+                if slot != NONE && slot < cand.stores {
+                  survives = false
+                  let val = curSlots[u32.toUsize(slot)]
+                  if val == NONE || isMarkedStamp(&aliasStamp, curAliasEpoch, val) || !definedAfterVirt(&f.*, &dom, cand, val, cb, j) {
+                    candOk = false
+                  } else {
+                    let valInfo = f.value(val)
+                    if valInfo.ty == Type.F64 || valInfo.ty == Type.I32 || valInfo.ty == Type.Bool || (valInfo.ty == Type.Value && valInfo.own == Own.Imm) {
+                      if !canChangeToImm(&f.*, &hasNonRetainBorrow, inst.result) { candOk = false }
+                    } else if !(valInfo.ty == Type.Value && valInfo.own == Own.Borrowed && valInfo.rootKind == RootKind.Argument) {
+                      candOk = false
+                    }
+                  }
+                }
+                // else: prototype-method GetField -> becomes Op.KnownMethod, survives with inst.exit
+              } else if inst.op == Op.PutField && isMarkedStamp(&aliasStamp, curAliasEpoch, inst.a) {
+                let slot = slotOfSite(&shapes, j, cand.ver)
+                curSlots[u32.toUsize(slot)] = safeFieldVal(&f.*, inst.b)
+                survives = false
+              } else if (inst.op == Op.CheckTag || inst.op == Op.CheckShape || inst.op == Op.Retain || inst.op == Op.Release) && isMarkedStamp(&aliasStamp, curAliasEpoch, inst.a) {
+                survives = false
+              }
+              if candOk && survives && inst.exit != NONE {
+                let ex = f.exit(inst.exit)
+                let total = f.slotCount(ex)
+                let liveCount = total - ex.drops
+                let mut hasLiveAlias = false
+                let mut s: u32 = 0
+                while s < liveCount {
+                  let sl = f.slot(ex, s)
+                  if sl.mode != SlotMode.Virtual && isMarkedStamp(&aliasStamp, curAliasEpoch, sl.value) { hasLiveAlias = true break }
+                  s = s + 1
+                }
+                if hasLiveAlias {
+                  if isHowStepCapable(inst) { candOk = false }
+                  else if ex.frames != 0 && (inst.op == Op.Call || inst.op == Op.Poll || inst.op == Op.NewObject || inst.op == Op.CheckConstruct) && bodyRecordsUsesAlias(&f.*, ex, &aliasStamp, curAliasEpoch) {
+                    candOk = false
+                  } else {
+                    let mut fk: u32 = 0
+                    while fk < cand.stores {
+                      let fv = curSlots[u32.toUsize(fk)]
+                      if fv == NONE || isMarkedStamp(&aliasStamp, curAliasEpoch, fv) || !definedAfterVirt(&f.*, &dom, cand, fv, cb, j) {
+                        candOk = false
+                        break
+                      }
+                      fk = fk + 1
+                    }
+                    if candOk {
+                      let eIdx = u32.toUsize(inst.exit)
+                      let eBase = eIdx * 8
+                      if exitCheckStamp.get(eIdx) != curExitEpoch {
+                        exitCheckStamp.set(eIdx, curExitEpoch)
+                        fk = 0
+                        while fk < cand.stores { exitSaved.set(eBase + u32.toUsize(fk), curSlots[u32.toUsize(fk)]) fk = fk + 1 }
+                      } else {
+                        fk = 0
+                        while fk < cand.stores {
+                          if exitSaved.get(eBase + u32.toUsize(fk)) != curSlots[u32.toUsize(fk)] { candOk = false break }
+                          fk = fk + 1
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+            j = j + 1
+          }
+        }
+      }
+      di = di + 1
+    }
+    if !candOk { continue }
+
+    // 9. All checks passed: mutate `cand` cleanly.
+    // 9a. Replace Op.NewObject with Op.CheckConstruct (guard-only, no result).
+    let mut chk = f.inst(cand.newObjInst)
+    chk.op = Op.CheckConstruct
+    chk.result = NONE
+    f.setInst(cand.newObjInst, chk)
+
+    // 9b. Remove Op.TagIs and rewrite Op.Branch(isUndef, slowPred, initPred) -> Op.Jump(initPred).
+    let mut tagGone = f.inst(cand.tagIsInst)
+    tagGone.op = Op.Removed
+    f.setInst(cand.tagIsInst, tagGone)
+    let mut bTerm = f.inst(bTermIdx)
+    bTerm.op = Op.Jump
+    bTerm.a = NONE
+    bTerm.edge = bTerm.edge + 1
+    f.setInst(bTermIdx, bTerm)
+    deadBlock.set(u32.toUsize(cand.slowPred), true)
+
+    // 9c. Remove all Op.InitSlot on `cand.obj` in `cand.initPred`.
+    ik = initBlk.firstInst
+    while ik < initBlk.firstInst + initBlk.instCount {
+      let mut inst = f.inst(ik)
+      if inst.op == Op.InitSlot && inst.a == cand.obj {
+        inst.op = Op.Removed
+        f.setInst(ik, inst)
+      }
+      ik = ik + 1
+    }
+
+    // 9d. Mark `cand.joined` param dead (dropped via `dropParams` at end).
+    deadParams.set(u32.toUsize(cand.joined), true)
+
+    // 9e. Rewrite uses of `isAlias` and exits across blocks dominated by `cand.joinBlock`.
+    becameImmList.truncate(0)
+    di = domStart
+    while di < domEnd {
+      let cb = dom.order.get(u32.toUsize(di))
+      if !deadBlock.get(u32.toUsize(cb)) && visitStamp.get(u32.toUsize(cb)) == curVisitEpoch {
+        let st = entryStateVirt(cand, startSlots, cb, &inFirst, &inEdges, &source, &deadBlock, &visitStamp, curVisitEpoch, &outSlot)
+        let mut curSlots = st.slots
+        let blk = f.blocks.get(u32.toUsize(cb))
+        let mut j = blk.firstInst
+        while j < blk.firstInst + blk.instCount {
+          let mut inst = f.inst(j)
+          if inst.op != Op.Removed {
+            let mut survives = true
+            if inst.op == Op.GetField && isMarkedStamp(&aliasStamp, curAliasEpoch, inst.a) {
+              let slot = slotOfSite(&shapes, j, cand.ver)
+              if slot != NONE && slot < cand.stores {
+                survives = false
+                let val = curSlots[u32.toUsize(slot)]
+                let valInfo = f.value(val)
+                let wasOwned = f.value(inst.result).own == Own.Owned
+                if valInfo.ty == Type.F64 || valInfo.ty == Type.I32 || valInfo.ty == Type.Bool {
+                  if valInfo.ty == Type.Bool && valInfo.def != NONE && f.inst(valInfo.def).op == Op.TagIs {
+                    run extraTagIsVal.append(val)
+                    run extraTagIsInst.append(j)
+                  }
+                  let mut boxed = inst
+                  boxed.op = boxOpFor(valInfo.ty)
+                  boxed.a = val
+                  boxed.b = NONE
+                  boxed.k = 0
+                  boxed.exit = NONE
+                  f.setInst(j, boxed)
+                  f.setOwnership(inst.result, Own.Imm, RootKind.None, NONE)
+                  if wasOwned { run becameImmList.append(inst.result) }
+                } else if valInfo.ty == Type.Value && valInfo.own == Own.Imm {
+                  run forward.replace(inst.result, val)
+                  inst.op = Op.Removed
+                  f.setInst(j, inst)
+                  if wasOwned { run becameImmList.append(inst.result) }
+                } else {
+                  // valInfo is Own.Borrowed with RootKind.Argument
+                  if wasOwned {
+                    let mut ret = inst
+                    ret.op = Op.Retain
+                    ret.a = val
+                    ret.b = NONE
+                    ret.k = 0
+                    ret.exit = NONE
+                    f.setInst(j, ret)
+                  } else {
+                    run forward.replace(inst.result, val)
+                    inst.op = Op.Removed
+                    f.setInst(j, inst)
+                  }
+                }
+              } else {
+                let kmKey = knownMethodKey(&f.*, &shapes, j, cand.ver)
+                let mut km = inst
+                km.op = Op.KnownMethod
+                km.a = NONE
+                km.b = NONE
+                km.k = kmKey
+                f.setInst(j, km)
+                if f.value(inst.result).own == Own.Borrowed && f.value(inst.result).rootKind == RootKind.Value {
+                  f.setOwnership(inst.result, Own.Borrowed, RootKind.Binding, NONE)
+                }
+              }
+            } else if inst.op == Op.PutField && isMarkedStamp(&aliasStamp, curAliasEpoch, inst.a) {
+              let slot = slotOfSite(&shapes, j, cand.ver)
+              curSlots[u32.toUsize(slot)] = safeFieldVal(&f.*, inst.b)
+              inst.op = Op.Removed
+              f.setInst(j, inst)
+              survives = false
+            } else if (inst.op == Op.CheckTag || inst.op == Op.CheckShape || inst.op == Op.Retain || inst.op == Op.Release) && isMarkedStamp(&aliasStamp, curAliasEpoch, inst.a) {
+              inst.op = Op.Removed
+              f.setInst(j, inst)
+              survives = false
+            }
+            if survives && inst.exit != NONE {
+              let ex = f.exit(inst.exit)
+              let total = f.slotCount(ex)
+              let liveCount = total - ex.drops
+              let mut hasLiveAlias = false
+              let mut s: u32 = 0
+              while s < liveCount {
+                let sl = f.slot(ex, s)
+                if sl.mode != SlotMode.Virtual && isMarkedStamp(&aliasStamp, curAliasEpoch, sl.value) { hasLiveAlias = true break }
+                s = s + 1
+              }
+              if hasLiveAlias {
+                let eIdx = u32.toUsize(inst.exit)
+                let mut voIdx = NONE
+                if exitVoStamp.get(eIdx) == curExitEpoch { voIdx = exitVoIdx.get(eIdx) }
+                if voIdx == NONE {
+                  let mut fields: [u32; 8] = [NONE; 8]
+                  let mut fk: u32 = 0
+                  while fk < cand.stores { fields[u32.toUsize(fk)] = curSlots[u32.toUsize(fk)] fk = fk + 1 }
+                  voIdx = usize.toU32(f.virtualObjs.length())
+                  run f.virtualObjs.append(VirtualObj { constructSite: cand.siteIdx, slotCount: cand.stores, fields: fields })
+                  run voExit.append(inst.exit)
+                  exitVoStamp.set(eIdx, curExitEpoch)
+                  exitVoIdx.set(eIdx, voIdx)
+                }
+                s = 0
+                while s < liveCount {
+                  let sl = f.slot(ex, s)
+                  if sl.mode != SlotMode.Virtual && isMarkedStamp(&aliasStamp, curAliasEpoch, sl.value) {
+                    f.setSlot(ex.firstSlot + s, Slot { value: voIdx, mode: SlotMode.Virtual, root: NONE })
+                  }
+                  s = s + 1
+                }
+              }
+              s = liveCount
+              while s < total {
+                let sl = f.slot(ex, s)
+                if sl.mode != SlotMode.Virtual && isMarkedStamp(&aliasStamp, curAliasEpoch, sl.value) {
+                  let u = run ensureUndef(&mut f, &mut undefVal)
+                  f.setSlot(ex.firstSlot + s, Slot { value: u, mode: SlotMode.Imm, root: NONE })
+                }
+                s = s + 1
+              }
+            }
+          }
+          j = j + 1
+        }
+      }
+      di = di + 1
+    }
+
+    // 9f. Clean up releases/borrows for any own-slot GetField that became Own.Imm, and
+    //     fix any surviving borrowed Retain whose root was flattened to `isAlias`.
+    let mut bmi: usize = 0
+    while bmi < becameImmList.length() {
+      let r = becameImmList.get(bmi)
+      uk = instUseFirst.get(u32.toUsize(r))
+      let rUseEnd = instUseFirst.get(u32.toUsize(r) + 1)
+      while uk < rUseEnd {
+        let ri = u32.toUsize(instUseList.get(u32.toUsize(uk)))
+        let mut inst = f.insts.get(ri)
+        if inst.op == Op.Release && inst.a == r {
+          inst.op = Op.Removed
+          f.insts.set(ri, inst)
+        }
+        uk = uk + 1
+      }
+      bk = borrowFirst.get(u32.toUsize(r))
+      let rBorrowEnd = borrowFirst.get(u32.toUsize(r) + 1)
+      while bk < rBorrowEnd {
+        let bv = borrowList.get(u32.toUsize(bk))
+        let info = f.value(bv)
+        if info.own == Own.Borrowed && info.rootKind == RootKind.Value && info.root == r && info.def != NONE {
+          let mut inst = f.inst(info.def)
+          if inst.op == Op.Retain && inst.result == bv {
+            run forward.replace(bv, inst.a)
+            inst.op = Op.Removed
+            f.setInst(info.def, inst)
+          }
+        }
+        bk = bk + 1
+      }
+      bmi = bmi + 1
+    }
+    let mut fixIter: u32 = 0
+    while fixIter < 8 {
+      let mut fixedAny = false
+      ai = 0
+      while ai < aliasList.length() {
+        let aVal = aliasList.get(ai)
+        bk = borrowFirst.get(u32.toUsize(aVal))
+        let bEnd = borrowFirst.get(u32.toUsize(aVal) + 1)
+        while bk < bEnd {
+          let bv = borrowList.get(u32.toUsize(bk))
+          let info = f.value(bv)
+          if info.block < f.blockCount() && !deadBlock.get(u32.toUsize(info.block))
+            && info.own == Own.Borrowed && info.rootKind == RootKind.Value && info.root == aVal
+            && !isMarkedStamp(&aliasStamp, curAliasEpoch, bv) {
+            if info.def != NONE {
+              let dInst = f.inst(info.def)
+              if dInst.op == Op.Retain {
+                let src = forward.resolve(dInst.a)
+                let srcInfo = f.value(src)
+                if srcInfo.own == Own.Imm {
+                  run forward.replace(bv, src)
+                  let mut gone = dInst gone.op = Op.Removed f.setInst(info.def, gone)
+                  fixedAny = true
+                } else if srcInfo.own == Own.Borrowed && (srcInfo.rootKind == RootKind.Binding || srcInfo.rootKind == RootKind.Argument) {
+                  f.setOwnership(bv, Own.Borrowed, srcInfo.rootKind, srcInfo.root)
+                  fixedAny = true
+                } else if srcInfo.own == Own.Owned {
+                  f.setOwnership(bv, Own.Borrowed, RootKind.Value, src)
+                  fixedAny = true
+                }
+              }
+            }
+          }
+          bk = bk + 1
+        }
+        ai = ai + 1
+      }
+      if !fixedAny { break }
+      fixIter = fixIter + 1
+    }
+    forward.apply(&mut f)
+    anyVirtualized = true
+    f.work = f.work + u32.toU64(domEnd - domStart)
+  }
+
+  if anyVirtualized {
+    while deadParams.length() < f.values.length() { run deadParams.append(false) }
+    run dropParams(&mut f, &deadParams)
+    run fixSlots(&mut f)
+    run f.compact()
+  }
+  return anyVirtualized
+}

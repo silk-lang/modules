@@ -1,0 +1,744 @@
+//! Loop-invariant guards and loads, moved in front of their loop (docs/jit/code-quality.md,
+//! "Hoisting").
+//!
+//! A loop is a header block with a back edge from a latch (the translator's block that polls
+//! and jumps back). An instruction of the loop whose operands are all defined outside it, and
+//! whose answer nothing in the loop can change, moves to a new block on the loop's one entry
+//! edge. A guard among them gets a new exit there: the interpreter state at the loop's
+//! header as the entry edge carries it, so a failing guard resumes the interpreter at the
+//! header before the first iteration.
+//!
+//! What moves:
+//! - `unbox.*`, `check.tag` and exiting arithmetic of invariant operands, when their block runs
+//!   on every iteration (it dominates every latch): a guard that the loop would not have
+//!   reached must not fail in front of it;
+//! - the same for `get.length`, `get.field`, `get.var` and `get.scope` whose result is a
+//!   borrow (ssa_opt_borrow, ssa_ownership.borrowFields; an owned result would need its
+//!   release moved too), in a loop without what could change the answer: a call (anything,
+//!   and a `get.field` that steps the interpreter, which may run a getter), `put.elem` (an
+//!   append changes a length), `put.field` of the same name (a store or an add changes only
+//!   the property it names, and its helper runs no JavaScript: a setter leaves; a length;
+//!   a global is a property, so any store for `get.var`), `put.var` and `put.scope`
+//!   (bindings);
+//! - `check.callee` of an invariant callee, as a guard, and the borrowed copies an inlined
+//!   body makes of its receiver, from anywhere in the loop;
+//! - arithmetic and comparisons that cannot fail, from anywhere in the loop.
+//!
+//! An instruction of an inlined body moves too. One that reads its frame (a field site's
+//! cache, a variable) takes the `inline.frame` that names the body's closure with it, as a
+//! copy in front of it: the frame is built from that closure where a helper needs it. A loop
+//! of an inlined body moves its own the same way: the new exit names the bodies' frames as
+//! the latch's poll does, with the entry edge's values for what the latch passes back.
+//!
+//! A loop whose header is among `sites` (the offsets earlier code of this function
+//! deoptimized at, jit_recompile) is left alone: a hoisted guard that failed there says
+//! nothing about which instruction to widen, the guard left in the loop does.
+import silk.collections.list { List }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.i32
+import silk.num.u32
+import silk.num.u8
+import silk.num.usize
+import ssa { Function, Exit, Own, RootKind, Op, Type, SlotMode, NONE, FIELD_STEPS, SITE_ARRAY, UNBOX_EXACT, edgeCount, readsK, steppedRead }
+import ssa_translate { FunctionInput }
+import ssa_shapes { fieldAtom }
+import silkjs.js_atom_data as atoms
+import silkjs.js_feedback as feedback
+import ssa_verify { readsA, readsB }
+import ssa_ownership { fixSlots }
+import ssa_opt_borrow { quiet }
+import ssa_calls as ssaCalls
+
+/// Guards of invariant operands whose answer never changes.
+fn fixedGuard(op: Op) -> bool {
+  return op == Op.Unbox || op == Op.UnboxBool || op == Op.UnboxF64 || op == Op.CheckTag || op == Op.Add || op == Op.Sub || op == Op.Mul
+    || op == Op.Shr || op == Op.Mod || op == Op.Neg || op == Op.ToInt32 || op == Op.ExactI32 || op == Op.CheckCallee
+}
+/// Instructions that read the CompiledFrame of their `frame` (x64_backend.frameInto).
+fn readsFrame(op: Op) -> bool { return op == Op.GetField || op == Op.GetVar || op == Op.GetScope || op == Op.AtomValue || op == Op.ConstVal }
+/// Operations that cannot fail and read nothing but their operands.
+fn pureOp(op: Op) -> bool {
+  return op == Op.ToF64 || op == Op.Cmp || op == Op.CmpF64 || op == Op.AddF64 || op == Op.SubF64 || op == Op.MulF64 || op == Op.DivF64 || op == Op.ModF64
+    || op == Op.NegF64 || op == Op.SqrtF64 || op == Op.AbsF64 || op == Op.FloorF64 || op == Op.BitAnd || op == Op.BitOr || op == Op.BitXor
+    || op == Op.Shl || op == Op.Sar || op == Op.BitNot || op == Op.NotBool || op == Op.Imul || op == Op.TagIs
+}
+
+/// The edges into each block (`edges[first[b] .. first[b + 1]]`) and the block each edge
+/// leaves, of a compacted function.
+pub struct Graph { pub first: List<u32>, pub edges: List<u32>, pub source: List<u32>, pub idom: List<u32> }
+
+pub effect fn graphOf(f: &Function) -> Graph ! OutOfMemoryError ? &mut Allocator {
+  let blocks = u32.toUsize(f.blockCount())
+  let mut source = List<u32>.make()
+  run source.appendRepeated(NONE, f.edges.length())
+  let mut b: u32 = 0
+  while b < f.blockCount() {
+    let block = f.blocks.get(u32.toUsize(b))
+    if block.instCount > 0 {
+      let last = f.inst(block.firstInst + block.instCount - 1)
+      let mut e: u32 = 0
+      while e < edgeCount(last.op) { source.set(u32.toUsize(last.edge + e), b) e = e + 1 }
+    }
+    b = b + 1
+  }
+  let mut first = List<u32>.make()
+  run first.appendRepeated(0, blocks + 1)
+  let mut e: usize = 0
+  while e < f.edges.length() { let t = u32.toUsize(f.edges.get(e).target) + 1 let c = first.get(t) + 1 first.set(t, c) e = e + 1 }
+  let mut i: usize = 0
+  while i < blocks { let c = first.get(i + 1) + first.get(i) first.set(i + 1, c) i = i + 1 }
+  let mut next = List<u32>.make()
+  run next.appendSlice(first.asSlice())
+  let mut edges = List<u32>.make()
+  run edges.appendRepeated(0, f.edges.length())
+  e = 0
+  while e < f.edges.length() {
+    let t = u32.toUsize(f.edges.get(e).target)
+    let at = next.get(t)
+    edges.set(u32.toUsize(at), usize.toU32(e))
+    next.set(t, at + 1)
+    e = e + 1
+  }
+  // Immediate dominators over the reverse postorder the blocks are in.
+  let mut idom = List<u32>.make()
+  run idom.appendRepeated(NONE, blocks)
+  if blocks > 0 { idom.set(0, 0) }
+  let mut changed = true
+  while changed {
+    changed = false
+    let mut x: usize = 1
+    while x < blocks {
+      let mut chosen = NONE
+      let mut k = first.get(x)
+      while k < first.get(x + 1) {
+        let pred = source.get(u32.toUsize(edges.get(u32.toUsize(k))))
+        if pred != NONE && idom.get(u32.toUsize(pred)) != NONE {
+          if chosen == NONE { chosen = pred } else { chosen = meet(&idom, chosen, pred) }
+        }
+        k = k + 1
+      }
+      if chosen != idom.get(x) { idom.set(x, chosen) changed = true }
+      x = x + 1
+    }
+  }
+  return Graph { first: move first, edges: move edges, source: move source, idom: move idom }
+}
+fn meet(idom: &List<u32>, a: u32, b: u32) -> u32 {
+  let mut x = a let mut y = b
+  while x != y {
+    while x > y { x = idom.get(u32.toUsize(x)) }
+    while y > x { y = idom.get(u32.toUsize(y)) }
+  }
+  return x
+}
+pub fn dominates(idom: &List<u32>, a: u32, b: u32) -> bool {
+  let mut x = b
+  while x > a { x = idom.get(u32.toUsize(x)) }
+  return x == a
+}
+pub fn has(list: &List<u32>, value: u32) -> bool {
+  let mut i: usize = 0
+  while i < list.length() { if list.get(i) == value { return true } i = i + 1 }
+  return false
+}
+pub fn hasPrefix(list: &List<u32>, count: usize, value: u32) -> bool {
+  let limit = if count < list.length() { count } else { list.length() }
+  let mut i: usize = 0
+  while i < limit { if list.get(i) == value { return true } i = i + 1 }
+  return false
+}
+
+/// Moves what the module comment lists out of every loop of a compacted function, one loop
+/// level per call. Answers whether anything moved; the caller compacts, and may call again
+/// to move instructions out of the next loop around. `sites[0..deoptCount]` are offsets
+/// earlier compiled code deoptimized at; entries past `deoptCount` are baseline-noted misses.
+pub effect fn hoist(f: &mut Function, input: &FunctionInput, sites: &List<u32>, deoptCount: usize, unboxedEntries: &mut bool) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let blockCount = f.blockCount()
+  // Any retreating edge at all? Most functions have no loop.
+  let mut loops = false
+  let mut scan: u32 = 0
+  while scan < blockCount && !loops {
+    let block = f.blocks.get(u32.toUsize(scan))
+    if block.instCount > 0 {
+      let last = f.inst(block.firstInst + block.instCount - 1)
+      let mut e: u32 = 0
+      while e < edgeCount(last.op) { if f.edge(last.edge + e).target <= scan { loops = true } e = e + 1 }
+    }
+    scan = scan + 1
+  }
+  if !loops { return false }
+  let graph = run graphOf(&f.*)
+  f.work = f.work + usize.toU64(f.edges.length()) + u32.toU64(blockCount)
+  let values = f.values.length()
+  // member[b], released[v], moved[v] hold the serial of the loop that set them.
+  let mut member = List<u32>.make() run member.appendRepeated(0, u32.toUsize(blockCount))
+  let mut released = List<u32>.make() run released.appendRepeated(0, values)
+  let mut moved = List<u32>.make() run moved.appendRepeated(0, values)
+  let mut stack = List<u32>.make()
+  let mut entryArgs = List<u32>.make()
+  // The names the loop stores to, and the inlined frames its front block names already.
+  let mut stored = List<u32>.make()
+  let mut framed = List<u32>.make()
+  // The element accesses a loop's `check.array` serves, and the Arrays it checks.
+  let mut trusted = List<u32>.make()
+  let mut checked = List<u32>.make()
+  let mut dropped = List<u32>.make()
+  let mut serial: u32 = 0
+  let mut changed = false
+  // Inner loops first: their headers come later in reverse postorder.
+  let mut h = blockCount
+  while h > 0 {
+    h = h - 1
+    // The back edges into h, and its one other edge.
+    let mut entry = NONE
+    let mut entries: u32 = 0
+    let mut lastLatch = NONE
+    let mut common = NONE
+    let mut k = graph.first.get(u32.toUsize(h))
+    while k < graph.first.get(u32.toUsize(h) + 1) {
+      let e = graph.edges.get(u32.toUsize(k))
+      let from = graph.source.get(u32.toUsize(e))
+      if from != NONE {
+        if from >= h && dominates(&graph.idom, h, from) {
+          if lastLatch == NONE || from > lastLatch { lastLatch = from }
+          if common == NONE { common = from } else { common = meet(&graph.idom, common, from) }
+        } else { entry = e entries = entries + 1 }
+      }
+      k = k + 1
+    }
+    if lastLatch == NONE || entries != 1 { continue }
+    serial = serial + 1
+    // The loop's blocks: h and whatever reaches a latch without passing h.
+    member.set(u32.toUsize(h), serial)
+    stack.clear()
+    k = graph.first.get(u32.toUsize(h))
+    while k < graph.first.get(u32.toUsize(h) + 1) {
+      let from = graph.source.get(u32.toUsize(graph.edges.get(u32.toUsize(k))))
+      if from != NONE && from >= h && dominates(&graph.idom, h, from) && member.get(u32.toUsize(from)) != serial { member.set(u32.toUsize(from), serial) run stack.append(from) }
+      k = k + 1
+    }
+    while stack.length() > 0 {
+      let b = stack.get(stack.length() - 1)
+      drop stack.pop()
+      let mut q = graph.first.get(u32.toUsize(b))
+      while q < graph.first.get(u32.toUsize(b) + 1) {
+        let from = graph.source.get(u32.toUsize(graph.edges.get(u32.toUsize(q))))
+        if from != NONE && member.get(u32.toUsize(from)) != serial { member.set(u32.toUsize(from), serial) run stack.append(from) }
+        q = q + 1
+      }
+    }
+    // What the loop does that could change an answer, the values it releases, and a poll
+    // (its exit is the state at the header, as a latch has it).
+    let mut calls = false let mut putsElem = false let mut putsField = false let mut putsBinding = false
+    let mut putsUnknown = false
+    stored.clear()
+    framed.clear()
+    let mut poll = NONE
+    let mut b = h
+    while b <= lastLatch {
+      if member.get(u32.toUsize(b)) == serial {
+        let block = f.blocks.get(u32.toUsize(b))
+        let mut i = block.firstInst
+        while i < block.firstInst + block.instCount {
+          let inst = f.inst(i)
+          if inst.block == b {
+            if !quiet(inst.op) && !(inst.op == Op.Call && (inst.k & ssaCalls.PLANNED) != 0) { calls = true }
+            else if steppedRead(inst) { calls = true }
+            else if inst.op == Op.PutElem { putsElem = true }
+            else if inst.op == Op.PutField {
+              putsField = true
+              let atom = fieldAtom(&f.*, input, inst)
+              if atom == 0 { putsUnknown = true } else if !has(&stored, atom) { run stored.append(atom) }
+            }
+            else if inst.op == Op.PutVar || inst.op == Op.PutScope { putsBinding = true }
+            else if inst.op == Op.Release && u32.toUsize(inst.a) < values { released.set(u32.toUsize(inst.a), serial) }
+            else if inst.op == Op.Poll && inst.exit != NONE { poll = i }
+          }
+          i = i + 1
+        }
+        f.work = f.work + u32.toU64(block.instCount)
+      }
+      b = b + 1
+    }
+    if poll == NONE { continue }
+    let state = f.exit(f.inst(poll).exit)
+    // A state with values to drop is not the header's plain state.
+    if hasPrefix(sites, deoptCount, state.pc) || state.drops != 0 { continue }
+    // The poll's state is what its latch passes back to the header.
+    let back = backEdge(&f.*, f.inst(poll).block, h)
+    if back == NONE { continue }
+    // The new block in front of the loop, made when the first instruction moves.
+    let mut front = NONE
+    let mut frontExit = NONE
+    let mut order: u32 = 2
+    let mut stop = false
+    b = h
+    while b <= lastLatch && !stop {
+      if member.get(u32.toUsize(b)) != serial { b = b + 1 continue }
+      let always = dominates(&graph.idom, b, common)
+      let block = f.blocks.get(u32.toUsize(b))
+      let mut i = block.firstInst
+      while i < block.firstInst + block.instCount {
+        let inst = f.inst(i)
+        let op = inst.op
+        let mut ok = inst.block == b
+        // An inlined body's read of its frame takes the closure the frame is built from.
+        let mut closure = NONE
+        if ok && inst.frame != 0 && readsFrame(op) {
+          closure = closureOf(&f.*, &member, &moved, serial, h, lastLatch, inst.frame - 1)
+          ok = closure != NONE
+        }
+        let mut guard = !pureOp(op)
+        let copy = op == Op.Retain && inst.result != NONE && f.value(inst.result).own == Own.Borrowed
+        if fixedGuard(op) { ok = ok && always }
+        else if copy || op == Op.GetLength || op == Op.GetField || op == Op.GetVar || op == Op.GetScope {
+          if copy { guard = false ok = ok && inst.result != NONE }
+          else {
+            ok = ok && always && !calls && inst.result != NONE
+            if op == Op.GetLength { ok = ok && !putsElem && !(putsUnknown || has(&stored, atoms.JS_ATOM_length)) }
+            else if op == Op.GetField {
+              let atom = fieldAtom(&f.*, input, inst)
+              ok = ok && (inst.k & FIELD_STEPS) == 0 && atom != 0 && !putsUnknown && !has(&stored, atom)
+            } else { ok = ok && !putsField && !putsBinding }
+          }
+          if ok {
+            // Only a borrow, and one whose root lives through the loop.
+            let info = f.value(inst.result)
+            ok = info.own == Own.Borrowed
+            if ok && info.rootKind == RootKind.Value {
+              ok = u32.toUsize(info.root) < values && released.get(u32.toUsize(info.root)) != serial && outside(&f.*, &member, &moved, serial, info.root)
+            } else if ok && info.rootKind == RootKind.Binding { ok = !putsBinding }
+            else if ok && info.rootKind == RootKind.None { ok = false }
+          }
+        } else if guard { ok = false }
+        if ok && readsA(op) { ok = outside(&f.*, &member, &moved, serial, inst.a) }
+        if ok && readsB(op) { ok = outside(&f.*, &member, &moved, serial, inst.b) }
+        if ok && readsK(op) { ok = outside(&f.*, &member, &moved, serial, i32.wrappingToU32(inst.k)) }
+        if ok && guard && frontExit == NONE {
+          let incoming = entryEdge(&f.*, entry, front)
+          ok = run entryState(&mut f, &member, serial, state, incoming, back, &mut entryArgs)
+          if !ok { stop = true break }
+          if front == NONE { front = run split(&mut f, entry, h) }
+          frontExit = run entryExit(&mut f, i, state, &entryArgs)
+        }
+        if ok {
+          if front == NONE { front = run split(&mut f, entry, h) }
+          if closure != NONE && !has(&framed, inst.frame) {
+            let named = f.inst(closure)
+            drop run f.emit(front, Op.InlineFrame, false, Type.I32, Own.Unboxed, named.a, NONE, named.k, named.pc)
+            let last = usize.toU32(f.insts.length() - 1)
+            let mut made = f.inst(last)
+            made.order = order made.frame = named.frame
+            f.setInst(last, made)
+            order = order + 2
+            run framed.append(inst.frame)
+          }
+          let mut at = f.inst(i)
+          if guard { at.exit = frontExit }
+          // Only a read of the frame needs the body's: the others run the same anywhere.
+          if !readsFrame(op) { at.frame = 0 }
+          f.setInst(i, at)
+          f.moveInst(i, front, order)
+          order = order + 2
+          if inst.result != NONE && u32.toUsize(inst.result) < values { moved.set(u32.toUsize(inst.result), serial) }
+          changed = true
+        }
+        i = i + 1
+      }
+      b = b + 1
+    }
+    // Element accesses of an invariant fast Array: one `check.array` in front of the loop,
+    // and the accesses trust it (Inst.trusted). Nothing in the loop may make the Array
+    // another kind of object: no call or stepped read (which run the program's code), no
+    // store of a field or a binding, and every element store is one of these (an untrusted
+    // one's helper may append past the end, which can end the fast kind). A trusted access
+    // leaves where its index is not below the count, so its helper never runs either, but
+    // for a store of a counted value below the count, which keeps the kind. An access is
+    // trusted where it runs on every turn, its site never left compiled code (sites; an
+    // inlined body's sites are not among them), and it saw fast Arrays alone (js_feedback
+    // ELEMENT_FAST), or on a baseline frame, where kinds are not recorded, nothing else (no
+    // ELEMENT_ORDINARY; an inlined body records none). Each check has an exit of its own
+    // at the header: one that fails is remembered apart (ssa.SITE_ARRAY, jit_runtime.noteLeft)
+    // and the next compile trusts nothing in this loop but keeps the rest of its hoisting.
+    if !stop && !calls && !putsField && !putsBinding && !has(sites, u32.bitOr(state.pc, SITE_ARRAY)) {
+      trusted.clear()
+      let mut every = true
+      b = h
+      while b <= lastLatch && every {
+        if member.get(u32.toUsize(b)) == serial {
+          let always = dominates(&graph.idom, b, common)
+          let block = f.blocks.get(u32.toUsize(b))
+          let mut i = block.firstInst
+          while i < block.firstInst + block.instCount {
+            let inst = f.inst(i)
+            // One trusted in an earlier round has its check already.
+            if inst.block == b && (inst.op == Op.GetElem || inst.op == Op.PutElem) && !inst.trusted {
+              let kind = f.elementKind(&inst)
+              // A store baseline code noted is an element store only in a loop that may be
+              // a fill (ssa_translate, fillStore): trusted like one that never missed.
+              let left = if inst.op == Op.PutElem { hasPrefix(sites, deoptCount, inst.pc) } else { has(sites, inst.pc) }
+              let ok = always && (inst.op == Op.PutElem || inst.k == 0) && (inst.frame != 0 || !left)
+                && (kind == u8.toU32(feedback.ELEMENT_FAST) || (kind == 0 && input.leavesBodies)) && outside(&f.*, &member, &moved, serial, inst.a)
+              if ok { run trusted.append(i) } else if inst.op == Op.PutElem { every = false }
+            } else if inst.block == b && inst.op == Op.PutElemF64 { every = false }
+            i = i + 1
+          }
+        }
+        b = b + 1
+      }
+      if every && trusted.length() > 0 && frontExit == NONE {
+        // The state at the header (entryArgs), as the guards' exit would have it.
+        let incoming = entryEdge(&f.*, entry, front)
+        every = run entryState(&mut f, &member, serial, state, incoming, back, &mut entryArgs)
+      }
+      if every && trusted.length() > 0 {
+        if front == NONE { front = run split(&mut f, entry, h) }
+        let pc = f.inst(f.blocks.get(u32.toUsize(h)).firstInst).pc
+        checked.clear()
+        let mut t: usize = 0
+        while t < trusted.length() {
+          let at = trusted.get(t)
+          let mut access = f.inst(at)
+          // One check per object: a borrowed copy (this_array and the local it came from)
+          // is checked as what it copies.
+          let object = copied(&f.*, access.a)
+          if !has(&checked, object) {
+            drop run f.emit(front, Op.CheckArray, false, Type.I32, Own.Unboxed, object, NONE, 0, pc)
+            let check = f.lastInst()
+            let mut made = f.inst(check) made.order = order made.frame = 0 f.setInst(check, made)
+            order = order + 2
+            drop run entryExit(&mut f, check, state, &entryArgs)
+            run checked.append(object)
+          }
+          access.trusted = true
+          f.setInst(at, access)
+          t = t + 1
+        }
+        changed = true
+      }
+    }
+    // A parameter the loop unboxes on every turn and passes back as a box of an i32 (a
+    // counter, an index, an accumulator) whose entry value is no box (an argument): its
+    // unbox goes onto the entry edge too, with the guards' exit, and the edge passes the
+    // number boxed, so that the ownership pass unboxes the parameter (unboxParams) and the
+    // loop stops boxing it at its latch. The entry unbox takes a Float64 holding an exact
+    // int32 as well (UNBOX_EXACT): the loop runs on it as on an Int. A value it refuses (a
+    // fraction, a string) exits at the header, which teaches a recompile nothing to widen;
+    // the next compile keeps the guard in the loop (the header is among its sites) and
+    // learns there, one compile later than a guard left in the loop would have.
+    let header = f.blocks.get(u32.toUsize(h))
+    // The owned values the entry edge passed and passes boxes in place of: the front block
+    // releases them after its last exit (whose states still move them).
+    dropped.clear()
+    let mut g: u32 = 0
+    while !stop && g < header.paramCount {
+      let p = f.paramAt(header, g)
+      let returned = f.edgeArg(f.edge(back), g)
+      let into = entryEdge(&f.*, entry, front)
+      let retOp = defOp(&f.*, returned)
+      if f.value(p).ty == Type.Value && (retOp == Op.BoxI32 || retOp == Op.BoxF64) && f.edge(into).argCount == header.paramCount {
+        let given = f.edgeArg(f.edge(into), g)
+        let givenOp = defOp(&f.*, given)
+        let isF64 = retOp == Op.BoxF64
+        let needBox = if isF64 { givenOp != Op.BoxF64 && givenOp != Op.BoxI32 } else { givenOp != Op.BoxI32 }
+        let wantUnbox = if isF64 { Op.UnboxF64 } else { Op.Unbox }
+        if f.value(given).ty == Type.Value && needBox && unboxedAlways(&f.*, &graph.idom, &member, serial, h, lastLatch, common, p, wantUnbox, sites, deoptCount) {
+          if frontExit == NONE && !run entryState(&mut f, &member, serial, state, into, back, &mut entryArgs) { stop = true }
+          if !stop {
+            if front == NONE { front = run split(&mut f, entry, h) }
+            let pc = f.inst(f.blocks.get(u32.toUsize(h)).firstInst).pc
+            let number = if isF64 {
+              run f.emit(front, Op.UnboxF64, true, Type.F64, Own.Unboxed, given, NONE, 0, pc)
+            } else {
+              run f.emit(front, Op.Unbox, true, Type.I32, Own.Unboxed, given, NONE, UNBOX_EXACT, pc)
+            }
+            let unbox = f.lastInst()
+            let mut made = f.inst(unbox) made.order = order made.frame = 0 f.setInst(unbox, made)
+            order = order + 2
+            if frontExit == NONE { frontExit = run entryExit(&mut f, unbox, state, &entryArgs) }
+            else { made = f.inst(unbox) made.exit = frontExit f.setInst(unbox, made) }
+            let boxed = run f.emit(front, retOp, true, Type.Value, Own.Imm, number, NONE, 0, pc)
+            let box = f.lastInst()
+            made = f.inst(box) made.order = order made.frame = 0 f.setInst(box, made)
+            order = order + 2
+            let through = entryEdge(&f.*, entry, front)
+            let edge = f.edge(through)
+            f.setEdgeArg(edge.firstArg + g, boxed)
+            if f.value(given).own == Own.Owned { run dropped.append(given) }
+            changed = true
+            unboxedEntries.* = true
+          }
+        }
+      }
+      g = g + 1
+    }
+    let mut d: usize = 0
+    while d < dropped.length() {
+      let given = dropped.get(d)
+      // Unless the edge passes it to another parameter still.
+      let edge = f.edge(entryEdge(&f.*, entry, front))
+      let mut passed = false
+      let mut q: u32 = 0
+      while q < edge.argCount { if f.edgeArg(edge, q) == given { passed = true } q = q + 1 }
+      if !passed {
+        let pc = f.inst(f.blocks.get(u32.toUsize(h)).firstInst).pc
+        drop run f.emit(front, Op.Release, false, Type.I32, Own.Unboxed, given, NONE, 0, pc)
+        let release = f.lastInst()
+        let mut made = f.inst(release) made.order = order made.frame = 0 f.setInst(release, made)
+        order = order + 2
+      }
+      d = d + 1
+    }
+  }
+  if changed { run fixSlots(&mut f) }
+  return changed
+}
+
+/// The value whose bits `v` borrows, through borrowed copies (`retain` with RootKind.Value),
+/// or v.
+pub fn copied(f: &Function, v: u32) -> u32 {
+  let mut x = v
+  let mut steps = 0
+  while steps < 8 {
+    let info = f.value(x)
+    if info.own != Own.Borrowed || info.rootKind != RootKind.Value || info.root == NONE || u32.toUsize(info.root) >= f.values.length() { return x }
+    if defOp(f, x) != Op.Retain { return x }
+    x = info.root
+    steps = steps + 1
+  }
+  return x
+}
+/// The number v boxes (box.i32, box.bool, box.f64), or NONE.
+fn boxedFrom(f: &Function, v: u32) -> u32 {
+  let op = defOp(f, v)
+  if op == Op.BoxI32 || op == Op.BoxBool || op == Op.BoxF64 { return f.inst(f.value(v).def).a }
+  return NONE
+}
+/// Boxes made for one edge of a branch alone move onto that edge (a new block on it): a
+/// loop's exit edge passes its numbers boxed to a block whose parameters stay boxed (it is
+/// also reached from in front of the loop), and the boxes ran on every iteration, between
+/// the loop's compare and its branch, which then could not use the compare's flags. A box
+/// whose one reader is that edge's argument goes; one an exit or another edge reads stays.
+/// Answers whether any moved; the caller compacts.
+pub effect fn sinkBoxes(f: &mut Function) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let values = f.values.length()
+  // How many times each value is read: operands, edge arguments, exit slots.
+  let mut reads = List<u32>.make()
+  run reads.appendRepeated(0, values)
+  let mut i: usize = 0
+  while i < f.insts.length() {
+    let inst = f.insts.get(i)
+    if inst.op != Op.Removed {
+      if readsA(inst.op) { count(&mut reads, inst.a) }
+      if readsB(inst.op) { count(&mut reads, inst.b) }
+      if readsK(inst.op) { count(&mut reads, i32.wrappingToU32(inst.k)) }
+    }
+    i = i + 1
+  }
+  i = 0
+  while i < f.edgeArgs.length() { count(&mut reads, f.edgeArgs.get(i)) i = i + 1 }
+  i = 0
+  while i < f.slots.length() {
+    let slot = f.slots.get(i)
+    if slot.mode == SlotMode.Virtual {
+      let vo = f.virtualObjs.get(u32.toUsize(slot.value))
+      let mut fk: u32 = 0
+      while fk < vo.slotCount && fk < 8 { count(&mut reads, vo.fields[u32.toUsize(fk)]) fk = fk + 1 }
+    } else { count(&mut reads, slot.value) }
+    i = i + 1
+  }
+  f.work = f.work + usize.toU64(f.insts.length() + f.edgeArgs.length() + f.slots.length())
+  let mut moved = false
+  let blocks = f.blockCount()
+  let mut b: u32 = 0
+  while b < blocks {
+    let block = f.blocks.get(u32.toUsize(b))
+    if block.instCount > 0 {
+      let last = f.inst(block.firstInst + block.instCount - 1)
+      if last.op == Op.Branch {
+        let mut e: u32 = 0
+        while e < 2 {
+          let index = last.edge + e
+          let edge = f.edge(index)
+          let mut front = NONE
+          let mut order: u32 = 0
+          let mut g: u32 = 0
+          while g < edge.argCount {
+            let a = f.edgeArg(edge, g)
+            let op = defOp(&f.*, a)
+            if (op == Op.BoxI32 || op == Op.BoxBool || op == Op.BoxF64) && reads.get(u32.toUsize(a)) == 1 && f.value(a).block == b {
+              if front == NONE { front = run split(&mut f, index, edge.target) }
+              let def = f.value(a).def
+              f.moveInst(def, front, order)
+              order = order + 2
+              moved = true
+            }
+            g = g + 1
+          }
+          e = e + 1
+        }
+      }
+    }
+    b = b + 1
+  }
+  return moved
+}
+fn count(reads: &mut List<u32>, v: u32) -> () {
+  if u32.toUsize(v) < reads.length() { let at = u32.toUsize(v) let before = reads.get(at) reads.set(at, before + 1) }
+}
+pub fn defOp(f: &Function, v: u32) -> Op {
+  if v == NONE || u32.toUsize(v) >= f.values.length() { return Op.Removed }
+  let def = f.value(v).def
+  if def == NONE { return Op.Removed }
+  return f.inst(def).op
+}
+/// The edge that carries the loop's entry arguments: `entry`, or once the entry edge was split
+/// (front), the new block's jump to the header.
+pub fn entryEdge(f: &Function, entry: u32, front: u32) -> u32 {
+  if front == NONE { return entry }
+  // The block is new, not compacted: its instructions are found by their block.
+  let mut i: usize = 0
+  let mut last = NONE
+  while i < f.insts.length() { let inst = f.insts.get(i) if inst.block == front && inst.op == Op.Jump { last = inst.edge } i = i + 1 }
+  return last
+}
+/// Whether a block of the loop `serial` marks (h to last) that runs on every turn (it
+/// dominates the latches' common dominator) unboxes `p` (or a `Retain` copy of `p`) with `want`.
+fn unboxedAlways(f: &Function, idom: &List<u32>, member: &List<u32>, serial: u32, h: u32, last: u32, common: u32, p: u32, want: Op, sites: &List<u32>, deoptCount: usize) -> bool {
+  let mut i: usize = 0
+  while i < f.insts.length() {
+    let inst = f.insts.get(i)
+    if inst.op == want && inst.block >= h && inst.block <= last && member.get(u32.toUsize(inst.block)) == serial
+      && dominates(idom, inst.block, common) && (want != Op.UnboxF64 || inst.frame != 0 || !hasPrefix(sites, deoptCount, inst.pc)) {
+      let src = if inst.a == p { p } else { copied(f, inst.a) }
+      if src == p || (defOp(f, src) == Op.Retain && f.inst(f.value(src).def).a == p) { return true }
+    }
+    i = i + 1
+  }
+  return false
+}
+/// The state at loop header h as edge `incoming` carries it, into entryArgs, from `state` (a
+/// latch's poll: the state the back edge carries). A slot holds what the latch passes back to
+/// some parameters, and then takes what the entry edge passes them, or one value around the
+/// loop. A value the latch passes that also stays in a slot of its own, or passes to
+/// parameters the entry edge gives different values, leaves the slots ambiguous: false.
+pub effect fn entryState(f: &mut Function, member: &List<u32>, serial: u32, state: Exit, incoming: u32, back: u32, entryArgs: &mut List<u32>) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let values = f.values.length()
+  let into = f.edge(incoming)
+  let returning = f.edge(back)
+  let paramCount = f.blocks.get(u32.toUsize(into.target)).paramCount
+  if into.argCount != paramCount || returning.argCount != paramCount { return false }
+  let slots = f.slotCount(state)
+  entryArgs.clear()
+  let mut ok = true
+  let mut s: u32 = 0
+  while ok && s < slots {
+    let slot = f.slot(state, s)
+    if slot.mode == SlotMode.Virtual { ok = false break }
+    let v = slot.value
+    let mut mapped = NONE
+    let mut passed: u32 = 0
+    let mut p: u32 = 0
+    while p < paramCount {
+      // An exit names a box's number (ssa_ownership); the latch passes the box.
+      let back = f.edgeArg(returning, p)
+      if back == v || boxedFrom(&f.*, back) == v {
+        passed = passed + 1
+        let given = f.edgeArg(into, p)
+        if mapped == NONE { mapped = given } else if mapped != given { ok = false }
+      }
+      p = p + 1
+    }
+    if passed == 0 {
+      if u32.toUsize(v) >= values || member.get(u32.toUsize(f.value(v).block)) == serial { ok = false }
+      mapped = v
+    } else {
+      let mut held: u32 = 0
+      let mut t: u32 = 0
+      while t < slots {
+        let ts = f.slot(state, t)
+        if ts.mode != SlotMode.Virtual && ts.value == v { held = held + 1 }
+        t = t + 1
+      }
+      if held != passed { ok = false }
+    }
+    run entryArgs.append(mapped)
+    s = s + 1
+  }
+  f.work = f.work + u32.toU64(slots) * u32.toU64(paramCount + slots)
+  return ok
+}
+/// Gives instruction i an exit at the header: state's pc and frames, entryArgs its slots.
+pub effect fn entryExit(f: &mut Function, i: u32, state: Exit, entryArgs: &List<u32>) -> u32 ! OutOfMemoryError ? &mut Allocator {
+  drop run f.exitFor(i, state.pc, state.stackDepth)
+  let exit = f.inst(i).exit
+  // The function's slots, the inlined bodies' frames, then their slots.
+  let slots = f.slotCount(state)
+  let outer = slots - state.inner
+  let mut s: u32 = 0
+  while s < outer { run f.slotAt(entryArgs.get(u32.toUsize(s)), SlotMode.Dup, NONE) s = s + 1 }
+  let mut n: u32 = 0
+  while n < state.frames { let frame = f.exitFrame(state, n) run f.frameAt(frame) n = n + 1 }
+  while s < slots { run f.innerAt(entryArgs.get(u32.toUsize(s)), SlotMode.Dup, NONE) s = s + 1 }
+  return exit
+}
+
+/// The `inline.frame` of the loop `serial` marks (blocks h to last) that names the closure of
+/// inlined callee `k`, when every one there names the same value and that value is defined
+/// outside the loop or moved out of it already; NONE otherwise.
+fn closureOf(f: &Function, member: &List<u32>, moved: &List<u32>, serial: u32, h: u32, last: u32, k: u32) -> u32 {
+  let mut found = NONE
+  let mut b = h
+  while b <= last {
+    if member.get(u32.toUsize(b)) == serial {
+      let block = f.blocks.get(u32.toUsize(b))
+      let mut i = block.firstInst
+      while i < block.firstInst + block.instCount {
+        let inst = f.inst(i)
+        if inst.op == Op.InlineFrame && inst.block == b && i32.wrappingToU32(inst.k) == k {
+          if found != NONE && f.inst(found).a != inst.a { return NONE }
+          if found == NONE { found = i }
+        }
+        i = i + 1
+      }
+    }
+    b = b + 1
+  }
+  if found == NONE || !outside(f, member, moved, serial, f.inst(found).a) { return NONE }
+  return found
+}
+
+/// The edge from `latch`'s terminator to `header`, or NONE.
+pub fn backEdge(f: &Function, latch: u32, header: u32) -> u32 {
+  let block = f.blocks.get(u32.toUsize(latch))
+  if block.instCount == 0 { return NONE }
+  let last = f.inst(block.firstInst + block.instCount - 1)
+  let mut e: u32 = 0
+  while e < edgeCount(last.op) { if f.edge(last.edge + e).target == header { return last.edge + e } e = e + 1 }
+  return NONE
+}
+
+/// Whether `v` is defined outside the loop `serial` marks, or moved out of it already.
+fn outside(f: &Function, member: &List<u32>, moved: &List<u32>, serial: u32, v: u32) -> bool {
+  if u32.toUsize(v) >= moved.length() { return false }
+  if moved.get(u32.toUsize(v)) == serial { return true }
+  let block = f.value(v).block
+  return u32.toUsize(block) < member.length() && member.get(u32.toUsize(block)) != serial
+}
+
+/// A new block on edge `entry` into `header`: the edge goes to it with no arguments, and it
+/// jumps to the header with the arguments the edge had.
+pub effect fn split(f: &mut Function, entry: u32, header: u32) -> u32 ! OutOfMemoryError ? &mut Allocator {
+  let old = f.edge(entry)
+  let mut args = List<u32>.make()
+  let mut g: u32 = 0
+  while g < old.argCount { run args.append(f.edgeArg(old, g)) g = g + 1 }
+  let front = run f.block()
+  let edge = run f.newEdge(header)
+  let mut i: usize = 0
+  while i < args.length() { run f.edgeArgument(args.get(i)) i = i + 1 }
+  let pc = f.inst(f.blocks.get(u32.toUsize(header)).firstInst).pc
+  run f.terminate(front, Op.Jump, NONE, edge, pc)
+  f.retarget(entry, front)
+  return front
+}

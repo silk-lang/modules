@@ -1,0 +1,192 @@
+//! From a hot FunctionBytecode to machine code for the compiled-entry ABI
+//! (docs/jit/compiled-entry.md): bytecode -> SSA (ssa_translate, ssa_opt, ssa_verify;
+//! docs/jit/ssa.md) -> x64_backend. A function the translator, the verifier or the backend
+//! does not take is refused with its reason.
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.collections.list { List }
+import silk.core.effect { Effect }
+import silk.core.result { Result }
+import silkjs.js_core_types { FunctionBytecode }
+import asm_x64 { Code, SplitInfo, UnboundLabelError }
+import ssa { Function, number }
+import silkjs.js_opcode_data as op
+import ssa_input { inputOf }
+import ssa_translate { translate, translateOsr, CallTarget, ConstructTarget, SiteShape, RecordSlot, Refusal as TranslateRefusal }
+import ssa_verify { verify, VerifyError }
+import ssa_opt
+import ssa_calls as calls
+import x64_backend { FramePlan, Lowering, Settings }
+import x64_backend as backend
+import ssa_shapes as shapes
+import silk.core.option { Option }
+import value_layout { ValueLayout }
+import value_layout as layouts
+import jit_cost { Cost, now, diff, elapsed }
+import silk.num.usize
+import silk.num.u8
+import silkjs.cli_io as io
+
+/// opcode is the bytecode the translator stopped at, or 0 with hasOpcode false (--jit-dump names it).
+pub struct Refusal { pub why: &'static [u8], pub opcode: u8, pub hasOpcode: bool }
+impl Refusal {
+  pub fn text(self: &Self) -> &'static [u8] { return self.why }
+}
+/// Code and its call block size (js_core_types.CompiledEntry.callWords: 0 when it makes no
+/// calls), or a refusal. inlined: the CallTarget.id of each inline target the code names, in
+/// symbol order (Code.link's symbol 3k is target k's FunctionBytecode cell, 3k + 1 the first
+/// byte of its code, 3k + 2 its closure when it is exact); empty when nothing was inlined.
+/// cells: the variable cells the code reads by address (ssa.Function.ownedCells), whose
+/// symbols follow the targets'. construct: frame mode's construct entry (Lowering.Code).
+/// split: hot/cold split metadata for frame-mode code (SplitInfo.none() when unsplit).
+pub union Lowered { Code { pub value: Code, pub construct: u32, pub split: SplitInfo, pub callWords: u32, pub genericSites: u32, pub inlined: List<u32>, pub cells: List<u32>, pub atoms: List<u32>, pub constructs: List<u32> }, Refused { pub reason: Refusal } }
+
+/// Bodies shorter than this (in bytecode bytes: `return_undef`, a constant or an argument
+/// returned) gain nothing compiled for interpreted callers: entering compiled code costs more
+/// than the interpreter's inline call that runs them. Code that makes calls needs them
+/// compiled all the same: a call to a hot function without code deoptimizes its caller
+/// (js_vm.reportedWithoutCode), and the interpreter keeps running a leaf frameless once it is
+/// linked (js_runtime.linkCompiled).
+const MIN_CODE_BYTES: usize = 3
+
+pub unsafe effect fn lowerFunction(function: &FunctionBytecode, stress: u32, allowCalls: bool) -> Lowered ! OutOfMemoryError | UnboundLabelError ? &mut Allocator {
+  let none = List<u32>.make()
+  let mut cost = Cost.make()
+  return run unsafe lowerEntry(function, stress, allowCalls, &none, 0, NO_HEADER, &mut cost, List<CallTarget>.make(), &none, List<SiteShape>.make(), Option<FramePlan>.none(), 0, 0, 0, List<RecordSlot>.make(), List<ConstructTarget>.make())
+}
+/// lowerFunction with `doubleSites` (ssa_translate.FunctionInput.doubleSites) from earlier
+/// compilations' deopts (jit_recompile).
+pub unsafe effect fn lowerWithSites(function: &FunctionBytecode, stress: u32, allowCalls: bool, doubleSites: &List<u32>, cost: &mut Cost) -> Lowered ! OutOfMemoryError | UnboundLabelError ? &mut Allocator {
+  let none = List<u32>.make()
+  return run unsafe lowerEntry(function, stress, allowCalls, doubleSites, doubleSites.length(), NO_HEADER, &mut cost, List<CallTarget>.make(), &none, List<SiteShape>.make(), Option<FramePlan>.none(), 0, 0, 0, List<RecordSlot>.make(), List<ConstructTarget>.make())
+}
+/// lowerWithSites that may inline the calls `targets` describes (docs/jit/inlining.md).
+/// elements: FunctionInput.elementKinds.
+pub unsafe effect fn lowerInlining(function: &FunctionBytecode, stress: u32, allowCalls: bool, doubleSites: &List<u32>, targets: List<CallTarget>, elements: &List<u32>, cost: &mut Cost) -> Lowered ! OutOfMemoryError | UnboundLabelError ? &mut Allocator {
+  return run unsafe lowerEntry(function, stress, allowCalls, doubleSites, doubleSites.length(), NO_HEADER, &mut cost, move targets, elements, List<SiteShape>.make(), Option<FramePlan>.none(), 0, 0, 0, List<RecordSlot>.make(), List<ConstructTarget>.make())
+}
+/// lowerInlining for the baseline frame of plan (x64_backend.lowerOnFrame,
+/// docs/jit/optimizer.md): code that takes the function's calls in place of its baseline
+/// code. It makes its calls itself, through the baseline call stubs.
+/// `deoptCount`: prefix of `doubleSites` from earlier code's deopts (entries past it are
+/// baseline-noted misses). arrayPush, arrayPop, records: FunctionInput's.
+pub unsafe effect fn lowerOnFrame(function: &FunctionBytecode, doubleSites: &List<u32>, deoptCount: usize, targets: List<CallTarget>, elements: &List<u32>, siteShapes: List<SiteShape>, plan: FramePlan, arrayPush: u32, arrayPop: u32, arrayShape: u32, records: List<RecordSlot>, constructs: List<ConstructTarget>, cost: &mut Cost) -> Lowered ! OutOfMemoryError | UnboundLabelError ? &mut Allocator {
+  return run unsafe lowerEntry(function, 0, true, doubleSites, deoptCount, NO_HEADER, &mut cost, move targets, elements, move siteShapes, Option<FramePlan>.some(plan), arrayPush, arrayPop, arrayShape, move records, move constructs)
+}
+/// lowerWithSites for an on-stack-replacement entry at loop header pc `header`
+/// (ssa_translate.translateOsr). OSR code makes calls only with allowCalls and when
+/// translateOsr finds that safe; otherwise calls are side exits there.
+pub unsafe effect fn lowerOsr(function: &FunctionBytecode, stress: u32, allowCalls: bool, doubleSites: &List<u32>, header: u32, cost: &mut Cost) -> Lowered ! OutOfMemoryError | UnboundLabelError ? &mut Allocator {
+  let none = List<u32>.make()
+  return run unsafe lowerEntry(function, stress, allowCalls, doubleSites, doubleSites.length(), header, &mut cost, List<CallTarget>.make(), &none, List<SiteShape>.make(), Option<FramePlan>.none(), 0, 0, 0, List<RecordSlot>.make(), List<ConstructTarget>.make())
+}
+const NO_HEADER: u32 = 4294967295
+unsafe effect fn lowerEntry(function: &FunctionBytecode, stress: u32, allowCalls: bool, doubleSites: &List<u32>, deoptCount: usize, header: u32, cost: &mut Cost, targets: List<CallTarget>, elements: &List<u32>, siteShapes: List<SiteShape>, plan: Option<FramePlan>, arrayPush: u32, arrayPop: u32, arrayShape: u32, records: List<RecordSlot>, constructs: List<ConstructTarget>) -> Lowered ! OutOfMemoryError | UnboundLabelError ? &mut Allocator {
+  if header == NO_HEADER && !allowCalls && (unsafe function.code.asSlice()).length < MIN_CODE_BYTES { return refused(b"a body too short to gain from compiling") }
+  let mut input = run inputOf(function)
+  run input.doubleSites.appendSlice(doubleSites.asSlice())
+  if deoptCount <= doubleSites.length() { input.notedSites = doubleSites.length() - deoptCount }
+  input.targets = move targets
+  input.siteShapes = move siteShapes
+  input.leavesBodies = plan.isSome()
+  input.arrayPush = arrayPush
+  input.arrayPop = arrayPop
+  input.arrayShape = arrayShape
+  input.records = move records
+  input.constructs = move constructs
+  run input.elementKinds.appendSlice(elements.asSlice())
+  cost.attempts = cost.attempts + 1
+  cost.bytecodeBytes = cost.bytecodeBytes + usize.toU64(input.code.length())
+  let t0 = now()
+  let translated = if header == NO_HEADER { run Effect.result(translate(&input)) } else { run Effect.result(translateOsr(&input, header, allowCalls)) }
+  // Refused translations count too: a big function refused late costs as much as one accepted.
+  let t1 = now()
+  cost.translate = cost.translate + diff(t0, t1)
+  let mut ssa = match move translated {
+    Result<Function, TranslateRefusal | OutOfMemoryError>.Success { value } => move value
+    Result<Function, TranslateRefusal | OutOfMemoryError>.Failure { error } => {
+      match move error {
+        TranslateRefusal { reason, opcode, .. } => { return Lowered.Refused { reason: Refusal { why: reason, opcode: opcode, hasOpcode: true } } }
+        OutOfMemoryError { .. } => { fail OutOfMemoryError {} }
+      }
+    }
+  }
+  cost.translated = cost.translated + usize.toU64(ssa.insts.length())
+  if header != NO_HEADER && calls.genericSites(&ssa) != 0 { return refused(b"a generic instruction inside an OSR loop") }
+  if !allowCalls && calls.callsFunctions(&ssa) { return refused(b"a call (calls from compiled code need --jit-calls)") }
+  run ssa_opt.pipelineWithDeopts(&mut ssa, &input, cost.passes, doubleSites, deoptCount)
+  let t2 = now()
+  cost.optimize = cost.optimize + diff(t1, t2)
+  cost.optimized = cost.optimized + usize.toU64(ssa.insts.length())
+  let verified = run Effect.result(verify(&ssa))
+  let t3 = now()
+  cost.verify = cost.verify + diff(t2, t3)
+  match move verified {
+    Result<(), VerifyError | OutOfMemoryError>.Success { .. } => ()
+    Result<(), VerifyError | OutOfMemoryError>.Failure { error } => {
+      match move error {
+        VerifyError { block, inst, value, reason } => {
+          if cost.dump {
+            // `jit: unverified ssa`, then `jit: verify: block <b> inst <i> value <v>`.
+            let mut out = List<u8>.make()
+            run out.appendSlice(b"jit: unverified ssa\n")
+            run ssa.print(&mut out)
+            run out.appendSlice(b"jit: verify: block ") run number(&mut out, block)
+            run out.appendSlice(b" inst ") run number(&mut out, inst)
+            run out.appendSlice(b" value ") run number(&mut out, value)
+            run out.append(10)
+            io.stderr(out.asSlice())
+          }
+          return refused(reason)
+        }
+        OutOfMemoryError { .. } => { fail OutOfMemoryError {} }
+      }
+    }
+  }
+  if cost.dump {
+    let mut out = List<u8>.make()
+    run out.appendSlice(b"jit: optimized ssa\n")
+    run ssa.print(&mut out)
+    let mut m: usize = 0
+    while m < ssa.inlineMisses.length() {
+      let miss = ssa.inlineMisses.get(m)
+      run out.appendSlice(b"jit: not inlined: ")
+      run out.appendSlice(miss.why)
+      if miss.opcode != 0 { run out.appendSlice(b": ") run out.appendSlice(op.opcodeName(miss.opcode, true)) }
+      run out.appendSlice(b" at ")
+      run number(&mut out, miss.pc)
+      run out.appendSlice(b" depth ")
+      run number(&mut out, miss.depth)
+      run out.append(10)
+      m = m + 1
+    }
+    io.stderr(out.asSlice())
+  }
+  let layout = match layouts.probe() {
+    Option<ValueLayout>.Some { value } => value
+    Option<ValueLayout>.None => { return refused(b"the engine's ValueBits layout is not one compiled code understands") }
+  }
+  let onFrame = plan.isSome()
+  let lowering = match plan {
+    Option<FramePlan>.Some { value } => {
+      let known = run shapes.analyze(&ssa, &input, doubleSites)
+      run backend.lowerOnFrame(&ssa, Settings { stress: stress, layout: layout, map: cost.dump }, value, input.code.asSlice(), move known)
+    }
+    Option<FramePlan>.None => run backend.lower(&ssa, Settings { stress: stress, layout: layout, map: cost.dump })
+  }
+  cost.backend = cost.backend + elapsed(t3)
+  match move lowering {
+    Lowering.Code { value, construct, split } => {
+      let mut inlined = List<u32>.make()
+      run inlined.appendSlice(ssa.inlineTargets.asSlice())
+      let cells = run ssa.ownedCells()
+      let mut atoms = List<u32>.make()
+      if onFrame { atoms = run ssa.linkedAtoms() }
+      let mut usedConstructs = List<u32>.make()
+      if onFrame { run usedConstructs.appendSlice(ssa.constructTargets.asSlice()) }
+      return Lowered.Code { value: move value, construct: construct, split: move split, callWords: calls.callWords(&ssa), genericSites: calls.genericSites(&ssa), inlined: move inlined, cells: move cells, atoms: move atoms, constructs: move usedConstructs }
+    }
+    Lowering.Unsupported { reason } => { return refused(reason.why) }
+  }
+}
+fn refused(why: &'static [u8]) -> Lowered { return Lowered.Refused { reason: Refusal { why: why, opcode: 0, hasOpcode: false } } }
+

@@ -55,6 +55,30 @@ Scores are wall-clock based and noisy on shared hosts. A score gap that the inst
 counts do not show usually comes from memory traffic, such as larger objects or more GC
 cycles.
 
+## Fixed-work CLI comparison with Node/V8
+
+From `modules/engine`, compare the release JIT shell with Node on JSON round trips, generated
+source parsing, Map/Set operations and regexp matching. These four checked-in macro workloads
+exercise engine paths used by CLI programs. They contain no network, filesystem or server load.
+
+```sh
+SILKJS_JIT=/path/to/silkjs-jit-shell NODE_REFERENCE=/path/to/node \
+  python3 scripts/jit_parity.py --calls --rounds 5 --json /tmp/jit-parity.json
+```
+
+Each round runs both executables on identical work and checks every invocation against
+`macro/expected.json`. The runner alternates which executable goes first. `cold_ms` measures
+process launch through exit for the original script, including Node's CLI initialization.
+`repeated_ms_per_call` times a batch inside a separate process after `--warmup` untimed calls.
+Each call runs the script body in a fresh function scope and prints its result. The default is
+two warmup calls and five timed calls. Report these as measurements at that warmup length.
+
+The ratio is the median of paired SilkJS time divided by Node time for that workload and metric.
+A ratio of 2 means SilkJS took twice as long. JSON records the raw samples, executable paths,
+flags, SHA-256 hashes, host, Node/V8 versions and workload revision. Supply `--only json,parse`
+for a smaller run. Omit `--calls` to compare the default `--jit` configuration. Use
+`--interpreter` and `SILKJS_ENGINE=/path/to/silkjs-engine` for the interpreter-only baseline.
+
 ## Comparison with other engines
 
 The tables that set silkjs beside V8 jitless (Node 24), JSC without its JIT, QuickJS and the two
@@ -68,8 +92,15 @@ silk task bench-octane                     # Octane 2, 3 interleaved rounds, bes
 silk task bench-octane richards splay      # selected benchmarks
 silk task bench-micro                      # microbench.js, best ns per test
 silk task bench-report                     # the table with the wasm columns; --native for the native-only one
+silk task bench-report --spread            # min, median and max over rounds, with peak RSS and startup
+silk task bench-startup                    # empty-script startup (30 starts), peak RSS, binary sizes
+silk task bench-warmup richards            # per-iteration ms over the first 200 iterations in one process
 silk task bench-fixed --only richards,deltablue old/silkjs new/silkjs    # A/B on fixed work
 ```
+
+`bench-octane` also writes the peak RSS of every process to `octane-rss.json`. `bench-startup`
+writes `startup.json`, `bench-warmup` writes `warmup.json` (`--iterations N`, default 200). See
+[`docs/jit/scorecard.md`](../../../docs/jit/scorecard.md) for what they measure and a recorded run.
 
 `--rounds N`, `--engine PATH` (the engine executable; default `$SILKJS_ENGINE`, else this host's
 release build), `--engines a,b` (columns; default every installed one of `silkjs`, `v8-jitless`,

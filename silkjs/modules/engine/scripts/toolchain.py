@@ -36,8 +36,16 @@ def silk_output() -> Path:
     return ROOT / "build"
 
 
+def release_dir() -> Path:
+    """The release output directory. Silk 0.1.0-dev.88 writes <output>/<target>/release; older
+    toolchains wrote <output>/llvm/<target>/release."""
+    current = silk_output() / host_target() / "release"
+    older = silk_output() / "llvm" / host_target() / "release"
+    return older if older.is_dir() and not current.is_dir() else current
+
+
 def release_binary() -> Path:
-    return silk_output() / "llvm" / host_target() / "release/silkjs-engine"
+    return release_dir() / "silkjs-engine"
 
 
 def compiler_path() -> Path:

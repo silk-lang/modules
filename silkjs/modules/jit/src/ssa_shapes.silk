@@ -1,0 +1,828 @@
+//! Shape facts for frame mode (docs/jit/optimizer.md, "Shapes"). A field site whose inline
+//! key held a shape version when the function was compiled is lowered against that version
+//! and slot as constants, and leaves compiled code when the object's shape is another: no
+//! helper answers a miss, so what the test proved stays true after it. This pass finds, for
+//! each such site, what earlier sites and tag checks already proved about its object: that
+//! it is an object (no tag test) and that it has the key's shape (no shape test).
+//!
+//! A fact holds from the instruction that proved it over what that instruction dominates,
+//! until something may change a shape: a call, or any helper that can run a getter, a
+//! setter or a conversion. Stores through a constant key write an existing slot in place and
+//! change no shape. Where blocks meet, a fact holds when every block before the meeting
+//! proved the same. A loop header is walked twice: first with no shape (its back edge is
+//! not known yet) and with the objects the blocks before the loop agree on (a value does
+//! not stop being one), then with the shapes those blocks and the end of every turn agree
+//! on. A poll changes no shape (see `quiet`).
+import silk.collections.list { List }
+import silk.core.ownership { Copy }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.i32
+import silk.num.u8
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+import ssa { Function, Inst, Op, NONE, edgeCount, TARGET_KNOWN, TARGET_EXACT }
+import ssa_translate { FunctionInput, SiteShape, FIELD_KEYED, FIELD_CACHED, CallTarget }
+import ssa_verify { dominators }
+import ssa_calls as calls
+import silkjs.js_compiled as compiled
+
+/// In Shapes.facts: the site's object is known to be an object; and to have the key's shape.
+pub const FACT_OBJECT: u8 = 1
+pub const FACT_SHAPE: u8 = 2
+/// The tag `check.tag` names for an object (ValueBits.tag).
+const TAG_OBJECT: i32 = -1
+/// A key the compiler has not filled (js_vm_property_ops.fieldKeyAt).
+const NO_KEY: u64 = 18446744073709551615
+
+/// A cached site (Shapes.reads) that left before: a shape it has no test for goes to the
+/// helper instead of leaving, so the site proves nothing.
+pub const FACT_HEDGED: u8 = 4
+/// A cached site whose object is known to have the shape of its pair n: (1 + n) << FACT_PAIR.
+pub const FACT_PAIR: u8 = 4
+/// A cached site with no shapes of its own whose method is known (knownTarget): the read is
+/// the known path or it leaves, so it runs nothing and proves the object (and its shape, when
+/// the method is known for one).
+pub const FACT_KNOWN: u8 = 8
+/// Instructions after a known read its callee test may be within (knownTarget).
+const KNOWN_WINDOW: u32 = 48
+
+/// By instruction: the constant key of a field site (shape version << 16 | slot), or 0 for
+/// an instruction lowered as before; and the FACT_* of its object. For a cached field site
+/// the embedder knows the shapes of (FunctionInput.siteShapes): reads is 1 + its index in
+/// sites, and the read is lowered as tests against those shapes.
+/// same, by instruction: for a field read whose value an earlier value still holds (an
+/// earlier read of the same property of the same object, or what was stored there, with
+/// nothing since that could change it), that value: the read is a copy of it. NONE otherwise.
+/// proven, by instruction: the shape version the object of a field site or shape test is
+/// known to have there, or 0.
+/// adds: per field store whose site's inline key is no write key, that key as it was (0: none;
+/// x64_backend.addInPlace takes an add key); atoms: the property each field site names.
+pub struct Shapes { pub keys: List<u64>, pub facts: List<u8>, pub reads: List<u32>, pub sites: List<SiteShape>, pub same: List<u32>, pub proven: List<u64>,
+  pub adds: List<u64>, pub atoms: List<u32> }
+/// A property whose value a value holds: `atom` of the object `object` (the first value
+/// that was this object, Retain copies seen through) is in the slot of `value`.
+struct Known { object: u32, atom: u32, value: u32 }
+impl Copy for Known {}
+/// The most properties tracked at a time; more push the oldest out.
+const KNOWN: usize = 8
+
+impl Shapes {
+  pub fn none() -> Shapes { return Shapes { keys: List<u64>.make(), facts: List<u8>.make(), reads: List<u32>.make(), sites: List<SiteShape>.make(), same: List<u32>.make(), proven: List<u64>.make(),
+    adds: List<u64>.make(), atoms: List<u32>.make() } }
+  pub fn add(self: &Self, inst: u32) -> u64 { if u32.toUsize(inst) < self.adds.length() { return self.adds.get(u32.toUsize(inst)) } return 0 }
+  pub fn atom(self: &Self, inst: u32) -> u32 { if u32.toUsize(inst) < self.atoms.length() { return self.atoms.get(u32.toUsize(inst)) } return 0 }
+  pub fn provenAt(self: &Self, inst: u32) -> u64 { if u32.toUsize(inst) < self.proven.length() { return self.proven.get(u32.toUsize(inst)) } return 0 }
+  pub fn sameAs(self: &Self, inst: u32) -> u32 { if u32.toUsize(inst) < self.same.length() { return self.same.get(u32.toUsize(inst)) } return NONE }
+  pub fn read(self: &Self, inst: u32) -> u32 { if u32.toUsize(inst) < self.reads.length() { return self.reads.get(u32.toUsize(inst)) } return 0 }
+  pub fn key(self: &Self, inst: u32) -> u64 { if u32.toUsize(inst) < self.keys.length() { return self.keys.get(u32.toUsize(inst)) } return 0 }
+  pub fn fact(self: &Self, inst: u32) -> u8 { if u32.toUsize(inst) < self.facts.length() { return self.facts.get(u32.toUsize(inst)) } return 0 }
+}
+
+/// The key the field site at pc of code holds: 8 bytes after its atom, low byte first.
+fn keyAt(code: &[u8], pc: u32) -> u64 {
+  let key = rawKeyAt(code, pc)
+  // A version the code can compare as a sign-extended 32-bit immediate.
+  if key == NO_KEY || u64.shiftRight(key, 16) == 0 || u64.shiftRight(key, 16) >= 2147483648 { return 0 }
+  return key
+}
+/// keyAt as the site holds it, whatever it is (NO_KEY past the code).
+fn rawKeyAt(code: &[u8], pc: u32) -> u64 {
+  let at = u32.toUsize(pc) + 5
+  if at + 8 > code.length { return NO_KEY }
+  let mut key: u64 = 0
+  let mut b: usize = 8
+  while b != 0 { b = b - 1 key = u64.bitOr(u64.shiftLeft(key, 8), u8.toU64(code[at + b])) }
+  return key
+}
+
+/// The shape version of a site cache key (own or of the prototype).
+pub fn versionOf(key: u64) -> u64 { return u64.shiftRight(u64.shiftLeft(key, 1), 17) }
+/// The entry of sites for the cached field site at pc, or none.
+fn siteAt(sites: &List<SiteShape>, pc: u32) -> SiteShape {
+  let mut s: usize = 0
+  while s < sites.length() { if sites.get(s).pc == pc { return sites.get(s) } s = s + 1 }
+  return SiteShape { pc: pc, count: 0, keys: [0, 0, 0, 0], protoKeys: [0, 0, 0, 0], firstKeys: [0, 0, 0, 0] }
+}
+
+/// What the field site at `pc` of inline target `id` has: its recorded shapes, its atom and its
+/// key. The target is one of `targets` or, an inlined body's own callee, one of theirs.
+struct InlinedSite { known: bool, site: SiteShape, atom: u32, key: u64, raw: u64 }
+impl Copy for InlinedSite {}
+fn inlinedSite(targets: &List<CallTarget>, id: u32, pc: u32) -> InlinedSite {
+  let mut t: usize = 0
+  while t < targets.length() {
+    let target = &targets.asSlice()[t]
+    if target.id == id {
+      return InlinedSite { known: true, site: siteAt(&target.input.siteShapes, pc), atom: atomAt(target.input.code.asSlice(), pc), key: keyAt(target.input.code.asSlice(), pc), raw: rawKeyAt(target.input.code.asSlice(), pc) }
+    }
+    let inner = inlinedSite(&target.input.targets, id, pc)
+    if inner.known { return inner }
+    t = t + 1
+  }
+  return InlinedSite { known: false, site: SiteShape { pc: pc, count: 0, keys: [0, 0, 0, 0], protoKeys: [0, 0, 0, 0], firstKeys: [0, 0, 0, 0] }, atom: 0, key: 0, raw: 0 }
+}
+/// The atom `inst`, a field read or store of `f` (whose input is `input`), names; 0 when
+/// it is not known.
+pub fn fieldAtom(f: &Function, input: &FunctionInput, inst: Inst) -> u32 {
+  if inst.frame == 0 { return atomAt(input.code.asSlice(), inst.pc) }
+  if u32.toUsize(inst.frame - 1) >= f.inlineTargets.length() { return 0 }
+  let found = inlinedSite(&input.targets, f.inlineTargets.get(u32.toUsize(inst.frame - 1)), inst.pc)
+  if found.known { return found.atom }
+  return 0
+}
+/// The atom of the field site at pc of code: the 4 bytes after its opcode. 0: none.
+fn atomAt(code: &[u8], pc: u32) -> u32 {
+  let at = u32.toUsize(pc) + 1
+  if at + 4 > code.length { return 0 }
+  return u8.toU32(code[at]) | u32.shiftLeft(u8.toU32(code[at + 1]), 8) | u32.shiftLeft(u8.toU32(code[at + 2]), 16) | u32.shiftLeft(u8.toU32(code[at + 3]), 24)
+}
+/// The value among held[0..] that holds `atom` of `object`, or NONE.
+fn knownValue(held: &List<Known>, object: u32, atom: u32) -> u32 {
+  let mut i: usize = 0
+  while i < held.length() {
+    let k = held.get(i)
+    if k.object == object && k.atom == atom { return k.value }
+    i = i + 1
+  }
+  return NONE
+}
+/// held without what it knew of `atom` (0: of anything), of any object: a store may alias.
+fn forget(held: &mut List<Known>, atom: u32) -> () {
+  let mut kept: usize = 0
+  let mut i: usize = 0
+  while i < held.length() {
+    let k = held.get(i)
+    if atom != 0 && k.atom != atom { held.set(kept, k) kept = kept + 1 }
+    i = i + 1
+  }
+  held.truncate(kept)
+}
+
+/// held with k, in place of what was held for the same property, the oldest dropped when full.
+effect fn remember(held: &mut List<Known>, k: Known) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut kept: usize = 0
+  let mut i: usize = 0
+  while i < held.length() {
+    let h = held.get(i)
+    if h.object != k.object || h.atom != k.atom { held.set(kept, h) kept = kept + 1 }
+    i = i + 1
+  }
+  held.truncate(kept)
+  if held.length() >= KNOWN {
+    i = 1
+    while i < held.length() { let h = held.get(i) held.set(i - 1, h) i = i + 1 }
+    let less = held.length() - 1
+    held.truncate(less)
+  }
+  run held.append(k)
+}
+
+/// The inline target whose method the cached field read at `index` reads when that method
+/// is known (ssa.TARGET_KNOWN, ssa.TARGET_EXACT): the target of the first `check.callee` of
+/// its result in the instructions that follow, with no `is.callee` of it before, when the
+/// read is the site the embedder marked it for. NONE otherwise.
+pub fn knownTarget(f: &Function, index: u32) -> u32 {
+  let read = f.inst(index)
+  if read.op != Op.GetField || read.result == NONE || (read.k & 1) != FIELD_CACHED { return NONE }
+  let mut at = index + 1
+  let end = usize.toU32(f.insts.length())
+  while at < end && at < index + 1 + KNOWN_WINDOW {
+    let next = f.inst(at)
+    at = at + 1
+    // Tests of several targets: their shape dispatch serves the read.
+    if next.op == Op.IsCallee && next.a == read.result { return NONE }
+    if next.op != Op.CheckCallee || next.a != read.result { continue }
+    let k = i32.wrappingToU32(next.k)
+    if u32.toUsize(k) >= f.inlineTargets.length() || next.frame != read.frame || f.inlineSites.get(u32.toUsize(k)) != read.pc { return NONE }
+    let id = f.inlineTargets.get(u32.toUsize(k))
+    if u32.bitAnd(id, TARGET_KNOWN) == 0 || u32.bitAnd(id, TARGET_EXACT) == 0 { return NONE }
+    return k
+  }
+  return NONE
+}
+
+/// Whether op leaves every object's shape as it is. Anything not listed may change one.
+/// A poll is listed: what it runs when the counter is out is the host's interrupt callback
+/// and the report of a hot function (js_interrupts.handle). Neither runs JavaScript or
+/// adds, removes or redefines a property, and the report makes baseline code only
+/// (jit_runtime.compileHot). With the poll quiet a loop header keeps the shapes its turns
+/// agree on.
+///
+/// That rests on where a prototype starts being watched (js_compiled_inline.watchHolder
+/// gives it a shape of its own): only in compileOptimized, at a function's entry, which is
+/// inside a call and so after every fact has died. A store whose shape test a fact removed
+/// would otherwise write a watched slot without ending the watch, since the new version
+/// failing that test is what sends the store to the path that ends it. Optimized code made
+/// from a poll (on-stack replacement) must not watch there, or polls stop being quiet.
+fn quiet(op: Op) -> bool {
+  return op == Op.Poll || op == Op.Arg || op == Op.ConstI32 || op == Op.Imm || op == Op.Unbox || op == Op.UnboxBool || op == Op.BoxI32 || op == Op.BoxBool
+    || op == Op.Add || op == Op.Sub || op == Op.Mul || op == Op.Cmp || op == Op.Retain || op == Op.Release
+    || op == Op.Jump || op == Op.Branch || op == Op.Return || op == Op.This || op == Op.CheckTag || op == Op.CheckArray || op == Op.CheckBound || op == Op.GrowBound || op == Op.Elements || op == Op.TagIn || op == Op.TagIs
+    || op == Op.AtomValue || op == Op.ConstVal || op == Op.GetVar || op == Op.PutVar || op == Op.GetScope || op == Op.PutScope || op == Op.Truthy || op == Op.TypeofAtom || op == Op.Typeof
+    || op == Op.CallArg || op == Op.CallResult || op == Op.CheckCallee || op == Op.CheckWatched || op == Op.IsCallee || op == Op.InlineFrame || op == Op.NewObject || op == Op.InitSlot || op == Op.CheckConstruct || op == Op.KnownMethod || op == Op.Removed
+    || op == Op.Equals || op == Op.ConstF64 || op == Op.UnboxF64 || op == Op.BoxF64 || op == Op.ToF64 || op == Op.AddF64 || op == Op.SubF64 || op == Op.MulF64
+    || op == Op.DivF64 || op == Op.ModF64 || op == Op.CmpF64 || op == Op.NegF64 || op == Op.SqrtF64 || op == Op.AbsF64 || op == Op.FloorF64 || op == Op.ToInt32
+    || op == Op.ExactI32 || op == Op.BitAnd || op == Op.BitOr || op == Op.BitXor || op == Op.Shl || op == Op.Sar || op == Op.Shr || op == Op.Mod
+    || op == Op.Neg || op == Op.BitNot || op == Op.NotBool || op == Op.Imul
+}
+
+/// The facts of f, compacted, whose own code is input's and whose inlined bodies' are its
+/// targets'. sites are the offsets earlier code of the function left at: a field site among
+/// them (of the function's own code) keeps its helper.
+/// What analyze keeps of value v (an index into the value table), in the list of the
+/// values it tracks (track): nothing is known of one it does not track.
+fn versionAt(list: &List<u64>, stamp: &List<u32>, epoch: u32, track: &List<u32>, v: usize) -> u64 {
+  let t = track.get(v)
+  if t == NONE { return 0 }
+  let u = u32.toUsize(t)
+  if stamp.get(u) != epoch { return 0 }
+  return list.get(u)
+}
+fn objectAt(list: &List<u8>, track: &List<u32>, v: usize) -> u8 { let t = track.get(v) if t == NONE { return 0 } return list.get(u32.toUsize(t)) }
+fn setVersion(list: &mut List<u64>, stamp: &mut List<u32>, epoch: u32, track: &List<u32>, v: usize, x: u64) -> () {
+  let t = track.get(v)
+  if t != NONE { let u = u32.toUsize(t) list.set(u, x) stamp.set(u, epoch) }
+}
+fn setObject(list: &mut List<u8>, track: &List<u32>, v: usize, x: u8) -> () { let t = track.get(v) if t != NONE { list.set(u32.toUsize(t), x) } }
+pub effect fn analyze(f: &Function, input: &FunctionInput, sites: &List<u32>) -> Shapes ! OutOfMemoryError ? &mut Allocator {
+  let count = f.insts.length()
+  let mut keys = List<u64>.make()
+  run keys.appendRepeated(0, count)
+  let mut facts = List<u8>.make()
+  run facts.appendRepeated(0, count)
+  let mut reads = List<u32>.make()
+  run reads.appendRepeated(0, count)
+  let mut read = List<SiteShape>.make()
+  let mut same = List<u32>.make()
+  run same.appendRepeated(NONE, count)
+  let mut proven = List<u64>.make()
+  run proven.appendRepeated(0, count)
+  // The property each field site names.
+  let mut atoms = List<u32>.make()
+  run atoms.appendRepeated(0, count)
+  let mut adds = List<u64>.make()
+  run adds.appendRepeated(0, count)
+  let mut any = false
+  let mut i: usize = 0
+  while i < count {
+    let inst = f.insts.get(i)
+    if inst.op == Op.GetField && (inst.k & 1) == FIELD_CACHED {
+      let mut site = SiteShape { pc: inst.pc, count: 0, keys: [0, 0, 0, 0], protoKeys: [0, 0, 0, 0], firstKeys: [0, 0, 0, 0] }
+      let mut hedged = false
+      if inst.frame == 0 {
+        site = siteAt(&input.siteShapes, inst.pc)
+        atoms.set(i, atomAt(input.code.asSlice(), inst.pc))
+        let mut s: usize = 0
+        while s < sites.length() { if sites.get(s) == inst.pc { hedged = true } s = s + 1 }
+      } else if u32.toUsize(inst.frame - 1) < f.inlineTargets.length() {
+        let found = inlinedSite(&input.targets, f.inlineTargets.get(u32.toUsize(inst.frame - 1)), inst.pc)
+        if found.known { site = found.site atoms.set(i, found.atom) }
+      }
+      if site.count != 0 {
+        run read.append(site)
+        reads.set(i, usize.toU32(read.length()))
+        if hedged { facts.set(i, FACT_HEDGED) }
+        any = true
+      } else if !hedged && knownTarget(f, usize.toU32(i)) != NONE { facts.set(i, FACT_KNOWN) any = true }
+    }
+    if inst.op == Op.CheckShape { any = true }
+    if inst.op == Op.Call && inst.frame == 0 && calls.kindOf(inst) == compiled.SITE_PUT_FIELD {
+      // A store that left before (a call that tries the helper, then steps): the add its
+      // inline key names may still go in place first.
+      let raw = rawKeyAt(input.code.asSlice(), inst.pc)
+      if raw != NO_KEY { adds.set(i, raw) atoms.set(i, atomAt(input.code.asSlice(), inst.pc)) }
+    }
+    if (inst.op == Op.GetField && inst.k == FIELD_KEYED) || inst.op == Op.PutField {
+      let mut key: u64 = 0
+      let mut raw: u64 = 0
+      // The own keys the site's inline key was filled with, when it had several.
+      let mut site = SiteShape { pc: inst.pc, count: 0, keys: [0, 0, 0, 0], protoKeys: [0, 0, 0, 0], firstKeys: [0, 0, 0, 0] }
+      if inst.frame == 0 {
+        let mut left = false
+        let mut s: usize = 0
+        while s < sites.length() { if sites.get(s) == inst.pc { left = true } s = s + 1 }
+        if !left { key = keyAt(input.code.asSlice(), inst.pc) site = siteAt(&input.siteShapes, inst.pc) }
+        // The add the inline key names is tested in full where it runs (an add in place
+        // or the general way), so a site that left still has it.
+        raw = rawKeyAt(input.code.asSlice(), inst.pc)
+        atoms.set(i, atomAt(input.code.asSlice(), inst.pc))
+      } else if u32.toUsize(inst.frame - 1) < f.inlineTargets.length() {
+        let found = inlinedSite(&input.targets, f.inlineTargets.get(u32.toUsize(inst.frame - 1)), inst.pc)
+        if found.known { key = found.key raw = found.raw site = found.site atoms.set(i, found.atom) }
+      }
+      if inst.op == Op.PutField && key == 0 && site.count < 2 && raw != NO_KEY { adds.set(i, raw) }
+      if site.count >= 2 || (inst.op == Op.GetField && site.count == 1 && site.protoKeys[0] != 0) {
+        // Tested against each in turn, like a cached site's; any other shape leaves.
+        run read.append(site)
+        reads.set(i, usize.toU32(read.length()))
+        any = true
+      } else if key != 0 { keys.set(i, key) any = true }
+    }
+    i = i + 1
+  }
+  let blocks = u32.toUsize(f.blockCount())
+  let values = u32.toUsize(f.valueCount())
+  // Construct-join parameters: a block with two incoming edges where one passes `Op.NewObject`
+  // (fast path) and the other passes `Op.Call` with `calls.PLANNED` (slow path). On entry to
+  // that join block, the joined value is guaranteed to be a live object with the site's shape,
+  // while `Op.NewObject`'s result itself remains unmarked (it can be Undefined on the slow path).
+  let mut joinParam = List<u32>.make()
+  let mut joinShape = List<u64>.make()
+  if f.constructTargets.length() > 0 {
+    run joinParam.appendRepeated(NONE, blocks)
+    run joinShape.appendRepeated(0, blocks)
+    let mut inCount = List<u32>.make() run inCount.appendRepeated(0, blocks)
+    let mut inFirst = List<u32>.make() run inFirst.appendRepeated(NONE, blocks)
+    let mut inSecond = List<u32>.make() run inSecond.appendRepeated(NONE, blocks)
+    let mut e: usize = 0
+    while e < f.edges.length() {
+      let t = u32.toUsize(f.edges.get(e).target)
+      if t < blocks {
+        let c = inCount.get(t)
+        if c == 0 { inFirst.set(t, usize.toU32(e)) }
+        else if c == 1 { inSecond.set(t, usize.toU32(e)) }
+        inCount.set(t, c + 1)
+      }
+      e = e + 1
+    }
+    let mut jb: usize = 1
+    while jb < blocks {
+      if inCount.get(jb) == 2 {
+        let blk = f.blocks.get(jb)
+        if blk.paramCount == 1 {
+          let e0 = f.edges.get(u32.toUsize(inFirst.get(jb)))
+          let e1 = f.edges.get(u32.toUsize(inSecond.get(jb)))
+          if e0.argCount == 1 && e1.argCount == 1 {
+            let a0 = f.edgeArg(e0, 0)
+            let a1 = f.edgeArg(e1, 0)
+            if u32.toUsize(a0) < values && u32.toUsize(a1) < values {
+              let d0 = f.value(a0).def
+              let d1 = f.value(a1).def
+              if d0 != NONE && d1 != NONE {
+                let i0 = f.inst(d0)
+                let i1 = f.inst(d1)
+                let mut newObj = NONE
+                if i0.op == Op.NewObject && i1.op == Op.Call && (i1.k & calls.PLANNED) != 0 { newObj = d0 }
+                else if i1.op == Op.NewObject && i0.op == Op.Call && (i0.k & calls.PLANNED) != 0 { newObj = d1 }
+                if newObj != NONE {
+                  let p = f.paramAt(blk, 0)
+                  let siteIdx = i32.toUsize(f.inst(newObj).k)
+                  let mut ver: u64 = 0
+                  if siteIdx < f.constructShapes.length() { ver = u32.toU64(f.constructShapes.get(siteIdx)) }
+                  joinParam.set(jb, p)
+                  joinShape.set(jb, ver)
+                  any = true
+                }
+              }
+            }
+          }
+        }
+      }
+      jb = jb + 1
+    }
+  }
+  if !any { return Shapes { keys: move keys, facts: move facts, reads: move reads, sites: move read, same: move same, proven: move proven, adds: move adds, atoms: move atoms } }
+  // The block each edge leaves.
+  // The values what is known could be kept under (tracked): the objects the field sites,
+  // shape and tag tests, counts and copies name, and the values the reads and stores hold.
+  // What each block leaves known is kept for those alone (r of them), not for every value.
+  let mut track = List<u32>.make()
+  run track.appendRepeated(NONE, values)
+  let mut r: usize = 0
+  let mut q: usize = 0
+  while q < count {
+    let inst = f.insts.get(q)
+    let op = inst.op
+    if op == Op.GetField || op == Op.PutField || op == Op.CheckShape || op == Op.CheckTag || op == Op.Release || op == Op.Retain {
+      if u32.toUsize(inst.a) < values && track.get(u32.toUsize(inst.a)) == NONE { track.set(u32.toUsize(inst.a), usize.toU32(r)) r = r + 1 }
+    }
+    if op == Op.PutField && u32.toUsize(inst.b) < values && track.get(u32.toUsize(inst.b)) == NONE { track.set(u32.toUsize(inst.b), usize.toU32(r)) r = r + 1 }
+    if (op == Op.GetField || op == Op.Retain) && inst.result != NONE && u32.toUsize(inst.result) < values && track.get(u32.toUsize(inst.result)) == NONE {
+      track.set(u32.toUsize(inst.result), usize.toU32(r)) r = r + 1
+    }
+    q = q + 1
+  }
+  if joinParam.length() == blocks {
+    let mut jb: usize = 0
+    while jb < blocks {
+      let p = joinParam.get(jb)
+      if p != NONE && u32.toUsize(p) < values && track.get(u32.toUsize(p)) == NONE {
+        track.set(u32.toUsize(p), usize.toU32(r)) r = r + 1
+      }
+      jb = jb + 1
+    }
+  }
+  let mut source = List<u32>.make()
+  run source.appendRepeated(NONE, f.edges.length())
+  let mut inStart = List<u32>.make()
+  run inStart.appendRepeated(0, blocks + 1)
+  let mut b: usize = 0
+  while b < blocks {
+    let block = f.blocks.get(b)
+    if block.instCount > 0 {
+      let last = f.inst(block.firstInst + block.instCount - 1)
+      let mut e: u32 = 0
+      while e < edgeCount(last.op) {
+        let ei = u32.toUsize(last.edge + e)
+        source.set(ei, usize.toU32(b))
+        let tgt = u32.toUsize(f.edges.get(ei).target)
+        if tgt < blocks {
+          let cnt = inStart.get(tgt + 1)
+          inStart.set(tgt + 1, cnt + 1)
+        }
+        e = e + 1
+      }
+    }
+    b = b + 1
+  }
+  b = 0
+  while b < blocks {
+    let sum = inStart.get(b + 1) + inStart.get(b)
+    inStart.set(b + 1, sum)
+    b = b + 1
+  }
+  let mut inFill = List<u32>.make()
+  run inFill.appendSlice(inStart.asSlice())
+  let mut inEdges = List<u32>.make()
+  run inEdges.appendRepeated(0, u32.toUsize(inStart.get(blocks)))
+  let mut ei: usize = 0
+  while ei < f.edges.length() {
+    if source.get(ei) != NONE {
+      let tgt = u32.toUsize(f.edges.get(ei).target)
+      if tgt < blocks {
+        let pos = inFill.get(tgt)
+        inEdges.set(u32.toUsize(pos), usize.toU32(ei))
+        inFill.set(tgt, pos + 1)
+      }
+    }
+    ei = ei + 1
+  }
+  // What each block leaves known, by value: its shape version (0: none) and whether it is
+  // an object; and the properties whose values are held (heldOut, KNOWN a block, heldCount
+  // of them in use). `done` tells a block that was walked from one that was not.
+  //
+  // Two walks. In the first a block entered from one not walked yet (a loop header, by its
+  // back edge) starts with nothing. The second takes what the first found at the end of
+  // such a block: that was found with nothing assumed at the header, so it holds at the end
+  // of every turn, and with it the header keeps what the code before the loop and every
+  // turn agree on.
+  let mut versions = List<u64>.make()
+  run versions.appendRepeated(0, blocks * r)
+  let mut blockHasVer = List<bool>.make()
+  run blockHasVer.appendRepeated(false, blocks)
+  let mut objects = List<u8>.make()
+  run objects.appendRepeated(0, blocks * r)
+  let mut heldOut = List<Known>.make()
+  run heldOut.appendRepeated(Known { object: NONE, atom: 0, value: NONE }, blocks * KNOWN)
+  let mut heldCount = List<u32>.make()
+  run heldCount.appendRepeated(0, blocks)
+  let mut done = List<u8>.make()
+  run done.appendRepeated(0, blocks)
+  let mut version = List<u64>.make()
+  run version.appendRepeated(0, r)
+  let mut verStamp = List<u32>.make()
+  run verStamp.appendRepeated(0, r)
+  let mut verEpoch: u32 = 1
+  let mut object = List<u8>.make()
+  run object.appendRepeated(0, r)
+  let mut held = List<Known>.make()
+  // The first value that was the same object as each value (Retain and copies seen through).
+  // What is known of an object is kept under that first value, so what a test of one copy
+  // proved holds for the others, the ones made before the test too.
+  let mut alias = List<u32>.make()
+  let idom = run dominators(f)
+  let mut pass: u32 = 0
+  while pass < 2 {
+  alias.truncate(0)
+  let mut v0: usize = 0
+  while v0 < values { run alias.append(usize.toU32(v0)) v0 = v0 + 1 }
+  let mut clear: usize = 0
+  while clear < count { let fixed = u8.bitAnd(facts.get(clear), FACT_HEDGED | FACT_KNOWN) facts.set(clear, fixed) same.set(clear, NONE) proven.set(clear, 0) clear = clear + 1 }
+  b = 0
+  while b < blocks {
+    // What every edge into the block agrees on; nothing when one comes from a block not
+    // walked yet, or when there is none (the entry).
+    let mut first = true
+    let mut open = false
+    let mut strange = false
+    let mut verAny = false
+    verEpoch = verEpoch + 1
+    held.truncate(0)
+    let inLo = u32.toUsize(inStart.get(b))
+    let inHi = u32.toUsize(inStart.get(b + 1))
+    let mut ie = inLo
+    while ie < inHi {
+      let e = u32.toUsize(inEdges.get(ie))
+      let from = source.get(e)
+      if from == NONE || done.get(u32.toUsize(from)) == 0 {
+        open = true
+        // A back edge comes from a block this one dominates; any other is not known.
+        let mut x = from
+        while x != NONE && u32.toUsize(x) > b && u32.toUsize(x) < blocks && idom.get(u32.toUsize(x)) < x { x = idom.get(u32.toUsize(x)) }
+        if from == NONE || u32.toUsize(x) != b { strange = true }
+      }
+      else {
+        let fromU = u32.toUsize(from)
+        let base = fromU * r
+        let fromHasVer = blockHasVer.get(fromU)
+        let verSlice = versions.asSlice()
+        let objSlice = objects.asSlice()
+        let curVer = version.asMutSlice()
+        let curStamp = verStamp.asMutSlice()
+        let curObj = object.asMutSlice()
+        if first {
+          let mut v: usize = 0
+          if fromHasVer {
+            while v < r {
+              let x = verSlice[base + v]
+              if x != 0 { curVer[v] = x curStamp[v] = verEpoch verAny = true }
+              curObj[v] = objSlice[base + v]
+              v = v + 1
+            }
+          } else {
+            while v < r {
+              curObj[v] = objSlice[base + v]
+              v = v + 1
+            }
+          }
+        } else {
+          if !fromHasVer && verAny {
+            verEpoch = verEpoch + 1
+            verAny = false
+          }
+          let mut v: usize = 0
+          if verAny {
+            let mut stillAny = false
+            while v < r {
+              if curStamp[v] == verEpoch {
+                if curVer[v] != verSlice[base + v] { curStamp[v] = 0 } else { stillAny = true }
+              }
+              if objSlice[base + v] == 0 { curObj[v] = 0 }
+              v = v + 1
+            }
+            verAny = stillAny
+          } else {
+            while v < r {
+              if objSlice[base + v] == 0 { curObj[v] = 0 }
+              v = v + 1
+            }
+          }
+        }
+        let theirs = fromU * KNOWN
+        let their = u32.toUsize(heldCount.get(fromU))
+        if first {
+          let mut k: usize = 0
+          while k < their { run held.append(heldOut.get(theirs + k)) k = k + 1 }
+        } else {
+          let mut kept: usize = 0
+          let mut k: usize = 0
+          while k < held.length() {
+            let mine = held.get(k)
+            let mut both = false
+            let mut t: usize = 0
+            while t < their {
+              let other = heldOut.get(theirs + t)
+              if other.object == mine.object && other.atom == mine.atom && other.value == mine.value { both = true }
+              t = t + 1
+            }
+            if both { held.set(kept, mine) kept = kept + 1 }
+            k = k + 1
+          }
+          held.truncate(kept)
+        }
+        first = false
+      }
+      ie = ie + 1
+    }
+    if first || open {
+      // That a value is an object stays true wherever the value is: over a back edge too,
+      // so a loop header keeps what the blocks before it agree on. A shape may change in
+      // the loop.
+      if verAny { verEpoch = verEpoch + 1 verAny = false }
+      if first || strange {
+        let curObj = object.asMutSlice()
+        let mut v: usize = 0
+        while v < r { curObj[v] = 0 v = v + 1 }
+      }
+      held.truncate(0)
+    }
+    if joinParam.length() == blocks {
+      let p = joinParam.get(b)
+      if p != NONE && u32.toUsize(p) < values {
+        let a = u32.toUsize(alias.get(u32.toUsize(p)))
+        setObject(&mut object, &track, a, 1)
+        let ver = joinShape.get(b)
+        if ver != 0 { setVersion(&mut version, &mut verStamp, verEpoch, &track, a, ver) verAny = true }
+      }
+    }
+    let block = f.blocks.get(b)
+    let mut n: u32 = 0
+    while n < block.instCount {
+      let index = u32.toUsize(block.firstInst + n)
+      let inst = f.insts.get(index)
+      let key = keys.get(index)
+      let atom = atoms.get(index)
+      // A read of a data property with no helper behind it: a keyed site, or a cached one
+      // that leaves on another shape.
+      let plain = inst.op == Op.GetField && u32.toUsize(inst.a) < values && u32.toUsize(inst.result) < values
+        && (key != 0 || (reads.get(index) != 0 && u8.bitAnd(facts.get(index), FACT_HEDGED) == 0))
+      if (inst.op == Op.GetField || inst.op == Op.PutField || inst.op == Op.CheckShape) && u32.toUsize(inst.a) < values {
+        proven.set(index, versionAt(&version, &verStamp, verEpoch, &track, u32.toUsize(alias.get(u32.toUsize(inst.a)))))
+      }
+      let known = inst.op == Op.GetField && u8.bitAnd(facts.get(index), FACT_KNOWN) != 0 && u32.toUsize(inst.a) < values
+      let mut copied = NONE
+      if plain && atom != 0 { copied = knownValue(&held, alias.get(u32.toUsize(inst.a)), atom) }
+      if copied != NONE && u32.toUsize(copied) < values {
+        // The property's value is still in `copied`: the same value, and what is known of it.
+        same.set(index, copied)
+        let first = alias.get(u32.toUsize(copied))
+        alias.set(u32.toUsize(inst.result), first)
+        if objectAt(&object, &track, u32.toUsize(first)) != 0 { let fact = u8.bitOr(facts.get(index), FACT_OBJECT) facts.set(index, fact) }
+      } else if inst.op == Op.CheckShape {
+        if u32.toUsize(inst.a) < values {
+          let a = u32.toUsize(alias.get(u32.toUsize(inst.a)))
+          let mut fact: u8 = 0
+          if objectAt(&object, &track, a) != 0 { fact = FACT_OBJECT }
+          if versionAt(&version, &verStamp, verEpoch, &track, a) == i32.wrappingToU64(inst.k) { fact = u8.bitOr(fact, FACT_SHAPE) }
+          facts.set(index, fact)
+          setObject(&mut object, &track, a, 1)
+          setVersion(&mut version, &mut verStamp, verEpoch, &track, a, i32.wrappingToU64(inst.k))
+          verAny = true
+        }
+      } else if known {
+        // The known path or an exit: the object is one, of a shape the method is known for.
+        let a = u32.toUsize(alias.get(u32.toUsize(inst.a)))
+        let mut fact = FACT_KNOWN
+        if objectAt(&object, &track, a) != 0 { fact = u8.bitOr(fact, FACT_OBJECT) }
+        facts.set(index, fact)
+        setObject(&mut object, &track, a, 1)
+        let k = knownTarget(f, usize.toU32(index))
+        if k != NONE && u32.toUsize(k) < f.inlineShapes.length() && versionAt(&version, &verStamp, verEpoch, &track, a) == 0 {
+          let shapes = f.inlineShapes.get(u32.toUsize(k)).shapes
+          if shapes[0] != 0 && shapes[1] == 0 { setVersion(&mut version, &mut verStamp, verEpoch, &track, a, u32.toU64(shapes[0])) verAny = true }
+        }
+      } else if inst.op == Op.CheckTag {
+        if u32.toUsize(inst.a) < values {
+          let a = u32.toUsize(alias.get(u32.toUsize(inst.a)))
+          if objectAt(&object, &track, a) != 0 && inst.k == TAG_OBJECT { facts.set(index, FACT_OBJECT) }
+          if inst.k == TAG_OBJECT { setObject(&mut object, &track, a, 1) }
+        }
+      } else if key != 0 {
+        let a = u32.toUsize(alias.get(u32.toUsize(inst.a)))
+        let mut fact: u8 = 0
+        if objectAt(&object, &track, a) != 0 { fact = FACT_OBJECT }
+        if versionAt(&version, &verStamp, verEpoch, &track, a) == u64.shiftRight(key, 16) { fact = u8.bitOr(fact, FACT_SHAPE) }
+        facts.set(index, fact)
+        setObject(&mut object, &track, a, 1)
+        setVersion(&mut version, &mut verStamp, verEpoch, &track, a, u64.shiftRight(key, 16))
+        verAny = true
+        if inst.op == Op.PutField {
+          // In place, in the slot of this property: whatever held it before is out of date,
+          // on any object (another value may be the same one), and the stored value has it.
+          forget(&mut held, atom)
+          if atom != 0 && u32.toUsize(inst.b) < values { run remember(&mut held, Known { object: usize.toU32(a), atom: atom, value: inst.b }) }
+        } else if atom != 0 { run remember(&mut held, Known { object: usize.toU32(a), atom: atom, value: inst.result }) }
+      } else if reads.get(index) != 0 {
+        let site = read.get(u32.toUsize(reads.get(index) - 1))
+        let a = u32.toUsize(alias.get(u32.toUsize(inst.a)))
+        let mut fact = facts.get(index)
+        if objectAt(&object, &track, a) != 0 { fact = u8.bitOr(fact, FACT_OBJECT) }
+        let curV = versionAt(&version, &verStamp, verEpoch, &track, a)
+        let mut m: u32 = 0
+        while m < site.count {
+          if curV != 0 && curV == versionOf(site.keys[u32.toUsize(m)]) { fact = u8.bitOr(fact, u8.shiftLeft(u32.wrappingToU8(m + 1), FACT_PAIR)) }
+          m = m + 1
+        }
+        facts.set(index, fact)
+        if u8.bitAnd(fact, FACT_HEDGED) != 0 {
+          // Its helper may run a getter.
+          if verAny { verEpoch = verEpoch + 1 verAny = false }
+          held.truncate(0)
+        } else {
+          setObject(&mut object, &track, a, 1)
+          if site.count == 1 { setVersion(&mut version, &mut verStamp, verEpoch, &track, a, versionOf(site.keys[0])) verAny = true }
+          if inst.op == Op.PutField {
+            // As a store by one key: in place, in the slot of this property.
+            forget(&mut held, atom)
+            if atom != 0 && u32.toUsize(inst.b) < values { run remember(&mut held, Known { object: usize.toU32(a), atom: atom, value: inst.b }) }
+          } else if atom != 0 { run remember(&mut held, Known { object: usize.toU32(a), atom: atom, value: inst.result }) }
+        }
+      } else if inst.op == Op.Release {
+        if u32.toUsize(inst.a) < values && objectAt(&object, &track, u32.toUsize(alias.get(u32.toUsize(inst.a)))) != 0 { facts.set(index, FACT_OBJECT) }
+      } else if inst.op == Op.Retain {
+        // Another owner of the same object.
+        if inst.result != NONE && u32.toUsize(inst.result) < values && u32.toUsize(inst.a) < values {
+          let first = alias.get(u32.toUsize(inst.a))
+          if objectAt(&object, &track, u32.toUsize(first)) != 0 { facts.set(index, FACT_OBJECT) }
+          alias.set(u32.toUsize(inst.result), first)
+        }
+      } else if !quiet(inst.op) && !(inst.op == Op.Call && (inst.k & calls.PLANNED) != 0) {
+        if verAny { verEpoch = verEpoch + 1 verAny = false }
+        held.truncate(0)
+      } else if inst.op == Op.PutVar {
+        // A global binding may be a property of the global object.
+        held.truncate(0)
+      }
+      n = n + 1
+    }
+    let base = b * r
+    let objOut = objects.asMutSlice()
+    let curObj = object.asSlice()
+    if verAny {
+      let verOut = versions.asMutSlice()
+      let curVer = version.asSlice()
+      let curStamp = verStamp.asSlice()
+      let mut v: usize = 0
+      while v < r {
+        verOut[base + v] = if curStamp[v] == verEpoch { curVer[v] } else { 0 }
+        objOut[base + v] = curObj[v]
+        v = v + 1
+      }
+      blockHasVer.set(b, true)
+    } else {
+      let mut v: usize = 0
+      while v < r { objOut[base + v] = curObj[v] v = v + 1 }
+      blockHasVer.set(b, false)
+    }
+    let mut k: usize = 0
+    while k < held.length() && k < KNOWN { heldOut.set(b * KNOWN + k, held.get(k)) k = k + 1 }
+    heldCount.set(b, usize.toU32(k))
+    done.set(b, 1)
+    b = b + 1
+  }
+  pass = pass + 1
+  }
+  return Shapes { keys: move keys, facts: move facts, reads: move reads, sites: move read, same: move same, proven: move proven, adds: move adds, atoms: move atoms }
+}
+
+/// Static per-instruction field-site metadata (`keys`, `reads`, `sites`, `adds`, and
+/// `FACT_HEDGED` in `facts`) in a single O(insts) pass without CFG shape dataflow.
+pub effect fn analyzeSites(f: &Function, input: &FunctionInput, sites: &List<u32>) -> Shapes ! OutOfMemoryError ? &mut Allocator {
+  let count = f.insts.length()
+  let mut keys = List<u64>.make()
+  run keys.appendRepeated(0, count)
+  let mut facts = List<u8>.make()
+  run facts.appendRepeated(0, count)
+  let mut reads = List<u32>.make()
+  run reads.appendRepeated(0, count)
+  let mut read = List<SiteShape>.make()
+  let mut adds = List<u64>.make()
+  run adds.appendRepeated(0, count)
+  let mut i: usize = 0
+  while i < count {
+    let inst = f.insts.get(i)
+    if inst.op == Op.GetField && (inst.k & 1) == FIELD_CACHED {
+      let mut site = SiteShape { pc: inst.pc, count: 0, keys: [0, 0, 0, 0], protoKeys: [0, 0, 0, 0], firstKeys: [0, 0, 0, 0] }
+      let mut hedged = false
+      if inst.frame == 0 {
+        site = siteAt(&input.siteShapes, inst.pc)
+        let mut s: usize = 0
+        while s < sites.length() { if sites.get(s) == inst.pc { hedged = true break } s = s + 1 }
+      } else if u32.toUsize(inst.frame - 1) < f.inlineTargets.length() {
+        let found = inlinedSite(&input.targets, f.inlineTargets.get(u32.toUsize(inst.frame - 1)), inst.pc)
+        if found.known { site = found.site }
+      }
+      if site.count != 0 {
+        run read.append(site)
+        reads.set(i, usize.toU32(read.length()))
+        if hedged { facts.set(i, FACT_HEDGED) }
+      }
+    }
+    if inst.op == Op.Call && inst.frame == 0 && calls.kindOf(inst) == compiled.SITE_PUT_FIELD {
+      let raw = rawKeyAt(input.code.asSlice(), inst.pc)
+      if raw != NO_KEY { adds.set(i, raw) }
+    }
+    if (inst.op == Op.GetField && inst.k == FIELD_KEYED) || inst.op == Op.PutField {
+      let mut key: u64 = 0
+      let mut raw: u64 = 0
+      let mut site = SiteShape { pc: inst.pc, count: 0, keys: [0, 0, 0, 0], protoKeys: [0, 0, 0, 0], firstKeys: [0, 0, 0, 0] }
+      if inst.frame == 0 {
+        let mut left = false
+        let mut s: usize = 0
+        while s < sites.length() { if sites.get(s) == inst.pc { left = true break } s = s + 1 }
+        if !left { key = keyAt(input.code.asSlice(), inst.pc) site = siteAt(&input.siteShapes, inst.pc) }
+        raw = rawKeyAt(input.code.asSlice(), inst.pc)
+      } else if u32.toUsize(inst.frame - 1) < f.inlineTargets.length() {
+        let found = inlinedSite(&input.targets, f.inlineTargets.get(u32.toUsize(inst.frame - 1)), inst.pc)
+        if found.known { key = found.key raw = found.raw site = found.site }
+      }
+      if inst.op == Op.PutField && key == 0 && site.count < 2 && raw != NO_KEY { adds.set(i, raw) }
+      if site.count >= 2 || (inst.op == Op.GetField && site.count == 1 && site.protoKeys[0] != 0) {
+        run read.append(site)
+        reads.set(i, usize.toU32(read.length()))
+      } else if key != 0 { keys.set(i, key) }
+    }
+    i = i + 1
+  }
+  return Shapes {
+    keys: move keys,
+    facts: move facts,
+    reads: move reads,
+    sites: move read,
+    same: List<u32>.make(),
+    proven: List<u64>.make(),
+    adds: move adds,
+    atoms: List<u32>.make(),
+  }
+}

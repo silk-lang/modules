@@ -51,6 +51,8 @@ import js_shapes
 import js_allocation_realms as allocationRealms
 import js_atom_data as atomIds
 import js_coverage as coverage
+import js_feedback as feedback
+import js_compiled_inline as inlineTargets
 
 /// Required real class/host dispatch. There are no default lifecycle callbacks.
 /// traceClass must visit each class-owned strong edge exactly once with tracer;
@@ -776,10 +778,51 @@ pub unsafe fn releaseValueCold<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHe
 @inlineNever
 unsafe fn releaseLastShape<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, node: *mut HeapHeader) -> () {
   unsafe leave(runtime, node)
-  // Cycle removal may be destroying this shape's prototype, so nothing is kept then.
   let mut doomed: ?*mut HeapHeader = node
   if unsafe phase(runtime) != GcPhase.RemoveCycles { doomed = unsafe js_shapes.park(runtime, node) }
+  // Cycle removal releases the shapes of the garbage it destroys. One whose prototype
+  // goes in the same collection goes with it; the others stay for the next object.
+  else if !unsafe prototypeIsGarbage(node) { unsafe mark(node, 0) doomed = unsafe js_shapes.park(runtime, node) }
   unsafe destroyShape(&mut hooks, runtime, doomed)
+}
+/// Whether the prototype of shape is garbage of the running collection, after its
+/// restore pass: marked 1, or MARK_ZOMBIE once cycle removal has destroyed it.
+@inlineAlways
+unsafe fn prototypeIsGarbage(shape: *mut HeapHeader) -> bool {
+  let anchor = ()
+  let prototype = (unsafe HeapCell.payload<ShapeData, ()>(&anchor, shape)).prototype
+  return match Pointer.nonNullMut<HeapHeader>(prototype) {
+    Option<*mut HeapHeader>.Some { value } => unsafe markOf(value) != 0
+    Option<*mut HeapHeader>.None => false
+  }
+}
+/// The parked shapes in a collection. A parked shape is no member, but the count it
+/// holds of its prototype must not keep the prototype alive: a shape lives as long as
+/// its prototype, not the other way round. So the collection takes each parked shape's
+/// count away after the decrement pass (operation Decrement) and gives it back once
+/// reachability is settled (RestoreUnreachable), as it does for the edges of its members.
+unsafe fn parkedEdges(runtime: *mut HeapHeader, tracer: &mut Tracer, operation: MarkOperation) -> () {
+  let anchor = ()
+  let mut cursor = (unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)).parkedShapes.first
+  while let Option<*mut HeapHeader>.Some { value: shape } = Pointer.nonNullMut<HeapHeader>(cursor) {
+    cursor = unsafe linkedNext(shape)
+    let prototype = (unsafe HeapCell.payload<ShapeData, ()>(&anchor, shape)).prototype
+    if let Option<*mut HeapHeader>.Some { value } = Pointer.nonNullMut<HeapHeader>(prototype) { unsafe tracer.edgeAs(value, operation) }
+  }
+}
+/// In phase RemoveCycles, before cycle removal: destroys the parked shapes whose
+/// prototype is garbage. The others stay parked over the collection, so the next object
+/// of their kind takes the same shape, under the version sites and compiled code know.
+unsafe fn dropDeadParked<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader) -> () {
+  let anchor = ()
+  let mut cursor = (unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)).parkedShapes.first
+  while let Option<*mut HeapHeader>.Some { value: shape } = Pointer.nonNullMut<HeapHeader>(cursor) {
+    cursor = unsafe linkedNext(shape)
+    if unsafe prototypeIsGarbage(shape) {
+      unsafe js_shapes.unparkOne(runtime, shape)
+      unsafe destroyShape(&mut hooks, runtime, shape)
+    }
+  }
 }
 @inlineNever
 unsafe fn enqueueZeroOutOfLine<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader,
@@ -878,11 +921,14 @@ pub unsafe fn receiverShape<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeade
   let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, function)
   let version = (unsafe HeapCell.payload<ShapeData, ()>(&anchor, data.shape)).version
   let address = Pointer.address<HeapHeader>(function)
-  let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
-  let slot = receiverWay(&state.*, address)
+  let mut stateAnchor = ()
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut stateAnchor, runtime)
+  let way = receiverWay(&mut state.*, address)
+  let hit = way < RECEIVER_MISS
+  let slot = way & 63
   let entry = state.receiverCache[slot]
   drop state
-  if entry.function != address || entry.version != version || data.isExotic() {
+  if !hit || entry.version != version || data.isExotic() {
     drop data
     return unsafe refillReceiver(&mut hooks, runtime, function, slot)
   }
@@ -928,44 +974,60 @@ unsafe fn refillReceiver<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, 
   let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut stateAnchor, runtime)
   let old = state.receiverCache[slot]
   let mut entry = blankReceiverEntry()
-  entry.function = Pointer.address<HeapHeader>(function) entry.version = version entry.index = index entry.empty = found
+  entry.version = version entry.index = index entry.empty = found
   state.receiverCache[slot] = entry
+  state.receiverFunctions[slot] = Pointer.address<HeapHeader>(function)
+  state.receiverHints[slot / 4] = usize.toU8(slot & 3)
   drop state
   unsafe releaseOptional(&mut hooks, runtime, old.empty)
   unsafe releaseOptional(&mut hooks, runtime, old.final)
   return found
 }
-/// The receiver cache entry holding function address, else the one to fill.
-/// Each hash has four ways. A newcomer takes an empty way, else one that holds
-/// no construct plan, else the last: constructors that hash alike keep their
-/// entries and plans, and one that is new each time (a function created per
-/// call and used with new once) or never earns a plan cannot push out the
-/// entries that have one.
+/// Added to receiverWay's way when no entry holds the function.
+const RECEIVER_MISS: usize = 64
+/// The receiver cache entry holding function address, else the one to fill
+/// plus RECEIVER_MISS. Each hash has four ways, probed from the set's last hit
+/// (receiverHints), so a constructor's cost does not depend on the way it took.
+/// A newcomer takes an empty way, else one that holds no construct plan, else
+/// the last: constructors that hash alike keep their entries and plans, and one
+/// that is new each time (a function created per call and used with new once)
+/// or never earns a plan cannot push out the entries that have one.
 @inlineAlways
-fn receiverWay(state: &RuntimeState, address: usize) -> usize {
-  let first = u64.toUsize(u64.shiftRight(u64.wrappingMultiply(usize.toU64(address / 16), 0x9e3779b97f4a7c15), 58)) & 60
-  if state.receiverCache[first].function == address { return first }
-  if state.receiverCache[first + 1].function == address { return first + 1 }
-  if state.receiverCache[first + 2].function == address { return first + 2 }
-  if state.receiverCache[first + 3].function == address { return first + 3 }
-  return vacantWay(&state, first)
+fn receiverWay(state: &mut RuntimeState, address: usize) -> usize {
+  let set = u64.toUsize(u64.shiftRight(u64.wrappingMultiply(usize.toU64(address / 16), 0x9e3779b97f4a7c15), 60))
+  let first = set * 4
+  let hinted = first + (u8.toUsize(state.receiverHints[set]) & 3)
+  if state.receiverFunctions[hinted] == address { return hinted }
+  return otherWay(&mut state, set, address)
 }
-/// Read-only 4-way probe of RuntimeState.receiverCache: returns the matching
+/// receiverWay past the hinted way: another way holding address becomes the
+/// set's hint, else vacantWay's choice.
+@inlineAlways
+fn otherWay(state: &mut RuntimeState, set: usize, address: usize) -> usize {
+  let first = set * 4
+  let mut way: usize = 0
+  while way < 4 {
+    if state.receiverFunctions[first + way] == address { state.receiverHints[set] = usize.toU8(way) return first + way }
+    way = way + 1
+  }
+  return vacantWay(&state, first) + RECEIVER_MISS
+}
+/// Read-only 4-way probe of RuntimeState.receiverFunctions: returns the matching
 /// slot index (0..63), or 64 on miss without calling vacantWay.
 @inlineAlways
 pub fn findReceiverWay(state: &RuntimeState, address: usize) -> usize {
   let first = u64.toUsize(u64.shiftRight(u64.wrappingMultiply(usize.toU64(usize.shiftRight(address, 4)), 0x9e3779b97f4a7c15), 58)) & 60
-  if state.receiverCache[first].function == address { return first }
-  if state.receiverCache[usize.wrappingAdd(first, 1)].function == address { return usize.wrappingAdd(first, 1) }
-  if state.receiverCache[usize.wrappingAdd(first, 2)].function == address { return usize.wrappingAdd(first, 2) }
-  if state.receiverCache[usize.wrappingAdd(first, 3)].function == address { return usize.wrappingAdd(first, 3) }
+  if state.receiverFunctions[first] == address { return first }
+  if state.receiverFunctions[usize.wrappingAdd(first, 1)] == address { return usize.wrappingAdd(first, 1) }
+  if state.receiverFunctions[usize.wrappingAdd(first, 2)] == address { return usize.wrappingAdd(first, 2) }
+  if state.receiverFunctions[usize.wrappingAdd(first, 3)] == address { return usize.wrappingAdd(first, 3) }
   return 64
 }
 /// receiverWay's choice among the four ways from first when none holds the function.
 @inlineNever
 fn vacantWay(state: &RuntimeState, first: usize) -> usize {
   let mut way: usize = 0
-  while way < 4 { if state.receiverCache[first + way].function == 0 { return first + way } way = way + 1 }
+  while way < 4 { if state.receiverFunctions[first + way] == 0 { return first + way } way = way + 1 }
   way = 0
   while way < 4 { if state.receiverCache[first + way].stores == 0 { return first + way } way = way + 1 }
   return first + 3
@@ -985,8 +1047,8 @@ pub unsafe fn noteForward(runtime: *mut HeapHeader, function: *mut HeapHeader, f
   let mut anchor = ()
   let address = Pointer.address<HeapHeader>(function)
   let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
-  let slot = receiverWay(&state.*, address)
-  if state.receiverCache[slot].function != address { return () }
+  let slot = receiverWay(&mut state.*, address)
+  if slot >= RECEIVER_MISS { return () }
   state.receiverCache[slot].forward = forward
   state.receiverCache[slot].recipeSlot = 255
 }
@@ -1017,10 +1079,12 @@ pub unsafe fn plannedShape(runtime: *mut HeapHeader, function: *mut HeapHeader, 
   let mut stateAnchor = ()
   let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut stateAnchor, runtime)
   let epoch = state.shapeEpoch
-  let slot = receiverWay(&state.*, address)
+  let way = receiverWay(&mut state.*, address)
+  let hit = way < RECEIVER_MISS
+  let slot = way & 63
   let entry = &mut state.receiverCache[slot]
   let missed = PlannedShape { final: Pointer.null<HeapHeader>(), empty: Pointer.null<HeapHeader>(), sources: [0; 8], stores: 0, tail: 0 }
-  if entry.function != address || entry.version != version || entry.stores == 0 || entry.bytecode != bytecode || data.isExotic() { return missed }
+  if !hit || entry.version != version || entry.stores == 0 || entry.bytecode != bytecode || data.isExotic() { return missed }
   let final = unsafe nonnull(entry.final)
   let finalShape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, final)
   // The version fixes the record at entry.index as a data property.
@@ -1099,11 +1163,13 @@ pub unsafe fn plannedShapeUnretained(runtime: *mut HeapHeader, function: *mut He
 /// receiver cache entry holds a plan; null otherwise. Not checked against
 /// function.prototype (plannedShape does that).
 pub unsafe fn planPrototype(runtime: *mut HeapHeader, function: *mut HeapHeader) -> ?*mut HeapHeader {
-  let anchor = ()
+  let mut anchor = ()
   let address = Pointer.address<HeapHeader>(function)
-  let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
-  let entry = &state.receiverCache[receiverWay(&state.*, address)]
-  if entry.function != address || entry.stores == 0 { return Pointer.null<HeapHeader>() }
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  let slot = receiverWay(&mut state.*, address)
+  if slot >= RECEIVER_MISS { return Pointer.null<HeapHeader>() }
+  let entry = &state.receiverCache[slot]
+  if entry.stores == 0 { return Pointer.null<HeapHeader>() }
   let final = unsafe nonnull(entry.final)
   drop entry drop state
   return (unsafe HeapCell.payload<ShapeData, ()>(&anchor, final)).prototype
@@ -1254,9 +1320,10 @@ pub unsafe fn notePlan<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, fu
   if depth > 3 || stores == 0 || stores > 32 { return () }
   let mut stateAnchor = ()
   let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut stateAnchor, runtime)
-  let slot = receiverWay(&state.*, address)
+  let slot = receiverWay(&mut state.*, address)
+  if slot >= RECEIVER_MISS { return () }
   let entry = state.receiverCache[slot]
-  if entry.function != address || entry.version != version || Pointer.address<HeapHeader>(unsafe nonnull(entry.empty)) != Pointer.address<HeapHeader>(empty) { return () }
+  if entry.version != version || Pointer.address<HeapHeader>(unsafe nonnull(entry.empty)) != Pointer.address<HeapHeader>(empty) { return () }
   if Pointer.address<HeapHeader>(unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(entry.final)) == Pointer.address<HeapHeader>(final) && entry.bytecode == bytecode { return () }
   unsafe HeapCell.retain(final)
   let mut updated = entry
@@ -1322,6 +1389,8 @@ pub unsafe fn releasePins<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader)
     let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
     let receiver = state.receiverCache[slot]
     state.receiverCache[slot] = blankReceiverEntry()
+    state.receiverFunctions[slot] = 0
+    if slot < 16 { state.receiverHints[slot] = 0 }
     drop state
     unsafe releaseOptional(&mut hooks, runtime, receiver.empty)
     unsafe releaseOptional(&mut hooks, runtime, receiver.final)
@@ -1441,7 +1510,8 @@ unsafe fn forgetLiteralSite<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeade
   drop state
   unsafe releaseOptional(&mut hooks, runtime, old.shape)
 }
-/// Destroys every parked shape so the collector sees only live references.
+/// Destroys every parked shape, releasing the prototypes they hold: for teardown, and for
+/// tests that count cells.
 pub unsafe fn flushParkedShapes<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader) -> () {
   let mut shape = unsafe js_shapes.unpark(runtime)
   while !Pointer.isNull<HeapHeader>(shape) {
@@ -1843,7 +1913,6 @@ unsafe effect fn collectCells<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHea
   unsafe releaseRetired(&mut hooks, runtime)
   unsafe releaseLiterals(&mut hooks, runtime)
   unsafe drainPending(&mut hooks, runtime)
-  unsafe flushParkedShapes(&mut hooks, runtime)
   require(Pointer.isNull<HeapHeader>(unsafe firstGc(runtime, 1)) && Pointer.isNull<HeapHeader>(unsafe firstGc(runtime, 3)))
   require(unsafe zeroQueueEmpty(runtime))
   // event bit 0: 0 start, 1 end; bit 1: a young-generation collection.
@@ -1856,12 +1925,15 @@ unsafe effect fn collectCells<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHea
   let mut tracer = Tracer { runtime: runtime, operation: MarkOperation.Decrement, stack: Pointer.fromMutRef<RestoreStack>(&mut stack), young: young,
     deferred: 0, round: false, resolved: false }
   unsafe decrementPass(&mut hooks, runtime, &mut tracer)
+  unsafe parkedEdges(runtime, &mut tracer, MarkOperation.Decrement)
   tracer.operation = MarkOperation.RestoreReachable
   unsafe restorePass(&mut hooks, runtime, &mut tracer)
   if tracer.deferred != 0 { unsafe ephemeronRounds(&mut hooks, runtime, &mut tracer) }
   tracer.operation = MarkOperation.RestoreUnreachable
+  unsafe parkedEdges(runtime, &mut tracer, MarkOperation.RestoreUnreachable)
   unsafe unreachablePass(&mut hooks, runtime, &mut tracer)
   unsafe setPhase(runtime, GcPhase.RemoveCycles)
+  unsafe dropDeadParked(&mut hooks, runtime)
   if tracer.deferred != 0 { run unsafe clearEphemerons(&mut hooks, runtime) }
   unsafe removeCycles(&mut hooks, runtime)
   unsafe setPhase(runtime, GcPhase.None)
@@ -3358,6 +3430,9 @@ unsafe fn destroyObject<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, n
   let mut anchor = ()
   let mut object = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, node)
   require(!object.freeMark())
+  // What names a prototype by address without a count of it (a compiler's SiteShapes) holds
+  // only while the epoch does.
+  if object.isPrototype() { unsafe js_shapes.bumpEpoch(runtime) }
   let shape = object.shape
   let classId = object.classId()
   // A plain object's slots in its own cell start over its payload (a small cell,
@@ -4676,6 +4751,8 @@ pub unsafe effect fn destroyRuntime<H: HeapHooks>(hooks: &mut H, runtime: *mut H
   unsafe dropParkedForIn(&mut hooks, runtime)
   require(unsafe phase(runtime) == GcPhase.None)
   unsafe coverage.stop(&mut hooks, runtime)
+  unsafe feedback.releaseAll(&mut hooks, runtime)
+  unsafe inlineTargets.releaseKept(&mut hooks, runtime)
   unsafe drainPending(&mut hooks, runtime)
   let mut anchor = ()
   while true {
@@ -4693,6 +4770,7 @@ pub unsafe effect fn destroyRuntime<H: HeapHooks>(hooks: &mut H, runtime: *mut H
   state.currentException = ValueBits.Null
   let thrownValue = Intrinsic.replace(state.thrownValue, ValueBits.Undefined)
   let thrownCode = Intrinsic.replace(state.thrownCode, ValueBits.Undefined)
+  let hotPending = Intrinsic.replace(state.hotPending, ValueBits.Undefined)
   let tracedValue = Intrinsic.replace(state.tracedValue, ValueBits.Undefined)
   let tracedStack = Intrinsic.replace(state.tracedStack, ValueBits.Undefined)
   let asyncContext = Intrinsic.replace(state.asyncContext, Value.immediate(ValueBits.Undefined)).intoBits()
@@ -4706,6 +4784,7 @@ pub unsafe effect fn destroyRuntime<H: HeapHooks>(hooks: &mut H, runtime: *mut H
   unsafe release(&mut hooks, runtime, exception)
   unsafe release(&mut hooks, runtime, thrownValue)
   unsafe release(&mut hooks, runtime, thrownCode)
+  unsafe release(&mut hooks, runtime, hotPending)
   unsafe release(&mut hooks, runtime, tracedValue)
   unsafe release(&mut hooks, runtime, tracedStack)
   let mut unit: usize = 0
@@ -4762,7 +4841,11 @@ pub unsafe effect fn destroyRuntime<H: HeapHooks>(hooks: &mut H, runtime: *mut H
   names.lexerNames.clear()
   drop names
   drop nameAtoms
+  // Parked shapes hold prototypes: they go before the last collection, and the ones it
+  // parks (shapes of no prototype, whose objects died in cycles) after it.
+  unsafe flushParkedShapes(&mut hooks, runtime)
   run unsafe collect(&mut hooks, runtime, false)
+  unsafe flushParkedShapes(&mut hooks, runtime)
   let finalState = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
   require(finalState.gcObjects.isEmpty() && finalState.zeroReferenceObjects.isEmpty() && finalState.temporaryGcObjects.isEmpty()
     && finalState.zombieGcObjects.isEmpty() && finalState.zeroPending == 0)

@@ -6,9 +6,15 @@ Property snapshots preserve the actual ordered own storage (including numeric ke
 UTF-16 units, descriptors, prototype identity and IEEE bits. Records are observed
 AFTER releasing the returned value, through the public native lookup API; duplicate
 lookup intentionally follows upstream's first-before-nine/newest-after rule.
+
+By default, C is also the exception text and position oracle. For a release
+that deliberately uses Node's JSON diagnostics, --diagnostic-baseline takes
+the previous Silk modules/engine directory. That mode still reports every
+difference from C and requires exact diagnostic equality with the baseline.
 """
 import argparse
 import hashlib
+import json
 from pathlib import Path
 import shutil
 import struct
@@ -20,6 +26,8 @@ import toolchain
 ROOT = Path(__file__).resolve().parents[1]
 SOURCES = [
     b'null', b'true', b'false', b'0', b'-0', b'-0.0', b'1', b'-1',
+    b'[999999999,-999999999,1000000000,-1000000000,-0,123456789.5,123456789e-8]',
+    b'{"ascii-key":123456789,"ascii\\u002dkey":-123456789,"10":0,"ascii-key":1000000000}',
     b'2147483647', b'2147483648', b'-2147483648', b'-2147483649',
     b'9007199254740991', b'9007199254740992', b'9007199254740993',
     b'1.7976931348623157e308', b'1.7976931348623159e308', b'-1e400',
@@ -132,6 +140,8 @@ import runtime_memory { RuntimeAllocator, AllocationObserver }
 import native_stack { currentFrameAddress }
 import js_heap { HeapCell, HeapHeader }
 import js_value { ValueBits }
+import js_owned_value { lendFor }
+import js_realm { lendRealm }
 import js_core_types { ContextState, RuntimeState, ObjectData, ObjectPayload, ShapeData, PropertySlot }
 import js_gc as gc
 import js_runtime as runtime
@@ -166,27 +176,27 @@ unsafe effect fn graph(out:&mut ByteBuffer,ctx:*mut HeapHeader,v:ValueBits)->() 
       let anchor=() let p=unsafe HeapCell.payload<ObjectData,()>(&anchor,node)
       let shape=unsafe HeapCell.payload<ShapeData,()>(&anchor,p.shape)
       let context=unsafe HeapCell.payload<ContextState,()>(&anchor,ctx)
-      let arr=p.classId==classes.JS_CLASS_ARRAY let mut kind:u32=7 let mut expectedClass=classes.JS_CLASS_OBJECT
+      let arr=p.classId()==classes.JS_CLASS_ARRAY let mut kind:u32=7 let mut expectedClass=classes.JS_CLASS_OBJECT
       if arr {kind=6 expectedClass=classes.JS_CLASS_ARRAY} run out.writeU32(kind)
       let expected=reference(context.classPrototypes.get(u32.toUsize(expectedClass)))
       run out.writeU32(boolean(Pointer.address<HeapHeader>(shape.prototype)==Pointer.address<HeapHeader>(expected)))
       if arr {
         match &p.payload {ObjectPayload.FastArray {array}=>{
-          run out.writeU32(usize.toU32(array.values.length()))
-          match p.properties.get(0){PropertySlot.Value {value}=>{run unsafe graph(&mut out,ctx,value)} _=>trap()}
-          let mut i:usize=0 while i<array.values.length(){run unsafe graph(&mut out,ctx,array.values.get(i)) i=i+1}
+          run out.writeU32(usize.toU32(array.values().length()))
+          match p.slot(0).view(shape.properties.get(0).flags){PropertySlot.Value {value}=>{run unsafe graph(&mut out,ctx,value)} _=>trap()}
+          let mut i:usize=0 while i<array.values().length(){run unsafe graph(&mut out,ctx,array.values().get(i)) i=i+1}
         } _=>trap()}
       } else {
         run out.writeU32(usize.toU32(shape.properties.length())) let mut i:usize=0
         while i<shape.properties.length(){let prop=shape.properties.get(i)
           run unsafe key(&mut out,context.runtime,prop.atom) run out.writeU32(u8.toU32(prop.flags))
-          match p.properties.get(i){PropertySlot.Value {value}=>{run unsafe graph(&mut out,ctx,value)} _=>trap()} i=i+1}
+          match p.slot(i).view(prop.flags){PropertySlot.Value {value}=>{run unsafe graph(&mut out,ctx,value)} _=>trap()} i=i+1}
       }
     }
     _=>{if !v.isString(){trap()} run out.writeU32(5) run unsafe text(&mut out,v)}
   }
 }
-unsafe effect fn record(out:&mut ByteBuffer,ctx:*mut HeapHeader,r:&JsonParseRecords,index:usize)->()
+unsafe effect fn record(out:&mut ByteBuffer,ctx:*mut HeapHeader,r:&JsonParseRecords<'_>,index:usize)->()
   ! OutOfMemoryError | StringLengthError ? &mut Allocator {
   let kind=r.kind(index) run out.writeU32(match kind {JsonRecordKind.Empty=>0 JsonRecordKind.Primitive=>1 JsonRecordKind.Object=>2 JsonRecordKind.Array=>3})
   let value=r.originalValue(index) run unsafe graph(&mut out,ctx,value)
@@ -211,7 +221,7 @@ unsafe effect fn probe(out:&mut ByteBuffer,ctx:*mut HeapHeader,hooks:&mut Hooks,
   filename:ValueBits,id:u32,source:&[u8],extended:bool,capture:bool)->()
   ! OutOfMemoryError | StringLengthError | BigIntError | ParserStackOverflow ? &mut Allocator {
   run out.writeU32(id)
-  let result=run Effect.result(unsafe json.parse(&mut hooks,memory,ctx,source,filename,extended,capture))
+  let result=run Effect.result(json.parse(&mut hooks,memory,unsafe lendRealm(&ctx,ctx),source,unsafe lendFor(filename),extended,capture))
   match move result {
     Result<ParsedJson,OutOfMemoryError | StringLengthError | BigIntError | SyntaxError | ParserStackOverflow>.Success {value:parsed}=>{
       let mut owned=move parsed run out.writeU32(0) run unsafe graph(&mut out,ctx,owned.value())
@@ -242,11 +252,17 @@ CALLS
   drop filename unsafe gc.releaseHeader(&mut hooks,rt,ctx) run unsafe gc.destroyRuntime(&mut hooks,rt) |> Effect.provideMut<Allocator>(&mut memory)
   return move ledger
 }
-pub effect fn main()->i32 ! OutOfMemoryError | StringLengthError | BigIntError | ParserStackOverflow | WriterError {
+effect fn emitOracle()->i32 ! OutOfMemoryError | StringLengthError | BigIntError | ParserStackOverflow | WriterError {
   let mut allocator=Allocator.systemAllocatorProvider() let mut out=ByteBuffer.make()
   let ledger=run all(&mut out) |> Effect.provideMut<Allocator>(&mut allocator)
   let mut writer=StdoutWriter.make() run Writer.writeAll(out.asSlice()) |> Effect.provideMut<Writer>(&mut writer)
   drop out if ledger.stats().usedBytes!=0 || ledger.stats().allocationCount!=0 {trap()} return 0
+}
+pub effect fn main()->i32 {
+  return match move run Effect.result(emitOracle()) {
+    Result<i32,OutOfMemoryError | StringLengthError | BigIntError | ParserStackOverflow | WriterError>.Success {value}=>value
+    Result<i32,OutOfMemoryError | StringLengthError | BigIntError | ParserStackOverflow | WriterError>.Failure {..}=>1
+  }
 }
 '''
 
@@ -346,6 +362,10 @@ def main():
     parser.add_argument('--silk', default=str(toolchain.compiler_path()))
     parser.add_argument('--stdlib', type=Path, default=toolchain.stdlib_path())
     parser.add_argument('--cc', default='cc')
+    parser.add_argument('--diagnostic-baseline', type=Path, metavar='ENGINE_DIRECTORY',
+                        help='compare exception text and positions to another native engine source tree; still report differences from pinned C')
+    parser.add_argument('--report', type=Path, help='write per-contract counts and every discrepancy to JSON')
+    parser.add_argument('--dev', action='store_true', help='build native oracles with the development profile')
     args = parser.parse_args()
     upstream = args.upstream.resolve()
     pins = validate_pins(upstream)
@@ -363,22 +383,72 @@ def main():
                  *(str(upstream / name) for name in SUPPORT), '-lm', '-lpthread', '-o', str(temp / 'oracle')],
                 600, owner='JSON C compilation')
         expected = process([str(temp / 'oracle')], 600, owner='JSON C oracle')
-        shutil.copytree(ROOT / 'src', temp / 'src')
-        (temp / 'src/main.silk').write_text(SILK_SOURCE.replace('CALLS', '\n'.join(s_calls)))
-        version = tomllib.loads((ROOT / 'silk.toml').read_text())['package']['silk-version']
-        (temp / 'silk.toml').write_text(f'[package]\nname="json-parse-oracle"\nversion="0.0.0"\nsilk-version="{version}"\n')
-        command = [silk, 'run', '--quiet', '--release']
-        if args.stdlib:
-            command += ['--stdlib', str(args.stdlib.resolve())]
-        actual = process(command, 900, owner='Native JSON oracle', cwd=temp)
+        def native_output(root, directory, label):
+            directory.mkdir()
+            shutil.copytree(root / 'src', directory / 'src')
+            (directory / 'src/main.silk').write_text(SILK_SOURCE.replace('CALLS', '\n'.join(s_calls)))
+            version = tomllib.loads((root / 'silk.toml').read_text())['package']['silk-version']
+            (directory / 'silk.toml').write_text(f'[package]\nname="json-parse-oracle"\nversion="0.0.0"\nsilk-version="{version}"\n')
+            command = [silk, 'run', '--quiet']
+            if not args.dev:
+                command.append('--release')
+            if args.stdlib:
+                command += ['--stdlib', str(args.stdlib.resolve())]
+            return process(command, 1200, owner=label, cwd=directory)
+
+        actual = native_output(ROOT, temp / 'candidate', 'Native JSON oracle')
+        baseline = None
+        before = None
+        if args.diagnostic_baseline:
+            before = native_output(args.diagnostic_baseline.resolve(), temp / 'baseline', 'Baseline JSON oracle')
+            baseline = Decoder(before, 'baseline')
         c, native = Decoder(expected, 'C'), Decoder(actual, 'native')
+        counts = dict(cases=len(CASES), accepted=0, rejected=0, matching_graphs=0, matching_acceptance=0,
+                      matching_c_diagnostics=0, different_c_diagnostics=0)
+        failures = []
+        diagnostic_differences = []
         for index, (source, extended, records) in enumerate(CASES):
-            mismatch = difference(c.case(index), native.case(index))
+            reference, candidate = c.case(index), native.case(index)
+            existing = baseline.case(index) if baseline else None
+            rejected = 'error' in reference
+            counts['rejected' if rejected else 'accepted'] += 1
+            detail = dict(index=index, source=repr(source), extended=extended, capture=records)
+            if rejected != ('error' in candidate):
+                failures.append(dict(detail, contract='acceptance', mismatch=difference(reference, candidate)))
+                continue
+            counts['matching_acceptance'] += 1
+            if not rejected:
+                mismatch = difference(reference, candidate)
+                if mismatch:
+                    failures.append(dict(detail, contract='graph and records', mismatch=mismatch))
+                else:
+                    counts['matching_graphs'] += 1
+                continue
+            mismatch = difference(reference, candidate)
             if mismatch:
-                raise SystemExit(f'JSON case {index}, extended={extended}, capture={records}, source={source!r}\n{mismatch}')
-        if c.index != len(c.words) or native.index != len(native.words):
-            raise SystemExit('JSON oracle has unexpected trailing output')
-        print(f'PASS JSON: {len(CASES)} graph/record cases; {pins} pinned files; SHA256={hashlib.sha256(actual).hexdigest()}')
+                counts['different_c_diagnostics'] += 1
+                diagnostic_differences.append(dict(detail, mismatch=mismatch))
+            else:
+                counts['matching_c_diagnostics'] += 1
+            authoritative = existing if baseline else reference
+            mismatch = difference(authoritative, candidate)
+            if mismatch:
+                failures.append(dict(detail, contract='baseline diagnostics' if baseline else 'C diagnostics', mismatch=mismatch))
+        for decoder in [c, native] + ([baseline] if baseline else []):
+            if decoder.index != len(decoder.words):
+                raise SystemExit('JSON oracle has unexpected trailing output')
+        report = dict(counts=counts, pinned_files=pins, c_sha256=hashlib.sha256(expected).hexdigest(),
+                      candidate_sha256=hashlib.sha256(actual).hexdigest(), failures=failures,
+                      c_diagnostic_differences=diagnostic_differences)
+        if before is not None:
+            report['baseline_sha256'] = hashlib.sha256(before).hexdigest()
+        if args.report:
+            args.report.write_text(json.dumps(report, indent=2) + '\n')
+        print(f'JSON oracle: {counts}; {pins} pinned files; candidate SHA256={report["candidate_sha256"]}')
+        if failures:
+            raise SystemExit(f'{len(failures)} contract failures; first: {failures[0]}')
+        print('PASS JSON')
+
 
 
 if __name__ == '__main__':

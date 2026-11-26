@@ -1,0 +1,315 @@
+//! The v8 benchmark census: how many functions of modules/engine/bench/v8 the SSA translator
+//! accepts. Each benchmark runs once (Setup, one run, TearDown) so that lazily compiled
+//! functions are finished, then every function reachable from the script's constants is
+//! translated, optimized and verified. Prints a table. Runs only when build/ssa-census exists,
+//! from modules/jit: `mkdir -p build && touch build/ssa-census && silk test --file
+//! src/ssa_census_tests.silk --optimization debug`.
+//! Counts include base.js's functions once per benchmark.
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.mem.pointer { Pointer }
+import silk.core.effect { Effect }
+import silk.core.result { Result }
+import silk.io.writer_native { StderrWriter }
+import silk.text.string { String }
+import silk.num.isize
+import silk.num.u32
+import silk.num.usize
+import silk.num.u8
+import ssa
+import silk.testing.testing { Testing, AssertionError }
+import silkjs.runtime_memory { RuntimeAllocator }
+import silkjs.js_atomics_native { WaiterDomain, SynchronizationError }
+import silkjs.js_engine { Engine }
+import silkjs.js_engine_no_host { NoHostServices }
+import silkjs.js_heap { HeapHeader, HeapCell }
+import silkjs.js_value { ValueBits }
+import silkjs.js_owned_value { Value }
+import silkjs.js_core_types { FunctionBytecode }
+import silkjs.js_realm { lendRealm }
+import silkjs.js_exceptions { JsException }
+import silkjs.js_strings { Strings }
+import silkjs.js_runtime as runtime
+import silkjs.js_gc as gc
+import silkjs.js_eval as eval
+import silkjs.js_eval_compile as compile
+import silkjs.js_intrinsic_install as intrinsics
+import silkjs.js_opcode_data as op
+import silkjs.native_stack as stack
+import ssa_input { inputOf }
+import ssa_translate { translate, Refusal }
+import ssa_translate
+import ssa_verify { verify, VerifyError }
+import ssa_ownership
+
+unsafe extern "C" fn open(path: ?[*]const u8, flags: i32, ...) -> i32
+unsafe extern "C" fn read(fd: i32, buffer: ?[*]mut u8, count: usize) -> isize
+unsafe extern "C" fn close(fd: i32) -> i32
+
+const BENCHMARKS: [&[u8]; 8] = [b"richards", b"deltablue", b"crypto", b"raytrace", b"earley-boyer", b"regexp", b"splay", b"navier-stokes"]
+const DIRECTORY: &[u8] = b"../engine/bench/v8/"
+const RUNNER: &[u8] = b"""
+var __error = "";
+(function () {
+try {
+for (var s = 0; s < BenchmarkSuite.suites.length; s++) {
+  var suite = BenchmarkSuite.suites[s];
+  for (var i = 0; i < suite.benchmarks.length; i++) {
+    var b = suite.benchmarks[i];
+    BenchmarkSuite.ResetRNG(); b.Setup(); b.run(); b.TearDown();
+  }
+}
+} catch (e) { __error = String(e) + "\\n" + e.stack; }
+})();
+__error;
+"""
+
+/// Appends the file `name`.js of the v8 directory to `out`; false when it cannot be opened.
+effect fn append(out: &mut List<u8>, name: &[u8]) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let mut path = List<u8>.make()
+  run path.appendSlice(DIRECTORY) run path.appendSlice(name) run path.appendSlice(b".js\x00")
+  let fd = unsafe open(Pointer.fromSlice<u8>(path.asSlice()), 0)
+  if fd < 0 { return false }
+  let mut chunk: [u8; 65536] = [0; 65536]
+  while true {
+    let got = unsafe read(fd, Pointer.fromMutSlice<u8>(Slice.viewMut<u8>(&mut chunk, 0, 65536)), 65536)
+    if got <= 0 { break }
+    run out.appendSlice(Slice.view<u8>(&chunk, 0, isize.toUsize(got)))
+  }
+  drop unsafe close(fd)
+  return true
+}
+
+struct Census {
+  functions: u32,
+  /// Finished functions whose opcodes outside the subset are all objects/properties/globals/
+  /// scopes/elements (workstream J), and those whose are all J's or calls (H).
+  onlyObjects: u32,
+  onlyObjectsAndCalls: u32,
+  /// Per opcode: finished non-generator functions it keeps out even with J and H done.
+  blockers: List<u32>,
+  /// Lazy or deferred stubs: never called, so never compiled.
+  stubs: u32,
+  accepted: u32,
+  rejectedByVerifier: u32,
+  /// Refusals by the opcode refused first.
+  byOpcode: List<u32>,
+  /// Refusals before any opcode: kind, closure variables, scope, no code.
+  byShape: List<u32>,
+}
+
+fn shapeIndex(reason: &[u8]) -> usize {
+  if same(reason, b"generator or async function") { return 0 }
+  if same(reason, b"closure variables") { return 1 }
+  if same(reason, b"a function scope") { return 2 }
+  return 3
+}
+const SHAPES: [&[u8]; 4] = [b"generator or async", b"closure variables", b"function scope", b"other"]
+
+fn same(a: &[u8], b: &[u8]) -> bool {
+  if a.length != b.length { return false }
+  let mut i: usize = 0
+  while i < a.length { if a[i] != b[i] { return false } i = i + 1 }
+  return true
+}
+
+fn bump(list: &mut List<u32>, index: usize) -> () { let n = list.get(index) list.set(index, n + 1) }
+
+/// Workstream J's opcodes: `this`, named properties, globals, captured and scope variables,
+/// elements.
+fn objectOpcode(o: u8) -> bool {
+  return o == op.OP_push_this || (o >= op.OP_get_var_undef && o <= op.OP_put_field) || (o >= op.OP_get_array_el && o <= op.OP_put_array_el)
+    || (o >= op.OP_get_var_ref && o <= op.OP_set_var_ref) || (o >= op.OP_get_var_ref_check && o <= op.OP_put_var_ref_check)
+    || (o >= op.OP_get_scope0 && o <= op.OP_put_scope0_check) || o == op.OP_get_scope0_el || o == op.OP_get_length
+    || (o >= op.OP_get_loc_field8 && o <= op.OP_get_arg_el8) || o == op.OP_put_loc_field_loc8 || o == op.OP_put_loc_field_arg8
+    || o == op.OP_get_loc_el_arg8 || o == op.OP_get_arg_el_arg8
+}
+/// Workstream H's: calls.
+fn callOpcode(o: u8) -> bool {
+  return (o >= op.OP_call_constructor && o <= op.OP_tail_call_method) || o == op.OP_apply || (o >= op.OP_call0 && o <= op.OP_call3)
+}
+/// Scans every instruction of a finished function: what the potential counts need.
+effect fn potential(bytecode: &FunctionBytecode, census: &mut Census) -> () ! OutOfMemoryError ? &mut Allocator {
+  let input = run inputOf(bytecode)
+  if !input.normal { return () }
+  let code = input.code.asSlice()
+  let mut seen = List<bool>.make() run seen.appendRepeated(false, 256)
+  let mut others = false
+  let mut calls = false
+  let mut pc: usize = 0
+  while pc < code.length {
+    let o = code[pc]
+    let size = u8.toUsize(op.opcodeInfo(o, true).size)
+    if size == 0 { return () }
+    if !ssa_translate.supported(o) {
+      if callOpcode(o) { calls = true }
+      else if !objectOpcode(o) { others = true seen.set(u8.toUsize(o), true) }
+    }
+    pc = pc + size
+  }
+  if !others {
+    census.onlyObjectsAndCalls = census.onlyObjectsAndCalls + 1
+    if !calls { census.onlyObjects = census.onlyObjects + 1 }
+  }
+  let mut i: usize = 0
+  while i < 256 { if seen.get(i) { bump(&mut census.blockers, i) } i = i + 1 }
+}
+
+/// Counts `node` and every function in its constants.
+unsafe effect fn walk(node: *mut HeapHeader, census: &mut Census) -> () ! OutOfMemoryError ? &mut Allocator {
+  let anchor = ()
+  let bytecode = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, node)
+  census.functions = census.functions + 1
+  if bytecode.pending.isSome() { census.stubs = census.stubs + 1 }
+  else {
+    run potential(&bytecode, &mut census)
+    let input = run inputOf(bytecode)
+    match move run Effect.result(translate(&input)) {
+      Result.Success { value: translated } => {
+        let mut f = move translated
+        run ssa_ownership.optimize(&mut f)
+        match move run Effect.result(verify(&f)) {
+          Result.Success { .. } => { census.accepted = census.accepted + 1 }
+          Result.Failure { error } => {
+            match move error {
+              VerifyError { reason, .. } => {
+                census.rejectedByVerifier = census.rejectedByVerifier + 1
+                StderrWriter.print("  verifier rejected a translated function: {}\n", &.(unsafe String.fromUtf8Unchecked(reason)))
+              }
+              OutOfMemoryError { .. } => { fail OutOfMemoryError {} }
+            }
+          }
+        }
+      }
+      Result.Failure { error } => {
+        match move error {
+          Refusal { pc, opcode, reason } => {
+            if pc == ssa.NONE { bump(&mut census.byShape, shapeIndex(reason)) } else { bump(&mut census.byOpcode, u8.toUsize(opcode)) }
+          }
+          OutOfMemoryError { .. } => { fail OutOfMemoryError {} }
+        }
+      }
+    }
+  }
+  let mut i: usize = 0
+  while i < bytecode.constants.length() {
+    match bytecode.constants.get(i) {
+      ValueBits.FunctionBytecode { reference } => { run unsafe walk(reference, &mut census) }
+      _ => ()
+    }
+    i = i + 1
+  }
+}
+
+unsafe effect fn measure<'m>(engine: &mut Engine<'m, NoHostServices>, context: *mut HeapHeader, source: &[u8], census: &mut Census) -> ()
+  ! JsException | OutOfMemoryError ? &mut Allocator {
+  let memory = engine.memory
+  let realm = unsafe lendRealm(&context, context)
+  let compiled = run eval.evaluate(&mut engine, memory, realm, source, b"v8.js", compile.FLAG_COMPILE_ONLY)
+  let keep = Value.intoBits(compiled.borrow().dup())
+  let ran = run Effect.result(eval.evaluateFunction(&mut engine, memory, realm, move compiled))
+  match move ran {
+    Result.Success { value: result } => {
+      let bits = Value.intoBits(move result)
+      if bits.isString() {
+        let text = run Strings.toUtf8(bits, false)
+        if text.length() != 0 { StderrWriter.print("  the benchmark threw: {}\n", &.(unsafe String.fromUtf8Unchecked(text.asSlice()))) }
+      }
+      unsafe gc.release(&mut engine, unsafe runtime.contextRuntime(context), bits)
+    }
+    Result.Failure { error } => { unsafe gc.release(&mut engine, unsafe runtime.contextRuntime(context), keep) fail move error }
+  }
+  match keep {
+    ValueBits.FunctionBytecode { reference } => { run unsafe walk(reference, &mut census) }
+    _ => { StderrWriter.print("  the compiled script is not a FunctionBytecode\n", &.()) }
+  }
+  unsafe gc.release(&mut engine, unsafe runtime.contextRuntime(context), keep)
+}
+
+/// Runs `source` in a fresh engine and adds its functions to `census`.
+effect fn census(source: &[u8], census: &mut Census) -> () ! OutOfMemoryError | SynchronizationError | JsException {
+  let mut allocator = run RuntimeAllocator.make(Allocator.systemAllocatorProvider())
+  let memory = run allocator.observe()
+  let mut system = Allocator.systemAllocatorProvider()
+  let domain = run WaiterDomain.make() |> Effect.provideMut<Allocator>(&mut system)
+  let rt = run runtime.allocateRuntimeStorage(stack.currentFrameAddress()) |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut engine = Engine { memory: &memory, domain: domain.handle(), services: NoHostServices {} }
+  // Debug builds have large native frames; the 1 MiB default overflows in deltablue.
+  unsafe runtime.setMaxStackSize(rt, 6291456)
+  let context = run unsafe intrinsics.create(&mut engine, &memory, rt) |> Effect.provideMut<Allocator>(&mut allocator)
+  let checked = run Effect.result(unsafe measure(&mut engine, context, source, &mut census)) |> Effect.provideMut<Allocator>(&mut allocator)
+  // The benchmarks leave cycles that only a collection frees.
+  run unsafe gc.collect(&mut engine, rt, true) |> Effect.provideMut<Allocator>(&mut allocator)
+  unsafe gc.releaseHeader(&mut engine, rt, context)
+  run unsafe gc.collect(&mut engine, rt, true) |> Effect.provideMut<Allocator>(&mut allocator)
+  run unsafe gc.destroyRuntime(&mut engine, rt) |> Effect.provideMut<Allocator>(&mut allocator)
+  match move checked {
+    Result<(), JsException | OutOfMemoryError>.Success { value: _ } => ()
+    Result<(), JsException | OutOfMemoryError>.Failure { error } => { fail move error }
+  }
+}
+
+/// The census runs only when the marker file build/ssa-census exists (test runners get no
+/// environment variables).
+fn wanted() -> bool {
+  let fd = unsafe open(Pointer.fromSlice<u8>(b"build/ssa-census\x00"), 0)
+  if fd < 0 { return false }
+  drop unsafe close(fd)
+  return true
+}
+
+test effect fn v8Census() -> () ! OutOfMemoryError | SynchronizationError | JsException | AssertionError<'static> {
+  // About 40 s in a debug build, so opt-in.
+  let mut system = Allocator.systemAllocatorProvider()
+  if !wanted() { return () }
+  let mut total = Census { functions: 0, onlyObjects: 0, onlyObjectsAndCalls: 0, blockers: List<u32>.make(), stubs: 0, accepted: 0, rejectedByVerifier: 0, byOpcode: List<u32>.make(), byShape: List<u32>.make() }
+  run total.byOpcode.appendRepeated(0, 256) |> Effect.provideMut<Allocator>(&mut system)
+  run total.byShape.appendRepeated(0, 4) |> Effect.provideMut<Allocator>(&mut system)
+  run total.blockers.appendRepeated(0, 256) |> Effect.provideMut<Allocator>(&mut system)
+  StderrWriter.print("benchmark       functions  stubs  accepted  only-J  only-J+H\n", &.())
+  let mut b: usize = 0
+  while b < 8 {
+    let mut source = List<u8>.make()
+    let found = run append(&mut source, b"base") |> Effect.provideMut<Allocator>(&mut system)
+    if !found { StderrWriter.print("v8 benchmarks not found from here; census skipped\n", &.()) return () }
+    drop run append(&mut source, BENCHMARKS[b]) |> Effect.provideMut<Allocator>(&mut system)
+    run source.appendSlice(RUNNER) |> Effect.provideMut<Allocator>(&mut system)
+    let mut one = Census { functions: 0, onlyObjects: 0, onlyObjectsAndCalls: 0, blockers: List<u32>.make(), stubs: 0, accepted: 0, rejectedByVerifier: 0, byOpcode: List<u32>.make(), byShape: List<u32>.make() }
+    run one.byOpcode.appendRepeated(0, 256) |> Effect.provideMut<Allocator>(&mut system)
+    run one.byShape.appendRepeated(0, 4) |> Effect.provideMut<Allocator>(&mut system)
+    run one.blockers.appendRepeated(0, 256) |> Effect.provideMut<Allocator>(&mut system)
+    run census(source.asSlice(), &mut one)
+    StderrWriter.print("{}  {}  {}  {}  {}  {}\n", &.(unsafe String.fromUtf8Unchecked(BENCHMARKS[b]), one.functions, one.stubs, one.accepted, one.onlyObjects, one.onlyObjectsAndCalls))
+    total.onlyObjects = total.onlyObjects + one.onlyObjects total.onlyObjectsAndCalls = total.onlyObjectsAndCalls + one.onlyObjectsAndCalls
+    total.functions = total.functions + one.functions total.stubs = total.stubs + one.stubs
+    total.accepted = total.accepted + one.accepted total.rejectedByVerifier = total.rejectedByVerifier + one.rejectedByVerifier
+    let mut i: usize = 0
+    while i < 256 { let n = total.byOpcode.get(i) total.byOpcode.set(i, n + one.byOpcode.get(i)) i = i + 1 }
+    i = 0
+    while i < 4 { let n = total.byShape.get(i) total.byShape.set(i, n + one.byShape.get(i)) i = i + 1 }
+    i = 0
+    while i < 256 { let n = total.blockers.get(i) total.blockers.set(i, n + one.blockers.get(i)) i = i + 1 }
+    b = b + 1
+  }
+  StderrWriter.print("total  {}  {}  {}  {}  {}  (verifier rejected {})\n", &.(total.functions, total.stubs, total.accepted, total.onlyObjects, total.onlyObjectsAndCalls, total.rejectedByVerifier))
+  StderrWriter.print("only-J: every opcode outside the subset is J's (this, properties, globals, scopes, elements); only-J+H: or a call\n", &.())
+  StderrWriter.print("opcodes still outside with J and H done (functions they keep out):\n", &.())
+  let mut q: usize = 0
+  while q < 256 {
+    let n = total.blockers.get(q)
+    if n != 0 { StderrWriter.print("  {}  {}\n", &.(unsafe String.fromUtf8Unchecked(op.opcodeName(usize.toU8(q), true)), n)) }
+    q = q + 1
+  }
+  StderrWriter.print("refused before any opcode:\n", &.())
+  let mut s: usize = 0
+  while s < 4 { StderrWriter.print("  {}  {}\n", &.(unsafe String.fromUtf8Unchecked(SHAPES[s]), total.byShape.get(s))) s = s + 1 }
+  StderrWriter.print("first refused opcode:\n", &.())
+  let mut o: usize = 0
+  while o < 256 {
+    let n = total.byOpcode.get(o)
+    if n != 0 { StderrWriter.print("  {}  {}\n", &.(unsafe String.fromUtf8Unchecked(op.opcodeName(usize.toU8(o), true)), n)) }
+    o = o + 1
+  }
+  run Testing.expect(total.rejectedByVerifier == 0, "the verifier accepts everything the translator and the ownership pass produce")
+}

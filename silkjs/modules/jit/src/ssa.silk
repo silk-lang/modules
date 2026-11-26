@@ -1,0 +1,1492 @@
+//! The ownership-aware SSA form (docs/jit/ssa.md): data structures, builder, compaction and
+//! the textual printer.
+//!
+//! A `Function` is built by appending: `block` makes a block, `param` gives it parameters,
+//! `emit` and the terminator methods append instructions to the block named in their call, in
+//! any order across blocks. `compact` then puts the blocks in reverse postorder from the entry,
+//! drops unreachable blocks and `Removed` instructions, and renumbers blocks, values and exits
+//! densely, so the form the backend and the printer see is canonical. Passes rewrite in place
+//! and compact again.
+//!
+//! Everything is an index: nothing here holds a pointer, so a function can be stored and read
+//! back unchanged.
+import silk.collections.list { List }
+import silk.core.ownership { Copy }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.i32
+import silk.num.u32
+import silk.num.usize
+
+/// The index that names nothing.
+pub const NONE: u32 = 4294967295
+/// In the sites a function's code left at, on a baseline frame (jit_runtime.noteLeft): bit
+/// 31 on a loop header's pc says the `check.array` in front of that loop failed
+/// (ssa_opt_hoist), so the loop's element accesses check their objects again.
+pub const SITE_ARRAY: u32 = 0x80000000
+/// Bit 30 on a loop header's pc: a `check.bound` in front of that loop failed
+/// (ssa_opt_bounds), so the loop's element accesses test their indexes again.
+pub const SITE_BOUND: u32 = 0x40000000
+/// GetElem's `k`: ELEM_STEP (a for-of step) exits where the element is not a fast Array's,
+/// instead of reading it through the engine.
+pub const ELEM_STEP: i32 = 1
+/// ELEM_TRY (a for-of step outside OSR code) leaves Uninitialized where the element is not a
+/// fast Array's, for a `tag.is` (k bit 2) to send the step to the engine; its exit is unused.
+pub const ELEM_TRY: i32 = 2
+/// unbox.i32's k for an entry guard that takes a Float64 holding an exact int32 too
+/// (ssa_opt_hoist, x64_backend).
+pub const UNBOX_EXACT: i32 = 1
+/// GetElem's `k` for a site that left compiled code before: on a baseline frame the
+/// interpreter steps what the inline test and the helper decline (past the end, a hole,
+/// another kind of object), and the code goes on. Its result is owned.
+pub const ELEM_STEPS: i32 = 8
+/// GetElem's `k` for a lazy arguments element read (`arguments[i]`) on a baseline frame.
+pub const ELEM_ARGUMENTS: i32 = 16
+/// GetLength's `k` for a lazy arguments length read (`arguments.length`) on a baseline frame.
+pub const LENGTH_ARGUMENTS: i32 = 1
+/// GetField's `k` bit 1, above the read that serves the site (ssa_translate.FIELD_KEYED or
+/// FIELD_CACHED in bit 0): the site left compiled code before. On a baseline frame the
+/// interpreter then runs the instruction where the helper declines, and the code goes on:
+/// its exit is the state before its own bytecode instruction, and its result is owned.
+pub const FIELD_STEPS: i32 = 2
+/// Whether `inst` is a read the interpreter may step (FIELD_STEPS on get.field or
+/// get.length, ELEM_STEPS on get.elem and get.key): its result is owned, and the step may run the program's code.
+pub fn steppedRead(inst: Inst) -> bool { return ((inst.op == Op.GetField || inst.op == Op.GetLength) && (inst.k & FIELD_STEPS) != 0) || ((inst.op == Op.GetElem || inst.op == Op.GetKey) && inst.k == ELEM_STEPS) }
+
+/// The type of a value. `Raw` is a machine word that is no value of the program: the elements
+/// of an Array (Op.Elements). No exit and no edge carries one.
+pub enum Type { I32, Bool, Value, F64, Raw }
+
+/// The ownership of a value. `Unboxed` is the only one an `i32`, `bool` or `f64` has; a `value` is
+/// `Owned` (one count, consumed exactly once on every path), `Borrowed` (no count, valid while
+/// its root is) or `Imm` (no heap reference, needs no count).
+pub enum Own { Unboxed, Owned, Borrowed, Imm }
+
+/// What a borrowed value borrows from: an argument cell (`root` is its index), an owned value
+/// (`root` is its value index) or a variable binding (no `root`; ssa_opt_borrow keeps calls
+/// and stores away from the borrow).
+pub enum RootKind { None, Argument, Value, Binding }
+
+/// The operation of an instruction. See docs/jit/ssa.md for each one's meaning.
+pub enum Op {
+  /// `arg k`: the bits of argument cell `k`, borrowed from it.
+  Arg,
+  /// `const.i32 k`.
+  ConstI32,
+  /// An immediate boxed constant; `k` is an `Imm` tag.
+  Imm,
+  /// `unbox.i32 a`: guard, exits unless `a` is an Int.
+  Unbox,
+  /// `unbox.bool a`: guard, exits unless `a` is a Bool.
+  UnboxBool,
+  /// `box.i32 a`.
+  BoxI32,
+  /// `box.bool a`.
+  BoxBool,
+  /// `add.i32 a, b`: guard, exits on overflow.
+  Add,
+  /// `sub.i32 a, b`: guard, exits on overflow.
+  Sub,
+  /// `mul.i32 a, b`: guard, exits on overflow and on a -0 result.
+  Mul,
+  /// `cmp.i32 a, b` with the `Cmp` in `k`: a bool.
+  Cmp,
+  /// `retain a`: a new owner of `a`'s bits.
+  Retain,
+  /// `release a`: consumes the owned `a`.
+  Release,
+  /// An interrupt safepoint on a loop back edge, with an exit at the loop target.
+  Poll,
+  /// Terminator: `jump` along `edge`.
+  Jump,
+  /// Terminator: `branch a`, along `edge` when true and `edge + 1` when false.
+  Branch,
+  /// Terminator: `return a`, transferring `a` to the caller.
+  Return,
+  // ---- objects (workstream J). None consumes an operand: a helper retains what it keeps.
+  /// `this`: the frame's receiver cell, borrowed (root: argument `argumentCount`).
+  This,
+  /// `check.tag a, k`: guard, exits unless `a`'s engine tag (ValueBits.tag) is `k`.
+  CheckTag,
+  /// `check.array a`: guard, exits unless `a` is a fast Array. ssa_opt_hoist puts it in front
+  /// of a loop whose element accesses of `a` then trust it (Inst.trusted).
+  CheckArray,
+  /// `check.bound a, b`: guard, exits unless the i32 `b` is an index below the element count
+  /// of `a`, a fast Array (a `check.array` of `a` comes before it). ssa_opt_bounds puts it in
+  /// front of a loop for the first and the last index a counted access reaches (Inst.proven).
+  CheckBound,
+  /// `grow.bound a, b, k`: guard in front of a loop that stores to every index from value
+  /// `k` to `b` of Array `a` and cannot leave before it has (ssa_opt_bounds): when `b` is
+  /// not below the count, the Array is grown to `b + 1` elements, the new ones undefined,
+  /// if no index would stay without a store (`k` is at most the count) and an append may
+  /// (js_native_functions.quickGrow); exits otherwise, with nothing changed. The last
+  /// instruction of its block that can exit.
+  GrowBound,
+  /// `elements a`: where the elements of `a` are, a fast Array (a `check.array` of `a` comes
+  /// before it); a raw word, no guard. ssa_opt_bounds puts it in front of a counted loop,
+  /// where nothing changes the Array's count, and the loop's proven accesses of `a` take it
+  /// for their first operand in place of `a` (Function.arrayOf).
+  Elements,
+  /// `tag.in a, k`: whether value `a`'s engine tag is one of the bits of `k` (bit tag + 9);
+  /// a bool, no guard.
+  TagIn,
+  /// `get.field a`: guard, the named property the instruction at `pc` reads from object `a`
+  /// (an owned value), through the interpreter's own site cache; exits on any miss.
+  GetField,
+  /// `put.field a, b`: guard, the named property store of the instruction at `pc` of value `b`
+  /// into object `a`, an existing own writable data property of the shape the site's key names;
+  /// exits on anything else. The object takes its own count of `b`.
+  /// k is 1 when the displaced value may lose its last reference, 0 when a field borrow spans the store.
+  PutField,
+  /// `atom.value k`: the string push_atom_value (k bit 0 clear) or push_empty_string (set)
+  /// at `pc` pushes, owned; exits for an integer atom. `k >> 1` is push_atom_value's atom
+  /// where it is a string's below 2^30 (else 0): frame mode's code links its cell
+  /// (Function.linkedAtoms).
+  AtomValue,
+  /// `get.var k`: the value of closure variable `k` (get_var, get_var_undef: globals), owned;
+  /// exits when it is uninitialized.
+  GetVar,
+  /// `put.var a, k`: stores `a` into closure variable `k` (put_var), which takes its own count;
+  /// exits for a const or uninitialized binding.
+  PutVar,
+  /// `get.scope k`: slot `k & 0xffff` of the function's own scope (get_scope0; bit 16:
+  /// get_scope0_check, exits when uninitialized), owned. Bit 17: captured operand `k & 0xffff`
+  /// instead (get_var_ref, get_var_ref_check), exits when uninitialized.
+  GetScope,
+  /// `put.scope a, k`: stores `a` into scope slot `k & 0xffff` (put_scope0, set_scope0; bit 16:
+  /// put_scope0_check, exits when uninitialized), which takes its own count. Bit 17: captured
+  /// operand `k & 0xffff` (put_var_ref, set_var_ref, put_var_ref_check), exits when uninitialized.
+  PutScope,
+  /// `get.elem a, b`: guard, element `b` (an i32) of `a` (get_array_el and its fused forms):
+  /// a fast Array's below its length, a typed array's, a fast arguments object's; owned;
+  /// exits on anything else.
+  GetElem,
+  /// A property read with a boxed key, returning an owned value or exiting without effects.
+  GetKey,
+  /// Guard an in-bounds, unshared Float64Array and load a double.
+  GetElemF64,
+  /// `put.elem a, b, k`: guard, stores `b` over existing element `k` (a value: an i32) of the
+  /// fast Array `a`, which takes its own count; exits on anything else.
+  PutElem,
+  /// Guard an unshared Float64Array and store a double, dropping out-of-bounds stores.
+  PutElemF64,
+  /// `put.key a, b, k`: stores `b` into object `a` under the boxed key `k` (put_array_el on
+  /// a baseline frame, at a site that met a key other than an index): inline under a Symbol
+  /// the element site cache names, else through the engine where no code of the program
+  /// runs, else the interpreter steps the instruction on the frame. The object takes its own
+  /// count of `b`. It may run the program's code (a setter).
+  PutKey,
+  /// `get.length a`: guard, a string's or an Array's length (get_length), owned; exits on
+  /// anything else.
+  GetLength,
+  /// `truthy a`: ToBoolean of boxed `a` (every condition on a boxed value), from the tag
+  /// where that tells and through a helper otherwise; no exit.
+  Truthy,
+  /// `tag.is a, k`: whether boxed `a` is undefined (k bit 0), null (k bit 1) or
+  /// uninitialized (k bit 2); no exit.
+  TagIs,
+  /// `typeof a`: the atom typeof answers for boxed `a` (a helper call), as an i32; exits for a
+  /// proxy.
+  TypeofAtom,
+  /// `typeof.str a`: the string typeof answers for boxed `a` (a helper call), owned; exits for a
+  /// proxy.
+  Typeof,
+  /// `instanceof a, b`: whether boxed `a` is an instance of boxed `b` through the ordinary
+  /// @@hasInstance and a plain prototype chain (a helper call), as a bool; exits when the
+  /// operator could run JavaScript or meet a proxy.
+  InstanceOf,
+  /// `equals a, b, k`: `a === b` (k 1) or `a == b` (k 0) of boxed operands through a helper,
+  /// as a bool; exits when the operator would coerce (and could run JavaScript).
+  Equals,
+  // ---- calls (workstream H)
+  /// `call.arg a, k`: operand `a` is argument `k` of the `call` that follows (CallArgs come
+  /// right before their call, in order). Borrows `a` for the call; consumes nothing.
+  CallArg,
+  /// `call a, b, k`: calls function `a` with receiver `b` and the `k` preceding `call.arg`s;
+  /// an owned result. Its exit is the throw exit: the frame before the call (operands still on
+  /// the stack), taken when the callee threw (the exception is pending).
+  Call,
+  // ---- numbers beyond int32 and the remaining int32 operators (docs/jit/doubles.md) ----
+  /// `const.f64 k`: the double `Function.numbers[k]`.
+  ConstF64,
+  /// `const.val k`: non-numeric constant `FunctionBytecode.constants[k]` (frame mode, depth 0).
+  ConstVal,
+  /// `unbox.f64 a`: guard, exits unless `a` is a number (an Int converts exactly).
+  UnboxF64,
+  /// `box.f64 a`: a Float64.
+  BoxF64,
+  /// `f64 a`: the i32 `a` as a double (exact).
+  ToF64,
+  /// `add.f64`, `sub.f64`, `mul.f64`, `div.f64 a, b`: IEEE, no guard.
+  AddF64,
+  SubF64,
+  MulF64,
+  DivF64,
+  ModF64,
+  /// `cmp.f64 a, b` with the `Cmp` in `k`: a bool; every comparison with NaN is false but `ne`.
+  CmpF64,
+  /// `neg.f64 a`, `sqrt.f64 a`, `abs.f64 a`.
+  NegF64,
+  SqrtF64,
+  AbsF64,
+  /// `floor.f64 a`: Math.floor, no guard (NaN, infinities and -0 stay themselves).
+  FloorF64,
+  /// `toint32 a`: ToInt32 of the double `a`, no guard (NaN and the infinities give 0, huge
+  /// values wrap modulo 2^32).
+  ToInt32,
+  /// `int.f64 a`: the double `a` as an i32 when it is one exactly (not -0); guard otherwise.
+  ExactI32,
+  /// int32 bitwise operators, never failing: `and`, `or`, `xor`, `shl`, `sar` (count & 31).
+  BitAnd,
+  BitOr,
+  BitXor,
+  Shl,
+  Sar,
+  /// `shr a, b` (>>>): guard, exits when the unsigned result is not an int32.
+  Shr,
+  /// `mod.i32 a, b`: guard, exits unless b > 0 and the result is not -0.
+  Mod,
+  /// `neg.i32 a`: guard, exits on 0 (-0) and the minimum (overflow).
+  Neg,
+  /// `not.i32 a` (~a).
+  BitNot,
+  /// `not.bool a` (!a).
+  NotBool,
+  /// `imul.i32 a, b`: Math.imul, the low 32 bits of the product; never fails.
+  Imul,
+  // ---- inlining (docs/jit/inlining.md)
+  /// `check.callee a, k`: guard, exits unless `a` is a bytecode closure of inline target `k`
+  /// (`Function.inlineTargets[k]`; the code names it by relocation symbol `3k`), or, for a
+  /// target marked TARGET_EXACT, that target's one closure (symbol `3k + 2`).
+  CheckCallee,
+  /// `check.shape a, k`: guard, exits unless `a` is an object whose shape's version is `k`
+  /// (below 2^31): an arm of a call with several targets, for the one receiver shape its
+  /// method is known for (ssa_shapes), so what the body reads of the receiver is proved.
+  CheckShape,
+  /// `check.watched a`: guard, exits unless object `a` (a `check.shape` before it proved it
+  /// one) still has its watched bit (js_compiled_inline.cellRecord): what compiled code
+  /// took as constants of a watched record is still in its slots.
+  CheckWatched,
+  /// `is.callee a, k`: whether `a` is a bytecode closure of inline target `k`, where
+  /// `check.callee` exits: the test of one arm of a call with several targets.
+  IsCallee,
+  /// `inline.frame a, k`: builds the CompiledFrame of inlined callee `k + 1` (closure `a`, the
+  /// one `check.callee a, k` passed) that instructions with `frame == k + 1` run for.
+  InlineFrame,
+  /// `call.result a, k`: an owned copy of value `k` (from 1) that the generic call `a` left
+  /// (calls.resultCount): read right after that call, which yields value 0.
+  CallResult,
+  /// `new.object a, b, k`: guard, validates construct descriptor `k` (`Function.constructTargets[k]`)
+  /// against function `a` and new.target `b` and allocates a fresh inline object from a spare cell
+  /// with uninitialized slots ready for `init.slot`; owned result, exits on miss.
+  NewObject,
+  /// `init.slot a, b, k`: writes value `b` (Value, F64, I32, or Bool) into slot `k` (0..7) of
+  /// fresh object `a`, retaining `b` if heap-tagged; no exit, no C call.
+  InitSlot,
+  /// `check.construct a, b, k`: guard-only validation of construct descriptor `k`
+  /// (`Function.constructTargets[k]`) against function `a` and new.target `b` for a
+  /// virtualized allocation; no result, exits on miss.
+  CheckConstruct,
+  /// `known.method k`: prototype-method guard + preset closure load without a receiver
+  /// (`k = (pair << 24) | target`, `pair: 0..3`, `target: inlineTargetIdx`); exits on miss.
+  KnownMethod,
+  /// Deleted by a pass; `compact` drops it.
+  Removed,
+}
+
+/// Comparisons, signed; stored in `Inst.k`.
+pub enum Cmp { Lt, Le, Gt, Ge, Eq, Ne }
+
+/// Immediate boxed constants; stored in `Inst.k`.
+pub enum Imm { Undefined, Null, False, True, Uninitialized }
+/// An `Op.Imm` whose `k` is at least this is the engine's `CatchOffset { offset: k - IMM_CATCH }`
+/// (the marker `catch` pushes; it holds no count).
+pub const IMM_CATCH: i32 = 8
+
+/// How a deoptimization exit writes a slot. See docs/jit/ssa.md.
+pub enum SlotMode { Int, Bool, Imm, Move, Dup, F64, Virtual }
+
+pub struct ValueInfo {
+  pub ty: Type,
+  pub own: Own,
+  pub rootKind: RootKind,
+  pub root: u32,
+  /// The block that defines it.
+  pub block: u32,
+  /// The defining instruction, or NONE for a block parameter.
+  pub def: u32,
+  /// A block parameter's place among its block's parameters when the translator made it:
+  /// the interpreter state slot (locals, then the operand stack) it stands for, which stays
+  /// true when passes remove other parameters. NONE for an instruction's result.
+  pub state: u32,
+}
+impl Copy for ValueInfo {}
+
+pub struct Inst {
+  pub op: Op,
+  /// The value it defines, or NONE.
+  pub result: u32,
+  pub a: u32,
+  pub b: u32,
+  /// Constant, argument index, `Cmp` or `Imm` tag.
+  pub k: i32,
+  /// A terminator's first edge, or NONE.
+  pub edge: u32,
+  /// The deoptimization exit of a guard or `poll`, or NONE.
+  pub exit: u32,
+  /// The bytecode offset of the instruction this came from.
+  pub pc: u32,
+  pub block: u32,
+  /// Position within the block; only `compact` reads it.
+  pub order: u32,
+  /// Whose CompiledFrame a frame-reading instruction (field sites, variables, scopes, atoms)
+  /// runs for: 0 the function's own, n the one `inline.frame` built for inlined callee n.
+  pub frame: u32,
+  /// A `get.elem` or `put.elem` whose object a `check.array` in front of its loop proved a
+  /// fast Array, in a loop where nothing makes it another kind of object (ssa_opt_hoist): it
+  /// tests only the index against the count, and leaves where that fails.
+  pub trusted: bool,
+  /// What the `check.bound`s in front of its loop proved (ssa_opt_bounds): a trusted
+  /// `get.elem` or `put.elem` whose index is below the count on every turn, which tests
+  /// nothing; an `add.i32` that cannot overflow, which has no use for its exit. On a
+  /// `mul.i32`: its one reader cannot tell a zero product from -0, so it tests for neither
+  /// (ssa_opt_unboxed.zeroProducts); its overflow exit stays.
+  pub proven: bool,
+}
+impl Copy for Inst {}
+
+pub struct Block {
+  pub firstParam: u32,
+  pub paramCount: u32,
+  pub firstInst: u32,
+  pub instCount: u32,
+}
+impl Copy for Block {}
+
+pub struct Edge { pub target: u32, pub firstArg: u32, pub argCount: u32 }
+impl Copy for Edge {}
+
+/// A deoptimization exit: resume the interpreter at `pc` with `localCount` local slots,
+/// `stackDepth` operand stack slots and `argumentSlots` parameter slots, in `Function.slots`
+/// from `firstSlot` (locals first, then the stack bottom first, then the parameters). After
+/// them come `drops` more slots the interpreter frame does not receive: values an inlined body
+/// holds when it leaves for the caller's state before the call. The exit releases those whose
+/// mode is `Move` and ignores the others.
+///
+/// An exit inside inlined bodies that leaves them part way through (after an effect, when
+/// the caller's call cannot be made again) has `frames` frames in `Function.exitFrames` from
+/// `firstFrame`, one per body around the guard, outermost first, and no drops: between the
+/// frame's slots and the drops stand `inner` slots, each such frame's locals and then its
+/// operands. The function's own frame is then at the outermost inlined call, whose callee
+/// goes on from the first of those frames (docs/jit/optimizer.md).
+pub struct Exit { pub pc: u32, pub stackDepth: u32, pub firstSlot: u32, pub drops: u32, pub inner: u32, pub firstFrame: u32, pub frames: u32 }
+impl Copy for Exit {}
+
+/// The activation of an inlined body at an exit that leaves it part way through: the call
+/// that began it has `argc` arguments (and a receiver when `method`) and the instruction
+/// after it is at `after` in its caller's code; the body has `locals` locals and `depth`
+/// operands and goes on at `pc` (for all but the innermost, with the call there that began
+/// the next frame).
+pub struct ExitFrame { pub after: u32, pub argc: u32, pub method: bool, pub locals: u32, pub depth: u32, pub pc: u32 }
+impl Copy for ExitFrame {}
+
+/// One slot of an exit. `root` is the argument index a `Dup` slot's value borrows from, or NONE.
+/// When `mode == SlotMode.Virtual`, `value` is the index into `Function.virtualObjs` and `root == NONE`.
+pub struct Slot { pub value: u32, pub mode: SlotMode, pub root: u32 }
+impl Copy for Slot {}
+
+/// A virtualized object described in an exit slot (`SlotMode.Virtual`): constructed via
+/// `constructSite` (`Function.constructTargets[constructSite]`) with `slotCount` (1..8)
+/// own data slots whose SSA values are `fields[0..slotCount]`.
+pub struct VirtualObj { pub constructSite: u32, pub slotCount: u32, pub fields: [u32; 8] }
+impl Copy for VirtualObj {}
+
+/// A call at `pc` that stayed a call: `why`, and the callee's opcode that stopped the attempt (or 0).
+pub struct InlineMiss { pub pc: u32, pub depth: u32, pub opcode: u8, pub why: &'static [u8] }
+impl Copy for InlineMiss {}
+
+/// In an inline target's identifier: the embedder knows the one closure object the site
+/// calls for this target and keeps it alive, so the callee is tested by its address and the
+/// body reads the closure's cells through it. Other targets are tested by their function,
+/// which any closure of it passes.
+pub const TARGET_EXACT: u32 = 0x80000000
+/// In an exact inline target's identifier: for some shapes the call's `get.field` site saw
+/// (`KnownShapes`), the embedder watches the objects the method is read through (the
+/// receivers' prototype, up to the prototype that holds it) and keeps them alive. While
+/// each has its watched bit set, an object of such a shape that is not exotic reads the
+/// target's closure there, so the read and the callee test are the tests of the shape and
+/// of the bits. Relocation symbols `3n + c + KNOWN_SYMBOLS * k` onwards are the watched
+/// objects of target k (n targets, c owned cells): KNOWN_CHAIN for each of its shapes,
+/// the first `lengths` of them set.
+pub const TARGET_KNOWN: u32 = 0x40000000
+/// The watched objects one known shape's read goes through at most, and the relocation
+/// symbols an inline target has for them (four shapes).
+pub const KNOWN_CHAIN: u32 = 3
+pub const KNOWN_SYMBOLS: u32 = 12
+/// The receivers' shapes an inline target's method is known for (TARGET_KNOWN): their
+/// versions, ended by 0, and for each how many watched objects the read goes through.
+pub struct KnownShapes { pub shapes: [u32; 4], pub lengths: [u8; 4] }
+impl Copy for KnownShapes {}
+impl KnownShapes {
+  pub fn none() -> Self { return Self { shapes: [0, 0, 0, 0], lengths: [0, 0, 0, 0] } }
+}
+/// In an inline target's identifier: the callee is a known local function
+/// (`ValueBits.FunctionBytecode`, tag -2) whose FunctionBytecode cell is symbol `3k`.
+pub const TARGET_KNOWN_FN: u32 = 0x20000000
+/// The marks of an inline target's identifier.
+pub const TARGET_FLAGS: u32 = 0xe0000000
+/// In a `get.var`'s k, inside the body of an exact inline target: the closure's variable cell
+/// owns an initialized value, as it will from then on (`CallTarget.owned`). The read is the
+/// cell's value, by the cell's address (a relocation symbol after the targets', in the order
+/// `Function.ownedCells` lists them), and never fails.
+pub const VAR_OWNED: i32 = 0x40000000
+
+pub struct Function {
+  /// FunctionInput.arrayShape: the version of a fresh array's shape in the function's
+  /// realm, for the push the backend makes in place (0: none).
+  pub arrayShape: u32,
+  pub argumentCount: u32,
+  pub localCount: u32,
+  /// argumentCount when the function writes a parameter (put_arg, set_arg): every exit then
+  /// lists each parameter's value after the stack, for the interpreter's argument cells.
+  pub argumentSlots: u32,
+  pub blocks: List<Block>,
+  /// Block parameters, grouped by block once compacted.
+  pub params: List<u32>,
+  pub insts: List<Inst>,
+  pub values: List<ValueInfo>,
+  pub edges: List<Edge>,
+  pub edgeArgs: List<u32>,
+  pub exits: List<Exit>,
+  /// The inlined activations of exits that leave bodies part way through (Exit.firstFrame).
+  pub exitFrames: List<ExitFrame>,
+  pub slots: List<Slot>,
+  /// Virtualized objects referenced by `SlotMode.Virtual` exit slots.
+  pub virtualObjs: List<VirtualObj>,
+  /// The bits of the doubles `const.f64` names, by index.
+  pub numbers: List<u64>,
+  /// The inline targets `check.callee` and `inline.frame` name, by index: each an identifier
+  /// the embedder gave (`ssa_translate.CallTarget.id`). Relocation symbol `3k` is target k's
+  /// FunctionBytecode cell, `3k + 1` the first byte of its code, `3k + 2` the closure of a
+  /// target marked TARGET_EXACT (anything otherwise).
+  pub inlineTargets: List<u32>,
+  /// For each inline target, the bytecode offset of the `get.field` (in the calling frame)
+  /// that read the method its call calls (`ssa_translate.CallTarget.pc`), or NONE for a
+  /// target named at the call itself.
+  pub inlineSites: List<u32>,
+  /// Per inline target: its body reads the scope it runs under, which is the scope of the
+  /// target's level on the frame's own chain (a known local function inlined into code on
+  /// that chain). `check.callee` then also tests that this scope is on the heap, so that
+  /// an exit inside the body can hand the engine a closure that holds it.
+  pub inlineScoped: List<bool>,
+  /// For each inline target, the receivers' shapes its method is known for
+  /// (`ssa_translate.CallTarget.known`): none unless it is marked TARGET_KNOWN.
+  pub inlineShapes: List<KnownShapes>,
+  /// Inlined construct descriptors named by `Op.NewObject` (embedder IDs in symbol order)
+  /// and each site's expected 31-bit final shape version (0: unknown).
+  pub constructTargets: List<u32>,
+  pub constructShapes: List<u32>,
+  /// Calls translated as calls, with why they were not inlined (for --jit-dump only).
+  pub inlineMisses: List<InlineMiss>,
+  /// FunctionInput.elementKinds: pc << 8 | element kind, for the function's own element sites
+  /// (frame 0); the backend tries that kind's access first.
+  pub elementKinds: List<u32>,
+  /// `Inst.frame` of the instructions `emit` appends (0 outside an inlined body).
+  pub frame: u32,
+  nextOrder: u32,
+  /// Instructions and exit slots the rewriting passes have walked so far (compact, and the
+  /// ownership pass's sweeps): compile cost in units that do not depend on the machine, for
+  /// the test that keeps it linear (ssa_tests.compileWorkStaysLinear).
+  pub work: u64,
+}
+
+/// Copies each exit's slots from the old table (`from`, at oldFirst[exit]) to their place in
+/// the new one, renumbering their values (Function.compact).
+fn copySlots(from: &[Slot], to: &mut [Slot], numbers: &[u32], exits: &List<Exit>, oldFirst: &List<u32>, fixed: u32) -> () {
+  let mut x: usize = 0
+  while x < exits.length() {
+    let exit = exits.get(x)
+    let source = u32.toUsize(oldFirst.get(x))
+    let target = u32.toUsize(exit.firstSlot)
+    let count = u32.toUsize(fixed + exit.stackDepth + exit.inner + exit.drops)
+    let mut s: usize = 0
+    while s < count {
+      let mut slot = from[source + s]
+      if slot.mode != SlotMode.Virtual { slot.value = numbers[u32.toUsize(slot.value)] }
+      to[target + s] = slot
+      s = s + 1
+    }
+    x = x + 1
+  }
+}
+
+/// A point in a function being built that `Function.rollback` returns to.
+pub struct Mark { insts: usize, values: usize, exits: usize, slots: usize, virtualObjs: usize, targets: usize, constructs: usize, order: u32,
+  blocks: usize, params: usize, edges: usize, edgeArgs: usize, frames: usize }
+impl Copy for Mark {}
+
+pub fn ownOf(ty: Type) -> Own { if ty == Type.Value { return Own.Owned } return Own.Unboxed }
+
+/// Whether an instruction may run JavaScript or reenter the engine. A borrow of an argument
+/// cell survives one (nothing writes the cells, compiled-entry.md 7.3); any other borrow ends.
+pub fn mayReenter(op: Op) -> bool { return op == Op.Call }
+
+pub fn isTerminator(op: Op) -> bool { return op == Op.Jump || op == Op.Branch || op == Op.Return }
+
+/// The number of successor edges a terminator has.
+pub fn edgeCount(op: Op) -> u32 {
+  if op == Op.Jump { return 1 }
+  if op == Op.Branch { return 2 }
+  return 0
+}
+
+impl Function {
+  pub fn make(argumentCount: u32, localCount: u32) -> Function {
+    return Function { arrayShape: 0, argumentCount: argumentCount, localCount: localCount, argumentSlots: 0, blocks: List<Block>.make(),
+      params: List<u32>.make(), insts: List<Inst>.make(), values: List<ValueInfo>.make(),
+      edges: List<Edge>.make(), edgeArgs: List<u32>.make(), exits: List<Exit>.make(), exitFrames: List<ExitFrame>.make(),
+      slots: List<Slot>.make(), virtualObjs: List<VirtualObj>.make(), numbers: List<u64>.make(), inlineTargets: List<u32>.make(), inlineSites: List<u32>.make(), inlineScoped: List<bool>.make(), inlineShapes: List<KnownShapes>.make(),
+      constructTargets: List<u32>.make(), constructShapes: List<u32>.make(),
+      inlineMisses: List<InlineMiss>.make(), elementKinds: List<u32>.make(), frame: 0, nextOrder: 0, work: 0 }
+  }
+
+  /// The element kind recorded for the element site at pc of the function's own code, or 0.
+  pub fn elementKind(self: &Self, inst: &Inst) -> u32 {
+    if inst.frame != 0 { return 0 }
+    return self.elementKindAt(inst.pc)
+  }
+  pub fn elementKindAt(self: &Self, pc: u32) -> u32 {
+    let mut i: usize = 0
+    while i < self.elementKinds.length() {
+      let entry = self.elementKinds.get(i)
+      if u32.shiftRight(entry, 8) == pc { return entry & 255 }
+      i = i + 1
+    }
+    return 0
+  }
+  pub fn valueCount(self: &Self) -> u32 { return usize.toU32(self.values.length()) }
+  pub fn blockCount(self: &Self) -> u32 { return usize.toU32(self.blocks.length()) }
+  pub fn value(self: &Self, v: u32) -> ValueInfo { return self.values.get(u32.toUsize(v)) }
+  pub fn inst(self: &Self, index: u32) -> Inst { return self.insts.get(u32.toUsize(index)) }
+  /// Whether `v` is the elements of an Array (Op.Elements).
+  pub fn isElements(self: &Self, v: u32) -> bool {
+    if v == NONE || u32.toUsize(v) >= self.values.length() { return false }
+    let def = self.value(v).def
+    return def != NONE && self.inst(def).op == Op.Elements
+  }
+  /// The Array of an element access whose first operand is `v`: `v`, or the Array `v` is
+  /// the elements of.
+  pub fn arrayOf(self: &Self, v: u32) -> u32 {
+    if self.isElements(v) { return self.inst(self.value(v).def).a }
+    return v
+  }
+  pub fn edge(self: &Self, index: u32) -> Edge { return self.edges.get(u32.toUsize(index)) }
+  pub fn edgeArg(self: &Self, edge: Edge, index: u32) -> u32 { return self.edgeArgs.get(u32.toUsize(edge.firstArg + index)) }
+  pub fn exit(self: &Self, index: u32) -> Exit { return self.exits.get(u32.toUsize(index)) }
+  pub fn slot(self: &Self, exit: Exit, index: u32) -> Slot { return self.slots.get(u32.toUsize(exit.firstSlot + index)) }
+  /// The number of slots `exit` lists: locals, its stack, then any parameters.
+  /// The slots an exit hands the interpreter: locals, stack, parameters (not its drops).
+  pub fn exitSlots(self: &Self, exit: Exit) -> u32 { return self.localCount + exit.stackDepth + self.argumentSlots }
+  /// A compacted block's `index`th parameter.
+  pub fn paramAt(self: &Self, block: Block, index: u32) -> u32 { return self.params.get(u32.toUsize(block.firstParam + index)) }
+  /// A compacted block's terminator.
+  pub fn terminator(self: &Self, block: Block) -> Inst { return self.insts.get(u32.toUsize(block.firstInst + block.instCount - 1)) }
+
+  pub fn setOwnership(self: &mut Self, v: u32, own: Own, rootKind: RootKind, root: u32) -> () {
+    let mut info = self.values.get(u32.toUsize(v))
+    info.own = own info.rootKind = rootKind info.root = root
+    self.values.set(u32.toUsize(v), info)
+  }
+  pub fn setType(self: &mut Self, v: u32, ty: Type) -> () {
+    let mut info = self.values.get(u32.toUsize(v))
+    info.ty = ty
+    self.values.set(u32.toUsize(v), info)
+  }
+  pub fn setInst(self: &mut Self, index: u32, inst: Inst) -> () { self.insts.set(u32.toUsize(index), inst) }
+  pub fn setSlot(self: &mut Self, index: u32, slot: Slot) -> () { self.slots.set(u32.toUsize(index), slot) }
+  pub fn setEdgeArg(self: &mut Self, index: u32, v: u32) -> () { self.edgeArgs.set(u32.toUsize(index), v) }
+  /// Points edge `index` at `target`, with no arguments (ssa_opt_hoist splits an edge).
+  pub fn retarget(self: &mut Self, index: u32, target: u32) -> () {
+    let mut edge = self.edges.get(u32.toUsize(index))
+    edge.target = target edge.argCount = 0
+    self.edges.set(u32.toUsize(index), edge)
+  }
+  /// Moves instruction `index` to `block`, at `order` among its instructions; `compact` puts
+  /// it there.
+  pub fn moveInst(self: &mut Self, index: u32, block: u32, order: u32) -> () {
+    let mut inst = self.insts.get(u32.toUsize(index))
+    inst.block = block inst.order = order
+    self.insts.set(u32.toUsize(index), inst)
+  }
+
+  // ---- building ----
+
+  /// A new block with no parameters and no instructions.
+  pub effect fn block(self: &mut Self) -> u32 ! OutOfMemoryError ? &mut Allocator {
+    run self.blocks.append(Block { firstParam: 0, paramCount: 0, firstInst: 0, instCount: 0 })
+    return usize.toU32(self.blocks.length() - 1)
+  }
+
+  effect fn newValue(self: &mut Self, ty: Type, own: Own, block: u32, def: u32) -> u32 ! OutOfMemoryError ? &mut Allocator {
+    run self.values.append(ValueInfo { ty: ty, own: own, rootKind: RootKind.None, root: NONE, block: block, def: def, state: NONE })
+    return usize.toU32(self.values.length() - 1)
+  }
+
+  /// Adds a parameter to `block`, after the ones it has.
+  pub effect fn addParam(self: &mut Self, block: u32, ty: Type, own: Own) -> u32 ! OutOfMemoryError ? &mut Allocator {
+    let v = run self.newValue(ty, own, block, NONE)
+    let mut made = self.values.get(u32.toUsize(v))
+    made.state = self.blocks.get(u32.toUsize(block)).paramCount
+    self.values.set(u32.toUsize(v), made)
+    // Before compact, a block's range is kept while its parameters arrive together (the
+    // translator adds each block's at once); paramsOf reads it.
+    let mut info = self.blocks.get(u32.toUsize(block))
+    if info.paramCount == 0 { info.firstParam = usize.toU32(self.params.length()) }
+    if info.firstParam != NONE && info.firstParam + info.paramCount == usize.toU32(self.params.length()) { info.paramCount = info.paramCount + 1 }
+    else { info.firstParam = NONE info.paramCount = info.paramCount + 1 }
+    self.blocks.set(u32.toUsize(block), info)
+    run self.params.append(v)
+    return v
+  }
+
+  /// The parameters of `block` in order, for a function that is not compacted yet.
+  pub effect fn paramsOf(self: &Self, block: u32) -> List<u32> ! OutOfMemoryError ? &mut Allocator {
+    let mut out = List<u32>.make()
+    let info = self.blocks.get(u32.toUsize(block))
+    if info.firstParam != NONE {
+      let mut g: u32 = 0
+      while g < info.paramCount { run out.append(self.params.get(u32.toUsize(info.firstParam + g))) g = g + 1 }
+      return move out
+    }
+    let mut i: usize = 0
+    while i < self.params.length() {
+      let v = self.params.get(i)
+      if self.values.get(u32.toUsize(v)).block == block { run out.append(v) }
+      i = i + 1
+    }
+    return move out
+  }
+
+  /// Appends an instruction to `block`. When `ty` is not NONE-like (the `hasResult` flag), the
+  /// instruction defines a new value of that type and ownership, returned; else NONE.
+  pub effect fn emit(self: &mut Self, block: u32, op: Op, hasResult: bool, ty: Type, own: Own, a: u32, b: u32, k: i32, pc: u32) -> u32
+    ! OutOfMemoryError ? &mut Allocator {
+    let index = usize.toU32(self.insts.length())
+    let mut result = NONE
+    if hasResult { result = run self.newValue(ty, own, block, index) }
+    run self.insts.append(Inst { op: op, result: result, a: a, b: b, k: k, edge: NONE, exit: NONE, pc: pc, block: block, order: self.nextOrder, frame: self.frame, trusted: false, proven: false })
+    self.nextOrder = self.nextOrder + 2
+    return result
+  }
+
+  /// Inserts an instruction just before instruction `before` (in the same block).
+  pub effect fn insertBefore(self: &mut Self, before: u32, op: Op, hasResult: bool, ty: Type, own: Own, a: u32, b: u32, k: i32) -> u32
+    ! OutOfMemoryError ? &mut Allocator {
+    let at = self.inst(before)
+    let index = usize.toU32(self.insts.length())
+    let mut result = NONE
+    if hasResult { result = run self.newValue(ty, own, at.block, index) }
+    run self.insts.append(Inst { op: op, result: result, a: a, b: b, k: k, edge: NONE, exit: NONE, pc: at.pc, block: at.block, order: at.order - 1, frame: at.frame, trusted: false, proven: false })
+    return result
+  }
+
+  /// Gives the last instruction appended an exit. Returns the exit's index; its slots are added
+  /// with `slotAt`.
+  pub effect fn exitFor(self: &mut Self, inst: u32, pc: u32, stackDepth: u32) -> u32 ! OutOfMemoryError ? &mut Allocator {
+    let index = usize.toU32(self.exits.length())
+    run self.exits.append(Exit { pc: pc, stackDepth: stackDepth, firstSlot: usize.toU32(self.slots.length()), drops: 0, inner: 0,
+      firstFrame: usize.toU32(self.exitFrames.length()), frames: 0 })
+    let mut at = self.inst(inst)
+    at.exit = index
+    self.setInst(inst, at)
+    return index
+  }
+  /// Appends a slot to the exit made last.
+  pub effect fn slotAt(self: &mut Self, value: u32, mode: SlotMode, root: u32) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.slots.append(Slot { value: value, mode: mode, root: root })
+  }
+  /// Appends a drop slot to the exit made last, after all its frame slots.
+  pub effect fn dropAt(self: &mut Self, value: u32, mode: SlotMode) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.slots.append(Slot { value: value, mode: mode, root: NONE })
+    let last = self.exits.length() - 1
+    let mut exit = self.exits.get(last)
+    exit.drops = exit.drops + 1
+    self.exits.set(last, exit)
+  }
+  /// Appends a frame to the exit made last (Exit.frames); its slots follow with `innerAt`.
+  pub effect fn frameAt(self: &mut Self, frame: ExitFrame) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.exitFrames.append(frame)
+    let last = self.exits.length() - 1
+    let mut exit = self.exits.get(last)
+    exit.frames = exit.frames + 1
+    self.exits.set(last, exit)
+  }
+  /// Appends a slot of an inlined frame to the exit made last, after its own frame's slots.
+  pub effect fn innerAt(self: &mut Self, value: u32, mode: SlotMode, root: u32) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.slots.append(Slot { value: value, mode: mode, root: root })
+    let last = self.exits.length() - 1
+    let mut exit = self.exits.get(last)
+    exit.inner = exit.inner + 1
+    self.exits.set(last, exit)
+  }
+  /// The slots of `exit`: the frame's, those of the inlined frames it leaves, then its drops.
+  pub fn slotCount(self: &Self, exit: Exit) -> u32 { return self.localCount + exit.stackDepth + self.argumentSlots + exit.inner + exit.drops }
+  /// The frame at `index` of those `exit` leaves part way through.
+  pub fn exitFrame(self: &Self, exit: Exit, index: u32) -> ExitFrame { return self.exitFrames.get(u32.toUsize(exit.firstFrame + index)) }
+  /// The index of the instruction appended last.
+  pub fn lastInst(self: &Self) -> u32 { return usize.toU32(self.insts.length() - 1) }
+
+  /// Appends an edge to `target` with no arguments yet; arguments follow with `edgeArgument`.
+  pub effect fn newEdge(self: &mut Self, target: u32) -> u32 ! OutOfMemoryError ? &mut Allocator {
+    run self.edges.append(Edge { target: target, firstArg: usize.toU32(self.edgeArgs.length()), argCount: 0 })
+    return usize.toU32(self.edges.length() - 1)
+  }
+  /// Adds an argument to the edge made last.
+  pub effect fn edgeArgument(self: &mut Self, v: u32) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.edgeArgs.append(v)
+    let last = self.edges.length() - 1
+    let mut e = self.edges.get(last)
+    e.argCount = e.argCount + 1
+    self.edges.set(last, e)
+  }
+
+  /// Ends `block` with a terminator whose edges are `edge` and, for a branch, `edge + 1`.
+  pub effect fn terminate(self: &mut Self, block: u32, op: Op, a: u32, edge: u32, pc: u32) -> () ! OutOfMemoryError ? &mut Allocator {
+    drop run self.emit(block, op, false, Type.I32, Own.Unboxed, a, NONE, 0, pc)
+    let last = self.lastInst()
+    let mut inst = self.inst(last)
+    inst.edge = edge
+    self.setInst(last, inst)
+  }
+
+  /// Where the function stands, for `rollback`.
+  /// The cells the function's owned variable reads (VAR_OWNED) name, each once, in
+  /// instruction order: (frame - 1) << 16 | variable. The code's symbol for entry n follows
+  /// the inline targets' symbols.
+  /// The atoms whose string cells code on a baseline frame links for its atom.value
+  /// (k >> 1), in order of first use: their symbols follow the realm's array natives'.
+  pub effect fn linkedAtoms(self: &Self) -> List<u32> ! OutOfMemoryError ? &mut Allocator {
+    let mut atoms = List<u32>.make()
+    let mut i: usize = 0
+    while i < self.insts.length() {
+      let inst = self.insts.get(i)
+      i = i + 1
+      if inst.op != Op.AtomValue || i32.shiftRight(inst.k, 1) == 0 { continue }
+      let atom = i32.wrappingToU32(i32.shiftRight(inst.k, 1))
+      let mut known = false
+      let mut n: usize = 0
+      while n < atoms.length() { if atoms.get(n) == atom { known = true } n = n + 1 }
+      if !known { run atoms.append(atom) }
+    }
+    return move atoms
+  }
+  pub effect fn ownedCells(self: &Self) -> List<u32> ! OutOfMemoryError ? &mut Allocator {
+    let mut cells = List<u32>.make()
+    let mut i: usize = 0
+    while i < self.insts.length() {
+      let inst = self.insts.get(i)
+      i = i + 1
+      if inst.op != Op.GetVar || (inst.k & VAR_OWNED) == 0 || inst.frame == 0 { continue }
+      let cell = u32.bitOr(u32.shiftLeft(inst.frame - 1, 16), i32.wrappingToU32(inst.k & 0xffff))
+      let mut known = false
+      let mut n: usize = 0
+      while n < cells.length() { if cells.get(n) == cell { known = true } n = n + 1 }
+      if !known { run cells.append(cell) }
+    }
+    return move cells
+  }
+  pub fn mark(self: &Self) -> Mark {
+    return Mark { insts: self.insts.length(), values: self.values.length(), exits: self.exits.length(), slots: self.slots.length(),
+      virtualObjs: self.virtualObjs.length(), targets: self.inlineTargets.length(), constructs: self.constructTargets.length(), order: self.nextOrder, blocks: self.blocks.length(), params: self.params.length(),
+      edges: self.edges.length(), edgeArgs: self.edgeArgs.length(), frames: self.exitFrames.length() }
+  }
+  /// Forgets every instruction, value, exit, inline target, block, parameter and edge added
+  /// since `mark` (the blocks made before it got no parameter since).
+  pub fn rollback(self: &mut Self, mark: Mark) -> () {
+    self.insts.truncate(mark.insts) self.values.truncate(mark.values) self.exits.truncate(mark.exits) self.exitFrames.truncate(mark.frames)
+    self.slots.truncate(mark.slots) self.virtualObjs.truncate(mark.virtualObjs) self.inlineTargets.truncate(mark.targets) self.inlineSites.truncate(mark.targets) self.inlineScoped.truncate(mark.targets) self.inlineShapes.truncate(mark.targets)
+    self.constructTargets.truncate(mark.constructs) self.constructShapes.truncate(mark.constructs) self.nextOrder = mark.order
+    self.blocks.truncate(mark.blocks) self.params.truncate(mark.params) self.edges.truncate(mark.edges) self.edgeArgs.truncate(mark.edgeArgs)
+  }
+
+  // ---- compaction ----
+
+  /// Puts the blocks in reverse postorder from block 0, drops unreachable blocks and removed
+  /// instructions, and renumbers blocks, values and exits densely in that order.
+  /// A loop's back edges: bit e of a block's entry says that edge e of its terminator goes
+  /// to a block the search from block 0 is still inside. The order of the blocks does not
+  /// tell: a block a pass appended (a loop's front block, ssa_opt_hoist.split) comes after
+  /// the header it jumps to.
+  effect fn backEdges(self: &Self, term: &List<u32>) -> List<u32> ! OutOfMemoryError ? &mut Allocator {
+    let blockCount = self.blocks.length()
+    let mut back = List<u32>.make()
+    run back.appendRepeated(0, blockCount)
+    // 1: the search is inside the block; 2: it left it.
+    let mut state = List<u8>.make()
+    run state.appendRepeated(0, blockCount)
+    let mut stack = run List<u32>.makeWithCapacity(blockCount)
+    let mut next = run List<u32>.makeWithCapacity(blockCount)
+    if blockCount > 0 { run stack.append(0) run next.append(0) state.set(0, 1) }
+    while stack.length() > 0 {
+      let top = stack.length() - 1
+      let b = u32.toUsize(stack.get(top))
+      let n = next.get(top)
+      let t = term.get(b)
+      let mut count: u32 = 0
+      if t != NONE { count = edgeCount(self.insts.get(u32.toUsize(t)).op) }
+      if n < count {
+        next.set(top, n + 1)
+        let target = self.edges.get(u32.toUsize(self.insts.get(u32.toUsize(t)).edge + n)).target
+        let seen = state.get(u32.toUsize(target))
+        if seen == 1 { let had = back.get(b) back.set(b, u32.bitOr(had, u32.shiftLeft(1, n))) }
+        else if seen == 0 { state.set(u32.toUsize(target), 1) run stack.append(target) run next.append(0) }
+      } else {
+        state.set(b, 2)
+        drop stack.pop() drop next.pop()
+      }
+    }
+    return move back
+  }
+  /// How many loops each block is in: for each back edge u -> v (backEdges), v and the
+  /// blocks that reach u without passing v. term holds each block's terminator.
+  effect fn loopDepths(self: &Self, term: &List<u32>) -> List<u32> ! OutOfMemoryError ? &mut Allocator {
+    let blockCount = self.blocks.length()
+    let back = run self.backEdges(term)
+    let mut depth = List<u32>.make()
+    run depth.appendRepeated(0, blockCount)
+    // The edges into each block, as their source blocks (first[b] .. first[b + 1]).
+    let mut first = List<u32>.make()
+    run first.appendRepeated(0, blockCount + 1)
+    let mut b: usize = 0
+    while b < blockCount {
+      let t = term.get(b)
+      if t != NONE {
+        let inst = self.insts.get(u32.toUsize(t))
+        let mut e: u32 = 0
+        while e < edgeCount(inst.op) { let to = u32.toUsize(self.edges.get(u32.toUsize(inst.edge + e)).target) + 1 let had = first.get(to) first.set(to, had + 1) e = e + 1 }
+      }
+      b = b + 1
+    }
+    b = 0
+    while b < blockCount { let sum = first.get(b + 1) + first.get(b) first.set(b + 1, sum) b = b + 1 }
+    let mut fill = List<u32>.make()
+    run fill.appendSlice(first.asSlice())
+    let mut from = List<u32>.make()
+    run from.appendRepeated(0, u32.toUsize(first.get(blockCount)))
+    let mut any = false
+    b = 0
+    while b < blockCount {
+      let t = term.get(b)
+      if t != NONE {
+        let inst = self.insts.get(u32.toUsize(t))
+        let mut e: u32 = 0
+        while e < edgeCount(inst.op) {
+          let to = u32.toUsize(self.edges.get(u32.toUsize(inst.edge + e)).target)
+          let at = fill.get(to)
+          from.set(u32.toUsize(at), usize.toU32(b))
+          fill.set(to, at + 1)
+          if u32.bitAnd(u32.shiftRight(back.get(b), e), 1) != 0 { any = true }
+          e = e + 1
+        }
+      }
+      b = b + 1
+    }
+    if !any { return move depth }
+    let mut mark = List<u32>.make()
+    run mark.appendRepeated(NONE, blockCount)
+    let mut stack = List<u32>.make()
+    let mut serial: u32 = 0
+    b = 0
+    while b < blockCount {
+      let t = term.get(b)
+      if t != NONE {
+        let inst = self.insts.get(u32.toUsize(t))
+        let mut e: u32 = 0
+        while e < edgeCount(inst.op) {
+          let header = u32.toUsize(self.edges.get(u32.toUsize(inst.edge + e)).target)
+          if u32.bitAnd(u32.shiftRight(back.get(b), e), 1) != 0 {
+            serial = serial + 1
+            mark.set(header, serial)
+            let had = depth.get(header) depth.set(header, had + 1)
+            stack.clear()
+            if mark.get(b) != serial { mark.set(b, serial) let d = depth.get(b) depth.set(b, d + 1) run stack.append(usize.toU32(b)) }
+            while stack.length() > 0 {
+              let x = u32.toUsize(stack.get(stack.length() - 1))
+              drop stack.pop()
+              let mut k = first.get(x)
+              while k < first.get(x + 1) {
+                let p = u32.toUsize(from.get(u32.toUsize(k)))
+                if mark.get(p) != serial { mark.set(p, serial) let d = depth.get(p) depth.set(p, d + 1) run stack.append(usize.toU32(p)) }
+                k = k + 1
+              }
+            }
+          }
+          e = e + 1
+        }
+      }
+      b = b + 1
+    }
+    return move depth
+  }
+  pub effect fn compact(self: &mut Self) -> () ! OutOfMemoryError ? &mut Allocator {
+    self.work = self.work + usize.toU64(self.insts.length() + self.slots.length())
+    let blockCount = self.blocks.length()
+    // The terminator of each block, to walk its successors.
+    let mut term = List<u32>.make()
+    run term.appendRepeated(NONE, blockCount)
+    let mut i: usize = 0
+    while i < self.insts.length() {
+      let inst = self.insts.get(i)
+      if isTerminator(inst.op) { term.set(u32.toUsize(inst.block), usize.toU32(i)) }
+      i = i + 1
+    }
+    // How many loops each block is in: a loop is a back edge u -> v and the blocks that
+    // reach u without passing v.
+    let depth = run self.loopDepths(&term)
+    // Iterative depth-first search for the postorder. Of a branch's two successors the one
+    // in fewer loops (a loop's exit) is searched first, so it comes after the other in the
+    // reverse postorder: a loop's blocks follow its header with nothing between, and a
+    // value it carries lives over its blocks alone (x64_regalloc's intervals).
+    let mut state = List<u8>.make()
+    run state.appendRepeated(0, blockCount)
+    let mut post = run List<u32>.makeWithCapacity(blockCount)
+    let mut stack = run List<u32>.makeWithCapacity(blockCount)
+    let mut next = run List<u32>.makeWithCapacity(blockCount)
+    if blockCount > 0 { run stack.append(0) run next.append(0) state.set(0, 1) }
+    while stack.length() > 0 {
+      let top = stack.length() - 1
+      let b = stack.get(top)
+      let n = next.get(top)
+      let t = term.get(u32.toUsize(b))
+      let mut count: u32 = 0
+      if t != NONE { count = edgeCount(self.insts.get(u32.toUsize(t)).op) }
+      if n < count {
+        next.set(top, n + 1)
+        let first = self.insts.get(u32.toUsize(t)).edge
+        let mut e = n
+        if count == 2 {
+          let zero = u32.toUsize(self.edges.get(u32.toUsize(first)).target)
+          let one = u32.toUsize(self.edges.get(u32.toUsize(first + 1)).target)
+          if depth.get(one) < depth.get(zero) { e = 1 - n }
+        }
+        let target = self.edges.get(u32.toUsize(first + e)).target
+        if state.get(u32.toUsize(target)) == 0 {
+          state.set(u32.toUsize(target), 1)
+          run stack.append(target) run next.append(0)
+        }
+      } else {
+        run post.append(b)
+        drop stack.pop() drop next.pop()
+      }
+    }
+    // rank[old block] = new index, or NONE when unreachable.
+    let mut rank = List<u32>.make()
+    run rank.appendRepeated(NONE, blockCount)
+    let mut order = run List<u32>.makeWithCapacity(blockCount)
+    let mut p = post.length()
+    while p > 0 { p = p - 1 rank.set(u32.toUsize(post.get(p)), usize.toU32(order.length())) run order.append(post.get(p)) }
+
+    // Instructions grouped by new block (a counting sort into one list: `sorted` from
+    // `first[b]` to `first[b + 1]`), then by order within it.
+    let mut first = List<u32>.make()
+    run first.appendRepeated(0, order.length() + 1)
+    i = 0
+    while i < self.insts.length() {
+      let inst = self.insts.get(i)
+      let r = rank.get(u32.toUsize(inst.block))
+      if r != NONE && inst.op != Op.Removed { let had = first.get(u32.toUsize(r) + 1) first.set(u32.toUsize(r) + 1, had + 1) }
+      i = i + 1
+    }
+    let mut bi: usize = 0
+    while bi < order.length() { let sum = first.get(bi + 1) + first.get(bi) first.set(bi + 1, sum) bi = bi + 1 }
+    let mut cursor = List<u32>.make()
+    run cursor.appendSlice(first.asSlice())
+    let mut sorted = List<u32>.make()
+    run sorted.appendRepeated(0, u32.toUsize(first.get(order.length())))
+    i = 0
+    while i < self.insts.length() {
+      let inst = self.insts.get(i)
+      let r = rank.get(u32.toUsize(inst.block))
+      if r != NONE && inst.op != Op.Removed {
+        let at = cursor.get(u32.toUsize(r))
+        sorted.set(u32.toUsize(at), usize.toU32(i))
+        cursor.set(u32.toUsize(r), at + 1)
+      }
+      i = i + 1
+    }
+    bi = 0
+    while bi < order.length() {
+      // Insertion sort by order: blocks are short and nearly sorted.
+      let low = u32.toUsize(first.get(bi))
+      let high = u32.toUsize(first.get(bi + 1))
+      let mut x: usize = low + 1
+      while x < high {
+        let item = sorted.get(x)
+        let key = self.insts.get(u32.toUsize(item)).order
+        let mut y = x
+        while y > low && self.insts.get(u32.toUsize(sorted.get(y - 1))).order > key { let prev = sorted.get(y - 1) sorted.set(y, prev) y = y - 1 }
+        sorted.set(y, item)
+        x = x + 1
+      }
+      bi = bi + 1
+    }
+
+    // New value numbers: each block's parameters (in creation order), then its results.
+    let mut renumber = List<u32>.make()
+    run renumber.appendRepeated(NONE, self.values.length())
+    let mut newValues = run List<ValueInfo>.makeWithCapacity(self.values.length())
+    let mut newParams = run List<u32>.makeWithCapacity(self.params.length())
+    let mut newBlocks = run List<Block>.makeWithCapacity(blockCount)
+    let mut newInsts = run List<Inst>.makeWithCapacity(self.insts.length())
+    // Parameters grouped by new block, in creation order: paramStart[r] .. paramStart[r + 1]
+    // of grouped. One pass, where scanning them per block was quadratic.
+    let mut paramStart = List<u32>.make()
+    run paramStart.appendRepeated(0, order.length() + 1)
+    let mut q: usize = 0
+    while q < self.params.length() {
+      let r = rank.get(u32.toUsize(self.values.get(u32.toUsize(self.params.get(q))).block))
+      if r != NONE { let at = u32.toUsize(r) + 1 let c = paramStart.get(at) + 1 paramStart.set(at, c) }
+      q = q + 1
+    }
+    bi = 0
+    while bi < order.length() { let c = paramStart.get(bi + 1) + paramStart.get(bi) paramStart.set(bi + 1, c) bi = bi + 1 }
+    let mut fill = List<u32>.make()
+    run fill.appendSlice(paramStart.asSlice())
+    let mut grouped = List<u32>.make()
+    run grouped.appendRepeated(NONE, u32.toUsize(paramStart.get(order.length())))
+    q = 0
+    while q < self.params.length() {
+      let v = self.params.get(q)
+      let r = rank.get(u32.toUsize(self.values.get(u32.toUsize(v)).block))
+      if r != NONE { let at = u32.toUsize(r) let slot = fill.get(at) grouped.set(u32.toUsize(slot), v) fill.set(at, slot + 1) }
+      q = q + 1
+    }
+    bi = 0
+    while bi < order.length() {
+      let firstParam = usize.toU32(newParams.length())
+      let mut g = paramStart.get(bi)
+      while g < paramStart.get(bi + 1) {
+        let v = grouped.get(u32.toUsize(g))
+        let info = self.values.get(u32.toUsize(v))
+        renumber.set(u32.toUsize(v), usize.toU32(newValues.length()))
+        run newParams.append(usize.toU32(newValues.length()))
+        let mut moved = info moved.block = usize.toU32(bi)
+        run newValues.append(moved)
+        g = g + 1
+      }
+      let firstInst = usize.toU32(newInsts.length())
+      let low = u32.toUsize(first.get(bi))
+      let high = u32.toUsize(first.get(bi + 1))
+      let mut x: usize = low
+      while x < high {
+        let mut inst = self.insts.get(u32.toUsize(sorted.get(x)))
+        inst.block = usize.toU32(bi)
+        // From 2, so insertBefore can still place an instruction before the first.
+        inst.order = usize.toU32(x - low) * 2 + 2
+        if inst.result != NONE {
+          let mut info = self.values.get(u32.toUsize(inst.result))
+          info.block = usize.toU32(bi) info.def = usize.toU32(newInsts.length())
+          renumber.set(u32.toUsize(inst.result), usize.toU32(newValues.length()))
+          inst.result = usize.toU32(newValues.length())
+          run newValues.append(info)
+        }
+        run newInsts.append(inst)
+        x = x + 1
+      }
+      run newBlocks.append(Block { firstParam: firstParam, paramCount: usize.toU32(newParams.length()) - firstParam,
+        firstInst: firstInst, instCount: usize.toU32(newInsts.length()) - firstInst })
+      bi = bi + 1
+    }
+
+    // Edges and exits in the order the new instructions use them; operands renumbered.
+    let mut newEdges = run List<Edge>.makeWithCapacity(self.edges.length())
+    let mut newArgs = run List<u32>.makeWithCapacity(self.edgeArgs.length())
+    let mut newExits = run List<Exit>.makeWithCapacity(self.exits.length())
+    let mut newSlots = List<Slot>.make()
+    // Each new exit's first slot in the old table, and the slots counted so far.
+    let mut oldFirst = run List<u32>.makeWithCapacity(self.exits.length())
+    let mut slotTotal: u32 = 0
+    i = 0
+    while i < newInsts.length() {
+      let mut inst = newInsts.get(i)
+      if inst.a != NONE && inst.op != Op.Arg && inst.op != Op.ConstI32 && inst.op != Op.Imm && inst.op != Op.ConstF64 && inst.op != Op.This { inst.a = renumber.get(u32.toUsize(inst.a)) }
+      if inst.b != NONE { inst.b = renumber.get(u32.toUsize(inst.b)) }
+      if readsK(inst.op) { inst.k = u32.wrappingToI32(renumber.get(u32.toUsize(i32.wrappingToU32(inst.k)))) }
+      if inst.edge != NONE {
+        let first = usize.toU32(newEdges.length())
+        let mut e: u32 = 0
+        while e < edgeCount(inst.op) {
+          let edge = self.edges.get(u32.toUsize(inst.edge + e))
+          let firstArg = usize.toU32(newArgs.length())
+          let mut g: u32 = 0
+          while g < edge.argCount { run newArgs.append(renumber.get(u32.toUsize(self.edgeArgs.get(u32.toUsize(edge.firstArg + g))))) g = g + 1 }
+          run newEdges.append(Edge { target: rank.get(u32.toUsize(edge.target)), firstArg: firstArg, argCount: edge.argCount })
+          e = e + 1
+        }
+        inst.edge = first
+      }
+      if inst.exit != NONE {
+        let exit = self.exits.get(u32.toUsize(inst.exit))
+        inst.exit = usize.toU32(newExits.length())
+        run oldFirst.append(exit.firstSlot)
+        run newExits.append(Exit { pc: exit.pc, stackDepth: exit.stackDepth, firstSlot: slotTotal, drops: exit.drops, inner: exit.inner,
+          firstFrame: exit.firstFrame, frames: exit.frames })
+        slotTotal = slotTotal + self.slotCount(exit)
+      }
+      newInsts.set(i, inst)
+      i = i + 1
+    }
+    // The exit slots, by far the largest table (every exit names every local): sized once
+    // and copied through slices.
+    run newSlots.appendRepeated(Slot { value: NONE, mode: SlotMode.Imm, root: NONE }, u32.toUsize(slotTotal))
+    copySlots(self.slots.asSlice(), newSlots.asMutSlice(), renumber.asSlice(), &newExits, &oldFirst, self.localCount + self.argumentSlots)
+    // Prune unreferenced VirtualObjs, remap surviving fields through renumber, and rewrite
+    // Virtual slot indices densely.
+    let mut newVirtualObjs = List<VirtualObj>.make()
+    if self.virtualObjs.length() > 0 {
+      let mut voMap = List<u32>.make()
+      run voMap.appendRepeated(NONE, self.virtualObjs.length())
+      let slotsSlice = newSlots.asMutSlice()
+      let mut si: usize = 0
+      while si < slotsSlice.length {
+        if slotsSlice[si].mode == SlotMode.Virtual {
+          let oldIdx = u32.toUsize(slotsSlice[si].value)
+          let mut mapped = voMap.get(oldIdx)
+          if mapped == NONE {
+            let mut vo = self.virtualObjs.get(oldIdx)
+            let mut fk: u32 = 0
+            while fk < vo.slotCount && fk < 8 {
+              vo.fields[u32.toUsize(fk)] = renumber.get(u32.toUsize(vo.fields[u32.toUsize(fk)]))
+              fk = fk + 1
+            }
+            mapped = usize.toU32(newVirtualObjs.length())
+            run newVirtualObjs.append(vo)
+            voMap.set(oldIdx, mapped)
+          }
+          slotsSlice[si].value = mapped
+        }
+        si = si + 1
+      }
+    }
+    // Value roots name values too.
+    let mut v: usize = 0
+    while v < newValues.length() {
+      let mut info = newValues.get(v)
+      if info.rootKind == RootKind.Value { info.root = renumber.get(u32.toUsize(info.root)) newValues.set(v, info) }
+      v = v + 1
+    }
+    self.blocks = move newBlocks
+    self.params = move newParams
+    self.insts = move newInsts
+    self.values = move newValues
+    self.edges = move newEdges
+    self.edgeArgs = move newArgs
+    self.exits = move newExits
+    self.slots = move newSlots
+    self.virtualObjs = move newVirtualObjs
+    self.nextOrder = usize.toU32(self.insts.length()) * 2 + 4
+  }
+
+  // ---- printing ----
+
+  /// The textual form: one line per block header, instruction and exit.
+  pub effect fn print(self: &Self, out: &mut List<u8>) -> () ! OutOfMemoryError ? &mut Allocator {
+    let mut b: u32 = 0
+    while b < self.blockCount() {
+      let block = self.blocks.get(u32.toUsize(b))
+      run text(&mut out, b"b") run number(&mut out, b)
+      if block.paramCount > 0 {
+        run text(&mut out, b"(")
+        let mut p: u32 = 0
+        while p < block.paramCount {
+          if p > 0 { run text(&mut out, b", ") }
+          let v = self.paramAt(block, p)
+          run self.typed(&mut out, v)
+          p = p + 1
+        }
+        run text(&mut out, b")")
+      }
+      run text(&mut out, b":\n")
+      let mut i: u32 = 0
+      while i < block.instCount {
+        run self.printInst(&mut out, self.inst(block.firstInst + i))
+        i = i + 1
+      }
+      b = b + 1
+    }
+    let mut e: u32 = 0
+    while e < usize.toU32(self.exits.length()) {
+      let exit = self.exit(e)
+      run text(&mut out, b"e") run number(&mut out, e) run text(&mut out, b": pc ") run number(&mut out, exit.pc)
+      run text(&mut out, b" locals [")
+      let mut s: u32 = 0
+      while s < self.localCount { if s > 0 { run text(&mut out, b", ") } run self.printSlot(&mut out, self.slot(exit, s)) s = s + 1 }
+      run text(&mut out, b"] stack [")
+      s = 0
+      while s < exit.stackDepth { if s > 0 { run text(&mut out, b", ") } run self.printSlot(&mut out, self.slot(exit, self.localCount + s)) s = s + 1 }
+      if self.argumentSlots != 0 {
+        run text(&mut out, b"] arguments [")
+        s = 0
+        while s < self.argumentSlots { if s > 0 { run text(&mut out, b", ") } run self.printSlot(&mut out, self.slot(exit, self.localCount + exit.stackDepth + s)) s = s + 1 }
+      }
+      run text(&mut out, b"]")
+      let mut at = self.exitSlots(exit)
+      let mut n: u32 = 0
+      while n < exit.frames {
+        let frame = self.exitFrame(exit, n)
+        run text(&mut out, b" in ")
+        if frame.method { run text(&mut out, b"method ") }
+        run text(&mut out, b"call ") run number(&mut out, frame.argc) run text(&mut out, b" then ") run number(&mut out, frame.after)
+        run text(&mut out, b": pc ") run number(&mut out, frame.pc) run text(&mut out, b" locals [")
+        s = 0
+        while s < frame.locals { if s > 0 { run text(&mut out, b", ") } run self.printSlot(&mut out, self.slot(exit, at + s)) s = s + 1 }
+        run text(&mut out, b"] stack [")
+        at = at + frame.locals
+        s = 0
+        while s < frame.depth { if s > 0 { run text(&mut out, b", ") } run self.printSlot(&mut out, self.slot(exit, at + s)) s = s + 1 }
+        at = at + frame.depth
+        run text(&mut out, b"]")
+        n = n + 1
+      }
+      if exit.drops > 0 {
+        run text(&mut out, b" drops [")
+        s = 0
+        while s < exit.drops { if s > 0 { run text(&mut out, b", ") } run self.printSlot(&mut out, self.slot(exit, at + s)) s = s + 1 }
+        run text(&mut out, b"]")
+      }
+      run text(&mut out, b"\n")
+      e = e + 1
+    }
+  }
+
+  effect fn typed(self: &Self, out: &mut List<u8>, v: u32) -> () ! OutOfMemoryError ? &mut Allocator {
+    run text(&mut out, b"v") run number(&mut out, v) run text(&mut out, b": ")
+    let info = self.value(v)
+    if info.ty == Type.I32 { run text(&mut out, b"i32") return () }
+    if info.ty == Type.Bool { run text(&mut out, b"bool") return () }
+    if info.ty == Type.F64 { run text(&mut out, b"f64") return () }
+    if info.ty == Type.Raw { run text(&mut out, b"raw") return () }
+    run text(&mut out, b"value ")
+    if info.own == Own.Owned { run text(&mut out, b"owned") }
+    else if info.own == Own.Imm { run text(&mut out, b"imm") }
+    else if info.own == Own.Borrowed {
+      run text(&mut out, b"borrowed(")
+      if info.rootKind == RootKind.Argument { run text(&mut out, b"arg ") run number(&mut out, info.root) }
+      else if info.rootKind == RootKind.Value { run text(&mut out, b"v") run number(&mut out, info.root) }
+      else if info.rootKind == RootKind.Binding { run text(&mut out, b"binding") }
+      else { run text(&mut out, b"?") }
+      run text(&mut out, b")")
+    } else { run text(&mut out, b"unboxed?") }
+  }
+
+  effect fn printEdge(self: &Self, out: &mut List<u8>, index: u32) -> () ! OutOfMemoryError ? &mut Allocator {
+    let edge = self.edge(index)
+    run text(&mut out, b"b") run number(&mut out, edge.target) run text(&mut out, b"(")
+    let mut g: u32 = 0
+    while g < edge.argCount { if g > 0 { run text(&mut out, b", ") } run text(&mut out, b"v") run number(&mut out, self.edgeArg(edge, g)) g = g + 1 }
+    run text(&mut out, b")")
+  }
+
+  effect fn printInst(self: &Self, out: &mut List<u8>, inst: Inst) -> () ! OutOfMemoryError ? &mut Allocator {
+    run text(&mut out, b"  ")
+    if inst.result != NONE { run self.typed(&mut out, inst.result) run text(&mut out, b" = ") }
+    let op = inst.op
+    if op == Op.Arg { run text(&mut out, b"arg ") run number(&mut out, i32.wrappingToU32(inst.k)) }
+    else if op == Op.ConstI32 { run text(&mut out, b"const.i32 ") run signed(&mut out, inst.k) }
+    else if op == Op.Imm { run text(&mut out, b"imm ") run text(&mut out, immName(inst.k)) }
+    else if op == Op.Unbox { run text(&mut out, b"unbox.i32 ") run operand(&mut out, inst.a) }
+    else if op == Op.UnboxBool { run text(&mut out, b"unbox.bool ") run operand(&mut out, inst.a) }
+    else if op == Op.BoxI32 { run text(&mut out, b"box.i32 ") run operand(&mut out, inst.a) }
+    else if op == Op.BoxBool { run text(&mut out, b"box.bool ") run operand(&mut out, inst.a) }
+    else if op == Op.Add || op == Op.Sub || op == Op.Mul || op == Op.Cmp {
+      if op == Op.Add { run text(&mut out, b"add.i32 ") }
+      else if op == Op.Sub { run text(&mut out, b"sub.i32 ") }
+      else if op == Op.Mul { run text(&mut out, b"mul.i32 ") }
+      else { run text(&mut out, cmpName(inst.k)) run text(&mut out, b".i32 ") }
+      run operand(&mut out, inst.a) run text(&mut out, b", ") run operand(&mut out, inst.b)
+      if inst.proven { run text(&mut out, b" proven") }
+    }
+    else if op == Op.ConstF64 { run text(&mut out, b"const.f64 #") run number(&mut out, i32.wrappingToU32(inst.k)) }
+    else if isNumberOp(op) {
+      run text(&mut out, numberOpName(op))
+      if op == Op.CmpF64 { run text(&mut out, cmpName(inst.k)) run text(&mut out, b".f64") }
+      run text(&mut out, b" ") run operand(&mut out, inst.a)
+      if numberOpReadsB(op) { run text(&mut out, b", ") run operand(&mut out, inst.b) }
+    }
+    else if op == Op.Retain { run text(&mut out, b"retain ") run operand(&mut out, inst.a) }
+    else if op == Op.Release { run text(&mut out, b"release ") run operand(&mut out, inst.a) }
+    else if op == Op.Poll { run text(&mut out, b"poll") }
+    else if op == Op.Jump { run text(&mut out, b"jump ") run self.printEdge(&mut out, inst.edge) }
+    else if op == Op.Branch {
+      run text(&mut out, b"branch ") run operand(&mut out, inst.a) run text(&mut out, b", ")
+      run self.printEdge(&mut out, inst.edge) run text(&mut out, b", ") run self.printEdge(&mut out, inst.edge + 1)
+    }
+    else if op == Op.Return { run text(&mut out, b"return ") run operand(&mut out, inst.a) }
+    else if op == Op.This { run text(&mut out, b"this") }
+    else if op == Op.CheckTag { run text(&mut out, b"check.tag ") run operand(&mut out, inst.a) run text(&mut out, b", ") run signed(&mut out, inst.k) }
+    else if op == Op.CheckArray { run text(&mut out, b"check.array ") run operand(&mut out, inst.a) }
+    else if op == Op.CheckBound { run text(&mut out, b"check.bound ") run operand(&mut out, inst.a) run text(&mut out, b", ") run operand(&mut out, inst.b) }
+    else if op == Op.GrowBound { run text(&mut out, b"grow.bound ") run operand(&mut out, inst.a) run text(&mut out, b", ") run operand(&mut out, inst.b) run text(&mut out, b", ") run operand(&mut out, i32.wrappingToU32(inst.k)) }
+    else if op == Op.Elements { run text(&mut out, b"elements ") run operand(&mut out, inst.a) }
+    else if op == Op.TagIn { run text(&mut out, b"tag.in ") run operand(&mut out, inst.a) run text(&mut out, b", ") run signed(&mut out, inst.k) }
+    else if op == Op.GetField { run text(&mut out, b"get.field ") run operand(&mut out, inst.a) }
+    else if op == Op.GetKey { run text(&mut out, b"get.key ") run operand(&mut out, inst.a) run text(&mut out, b", ") run operand(&mut out, inst.b) }
+    else if op == Op.GetElem || op == Op.GetElemF64 {
+      if op == Op.GetElem { run text(&mut out, b"get.elem ") } else { run text(&mut out, b"get.elem.f64 ") }
+      run operand(&mut out, inst.a) run text(&mut out, b", ") run operand(&mut out, inst.b)
+      if inst.trusted { run text(&mut out, b" trusted") }
+      if inst.proven { run text(&mut out, b" proven") }
+    }
+    else if op == Op.PutElem || op == Op.PutElemF64 || op == Op.PutKey {
+      if op == Op.PutElem { run text(&mut out, b"put.elem ") } else if op == Op.PutKey { run text(&mut out, b"put.key ") } else { run text(&mut out, b"put.elem.f64 ") }
+      run operand(&mut out, inst.a) run text(&mut out, b", ") run operand(&mut out, inst.b) run text(&mut out, b", ") run operand(&mut out, i32.wrappingToU32(inst.k))
+      if inst.trusted { run text(&mut out, b" trusted") }
+      if inst.proven { run text(&mut out, b" proven") }
+    }
+    else if op == Op.GetLength { run text(&mut out, b"get.length ") run operand(&mut out, inst.a) }
+    else if op == Op.Truthy { run text(&mut out, b"truthy ") run operand(&mut out, inst.a) }
+    else if op == Op.TagIs { run text(&mut out, b"tag.is ") run operand(&mut out, inst.a) run text(&mut out, b", ") run signed(&mut out, inst.k) }
+    else if op == Op.Equals { run text(&mut out, b"equals ") run operand(&mut out, inst.a) run text(&mut out, b", ") run operand(&mut out, inst.b) run text(&mut out, b", ") run signed(&mut out, inst.k) }
+    else if op == Op.InstanceOf { run text(&mut out, b"instanceof ") run operand(&mut out, inst.a) run text(&mut out, b", ") run operand(&mut out, inst.b) }
+    else if op == Op.TypeofAtom { run text(&mut out, b"typeof ") run operand(&mut out, inst.a) }
+    else if op == Op.Typeof { run text(&mut out, b"typeof.str ") run operand(&mut out, inst.a) }
+    else if op == Op.GetScope { run text(&mut out, b"get.scope ") run signed(&mut out, inst.k) }
+    else if op == Op.PutScope { run text(&mut out, b"put.scope ") run operand(&mut out, inst.a) run text(&mut out, b", ") run signed(&mut out, inst.k) }
+    else if op == Op.GetVar { run text(&mut out, b"get.var ") run signed(&mut out, inst.k & (VAR_OWNED - 1)) if (inst.k & VAR_OWNED) != 0 { run text(&mut out, b" owned") } }
+    else if op == Op.PutVar { run text(&mut out, b"put.var ") run operand(&mut out, inst.a) run text(&mut out, b", ") run signed(&mut out, inst.k) }
+    else if op == Op.AtomValue { run text(&mut out, b"atom.value ") run signed(&mut out, inst.k) }
+    else if op == Op.ConstVal { run text(&mut out, b"const.val ") run signed(&mut out, inst.k) }
+    else if op == Op.PutField { run text(&mut out, b"put.field ") run operand(&mut out, inst.a) run text(&mut out, b", ") run operand(&mut out, inst.b) }
+    else if op == Op.CallArg { run text(&mut out, b"call.arg ") run operand(&mut out, inst.a) run text(&mut out, b", ") run signed(&mut out, inst.k) }
+    else if op == Op.Call {
+      run text(&mut out, b"call ") run operand(&mut out, inst.a) run text(&mut out, b", ") run operand(&mut out, inst.b)
+      run text(&mut out, b", ") run signed(&mut out, inst.k)
+    }
+    else if op == Op.CallResult { run text(&mut out, b"call.result ") run operand(&mut out, inst.a) run text(&mut out, b", ") run signed(&mut out, inst.k) }
+    else if op == Op.CheckCallee { run text(&mut out, b"check.callee ") run operand(&mut out, inst.a) run text(&mut out, b", ") run signed(&mut out, inst.k) }
+    else if op == Op.CheckShape { run text(&mut out, b"check.shape ") run operand(&mut out, inst.a) run text(&mut out, b", ") run signed(&mut out, inst.k) }
+    else if op == Op.CheckWatched { run text(&mut out, b"check.watched ") run operand(&mut out, inst.a) }
+    else if op == Op.IsCallee { run text(&mut out, b"is.callee ") run operand(&mut out, inst.a) run text(&mut out, b", ") run signed(&mut out, inst.k) }
+    else if op == Op.InlineFrame { run text(&mut out, b"inline.frame ") run operand(&mut out, inst.a) run text(&mut out, b", ") run signed(&mut out, inst.k) }
+    else if op == Op.NewObject { run text(&mut out, b"new.object ") run operand(&mut out, inst.a) run text(&mut out, b", ") run operand(&mut out, inst.b) run text(&mut out, b", ") run signed(&mut out, inst.k) }
+    else if op == Op.InitSlot { run text(&mut out, b"init.slot ") run operand(&mut out, inst.a) run text(&mut out, b", ") run operand(&mut out, inst.b) run text(&mut out, b", ") run signed(&mut out, inst.k) }
+    else if op == Op.CheckConstruct { run text(&mut out, b"check.construct ") run operand(&mut out, inst.a) run text(&mut out, b", ") run operand(&mut out, inst.b) run text(&mut out, b", ") run signed(&mut out, inst.k) }
+    else if op == Op.KnownMethod { run text(&mut out, b"known.method ") run signed(&mut out, i32.shiftRight(inst.k, 24)) run text(&mut out, b", ") run signed(&mut out, inst.k & 0xffffff) }
+    else { run text(&mut out, b"removed") }
+    if inst.frame != 0 { run text(&mut out, b" frame ") run number(&mut out, inst.frame) }
+    if inst.exit != NONE { run text(&mut out, b" exit e") run number(&mut out, inst.exit) }
+    run text(&mut out, b"   @") run number(&mut out, inst.pc)
+    run text(&mut out, b"\n")
+  }
+
+  effect fn printSlot(self: &Self, out: &mut List<u8>, slot: Slot) -> () ! OutOfMemoryError ? &mut Allocator {
+    if slot.mode == SlotMode.Virtual {
+      run text(&mut out, b"virtual #") run number(&mut out, slot.value)
+      if u32.toUsize(slot.value) < self.virtualObjs.length() {
+        let vo = self.virtualObjs.get(u32.toUsize(slot.value))
+        run text(&mut out, b"(c") run number(&mut out, vo.constructSite) run text(&mut out, b": ")
+        let mut fk: u32 = 0
+        while fk < vo.slotCount && fk < 8 {
+          if fk > 0 { run text(&mut out, b", ") }
+          run operand(&mut out, vo.fields[u32.toUsize(fk)])
+          fk = fk + 1
+        }
+        run text(&mut out, b")")
+      }
+      return ()
+    }
+    run text(&mut out, slotModeName(slot.mode)) run text(&mut out, b" ") run operand(&mut out, slot.value)
+    if slot.root != NONE { run text(&mut out, b" (arg ") run number(&mut out, slot.root) run text(&mut out, b")") }
+  }
+}
+
+pub fn immName(k: i32) -> &'static [u8] {
+  if k == 0 { return b"undefined" }
+  if k == 1 { return b"null" }
+  if k == 2 { return b"false" }
+  if k == 3 { return b"true" }
+  if k >= IMM_CATCH { return b"catch" }
+  return b"uninitialized"
+}
+pub fn cmpName(k: i32) -> &'static [u8] {
+  if k == 0 { return b"lt" }
+  if k == 1 { return b"le" }
+  if k == 2 { return b"gt" }
+  if k == 3 { return b"ge" }
+  if k == 4 { return b"eq" }
+  return b"ne"
+}
+pub fn slotModeName(mode: SlotMode) -> &'static [u8] {
+  if mode == SlotMode.Int { return b"int" }
+  if mode == SlotMode.Bool { return b"bool" }
+  if mode == SlotMode.Imm { return b"imm" }
+  if mode == SlotMode.Move { return b"move" }
+  if mode == SlotMode.F64 { return b"f64" }
+  if mode == SlotMode.Virtual { return b"virtual" }
+  return b"dup"
+}
+
+pub effect fn text(out: &mut List<u8>, bytes: &[u8]) -> () ! OutOfMemoryError ? &mut Allocator { run out.appendSlice(bytes) }
+effect fn operand(out: &mut List<u8>, v: u32) -> () ! OutOfMemoryError ? &mut Allocator { run text(&mut out, b"v") run number(&mut out, v) }
+/// Appends `value` in decimal.
+pub effect fn number(out: &mut List<u8>, value: u32) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut digits: [u8; 10] = [0; 10]
+  let mut count: usize = 0
+  let mut rest = value
+  while count == 0 || rest > 0 { digits[count] = u32.wrappingToU8(rest % 10) + 48 rest = rest / 10 count = count + 1 }
+  while count > 0 { count = count - 1 run out.append(digits[count]) }
+}
+/// Appends `value` in decimal with a sign when negative.
+pub effect fn signed(out: &mut List<u8>, value: i32) -> () ! OutOfMemoryError ? &mut Allocator {
+  if value < 0 {
+    run out.append(45)
+    // -2^31 has no positive i32; its magnitude still fits a u32.
+    run number(&mut out, u32.wrappingSubtract(0, i32.wrappingToU32(value)))
+    return ()
+  }
+  run number(&mut out, i32.wrappingToU32(value))
+}
+
+/// Whether `op` reads a third value, whose number its `k` holds (put.elem's index).
+pub fn readsK(op: Op) -> bool { return op == Op.PutElem || op == Op.PutElemF64 || op == Op.PutKey || op == Op.GrowBound }
+/// The printed name of a K operation (docs/jit/doubles.md), or empty. `cmp.f64` prints its
+/// comparison after this prefix.
+pub fn numberOpName(op: Op) -> &'static [u8] {
+  if op == Op.UnboxF64 { return b"unbox.f64" }
+  if op == Op.BoxF64 { return b"box.f64" }
+  if op == Op.ToF64 { return b"f64" }
+  if op == Op.AddF64 { return b"add.f64" }
+  if op == Op.SubF64 { return b"sub.f64" }
+  if op == Op.MulF64 { return b"mul.f64" }
+  if op == Op.DivF64 { return b"div.f64" }
+  if op == Op.ModF64 { return b"mod.f64" }
+  if op == Op.CmpF64 { return b"" }
+  if op == Op.NegF64 { return b"neg.f64" }
+  if op == Op.SqrtF64 { return b"sqrt.f64" }
+  if op == Op.AbsF64 { return b"abs.f64" }
+  if op == Op.FloorF64 { return b"floor.f64" }
+  if op == Op.ToInt32 { return b"toint32" }
+  if op == Op.ExactI32 { return b"int.f64" }
+  if op == Op.BitAnd { return b"and.i32" }
+  if op == Op.BitOr { return b"or.i32" }
+  if op == Op.BitXor { return b"xor.i32" }
+  if op == Op.Shl { return b"shl.i32" }
+  if op == Op.Sar { return b"sar.i32" }
+  if op == Op.Shr { return b"shr.i32" }
+  if op == Op.Mod { return b"mod.i32" }
+  if op == Op.Neg { return b"neg.i32" }
+  if op == Op.BitNot { return b"not.i32" }
+  if op == Op.NotBool { return b"not.bool" }
+  if op == Op.Imul { return b"imul.i32" }
+  return b""
+}
+/// Whether a K operation is one (numberOpName nonempty or `cmp.f64`).
+pub fn isNumberOp(op: Op) -> bool { return op == Op.CmpF64 || numberOpName(op).length > 0 }
+/// Whether a K operation reads operand `b`.
+pub fn numberOpReadsB(op: Op) -> bool {
+  return op == Op.AddF64 || op == Op.SubF64 || op == Op.MulF64 || op == Op.DivF64 || op == Op.ModF64 || op == Op.CmpF64 || op == Op.BitAnd
+    || op == Op.BitOr || op == Op.BitXor || op == Op.Shl || op == Op.Sar || op == Op.Shr || op == Op.Mod || op == Op.Imul
+}
+/// Whether a K operation is a guard (carries an exit).
+pub fn numberOpHasExit(op: Op) -> bool {
+  return op == Op.UnboxF64 || op == Op.ExactI32 || op == Op.Shr || op == Op.Mod || op == Op.Neg
+}

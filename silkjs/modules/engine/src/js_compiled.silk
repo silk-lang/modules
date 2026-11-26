@@ -1,0 +1,522 @@
+//! Entry into machine code an embedder compiled for a function, and the
+//! deoptimization back into its interpreter frame (docs/jit/compiled-entry.md).
+//! The engine knows only the C ABI and the exit format below; what compiles the
+//! code (modules/jit) is linked by a separate executable, never imported here.
+import silk.core.ownership { Copy }
+import silk.mem.pointer { Pointer }
+import silk.num.i32
+import silk.num.u8
+import silk.num.u16
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+import js_heap { HeapCell, HeapHeader }
+import js_value { ValueBits }
+import js_core_types { FunctionBytecode, ContextState, RuntimeState, CompiledEntry, StackFrame }
+import js_vm_state { Machine }
+import js_vm_activation as activation
+import js_core_types { ObjectData, ObjectPayload }
+import js_class_data as classes
+import js_opcode_data as op
+import js_gc as gc
+
+/// What compiled code returned (its u32 result).
+pub const EXIT_RETURNED: u32 = 0
+pub const EXIT_DEOPT: u32 = 1
+/// An interrupt poll fell due on a back edge: resume in the interpreter, which polls.
+pub const EXIT_POLL: u32 = 2
+/// A call the code made threw: the state is the frame before the call (its operands still on
+/// the stack), and the exception is pending, as when the interpreter's call instruction fails.
+pub const EXIT_THROW: u32 = 3
+
+/// A call the code makes (section 7.3 of docs/jit/compiled-entry.md): the code saved its
+/// values and the call's operands in the call block (CompiledFrame.calls) and left; the engine
+/// makes the call, writes the answer into the block and runs the code again, which resumes there.
+pub const EXIT_CALL: u32 = 4
+
+/// What enterBase did: the code returned (value written), the interpreter continues from the
+/// frame it left (or the code was skipped), or a call in it threw from the restored frame.
+pub const ENTER_RETURNED: u32 = 0
+pub const ENTER_INTERPRET: u32 = 1
+pub const ENTER_THREW: u32 = 2
+
+/// The call block, in u64 words (offsets are part of the code ABI). Word 0: 0 for a fresh run;
+/// at EXIT_CALL the code writes its resume point there shifted left by 2, and the engine adds
+/// how the call went (CALL_*). Word 1: the call's bytecode offset (low 32 bits), argument
+/// count (bits 32-39) and SITE_CONSTRUCT for `new`. Words 2-3: the owned result on CALL_RETURNED. From word 4: the call area,
+/// CALL_AREA_SLOTS ValueBits (callee, receiver, arguments, borrowed by the call). Word 24
+/// (CALL_CALLEE_EXIT): 0, or the exit code (low 32 bits) and table index (high 32) of a
+/// compiled callee the code ran directly (CALL_FAST) that left at a deopt or poll, whose state
+/// is at CALL_STATE (CALL_STATE_WORDS words). CALL_FRAME and CALL_INDEX: a direct call's
+/// callee frame and index (DIRECT_*). From CALL_SAVED: the code's saved values, which
+/// keep their counts while the call runs.
+pub const CALL_RESUME: usize = 0
+/// CALL_SITE's flag for a constructor call (OP_call_constructor: the receiver slot holds new.target).
+pub const SITE_CONSTRUCT: u64 = 0x10000000000
+/// CALL_SITE's flag for a generic instruction exit (docs/jit/compiled-entry.md 7.8): the
+/// engine runs the instruction at the site's pc as the interpreter does, on the argument
+/// count's operands at CALL_AREA + 2 (borrowed from the code), and leaves its result there
+/// (owned; undefined when it pushes none).
+pub const SITE_GENERIC: u64 = 0x20000000000
+/// CALL_SITE's flag for a call that deoptimized in an earlier compilation (compiled-entry.md
+/// 7.9): the engine makes the call even when the callee is a bytecode function that is hot but
+/// has no code, instead of leaving to the interpreter. A known local function still leaves.
+pub const SITE_CALL_ALWAYS: u64 = 0x40000000000
+/// CALL_SITE's flag for `f.apply(x, arguments)` in a function whose arguments object is lazy
+/// (js_bytecode.lazyArgumentsSite): the last argument is the stand-in, Uninitialized. The
+/// engine calls f on the running frame's own arguments when the method is the intrinsic apply
+/// and f a bytecode function, as the interpreter's OP_call_method does; otherwise CALL_DEOPT,
+/// and the interpreter builds the object.
+pub const SITE_LAZY_ARGUMENTS: u64 = 0x80000000000
+/// The argument count of a CALL_SITE word.
+@inlineAlways
+pub fn siteCount(site: u64) -> usize { return u64.toUsize(u64.shiftRight(site, 32) & 0xff) }
+/// The values a generic site's instruction leaves on its stack when more than one (bits 44-47,
+/// calls.RESULTS_SHIFT in k), else 0: compiledOp checks the count.
+pub fn siteResults(site: u64) -> usize { return u64.toUsize(u64.shiftRight(site, 44) & 0xf) }
+/// The cells of such a site the instruction leaves as they were (bits 48-55, calls.KEPT_SHIFT in
+/// k; bit c: cell c): compiledOp releases its copies, the code keeps its own values.
+pub fn siteKept(site: u64) -> u64 { return u64.shiftRight(site, 48) & 0xff }
+pub const CALL_SITE: usize = 1
+pub const CALL_RESULT: usize = 2
+pub const CALL_AREA: usize = 4
+pub const CALL_AREA_SLOTS: usize = 10
+pub const CALL_CALLEE_EXIT: usize = 24
+pub const CALL_STATE: usize = 25
+pub const CALL_STATE_WORDS: usize = 64
+/// The CompiledFrame (9 words) a direct call from machine code builds for a leaf callee (for
+/// one that makes calls, word 0 holds its activation), then the callee's table index.
+pub const CALL_FRAME: usize = 89
+pub const CALL_INDEX: usize = 98
+pub const CALL_SAVED: usize = 99
+/// What machine code reads to call a compiled callee that makes no calls itself (docs/jit/
+/// compiled-entry.md 7.7), as byte offsets from a cell's header; js_vm.directLayoutHolds
+/// checks each against the engine's accessors. A function value's tag byte is
+/// DIRECT_OBJECT_TAG; its object's class (u16) is DIRECT_BYTECODE_CLASS, and then its closure
+/// has the bytecode, captured-cell list (a BoxList: null, or DIRECT_BOX_DATA bytes before its
+/// cells) and scope. The bytecode's compiled index is a u32; the runtime holds the table
+/// (entries, count) and observeInstructions (a byte, bit 0).
+pub const DIRECT_OBJECT_TAG: u32 = 6
+pub const DIRECT_OBJECT_CLASS: i32 = 10
+pub const DIRECT_BYTECODE_CLASS: u32 = 13
+pub const DIRECT_CLOSURE_BYTECODE: i32 = 48
+pub const DIRECT_CLOSURE_REFERENCES: i32 = 56
+pub const DIRECT_CLOSURE_SCOPE: i32 = 72
+pub const DIRECT_BOX_DATA: i32 = 8
+pub const DIRECT_BYTECODE_INDEX: i32 = 36
+pub const DIRECT_RUNTIME_OBSERVE: i32 = 32
+pub const DIRECT_RUNTIME_ENTRIES: i32 = 4064
+pub const DIRECT_RUNTIME_COUNT: i32 = 4072
+/// A CompiledEntry's size and the fields a direct call reads.
+pub const DIRECT_ENTRY_BYTES: u32 = 160
+pub const DIRECT_ENTRY_CODE: i32 = 0
+pub const DIRECT_ENTRY_DATA: i32 = 8
+pub const DIRECT_ENTRY_ENV: i32 = 16
+pub const DIRECT_ENTRY_RUNS: i32 = 40
+pub const DIRECT_ENTRY_COUNTER: i32 = 88
+pub const DIRECT_ENTRY_ARITY: i32 = 96
+pub const DIRECT_ENTRY_REALM: i32 = 104
+pub const DIRECT_ENTRY_SOURCE: i32 = 112
+/// CompiledEntry.directArity until the entry can be called directly.
+pub const DIRECT_NOT_READY: u32 = 4294967295
+/// CALL_SITE bits 56–57 select a widened instruction that uses the call area. Zero is a
+/// regular call or generic exit. Its flags, result count and kept cells occupy bits 40–55.
+pub const SITE_CALL: u32 = 0
+/// Frame mode only: the + of the area's two values where a string takes part, which the
+/// code asks the engine for (js_baseline.SERVICE_CONCAT), stepping the instruction on the
+/// frame when neither is a string.
+pub const SITE_ADD: u32 = 1
+/// Run put_field on the area's object and value, including prototype setters and additions.
+pub const SITE_PUT_FIELD: u32 = 2
+/// Run eq or neq on the area's two values with their ordinary coercions.
+pub const SITE_EQUAL: u32 = 3
+pub fn siteKind(site: u64) -> u32 { return u64.wrappingToU32(u64.shiftRight(site, 56) & 3) }
+/// For a callee that makes calls, machine code also pushes its activation (js_vm.Activation)
+/// on the runtime's activation stack: the entry's callWords and activationWords (u32), the
+/// bytecode's mode byte, the table's stack (base, capacity and top in words, native depth).
+pub const DIRECT_ENTRY_CALL_WORDS: i32 = 36
+pub const DIRECT_ENTRY_WORDS: i32 = 84
+pub const DIRECT_BYTECODE_MODE: i32 = 9
+pub const DIRECT_RUNTIME_ACTIVATIONS: i32 = 4080
+pub const DIRECT_RUNTIME_CAPACITY: i32 = 4088
+pub const DIRECT_RUNTIME_TOP: i32 = 4096
+pub const DIRECT_RUNTIME_DEPTH: i32 = 4104
+/// Activations run nested on the native stack before the rest is left to the runner.
+pub const DIRECT_NESTING: u32 = 64
+/// An activation's byte offsets: its CompiledFrame at 0, then Prepared (code, data, env,
+/// counter), cells, state, stack frame, pc, published and mode (bytes), function and
+/// receiver (ValueBits), argv (data, count), parent, mark, index and flags (u32), exit (u32)
+/// and known (a byte). Its stack frame follows at DIRECT_ACTIVATION_WORDS words and its call
+/// block at DIRECT_ACTIVATION_HEADER words (no padded arguments: argc >= the arity).
+pub const DIRECT_ACT_PREPARED: i32 = 72
+pub const DIRECT_ACT_CELLS: i32 = 104
+pub const DIRECT_ACT_STATE: i32 = 112
+pub const DIRECT_ACT_STACK_FRAME: i32 = 120
+pub const DIRECT_ACT_PC: i32 = 128
+pub const DIRECT_ACT_PUBLISHED: i32 = 136
+pub const DIRECT_ACT_FUNCTION: i32 = 144
+pub const DIRECT_ACT_RECEIVER: i32 = 160
+pub const DIRECT_ACT_ARGV: i32 = 176
+pub const DIRECT_ACT_PARENT: i32 = 192
+pub const DIRECT_ACT_MARK: i32 = 200
+pub const DIRECT_ACT_INDEX: i32 = 208
+pub const DIRECT_ACT_EXIT: i32 = 216
+pub const DIRECT_ACTIVATION_WORDS: i32 = 28
+pub const DIRECT_ACTIVATION_HEADER: i32 = 48
+/// The flags of an activation whose arguments are the caller's cells (borrowed).
+pub const DIRECT_COPY_ARGUMENTS: u32 = 2
+/// CompiledFrame.activation's offset: the code passes it as a callee's parent.
+pub const FRAME_ACTIVATION: i32 = 64
+pub const CALL_RETURNED: u64 = 0
+pub const CALL_THREW: u64 = 1
+/// Nothing was called (a callee only the interpreter calls): deoptimize before the call.
+pub const CALL_DEOPT: u64 = 2
+
+/// Activation.exit of an activation pushed but not run yet.
+pub const EXIT_FRESH: u32 = 5
+/// Resume.exit of an activation that optimized code on a baseline frame had inlined
+/// (js_baseline.Inlined, which the state then is): the new frame takes its locals and
+/// operands and goes on from there.
+pub const EXIT_INLINED: u32 = 6
+/// What a direct call (js_vm.fastCall, the CALL_FAST helper) did: the callee returned (owned
+/// result at CALL_RESULT), nothing ran (make the call through EXIT_CALL), or the callee ran
+/// and left at a deopt or poll (CALL_CALLEE_EXIT; EXIT_CALL resumes it in the interpreter).
+pub const FAST_RETURNED: u32 = 0
+pub const FAST_GENERIC: u32 = 1
+pub const FAST_EXITED: u32 = 2
+/// CALL_CALLEE_EXIT after CALL_FAST pushed an activation for a callee that makes calls
+/// (js_vm.runActivations), whose address is then at CALL_STATE.
+pub const CALLEE_PUSHED: u64 = 0xffffffffffffffff
+
+/// What a compiled function runs for, passed as the code's sixth argument. Field offsets
+/// are part of the code ABI (each a pointer, in this order). Everything is borrowed for the
+/// call: thisValue is the frame's receiver cell, bytecode its FunctionBytecode cell.
+pub extern "C" struct CompiledFrame {
+  pub thisValue: *const ValueBits,
+  pub bytecode: *mut HeapHeader,
+  pub context: *mut HeapHeader,
+  pub runtime: *mut HeapHeader,
+  /// The closure's captured variable cells (Machine.closureReferences).
+  pub closureReferences: *const ?*mut HeapHeader,
+  /// The running scope (Machine.scope), or null.
+  pub scope: ?*mut HeapHeader,
+  /// The call block of code that makes calls (CompiledEntry.callWords words), or null.
+  pub calls: ?*mut u64,
+  /// The first byte of bytecode's code (Machine.code): inline field reads find a site's
+  /// key at code + pc.
+  pub code: *const u8,
+  /// The engine's record of this run when it is an activation (js_vm.runActivations), or
+  /// null. The code never reads it.
+  pub activation: ?*mut u8
+}
+impl CompiledFrame {
+  /// What machine, a freshly entered frame, runs.
+  pub fn of(machine: &Machine) -> CompiledFrame {
+    return CompiledFrame { thisValue: Pointer.fromRef<ValueBits>(&machine.thisValue), bytecode: machine.bytecode, context: machine.context,
+      runtime: machine.runtime, closureReferences: machine.closureReferences, scope: machine.scope,
+      calls: Pointer.null<u64>(), code: machine.code, activation: Pointer.null<u8>() }
+  }
+}
+
+/// The code's C ABI. arguments are the frame's argument cells (borrowed: the code never
+/// writes them nor relies on their address); state receives the exit; counter is the
+/// context's interrupt counter; data and env are the entry's words; frame says what runs.
+pub type CompiledCode = extern "C" fn(*const ValueBits, *mut u64, *mut i32, ?*mut u8, ?*mut u8, *const CompiledFrame) -> u32
+
+/// The exit state a function needs, in u64 words: on EXIT_RETURNED, the owned result
+/// ValueBits (words 0-1) and the bytecode offset of its return (word 2); on an exit, the pc
+/// to resume at (word 0), the operand stack depth (word 1), then one ValueBits per local and
+/// per stack slot, bottom first, each owning one count that the frame takes over.
+pub fn stateWords(locals: usize, stackSize: usize) -> usize { return 2 + 2 * (locals + stackSize) + 1 }
+/// The parameter slots a state of a function needs besides its locals: its parameter count
+/// when it may write one (a function that writes a parameter never borrows its arguments,
+/// js_bytecode.CallFacts), else none. Add it to the locals given to stateWords.
+pub fn argumentRoom(parameters: u16, borrowsArguments: bool) -> usize {
+  if borrowsArguments { return 0 }
+  return u16.toUsize(parameters)
+}
+/// In a state's depth word (word 1): the parameter values follow the stack values, one per
+/// parameter (compiled code of a function that writes a parameter, jit_exit_state).
+pub const ARGUMENTS_FOLLOW: u64 = 4294967296
+/// Writes the parameter values of a state (count of them at values) into machine's argument
+/// cells, releasing what each held. Machine is a frame of a function that does not borrow its
+/// arguments: its cells are its own, one per parameter at least (js_vm_activation pads them).
+pub unsafe fn writeArguments(machine: &Machine, values: [*]mut ValueBits, count: usize) -> () {
+  // The cells, not the arguments passed: fewer passed than parameters leaves undefined cells.
+  let cells = (unsafe activation.frameArguments(unsafe Intrinsic.pointerRequalify<*mut StackFrame, *const StackFrame>(machine.frame))).count
+  if count > cells { trap() }
+  let bytecodeAnchor = () let bytecode = unsafe HeapCell.payload<FunctionBytecode, ()>(&bytecodeAnchor, machine.bytecode)
+  let borrows = bytecode.borrowsArguments
+  drop bytecode
+  if borrows { trap() }
+  let mut position: usize = 0
+  while position < count {
+    let cell = unsafe machine.argumentCell(position)
+    let old = unsafe Pointer.read<ValueBits>(cell)
+    unsafe Pointer.write<ValueBits>(cell, unsafe Pointer.read<ValueBits>(unsafe Pointer.atMut<ValueBits>(values, position)))
+    unsafe gc.releaseDeferred(old)
+    position = position + 1
+  }
+}
+
+fn trap() -> never { return Intrinsic.trap("compiled code table invariant violated") }
+
+/// A deoptimized run of compiled code that the interpreter frame being built
+/// continues from (callInternal, callKnown); state is null for an ordinary entry.
+pub struct Resume { pub state: ?*mut u64, pub exit: u32, pub index: u32 }
+impl Copy for Resume {}
+@inlineAlways
+pub fn fresh() -> Resume { return Resume { state: Pointer.null<u64>(), exit: 0, index: 0 } }
+
+/// The call block words of the code linked as index (CompiledEntry.callWords): 0 when it makes
+/// no calls. Code that makes calls runs only from a base frame (js_vm.enterBase), never frameless.
+pub unsafe fn callWords(runtime: *mut HeapHeader, index: u32) -> usize {
+  let entrySlot = unsafe entryAt(runtime, index)
+  let anchor = () return u32.toUsize((unsafe Pointer.borrow<(), CompiledEntry>(&anchor, unsafe Intrinsic.pointerRequalify<*mut CompiledEntry, *const CompiledEntry>(entrySlot))).callWords)
+}
+/// Runs the compiled code linked as index for frame.bytecode, whose arguments are the
+/// count cells at cells (parameters past count read as undefined), with no interpreter
+/// frame. state has room for stateWords. Returns the exit code:
+/// EXIT_RETURNED (see result), EXIT_DEOPT / EXIT_POLL / EXIT_THROW with the frame state for
+/// restore, or EXIT_CALL (see the call block).
+pub unsafe fn runCode(index: u32, frame: &CompiledFrame, cells: *mut ValueBits, count: usize, state: *mut u64) -> u32 {
+  let entrySlot = unsafe entryAt(frame.runtime, index)
+  let mut entryAnchor = () let entry = unsafe Pointer.borrowMut<(), CompiledEntry>(&mut entryAnchor, entrySlot)
+  let code = unsafe Intrinsic.pointerRequalify<?*const u8, *const u8>(entry.code)
+  let data = entry.data
+  let env = entry.env
+  entry.runs = entry.runs + 1
+  drop entry
+  let bytecodeAnchor = () let function = unsafe HeapCell.payload<FunctionBytecode, ()>(&bytecodeAnchor, frame.bytecode)
+  let parameters = u16.toUsize(function.argumentCount)
+  drop function
+  let mut arguments = unsafe Intrinsic.pointerRequalify<*mut ValueBits, *const ValueBits>(cells)
+  let mut room: usize = 0
+  if count < parameters { room = parameters }
+  let spare = unsafe Intrinsic.pointerRequalify<[*]mut ValueBits, *mut ValueBits>(unsafe Intrinsic.stackAllocate<ValueBits>(room))
+  if count < parameters {
+    // Missing parameters read as undefined: the code sees a padded copy (bits, borrowed).
+    let padded = unsafe Pointer.assumeManyMut<ValueBits>(spare)
+    let given = unsafe Pointer.assumeManyMut<ValueBits>(cells)
+    let mut position: usize = 0
+    while position < parameters {
+      let mut bits = ValueBits.Undefined
+      if position < count { bits = unsafe Pointer.read<ValueBits>(unsafe Pointer.atMut<ValueBits>(given, position)) }
+      unsafe Pointer.write<ValueBits>(unsafe Pointer.atMut<ValueBits>(padded, position), bits)
+      position = position + 1
+    }
+    arguments = unsafe Intrinsic.pointerRequalify<*mut ValueBits, *const ValueBits>(unsafe Pointer.atMut<ValueBits>(padded, 0))
+  }
+  let mut contextAnchor = () let realm = unsafe HeapCell.payloadMut<ContextState, ()>(&mut contextAnchor, frame.context)
+  let counter = Pointer.fromMutRef<i32>(&mut realm.interruptCounter)
+  drop realm
+  let slot = unsafe Intrinsic.pointerReinterpret<*const *const u8, *const CompiledCode>(Pointer.fromRef<*const u8>(&code))
+  let machineCode = unsafe Pointer.read<CompiledCode>(slot)
+  let exit = unsafe machineCode(arguments, state, counter, data, env, Pointer.fromRef<CompiledFrame>(&frame))
+  if exit > EXIT_CALL { trap() }
+  return exit
+}
+/// What runCode looks up to run index for frame, kept by an activation that runs the code many
+/// times (js_vm.runActivations); looking it up counts one run. The code address is
+/// process-local and lives only as long as the activation.
+pub struct Prepared { pub code: CompiledCode, pub data: ?*mut u8, pub env: ?*mut u8, pub counter: *mut i32 }
+pub unsafe fn prepare(index: u32, frame: &CompiledFrame) -> Prepared {
+  let entrySlot = unsafe entryAt(frame.runtime, index)
+  let mut entryAnchor = () let entry = unsafe Pointer.borrowMut<(), CompiledEntry>(&mut entryAnchor, entrySlot)
+  let code = unsafe Intrinsic.pointerRequalify<?*const u8, *const u8>(entry.code)
+  let data = entry.data
+  let env = entry.env
+  entry.runs = entry.runs + 1
+  drop entry
+  let mut contextAnchor = () let realm = unsafe HeapCell.payloadMut<ContextState, ()>(&mut contextAnchor, frame.context)
+  let counter = Pointer.fromMutRef<i32>(&mut realm.interruptCounter)
+  drop realm
+  let slot = unsafe Intrinsic.pointerReinterpret<*const *const u8, *const CompiledCode>(Pointer.fromRef<*const u8>(&code))
+  return Prepared { code: unsafe Pointer.read<CompiledCode>(slot), data: data, env: env, counter: counter }
+}
+/// runCode with what prepare looked up; cells has every parameter (no padding here).
+@inlineAlways
+pub unsafe fn runPrepared(prepared: &Prepared, frame: &CompiledFrame, cells: *const ValueBits, state: *mut u64) -> u32 {
+  let machineCode = prepared.code
+  let exit = unsafe machineCode(cells, state, prepared.counter, prepared.data, prepared.env, Pointer.fromRef<CompiledFrame>(&frame))
+  if exit > EXIT_CALL { trap() }
+  return exit
+}
+/// The owned value an EXIT_RETURNED state holds.
+pub unsafe fn result(state: *mut u64) -> ValueBits {
+  return unsafe Pointer.read<ValueBits>(unsafe Intrinsic.pointerReinterpret<*mut u64, *mut ValueBits>(state))
+}
+/// Applies an EXIT_DEOPT, EXIT_POLL or EXIT_THROW state of entry index to machine, a freshly
+/// entered base frame of the same function that has not executed anything (its
+/// locals hold no counts), and counts the exit (unlinking after deoptLimit deopts).
+pub unsafe fn restore(machine: &mut Machine, index: u32, exit: u32, state: *mut u64) -> () {
+  let entrySlot = unsafe entryAt(machine.runtime, index)
+  let bytecodeAnchor = () let bytecode = unsafe HeapCell.payload<FunctionBytecode, ()>(&bytecodeAnchor, machine.bytecode)
+  let locals = u16.toUsize(bytecode.variableCount)
+  let stackSize = u16.toUsize(bytecode.stackSize)
+  let parameters = u16.toUsize(bytecode.argumentCount)
+  drop bytecode
+  let stateWords = unsafe Pointer.assumeManyMut<u64>(state)
+  let pc = u64.toUsize(unsafe Pointer.read<u64>(unsafe Pointer.atMut<u64>(stateWords, 0)))
+  let depthWord = unsafe Pointer.read<u64>(unsafe Pointer.atMut<u64>(stateWords, 1))
+  let depth = u64.toUsize(depthWord & 4294967295)
+  if depth > stackSize { trap() }
+  let values = unsafe Pointer.assumeManyMut<ValueBits>(unsafe Intrinsic.pointerReinterpret<*mut u64, *mut ValueBits>(unsafe Pointer.atMut<u64>(stateWords, 2)))
+  let localCells = unsafe Pointer.assumeManyMut<ValueBits>(machine.locals)
+  let mut position: usize = 0
+  while position < locals {
+    unsafe Pointer.write<ValueBits>(unsafe Pointer.atMut<ValueBits>(localCells, position), unsafe Pointer.read<ValueBits>(unsafe Pointer.atMut<ValueBits>(values, position)))
+    position = position + 1
+  }
+  position = 0
+  while position < depth {
+    unsafe machine.push(unsafe Pointer.read<ValueBits>(unsafe Pointer.atMut<ValueBits>(values, locals + position)))
+    position = position + 1
+  }
+  if (depthWord & ARGUMENTS_FOLLOW) != 0 { unsafe writeArguments(&machine.*, unsafe Pointer.assumeManyMut<ValueBits>(unsafe Pointer.atMut<ValueBits>(values, locals + depth)), parameters) }
+  unsafe machine.setPc(pc)
+  let mut unlink = false
+  let mut frameCells: u32 = 0
+  let mut leaf: u8 = 0
+  let mut afterAnchor = () let after = unsafe Pointer.borrowMut<(), CompiledEntry>(&mut afterAnchor, entrySlot)
+  if exit == EXIT_POLL { after.polls = after.polls + 1 }
+  else if exit == EXIT_DEOPT && !unsafe coldExit(&machine.*, pc) {
+    after.deopts = after.deopts + 1
+    recordDeopt(&mut after, pc, unsafe deoptKind(&machine.*, pc, depth))
+    unlink = after.deoptLimit != 0 && after.deopts >= u32.toU64(after.deoptLimit)
+    frameCells = after.frameCells
+    leaf = after.leaf
+  }
+  drop after
+  if unlink {
+    let mut codeAnchor = () let owner = unsafe HeapCell.payloadMut<FunctionBytecode, ()>(&mut codeAnchor, machine.bytecode)
+    owner.frameCells = frameCells
+    owner.leaf = leaf
+    owner.compiled = 0
+    drop owner
+    unsafe rearmHotness(machine.runtime, machine.bytecode)
+  }
+}
+/// A deopt exit at a `throw` or `throw_error` (docs/jit/compiled-entry.md 3.1): the code leaves
+/// there on purpose and the interpreter throws, so it is not counted against the deopt limit
+/// and is no recompilation site.
+pub unsafe fn coldExit(machine: &Machine, pc: usize) -> bool {
+  let opcode = unsafe machine.byteAt(pc)
+  return opcode == op.OP_throw || opcode == op.OP_throw_error
+}
+/// The interpreter frame size (FunctionBytecode.frameCells) linking index saved.
+pub unsafe fn linkedFrameCells(runtime: *mut HeapHeader, index: u32) -> u32 {
+  let entrySlot = unsafe entryAt(runtime, index)
+  let anchor = () return (unsafe Pointer.borrow<(), CompiledEntry>(&anchor, unsafe Intrinsic.pointerRequalify<*mut CompiledEntry, *const CompiledEntry>(entrySlot))).frameCells
+}
+/// Notes pc among entry's first distinct deopt offsets, with operands of unknown kind.
+pub fn recordDeoptPc(entry: &mut CompiledEntry, pc: usize) -> () { recordDeopt(&mut entry, pc, KIND_NONE) }
+/// Notes pc and the operand kinds there (deoptKind) among entry's first distinct deopt offsets;
+/// a pc keeps the kinds of its first deopt.
+pub fn recordDeopt(entry: &mut CompiledEntry, pc: usize, kinds: u8) -> () {
+  let offset = usize.toU32(pc)
+  let mut index: usize = 0
+  while index < u8.toUsize(entry.deoptPcCount) { if entry.deoptPcs[index] == offset { return () } index = index + 1 }
+  if entry.deoptPcCount < 4 {
+    entry.deoptPcs[u8.toUsize(entry.deoptPcCount)] = offset
+    entry.deoptKinds[u8.toUsize(entry.deoptPcCount)] = kinds
+    entry.deoptPcCount = entry.deoptPcCount + 1
+  }
+}
+/// Operand kinds (CompiledEntry.deoptKinds), one nibble each.
+pub const KIND_NONE: u8 = 0
+pub const KIND_INT: u8 = 1
+pub const KIND_FLOAT64: u8 = 2
+pub const KIND_BOOL: u8 = 3
+pub const KIND_UNDEFINED: u8 = 4
+pub const KIND_NULL: u8 = 5
+pub const KIND_STRING: u8 = 6
+/// A symbol or a BigInt.
+pub const KIND_SYMBOL: u8 = 7
+/// A known local function (its value is its FunctionBytecode, js_compiler_known) without
+/// linked code; with linked code it is KIND_LINKED_FUNCTION.
+pub const KIND_LOCAL_FUNCTION: u8 = 8
+pub const KIND_OBJECT: u8 = 9
+pub const KIND_ARRAY: u8 = 10
+/// A bytecode function (a closure or a known local one) whose bytecode has compiled code
+/// linked, and a closure without.
+pub const KIND_LINKED_FUNCTION: u8 = 11
+pub const KIND_BYTECODE_FUNCTION: u8 = 12
+pub const KIND_NATIVE_FUNCTION: u8 = 13
+pub const KIND_BOUND_FUNCTION: u8 = 14
+/// A proxy or any other exotic or callable class.
+pub const KIND_OTHER: u8 = 15
+pub unsafe fn operandKind(value: ValueBits) -> u8 {
+  if value.isString() { return KIND_STRING }
+  if value.isBigInt() { return KIND_SYMBOL }
+  match value {
+    ValueBits.Int { .. } => { return KIND_INT }
+    ValueBits.Float64 { .. } => { return KIND_FLOAT64 }
+    ValueBits.Bool { .. } => { return KIND_BOOL }
+    ValueBits.Undefined => { return KIND_UNDEFINED }
+    ValueBits.Null => { return KIND_NULL }
+    ValueBits.Symbol { .. } => { return KIND_SYMBOL }
+    ValueBits.FunctionBytecode { reference } => {
+      let anchor = () let function = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, reference)
+      if function.compiled != 0 { return KIND_LINKED_FUNCTION }
+      return KIND_LOCAL_FUNCTION
+    }
+    ValueBits.Object { reference } => {
+      let anchor = () let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, reference)
+      let classId = object.classId()
+      if classId == classes.JS_CLASS_BYTECODE_FUNCTION {
+        let bytecode = match &object.payload { ObjectPayload.BytecodeFunction { function: closure } => closure.bytecode _ => { return KIND_OTHER } }
+        drop object
+        let codeAnchor = () let function = unsafe HeapCell.payload<FunctionBytecode, ()>(&codeAnchor, bytecode)
+        if function.compiled != 0 { return KIND_LINKED_FUNCTION }
+        return KIND_BYTECODE_FUNCTION
+      }
+      if classId == classes.JS_CLASS_C_FUNCTION { return KIND_NATIVE_FUNCTION }
+      if classId == classes.JS_CLASS_BOUND_FUNCTION { return KIND_BOUND_FUNCTION }
+      if classId == classes.JS_CLASS_ARRAY { return KIND_ARRAY }
+      if object.isExotic() || classId == classes.JS_CLASS_PROXY { return KIND_OTHER }
+      return KIND_OBJECT
+    }
+    _ => { return KIND_OTHER }
+  }
+}
+/// The kinds of the operands the instruction at pc meets on machine's restored stack of depth
+/// values: for a call its callee and (call_method) receiver, otherwise the top two.
+pub unsafe fn deoptKind(machine: &Machine, pc: usize, depth: usize) -> u8 {
+  let anchor = () let bytecode = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, machine.bytecode)
+  let code = unsafe bytecode.code.asSlice()
+  if pc >= code.length { return KIND_NONE }
+  let opcode = code[pc]
+  let mut first: usize = 1
+  let mut second: usize = 2
+  if opcode >= op.OP_call0 && opcode <= op.OP_call3 { first = u8.toUsize(opcode - op.OP_call0) + 1 second = 0 }
+  else if (opcode == op.OP_call || opcode == op.OP_call_method || opcode == op.OP_call_constructor) && pc + 2 < code.length {
+    let argc = u8.toUsize(code[pc + 1]) + u8.toUsize(code[pc + 2]) * 256
+    first = argc + 1 second = 0
+    if opcode == op.OP_call_method { second = argc + 2 }
+    if opcode == op.OP_call_constructor { first = argc + 2 }
+  }
+  drop bytecode
+  let mut kinds: u8 = 0
+  if first <= depth { kinds = unsafe operandKind(unsafe machine.top(first)) }
+  if second != 0 && second <= depth { kinds = kinds | (unsafe operandKind(unsafe machine.top(second))) * 16 }
+  return kinds
+}
+/// An unlinked function counts its entries again from the runtime's hot budget, so the
+/// embedder hears of it again and can compile it anew from what deoptimized.
+@inlineNever
+pub unsafe fn rearmHotness(runtime: *mut HeapHeader, bytecode: *mut HeapHeader) -> () {
+  let anchor = ()
+  let budget = (unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)).hotEntryBudget
+  let mut codeAnchor = () let owner = unsafe HeapCell.payloadMut<FunctionBytecode, ()>(&mut codeAnchor, bytecode)
+  owner.hotness = budget
+}
+/// The table entry of index (FunctionBytecode.compiled, nonzero).
+pub unsafe fn entryAt(runtime: *mut HeapHeader, index: u32) -> *mut CompiledEntry {
+  let anchor = ()
+  let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
+  if index == 0 || index > state.compiled.count { trap() }
+  let table = unsafe Intrinsic.pointerRequalify<?*mut CompiledEntry, *mut CompiledEntry>(state.compiled.entries)
+  drop state
+  return unsafe Pointer.atMut<CompiledEntry>(unsafe Pointer.assumeManyMut<CompiledEntry>(table), u32.toUsize(index - 1))
+}

@@ -1,0 +1,226 @@
+//! What the JIT remembers between compilations of a function (docs/jit/doubles.md,
+//! "Recompilation"). A function the engine unlinked for deoptimizing too often is reported hot
+//! again (js_compiled.rearmHotness); its next compilation widens the sites that deoptimized
+//! (CompiledEntry.deoptPcs) to numbers, at most MAX_RECOMPILES times, and refuses it for good
+//! when that runs out or when it deoptimized only where it was already widened.
+//!
+//! Functions are recognised by their code: a hash of the bytecode bytes with the argument and
+//! local counts. The cell address only tells a re-report of the same function from another
+//! function with the same code (which starts from what the first one learned). Both are hints:
+//! every guard stays in the compiled code, so a wrong match costs speed, never correctness.
+import silk.collections.list { List }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.u8
+import silk.num.u16
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+import silkjs.js_core_types { FunctionBytecode, CompiledEntry }
+import silkjs.js_opcode_data as op
+
+/// Compilations after the first a function may have.
+pub const MAX_RECOMPILES: u32 = 2
+const NONE: u32 = 4294967295
+
+struct Record {
+  address: usize,
+  hash: u64,
+  /// Compilations so far, refusals included.
+  compiles: u32,
+  /// The table entry of the code compiled last, or NONE.
+  entry: u32,
+  sites: List<u32>,
+  /// Element kinds the recording saw (Plan.elements).
+  elements: List<u32>,
+  /// Bytecode bytes translated for it so far, normal and OSR lowerings and refusals alike:
+  /// what the compile budget counts (jit_runtime Options.compileBudget).
+  lowered: u64,
+  /// Whether its coming recompilation already waited for the function to prove hot again.
+  waited: bool,
+  /// Whether it was sent to record feedback before its first compilation (profile).
+  profiled: bool
+}
+
+pub struct History { records: List<Record> }
+
+/// What to do with a reported function: refuse it (with why), or compile it with `sites` as
+/// double sites. `record` names the History record to update afterwards; `recompile` says
+/// whether this is a function's second or later compilation.
+/// kinds: for each of sites the operand kinds the entry recorded there (CompiledEntry.deoptKinds),
+/// 0 for a site of an earlier compilation. elements: pc << 8 | js_feedback element kind, for
+/// the element sites the recording saw with one kind (ssa_translate.FunctionInput.elementKinds).
+pub struct Plan { pub refuse: bool, pub why: &'static [u8], pub sites: List<u32>, pub kinds: List<u8>, pub elements: List<u32>, pub recompile: bool, record: usize,
+  /// Where in `sites` the offsets its last code deoptimized at begin (the rest were known).
+  pub fresh: usize }
+
+/// FNV-1a over the code and the counts the translator reads.
+unsafe fn hashOf(function: &FunctionBytecode) -> u64 {
+  let mut hash: u64 = 14695981039346656037
+  let bytes = unsafe function.code.asSlice()
+  let mut index: usize = 0
+  while index < bytes.length { hash = u64.wrappingMultiply(u64.bitXor(hash, u8.toU64(bytes[index])), 1099511628211) index = index + 1 }
+  hash = u64.wrappingMultiply(u64.bitXor(hash, u16.toU64(function.argumentCount)), 1099511628211)
+  hash = u64.wrappingMultiply(u64.bitXor(hash, u16.toU64(function.variableCount)), 1099511628211)
+  return u64.wrappingMultiply(u64.bitXor(hash, usize.toU64(bytes.length)), 1099511628211)
+}
+
+effect fn copy(from: &List<u32>) -> List<u32> ! OutOfMemoryError ? &mut Allocator {
+  let mut out = List<u32>.make()
+  run out.appendSlice(from.asSlice())
+  return move out
+}
+/// Sites that go generic together: a store or a call that deoptimized names the function's
+/// other stores (a constructor adding its fields) or calls (to callees only the interpreter
+/// runs) too, since a deopt at the first leaves the rest unseen and each would cost a
+/// recompilation of its own. 0 for any other opcode.
+fn family(opcode: u8) -> u32 {
+  if opcode == op.OP_put_field || opcode == op.OP_put_loc_field_loc8 || opcode == op.OP_put_loc_field_arg8 { return 1 }
+  if (opcode >= op.OP_call0 && opcode <= op.OP_call3) || opcode == op.OP_call || opcode == op.OP_call_method || opcode == op.OP_call_constructor { return 2 }
+  return 0
+}
+/// Adds to sites every instruction of function in the family of the one at pc.
+unsafe effect fn widenFamily(function: &FunctionBytecode, sites: &mut List<u32>, pc: u32) -> () ! OutOfMemoryError ? &mut Allocator {
+  let bytes = unsafe function.code.asSlice()
+  if u32.toUsize(pc) >= bytes.length { return () }
+  let kind = family(bytes[u32.toUsize(pc)])
+  if kind == 0 { return () }
+  let mut at: usize = 0
+  while at < bytes.length {
+    let size = u8.toUsize(op.opcodeInfo(bytes[at], true).size)
+    if size == 0 { return () }
+    if family(bytes[at]) == kind && !has(&sites, usize.toU32(at)) { run sites.append(usize.toU32(at)) }
+    at = at + size
+  }
+}
+fn has(list: &List<u32>, value: u32) -> bool {
+  let mut i: usize = 0
+  while i < list.length() { if list.get(i) == value { return true } i = i + 1 }
+  return false
+}
+
+impl History {
+  pub fn make() -> History { return History { records: List<Record>.make() } }
+
+  /// The plan for `function`, reported hot, at `address`; `entries` is the compiled code table.
+  pub unsafe effect fn plan(self: &mut Self, function: &FunctionBytecode, address: usize, entries: &List<CompiledEntry>) -> Plan
+    ! OutOfMemoryError ? &mut Allocator {
+    let hash = unsafe hashOf(&function)
+    let mut same = self.records.length()
+    let mut alike = self.records.length()
+    let mut i: usize = 0
+    while i < self.records.length() {
+      let record = &self.records.asSlice()[i]
+      if record.hash == hash {
+        if record.address == address { same = i } else if alike == self.records.length() { alike = i }
+      }
+      i = i + 1
+    }
+    if same < self.records.length() {
+      // Reported again: its code was unlinked (or it was refused and the engine re-armed it).
+      let record = &mut self.records.asMutSlice()[same]
+      // Back from recording feedback: this is its first compilation.
+      if record.compiles == 0 && record.profiled {
+        return Plan { refuse: false, why: b"", sites: run copy(&record.sites), kinds: List<u8>.make(), elements: run copy(&record.elements), recompile: false, record: same, fresh: 0 }
+      }
+      if record.compiles > MAX_RECOMPILES {
+        return Plan { refuse: true, why: b"recompiled too often", sites: List<u32>.make(), kinds: List<u8>.make(), elements: List<u32>.make(), recompile: true, record: same, fresh: 0 }
+      }
+      let mut sites = run copy(&record.sites)
+      let fresh = sites.length()
+      let mut widened = false
+      if record.entry != NONE {
+        let entry = &entries.asSlice()[u32.toUsize(record.entry)]
+        let mut k: usize = 0
+        while k < u8.toUsize(entry.deoptPcCount) {
+          let pc = entry.deoptPcs[k]
+          if !has(&sites, pc) { run sites.append(pc) run unsafe widenFamily(&function, &mut sites, pc) widened = true }
+          k = k + 1
+        }
+      }
+      let mut kinds = List<u8>.make()
+      let mut s: usize = 0
+      while s < sites.length() {
+        let mut kind: u8 = 0
+        if record.entry != NONE {
+          let entry = &entries.asSlice()[u32.toUsize(record.entry)]
+          let mut k: usize = 0
+          while k < u8.toUsize(entry.deoptPcCount) { if entry.deoptPcs[k] == sites.get(s) { kind = entry.deoptKinds[k] } k = k + 1 }
+        }
+        run kinds.append(kind)
+        s = s + 1
+      }
+      if !widened {
+        record.compiles = MAX_RECOMPILES + 1
+        return Plan { refuse: true, why: b"deoptimized again where it was already widened", sites: move sites, kinds: move kinds, elements: run copy(&record.elements), recompile: true, record: same, fresh: fresh }
+      }
+      return Plan { refuse: false, why: b"", sites: move sites, kinds: move kinds, elements: run copy(&record.elements), recompile: true, record: same, fresh: fresh }
+    }
+    let mut sites = List<u32>.make()
+    if alike < self.records.length() { sites = run copy(&self.records.asSlice()[alike].sites) }
+    run self.records.append(Record { address: address, hash: hash, compiles: 0, entry: NONE, sites: List<u32>.make(), elements: List<u32>.make(), lowered: 0, waited: false, profiled: false })
+    return Plan { refuse: false, why: b"", sites: move sites, kinds: List<u8>.make(), elements: List<u32>.make(), recompile: false, record: self.records.length() - 1, fresh: 0 }
+  }
+
+  /// Records the outcome of `plan`: compiled into table entry `entry`, or NONE when refused.
+  pub effect fn remember(self: &mut Self, plan: &Plan, entry: u32) -> () ! OutOfMemoryError ? &mut Allocator {
+    let record = &mut self.records.asMutSlice()[plan.record]
+    record.compiles = record.compiles + 1
+    record.entry = entry
+    record.waited = false
+    record.sites.clear()
+    run record.sites.appendSlice(plan.sites.asSlice())
+    record.elements.clear()
+    run record.elements.appendSlice(plan.elements.asSlice())
+  }
+}
+
+impl History {
+  /// Whether lowering `bytes` more bytecode bytes for plan's function stays within `budget`
+  /// (0: no budget); if so they are counted.
+  pub fn charge(self: &mut Self, plan: &Plan, bytes: usize, budget: u64) -> bool {
+    let record = &mut self.records.asMutSlice()[plan.record]
+    let total = record.lowered + usize.toU64(bytes)
+    if budget != 0 && total > budget { return false }
+    record.lowered = total
+    return true
+  }
+}
+
+/// Entries a recompilation waits for, as a multiple of the hot budget, per compilation so far.
+const BACKOFF: u32 = 8
+
+impl History {
+  /// How many hot budgets of entries plan's function must run before it is compiled again, or
+  /// 0 to compile now. Code that deoptimized until it was unlinked was wasted work, so each
+  /// recompilation asks for BACKOFF times more proof than the one before; asked once per
+  /// recompilation (the function is reported again when the entries are used up). While it
+  /// waits its count is above the hot budget, which the engine takes for a function without
+  /// code: compiled callers deoptimize at their calls to it and are unlinked too
+  /// (js_vm.reportedWithoutCode). Measured, that costs less than keeping them linked: a call
+  /// from compiled code to an interpreted function costs more than the interpreter's own.
+  pub fn backoff(self: &mut Self, plan: &Plan) -> u32 {
+    if !plan.recompile || plan.refuse { return 0 }
+    let record = &mut self.records.asMutSlice()[plan.record]
+    if record.waited { return 0 }
+    record.waited = true
+    let mut wait: u32 = BACKOFF
+    let mut n: u32 = 1
+    while n < record.compiles && n < MAX_RECOMPILES { wait = wait * BACKOFF n = n + 1 }
+    return wait
+  }
+}
+
+impl History {
+  /// Whether plan's function should record feedback before it is compiled: once, before its
+  /// first compilation, unless another function with the same code already taught its sites.
+  pub fn profile(self: &mut Self, plan: &Plan) -> bool {
+    if plan.recompile || plan.refuse || plan.sites.length() != 0 { return false }
+    let record = &mut self.records.asMutSlice()[plan.record]
+    if record.compiles != 0 || record.profiled { return false }
+    record.profiled = true
+    return true
+  }
+}
+
+/// The NONE entry for `remember`.
+pub fn noEntry() -> u32 { return NONE }

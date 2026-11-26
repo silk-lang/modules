@@ -41,6 +41,7 @@ import js_debugger_types { State as DebuggerState }
 import js_debugger_metadata { Metadata as DebuggerMetadata }
 import js_coverage { State as CoverageState }
 import js_cpu_profile { State as CpuProfileState }
+import js_feedback { State as FeedbackState }
 import js_compiler_types { PendingFunction }
 import js_bytecode { StackScratch }
 
@@ -48,7 +49,11 @@ pub const JS_MODE_STRICT: u8 = 1
 pub const JS_MODE_ASYNC: u8 = 4
 pub const JS_MODE_BACKTRACE_BARRIER: u8 = 8
 pub const JS_MAX_LOCAL_VARS: usize = 65534
-pub const JS_INTERRUPT_COUNTER_INIT: i32 = 10000
+/// Decrements (back edges and calls) between interrupt polls. Prime, so a loop that
+/// decrements k times an iteration (k below it) does not poll at the same instruction
+/// every time: with 10000 a loop with one call polled only at the call, never on its back
+/// edge, so on-stack replacement never entered it (docs/jit/osr.md).
+pub const JS_INTERRUPT_COUNTER_INIT: i32 = 10007
 pub const ARG_SCOPE_INDEX: i32 = 1
 pub const ARG_SCOPE_END: i32 = -2
 
@@ -778,9 +783,20 @@ pub struct RuntimeState {
   pub debugger: DebuggerState,
   pub coverage: CoverageState,
   pub cpuProfile: CpuProfileState,
+  /// Call and type feedback of the functions an embedder records (js_feedback).
+  pub feedback: FeedbackState,
   /// Monotonic compilation identity shared by all realms; zero means no script.
   pub nextScriptId: u64,
   pub interrupt: HostHook,
+  /// The embedder's hot function handler (js_hotness); none by default.
+  pub hotFunctions: HostHook,
+  /// A FunctionBytecode (retained) waiting for the next interrupt poll to be
+  /// reported to hotFunctions, or Undefined.
+  pub hotPending: ValueBits,
+  /// FunctionBytecode.hotness of a function created from now on.
+  pub hotEntryBudget: u32,
+  /// Machine code an embedder linked to functions (js_compiled); empty by default.
+  pub compiled: CompiledTable,
   pub promiseRejectionTracker: HostHook,
   /// FIFO Auxiliary HeapCell<JobEntry> nodes; queue ownership is explicit JS roots.
   pub jobs: HeapList,
@@ -832,6 +848,11 @@ pub struct RuntimeState {
   /// Constructor receiver cache (js_gc.receiverShape): each entry owns the empty
   /// shape for its constructor's `prototype`, released before each collection.
   pub receiverCache: [ReceiverCacheEntry; 64],
+  /// The constructor address of each receiverCache entry (0 when empty), kept
+  /// apart so js_gc.receiverWay probes a set's four ways in one cache line.
+  pub receiverFunctions: [usize; 64],
+  /// Per four-way set of receiverCache, the way of its last hit, probed first.
+  pub receiverHints: [u8; 16],
   /// Interned empty shapes by prototype address (js_gc.cachedEmpty), each owned
   /// here and released before each collection: object literals and
   /// Object.create skip the shape table search.
@@ -1146,8 +1167,8 @@ impl Copy for ConstructPin {}
 /// `version` inherits an ordinary, non-writable, non-configurable
 /// Symbol.hasInstance from its prototype and has its own data `prototype` at slot
 /// `index`. A shape's version fixes both; INSTANCE_CACHE_EMPTY matches no shape.
-/// One RuntimeState.receiverCache entry: a constructor at address function
-/// (0 when empty) whose shape had version `version` kept its own data `prototype`
+/// One RuntimeState.receiverCache entry: the constructor at the address
+/// receiverFunctions holds for the same slot, whose shape had version `version` kept its own data `prototype`
 /// at slot `index`; empty is the (owned) interned empty shape of the prototype
 /// that slot held when filled, valid while that slot still holds it.
 ///
@@ -1157,7 +1178,6 @@ impl Copy for ConstructPin {}
 /// sources[i], while the function still runs bytecode and the prototype chain
 /// from final's prototype still has the shape versions in chain (depth links).
 pub struct ReceiverCacheEntry {
-  pub function: usize,
   pub version: u64,
   pub index: usize,
   pub empty: ?*mut HeapHeader,
@@ -1196,7 +1216,7 @@ pub fn blankForwardEntry() -> ForwardEntry {
 }
 /// A ReceiverCacheEntry that matches no constructor.
 pub fn blankReceiverEntry() -> ReceiverCacheEntry {
-  return ReceiverCacheEntry { function: 0, version: 0, index: 0, empty: Pointer.null<HeapHeader>(), final: Pointer.null<HeapHeader>(),
+  return ReceiverCacheEntry { version: 0, index: 0, empty: Pointer.null<HeapHeader>(), final: Pointer.null<HeapHeader>(),
     bytecode: 0, stores: 0, depth: 0, sources: [0; 8], tail: 0, recipeSlot: 255, chain: [0; 3], epoch: 0, forward: blankForwardEntry() }
 }
 /// One RuntimeState.emptyShapes entry: the empty shape (a weak reference, cleared
@@ -1297,6 +1317,10 @@ pub struct TransitionEntry {
   pub baseVersion: u64
 }
 pub const CHAIN_UNVERIFIED: u8 = 255
+/// RuntimeState.transitions' entries (a power of two) and the longest prototype chain an
+/// entry's TransitionChain records.
+pub const MEMO_ENTRIES: usize = 2048
+pub const MAX_CHAIN_DEPTH: u8 = 6
 impl Copy for TransitionEntry {}
 /// A TransitionEntry's verified prototype chain (RuntimeState.transitionChains).
 pub struct TransitionChain {
@@ -1927,6 +1951,9 @@ impl FastArrayData {
   /// The payload of an array with no elements yet.
   @inlineAlways
   pub fn empty() -> FastArrayData { return FastArrayData { items: ThinList<ValueBits>.make(), plain: true, clearHead: 0 } }
+  /// Bytes from the payload to its plain flag (compiled code clears it when it pushes a
+  /// heap value, as noteStored does).
+  pub fn plainOffset(self: &Self) -> usize { return Pointer.address<bool>(Pointer.fromRef<bool>(&self.plain)) - Pointer.address<FastArrayData>(Pointer.fromRef<FastArrayData>(self)) }
   /// The payload over values that hold no heap value.
   @inlineAlways
   pub unsafe fn ofPlain(values: ThinList<ValueBits>) -> FastArrayData { return FastArrayData { items: move values, plain: true, clearHead: 0 } }
@@ -2103,10 +2130,21 @@ const OBJECT_ROLE_PROTOTYPE: u8 = 1
 /// ObjectData.roles: RuntimeState.allocationRealms holds this object's
 /// allocation realm (js_allocation_realms), with one counted reference to it.
 const OBJECT_ROLE_RECORDED_REALM: u8 = 2
+/// ObjectData.roles: compiled code relies on what this object's slots hold now (a method
+/// it inlined was read from one, js_compiled_inline.watchHolder). Any write to a slot
+/// through ObjectData's own methods clears the bit, and so does any change to the
+/// records of its shape (js_shapes.noteShapeChange, prepareUpdate): compiled code tests
+/// the bit where it relies on a slot. A watched object has a shape of its own with a
+/// version no store key was filled for before the bit was set, so a store that goes by a
+/// key (setSlotKeyed) cannot reach it until a tested store has cleared the bit.
+const OBJECT_ROLE_WATCHED: u8 = 4
+/// ObjectData.roles: the object was watched once (sticky). It is not watched again after
+/// a write cleared OBJECT_ROLE_WATCHED: store keys may hold its shape's version by then.
+const OBJECT_ROLE_WAS_WATCHED: u8 = 8
 /// ObjectData.roles: the cell was allocated with no tail bytes (separateNode or
 /// a small PAIR_SLOTS cell), so destroyObject may recycle it into spare Bin 3
 /// even when its property storage is owned separately.
-const OBJECT_ROLE_NO_TAIL: u8 = 4
+const OBJECT_ROLE_NO_TAIL: u8 = 16
 @inlineAlways
 fn objectFlag(flags: u8, bit: u8, value: bool) -> u8 {
   if value { return u8.bitOr(flags, bit) }
@@ -2160,6 +2198,24 @@ impl ObjectData {
   /// Clears every role bit: a fresh object's (its cell may be uninitialized or reused).
   @inlineAlways
   pub fn clearRoles(self: &mut Self) -> () { self.roles = 0 }
+  /// Whether compiled code relies on the slots' present values (OBJECT_ROLE_WATCHED).
+  @inlineAlways
+  pub fn isWatched(self: &Self) -> bool { return u8.bitAnd(self.roles, OBJECT_ROLE_WATCHED) != 0 }
+  @inlineAlways
+  pub fn wasWatched(self: &Self) -> bool { return u8.bitAnd(self.roles, OBJECT_ROLE_WAS_WATCHED) != 0 }
+  /// Starts the watch. The caller has given the object a shape of its own whose version
+  /// no store key holds (js_compiled_inline.watchHolder).
+  @inlineAlways
+  pub fn watch(self: &mut Self) -> () { self.roles = u8.bitOr(self.roles, u8.bitOr(OBJECT_ROLE_WATCHED, OBJECT_ROLE_WAS_WATCHED)) }
+  /// Ends the watch: a slot or the shape's records are about to change.
+  @inlineAlways
+  pub fn unwatch(self: &mut Self) -> () {
+    if u8.bitAnd(self.roles, OBJECT_ROLE_WATCHED) != 0 { self.roles = u8.bitAnd(self.roles, u8.bitNot(OBJECT_ROLE_WATCHED)) }
+  }
+  /// The roles bit of a watched object, and the bytes from the ObjectData to its roles
+  /// byte (compiled code).
+  pub fn watchedFlag() -> u8 { return OBJECT_ROLE_WATCHED }
+  pub fn rolesOffset(self: &Self) -> usize { return Pointer.address<u8>(Pointer.fromRef<u8>(&self.roles)) - Pointer.address<ObjectData>(Pointer.fromRef<ObjectData>(self)) }
   /// Whether RuntimeState.allocationRealms holds this object's allocation realm.
   @inlineAlways
   pub fn hasRecordedRealm(self: &Self) -> bool { return u8.bitAnd(self.roles, OBJECT_ROLE_RECORDED_REALM) != 0 }
@@ -2174,6 +2230,8 @@ impl ObjectData {
   pub fn setClassId(self: &mut Self, classId: u32) -> () { self.classBits = classBits(classId) }
   @inlineAlways
   pub fn isStandardArrayPrototype(self: &Self) -> bool { return u8.bitAnd(self.flags, OBJECT_STANDARD_ARRAY_PROTOTYPE) != 0 }
+  /// The flags bit of isStandardArrayPrototype (compiled code).
+  pub fn standardArrayPrototypeFlag() -> u8 { return OBJECT_STANDARD_ARRAY_PROTOTYPE }
   @inlineAlways
   pub fn setIsStandardArrayPrototype(self: &mut Self, value: bool) -> () { self.flags = objectFlag(self.flags, OBJECT_STANDARD_ARRAY_PROTOTYPE, value) }
   /// Whether a function object is as shapedFunction made it: extensible, a
@@ -2223,12 +2281,56 @@ impl ObjectData {
   @inlineAlways
   pub fn slot(self: &Self, index: usize) -> SlotBits { return self.slotList.get(index) }
   @inlineAlways
-  pub fn setSlot(self: &mut Self, index: usize, value: SlotBits) -> () { self.slotList.set(index, value) }
+  pub fn setSlot(self: &mut Self, index: usize, value: SlotBits) -> () { self.unwatch() self.slotList.set(index, value) }
   /// slot without the bounds check, for an index the shape keeps in range.
   @inlineAlways
   pub unsafe fn slotUnchecked(self: &Self, index: usize) -> SlotBits { return unsafe self.slotList.getUnchecked(index) }
+  /// Bytes from the ObjectData to its flags byte and to its 16-bit class id (compiled code).
+  pub fn flagsOffset(self: &Self) -> usize { return Pointer.address<u8>(Pointer.fromRef<u8>(&self.flags)) - Pointer.address<ObjectData>(Pointer.fromRef<ObjectData>(self)) }
+  pub fn classOffset(self: &Self) -> usize { return Pointer.address<u16>(Pointer.fromRef<u16>(&self.classBits)) - Pointer.address<ObjectData>(Pointer.fromRef<ObjectData>(self)) }
+  /// The flags bits of an exotic object and of a fast Array (compiled code).
+  pub fn exoticFlag() -> u8 { return OBJECT_EXOTIC }
+  /// The flags bit of an object that is falsy (isHtmlDda).
+  pub fn htmlDdaFlag() -> u8 { return OBJECT_HTML_DDA }
+  pub fn fastArrayFlag() -> u8 { return OBJECT_FAST_ARRAY }
+  /// Bytes from the ObjectData to the word holding its first slot's address (compiled code).
+  pub fn slotsWordOffset(self: &Self) -> usize {
+    let list = Pointer.address<ThinList<SlotBits>>(Pointer.fromRef<ThinList<SlotBits>>(&self.slotList))
+    return list - Pointer.address<ObjectData>(Pointer.fromRef<ObjectData>(self)) + self.slotList.dataWordOffset()
+  }
+  /// Bytes from the ObjectData to its 32-bit slot count and to the word whose low bits are
+  /// its slot capacity (ThinList.capacityMask), for compiled code's adds.
+  pub fn slotCountOffset(self: &Self) -> usize {
+    let list = Pointer.address<ThinList<SlotBits>>(Pointer.fromRef<ThinList<SlotBits>>(&self.slotList))
+    return list - Pointer.address<ObjectData>(Pointer.fromRef<ObjectData>(self)) + self.slotList.countWordOffset()
+  }
+  pub fn slotMetaOffset(self: &Self) -> usize {
+    let list = Pointer.address<ThinList<SlotBits>>(Pointer.fromRef<ThinList<SlotBits>>(&self.slotList))
+    return list - Pointer.address<ObjectData>(Pointer.fromRef<ObjectData>(self)) + self.slotList.metaWordOffset()
+  }
+  /// The flags an add in place tests (js_vm_property_ops.addsInPlace): of these bits, only
+  /// the extensible one may be set.
+  pub fn addTestedFlags() -> u8 { return u8.bitOr(u8.bitOr(OBJECT_STANDARD_ARRAY_PROTOTYPE, OBJECT_EXTENSIBLE), OBJECT_EXOTIC) }
+  pub fn extensibleFlag() -> u8 { return OBJECT_EXTENSIBLE }
+  /// The roles bit of an object some shape has for its prototype.
+  pub fn prototypeRole() -> u8 { return OBJECT_ROLE_PROTOTYPE }
   @inlineAlways
-  pub unsafe fn setSlotUnchecked(self: &mut Self, index: usize, value: SlotBits) -> () { unsafe self.slotList.setUnchecked(index, value) }
+  pub unsafe fn setSlotUnchecked(self: &mut Self, index: usize, value: SlotBits) -> () { self.unwatch() unsafe self.slotList.setUnchecked(index, value) }
+  /// setSlotUnchecked for a store that a key proved (the object's shape has the version a
+  /// store key holds): such a key is filled only after a store through setSlot or
+  /// setSlotUnchecked, so the object is not watched and the bit needs no test.
+  @inlineAlways
+  pub unsafe fn setSlotKeyedUnchecked(self: &mut Self, index: usize, value: SlotBits) -> () { unsafe self.slotList.setUnchecked(index, value) }
+  /// setSlot for a store that a key proved (setSlotKeyedUnchecked), the index tested.
+  @inlineAlways
+  pub fn setSlotKeyed(self: &mut Self, index: usize, value: SlotBits) -> () { self.slotList.set(index, value) }
+  /// setSlot on an object that is being made: no code has seen it yet, so it is not
+  /// watched and the bit needs no test.
+  @inlineAlways
+  pub fn setSlotFresh(self: &mut Self, index: usize, value: SlotBits) -> () { self.slotList.set(index, value) }
+  /// setSlotUnchecked on an object that is being made (setSlotFresh).
+  @inlineAlways
+  pub unsafe fn setSlotFreshUnchecked(self: &mut Self, index: usize, value: SlotBits) -> () { unsafe self.slotList.setUnchecked(index, value) }
   /// Whether the slots live in the object's own cell.
   @inlineAlways
   pub fn slotsInCell(self: &Self) -> bool { return self.slotList.borrowsStorage() }
@@ -2237,7 +2339,7 @@ impl ObjectData {
   @inlineAlways
   pub fn slotView(self: &Self) -> &[SlotBits] { return self.slotList.asSlice() }
   @inlineAlways
-  pub fn truncateSlots(self: &mut Self, length: usize) -> () { self.slotList.truncate(length) }
+  pub fn truncateSlots(self: &mut Self, length: usize) -> () { self.unwatch() self.slotList.truncate(length) }
   @inlineAlways
   pub unsafe fn pushSlotUnchecked(self: &mut Self, value: SlotBits) -> () { unsafe self.slotList.pushUnchecked(value) }
   @inlineAlways
@@ -2247,11 +2349,19 @@ impl ObjectData {
   /// Moves the slots out, leaving none.
   @inlineAlways
   pub fn takeSlots(self: &mut Self) -> ThinList<SlotBits> {
+    self.unwatch()
     return Intrinsic.replace(self.slotList, ThinList<SlotBits>.make())
   }
   /// Replaces the slots (dropping the old ones) with slots.
   @inlineAlways
-  pub fn setSlots(self: &mut Self, slots: ThinList<SlotBits>) -> () { self.slotList = move slots }
+  pub fn setSlots(self: &mut Self, slots: ThinList<SlotBits>) -> () { self.unwatch() self.slotList = move slots }
+  /// setSlots on an object that is being made (setSlotFresh).
+  @inlineAlways
+  pub fn setSlotsFresh(self: &mut Self, slots: ThinList<SlotBits>) -> () { self.slotList = move slots }
+  /// takeSlots of an object that is being destroyed: nothing reads its slots again, and
+  /// compiled code keeps alive what it watches (js_compiled_inline.watchHolder).
+  @inlineAlways
+  pub fn takeSlotsLast(self: &mut Self) -> ThinList<SlotBits> { return Intrinsic.replace(self.slotList, ThinList<SlotBits>.make()) }
   /// Stores slots over uninitialized slot storage, dropping nothing.
   @inlineAlways
   pub unsafe fn putSlots(self: &mut Self, slots: ThinList<SlotBits>) -> () {
@@ -2259,7 +2369,7 @@ impl ObjectData {
   }
   /// The slot list itself, for code that still works on a ThinList.
   @inlineAlways
-  pub fn slotListMut(self: &mut Self) -> &mut ThinList<SlotBits> { return &mut self.slotList }
+  pub fn slotListMut(self: &mut Self) -> &mut ThinList<SlotBits> { self.unwatch() return &mut self.slotList }
 }
 @inlineAlways
 fn classBits(classId: u32) -> u16 {
@@ -2450,6 +2560,211 @@ pub struct KnownCall { pub state: u8, pub envLevel: u32, pub refs: BoxList<?*mut
 impl KnownCall {
   pub fn none() -> Self { return Self { state: KNOWN_NONE, envLevel: 0, refs: BoxList<?*mut HeapHeader>.make() } }
 }
+/// CompiledEntry.callWords of an entry linked for on-stack replacement only (code null,
+/// js_runtime.linkOsr): every frameless call path skips code with call words, and
+/// js_vm.enterBase interprets this one, so only its loop headers run compiled.
+pub const OSR_ONLY_CALL_WORDS: u32 = 4294967295
+/// One compiled function, in an embedder-owned table (RuntimeState.compiled, js_compiled).
+/// code is extern "C" fn(arguments: *const u64, state: *mut u64,
+/// counter: *mut i32, data: ?*mut u8) -> u32.
+pub struct CompiledEntry {
+  pub code: ?*const u8,
+  /// Passed to the code as its fourth argument; the engine never reads it.
+  pub data: ?*mut u8,
+  /// Passed to the code as its fifth argument: the embedder's environment for compiled code
+  /// (its helper table and runtime); the engine never reads it.
+  pub env: ?*mut u8,
+  /// Deopts after which the engine unlinks the function (0: never).
+  pub deoptLimit: u32,
+  /// Written by js_runtime.linkCompiled: the function's FunctionBytecode.frameCells
+  /// while it is linked (the field itself then holds STUB_FRAME_CELLS so inline entries
+  /// never fit and calls take the native-stack entry that runs the code).
+  pub frameCells: u32,
+  /// Likewise its FunctionBytecode.leaf, which reads 0 while linked so no call runs it frameless.
+  pub leaf: u8,
+  /// The call block's size in u64 words when the code makes calls (js_compiled.CALL_SAVED
+  /// plus two per value it saves), else 0. Such code runs only from a base frame.
+  pub callWords: u32,
+  pub runs: u64,
+  pub deopts: u64,
+  pub polls: u64,
+  /// The first distinct bytecode offsets this code deoptimized at (js_compiled.enter), for
+  /// the embedder's next compilation of the function; deoptPcCount of them are set.
+  pub deoptPcs: [u32; 4],
+  pub deoptPcCount: u8,
+  /// js_vm's activation size for this code in u64 words (header, call block and exit state),
+  /// 0 until its first activation, and the interrupt counter of its function's realm then.
+  /// For code that makes no calls: its exit state size, set at its first direct call.
+  pub activationWords: u32,
+  pub counter: ?*mut i32,
+  /// Direct calls from machine code (js_compiled.DIRECT_*): the parameter count of code that
+  /// makes no calls once its first direct call cached what it needs (DIRECT_NOT_READY
+  /// until then, and always for code that makes calls), its realm and its bytecode's code.
+  pub directArity: u32,
+  pub directRealm: ?*mut HeapHeader,
+  pub directCode: ?*const u8,
+  /// Loop-header entries for on-stack replacement (js_compiled_osr): osrCount entries at
+  /// osr, embedder-owned and unmoved while linked; null and 0 when there are none.
+  pub osr: ?*mut OsrEntry,
+  pub osrCount: u32,
+  /// Runs and deopts of the osr code (its poll exits count in polls); polls stop entering
+  /// it after deoptLimit deopts, the normal entry stays linked.
+  pub osrRuns: u64,
+  pub osrDeopts: u64,
+  /// The operands seen at each of deoptPcs when it was recorded (js_compiled.deoptKind): the
+  /// low nibble the decisive operand (a call's callee, else the stack top), the high nibble
+  /// the next one (a method call's receiver, else the second from the top). Last in the
+  /// struct: machine code reads the fields before it at fixed offsets (DIRECT_ENTRY_*).
+  pub deoptKinds: [u8; 4]
+}
+/// Machine code entered at bytecode offset pc of a running frame with depth operand
+/// stack slots, on the compiled-entry ABI with the frame's arguments then its locals as arguments.
+pub struct OsrEntry {
+  pub pc: u32,
+  pub depth: u32,
+  /// Null: the embedder refused this header (no code, and the poll does not ask again).
+  pub code: ?*const u8,
+  /// The call block words the code needs (CompiledEntry.callWords for OSR code): 0 when it
+  /// makes no calls.
+  pub callWords: u32,
+  /// The bytecode range [start, end] of the outermost loop around pc that the code covers: an
+  /// exit outside it is the loop finishing, not a deopt.
+  pub start: u32,
+  pub end: u32,
+  /// Written by the engine: deopts of this code, polls at pc to let pass before entering it
+  /// again (doubled by each deopt), and the opcode it last deoptimized at plus one (0: none).
+  pub deopts: u32,
+  pub wait: u32,
+  pub deoptOpcode: u32
+}
+impl Copy for OsrEntry {}
+/// The embedder's table: entries is null and count 0 until js_runtime.setCompiledTable.
+pub struct CompiledTable {
+  pub entries: ?*mut CompiledEntry,
+  pub count: u32,
+  /// The activation stack of compiled code that makes calls (js_vm.runActivations): words
+  /// of storage the embedder lends, and how many are in use. Process-local, never stored.
+  pub activations: ?*mut u64,
+  pub activationWords: usize,
+  pub activationTop: usize,
+  /// Activations running nested on the native stack (js_vm.fastCall).
+  pub nativeDepth: u32,
+  /// The loop header whose back-edge poll reported the function in hotPending, or u32.MAX
+  /// when its entries did (js_hotness).
+  pub loopPc: u32,
+  /// An activation an interpreted call ran that left before returning (js_vm.linkedCall),
+  /// for the callInline that follows to continue; null otherwise.
+  pub handedOff: ?*mut u8,
+  /// Values compiled code names by address (inline targets, js_compiled_inline.keep), each
+  /// retained until destroyRuntime: storage the embedder lends, its size and how many are in.
+  pub kept: ?*mut ValueBits,
+  pub keptCapacity: usize,
+  pub keptCount: usize,
+  /// Baseline code (js_baseline): each linked function's entries (js_baseline.TABLE_WORDS,
+  /// from FunctionBytecode.baseline - 1), in storage the embedder lends, and how many are
+  /// linked. Process-local, never stored.
+  pub baseline: ?*mut ?*const u8,
+  pub baselineCount: u32,
+  /// The embedder's entry into baseline code from the engine (js_baseline.Enter) and the
+  /// environment word it passes; null until js_baseline.setEntry.
+  pub baselineEnter: ?*const u8,
+  pub baselineEnv: ?*mut u8,
+  /// What baseline code asks the engine for through the host (js_baseline.ServiceEntry): the
+  /// host's entry, the hooks of the dispatch that entered baseline code last (set around every
+  /// entry, js_vm.enterBaseline) and the allocator provider the embedder lends for the
+  /// runtime's life. Null without a host that set them.
+  pub serviceEntry: ?*const u8,
+  pub serviceHooks: ?*mut u8,
+  pub serviceAllocator: ?*mut u8,
+  /// What each cached field site read from, for a compiler (SiteShapes): storage the
+  /// embedder lends (js_compiled_inline.setSiteShapes), a power of two of entries less one.
+  /// Null without one, and then nothing is recorded.
+  pub siteShapes: ?*mut SiteShapes,
+  pub siteShapeMask: usize
+}
+/// The shapes one field site (its atom operand's address is site) read or wrote a data
+/// property by. For a cached site (get_field2) they are what its site cache entries named:
+/// keys[i] is a FieldCacheEntry.key (shape version << 16 | slot for an own property,
+/// version << 16 | FIELD_PROTO_KEY for one of a prototype) and protoKeys[i] the holder's
+/// shape version << 16 | slot. For a site with an inline key (get_field, put_field and the
+/// fused reads) they are the own keys its key was filled with. seen counts distinct
+/// versions; past SITE_SHAPES the oldest are replaced. Versions are runtime ids: a hint for
+/// a compiler, which tests them where it uses them.
+/// For a property of a prototype, holders[i] is the object that holds it and epochs[i] the
+/// RuntimeState.shapeEpoch the entry was filled at; firsts[i] is null when the holder is the
+/// receiver's own prototype, and that prototype when the holder is further up. The table
+/// owns no count of either: they are objects only while the epoch is still that one, since
+/// a prototype that is destroyed bumps it (js_gc.destroyObject).
+pub struct SiteShapes { pub site: usize, pub seen: usize, pub keys: [u64; 4], pub protoKeys: [u64; 4], pub holders: [?*mut HeapHeader; 4], pub firsts: [?*mut HeapHeader; 4], pub epochs: [u64; 4] }
+impl Copy for SiteShapes {}
+pub const SITE_SHAPES: usize = 4
+impl SiteShapes {
+  pub fn none() -> Self {
+    return Self { site: 0, seen: 0, keys: [0, 0, 0, 0], protoKeys: [0, 0, 0, 0],
+      holders: [Pointer.null<HeapHeader>(), Pointer.null<HeapHeader>(), Pointer.null<HeapHeader>(), Pointer.null<HeapHeader>()],
+      firsts: [Pointer.null<HeapHeader>(), Pointer.null<HeapHeader>(), Pointer.null<HeapHeader>(), Pointer.null<HeapHeader>()], epochs: [0, 0, 0, 0] }
+  }
+}
+/// The two CompiledTable.siteShapes entries a site may have, under mask: its record is in
+/// the first unless another site took that before it.
+@inlineAlways
+pub fn siteShapeIndex(site: usize, mask: usize) -> usize { return (site ^ usize.shiftRight(site, 11)) & mask }
+@inlineAlways
+pub fn siteShapeSecond(site: usize, mask: usize) -> usize { return usize.shiftRight(usize.wrappingMultiply(site, 2654435761), 13) & mask }
+/// The index of site's record in table (CompiledTable.siteShapes, with its mask), or
+/// usize.MAX when it has none.
+pub unsafe fn siteShapeAt(table: *mut SiteShapes, mask: usize, site: usize) -> usize {
+  let entries = unsafe Pointer.assumeManyMut<SiteShapes>(table)
+  let first = siteShapeIndex(site, mask)
+  if (unsafe Pointer.read<SiteShapes>(unsafe Pointer.atMut<SiteShapes>(entries, first))).site == site { return first }
+  let second = siteShapeSecond(site, mask)
+  if (unsafe Pointer.read<SiteShapes>(unsafe Pointer.atMut<SiteShapes>(entries, second))).site == site { return second }
+  return usize.MAX
+}
+/// Records in table (CompiledTable.siteShapes, with its mask) that site read or wrote by
+/// key and protoKey, the property found in holder at epoch (null and 0 for an own
+/// property), first as SiteShapes.firsts has it.
+@inlineNever
+pub unsafe fn noteSiteShape(table: *mut SiteShapes, mask: usize, site: usize, key: u64, protoKey: u64, holder: ?*mut HeapHeader, first: ?*mut HeapHeader, epoch: u64) -> () {
+  let entries = unsafe Pointer.assumeManyMut<SiteShapes>(table)
+  let mut at = unsafe siteShapeAt(table, mask, site)
+  if at == usize.MAX {
+    // A free entry of the two, or the first one's site makes way.
+    at = siteShapeIndex(site, mask)
+    let second = siteShapeSecond(site, mask)
+    if (unsafe Pointer.read<SiteShapes>(unsafe Pointer.atMut<SiteShapes>(entries, at))).site != 0
+      && (unsafe Pointer.read<SiteShapes>(unsafe Pointer.atMut<SiteShapes>(entries, second))).site == 0 { at = second }
+  }
+  let mut anchor = ()
+  let entry = unsafe Pointer.borrowMut<(), SiteShapes>(&mut anchor, unsafe Pointer.atMut<SiteShapes>(entries, at))
+  if entry.site != site { entry.site = site entry.seen = 0 }
+  // The version without the slot and the prototype flag.
+  let version = u64.shiftRight(u64.shiftLeft(key, 1), 17)
+  let mut held = entry.seen
+  if held > SITE_SHAPES { held = SITE_SHAPES }
+  let mut i: usize = 0
+  while i < held {
+    if u64.shiftRight(u64.shiftLeft(entry.keys[i], 1), 17) == version {
+      entry.keys[i] = key entry.protoKeys[i] = protoKey entry.holders[i] = holder entry.firsts[i] = first entry.epochs[i] = epoch
+      return ()
+    }
+    i = i + 1
+  }
+  let pair = entry.seen % SITE_SHAPES
+  entry.keys[pair] = key entry.protoKeys[pair] = protoKey entry.holders[pair] = holder entry.firsts[pair] = first entry.epochs[pair] = epoch
+  if entry.seen < 255 { entry.seen = entry.seen + 1 }
+}
+impl CompiledTable {
+  pub fn none() -> Self {
+    return Self { entries: Pointer.null<CompiledEntry>(), count: 0, activations: Pointer.null<u64>(), activationWords: 0, activationTop: 0, nativeDepth: 0, loopPc: 4294967295, handedOff: Pointer.null<u8>(),
+      kept: Pointer.null<ValueBits>(), keptCapacity: 0, keptCount: 0,
+      baseline: Pointer.null<?*const u8>(), baselineCount: 0, baselineEnter: Pointer.null<u8>(), baselineEnv: Pointer.null<u8>(),
+      serviceEntry: Pointer.null<u8>(), serviceHooks: Pointer.null<u8>(), serviceAllocator: Pointer.null<u8>(),
+      siteShapes: Pointer.null<SiteShapes>(), siteShapeMask: 0 }
+  }
+}
+/// FunctionBytecode.hotness at creation: entries before js_hotness reports a function.
+pub const HOT_ENTRY_BUDGET: u32 = 1000
 pub struct FunctionBytecode {
   // Fields read on every call entry come first, so they share as few cache lines as possible.
   /// Nonzero when js_bytecode.leafCode holds for a plain function: calls may run
@@ -2480,6 +2795,16 @@ pub struct FunctionBytecode {
   /// locals, operand stack, reference table and frame-resident scope
   /// (js_scopes.inlineFrameCells of the four counts above).
   pub frameCells: u32,
+  /// Entries left before js_hotness reports the function (HOT_ENTRY_BUDGET at
+  /// creation). Runtime state: never serialized.
+  pub hotness: u32,
+  /// 1 + the index of this function's machine code in RuntimeState.compiled,
+  /// or 0 (js_compiled). Runtime state: never serialized.
+  pub compiled: u32,
+  /// One plus the index of the function's first word in CompiledTable.baseline, or 0
+  /// (js_baseline). While it is linked frameCells holds STUB_FRAME_CELLS unless the function
+  /// is a leaf, so interpreted calls of it reach js_vm.callInline, which runs the code.
+  pub baseline: u32,
   /// Whether the function is a known local function (js_compiler_known) and,
   /// once created, how a call finds its scope and global references.
   pub known: KnownCall,
@@ -2809,7 +3134,7 @@ pub struct JobEntry {
 /// Recomputes state.observeInstructions after any of its four flags changes.
 pub fn refreshObservation(state: &mut RuntimeState) -> () {
   let observed = state.debugger.enabled || state.coverage.enabled || state.cpuProfile.enabled ||
-    state.debugger.restricted
+    state.debugger.restricted || state.feedback.recording != 0
   if observed && !state.observeInstructions {
     state.adoptFrames = true
     let next = u32.wrappingAdd(state.debugger.observeEpoch, 1)

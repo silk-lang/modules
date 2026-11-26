@@ -33,6 +33,37 @@ Results: `res.json` holds every sample, `results.csv` the medians with the serve
 user and system microseconds per request, `mem.json` the peak RSS samples, `cold.json` and
 `cold.txt` the cold start table.
 
+## HTTP orders on the JIT embedding host and Node
+
+The JIT embedding host and Node load the same ES module. From the repository root on Linux
+with Python 3.11+ and two available CPUs, build the host, then run the benchmark while
+the compiler is idle.
+
+```sh
+silk build --release --manifest-path modules/jit/embed-smoke/silk.toml
+python3 modules/runtime/bench/jit_http.py --runtime build/llvm/x86_64-unknown-linux-gnu/release/silkjs-jit-embed-smoke \
+  --node /absolute/path/node --json /tmp/http-orders.json
+```
+
+To measure compiled calls, add `--jit-calls` and use a separate JSON output file.
+Use `--no-jit` for the interpreter baseline in the same host executable. The client verifies that its JIT counters stayed at zero. Node uses its default JIT in each comparison.
+
+Each process runs the same `node:http` module. One client sends JSON orders with 64 line items by default (set `--items` to vary the payload),
+checks each total and uses a single persistent loopback connection. Server and client
+are pinned to separate CPUs. Each server has a single-CPU budget including its compiler threads.
+Each of three rounds launches both engines, alternating order. Launch-to-first-response
+includes fresh-process startup and the first verified order with ordinary OS file caching. After 1,200
+warmup requests, three seconds of sequential request/response exchanges measure single-client
+throughput. The latency interval schedules 400 arrivals at 100 orders/s. Latency starts
+at each scheduled arrival so client-side backlog counts. The rate must be below half
+the measured sequential throughput in every run. Set the same lower `--rate` for both
+engines on a slower host.
+
+The report includes times for all scheduled orders, per-process p99, CPU/request
+during the throughput interval, high-water RSS before shutdown, binary and workload hashes
+and JIT counters. Each SilkJS process must complete successfully. In JIT modes the client also verifies that compiled code ran.
+Use a representative service and concurrent clients for a production capacity estimate.
+
 ## What the tasks hold fixed
 
 The tasks are Silk all the way: `src/tasks.silk` calls the `runtimes` module of

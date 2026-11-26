@@ -37,6 +37,17 @@ what each read needs kept away:
 An element or a length read from an object that itself borrows from a binding borrows from
 the binding too, and ends at both lists.
 
+A poll ends none of them, and no borrow of a field's value either. What a poll runs (the
+report of a hot function, the host's interrupt callback) stores to no property, element or
+binding: `js_interrupts.handle` states it, next to the rule that it runs no JavaScript and
+changes no shape. So `x.array` read in front of a loop stays a borrow through the loop's
+latch and through the poll `ssa_opt_bounds` puts in front of a counted loop inside it. In
+Crypto's `bnpSquareTo` each outer turn runs two inlined `am` loops, each with such a poll
+in front: `x.am`, `this.array` and `w.array` were read, tested, counted and released around
+each of them, and the outer loop's own element reads went through the general path
+because the Array they read was a new value on every turn. With the borrows the outer turn
+runs 329 instructions where it ran 457, `montReduce`'s 163 where it ran 225.
+
 `a[i] = b[j]` borrows as well: a `put.elem` that stores the element read, as its last reader
 with only releases up to the value's own, takes the Array's count of the value before it
 lets go of the element it replaces (`writeElement`), so the store may be what ends the
@@ -151,6 +162,14 @@ access must run on every turn and its site must never have left compiled code. W
 recorded kinds (code made off a baseline frame) the site saw fast Arrays alone; on a
 baseline frame, where no kinds are recorded, it saw no keyed reads (ELEMENT_ORDINARY).
 
+An access that runs on some turns only (`if (c >= DV) { r[i + t] -= DV; r[i + t + 1] = 1 }`)
+is trusted with the others when one that runs on every turn checks its Array already: it
+adds no check, so nothing can fail in front of the loop that the loop would not have come
+to. Where no such access checks its Array a read stays as it was, and a store ends the
+loop's trust like any untrusted store. `tests/baseline/t97.js` runs such loops with the
+branch taken on no turn, on some and on all, on Arrays that are too short, and with a
+second Array only the branch stores to.
+
 A `check.array` that fails (a typed array, a string, `arguments`) leaves at the header
 with a record that says so (`jit_exit_state.CODE_ARRAY_CHECK`). `jit_runtime.noteLeft`
 remembers the header's pc with `ssa.SITE_ARRAY`, and the next compile trusts nothing in
@@ -160,7 +179,30 @@ arrays, strings, `arguments`, frozen, holey and getter-holding arrays, past the 
 with stores that append.
 
 A borrowed copy of the Array (`this_array` read from a local the loop's front block
-copied) is checked as what it copies: one `check.array` per object.
+copied) is checked as what it copies: one `check.array` per object. That is the value the
+copy's `retain` names, through copies of copies (`ssa_opt_hoist.copied`), and not what the
+copy borrows from: `x.array` read into a local borrows from `x`, and it is the Array that
+is checked, not the object that holds it (`tests/baseline/t98.js`: objects that are
+Arrays themselves and hold an Array under the name the loop reads).
+
+**A loop around the loop.** The second round of `ssa_opt_hoist` finds an inner loop's front
+block, with its checks, among the blocks of the loop around it. Where that loop keeps its
+own trust (nothing in it changes what kind of object an Array is) and the Array comes from
+outside it, its front block makes the check and the inner one tests nothing
+(`Inst.proven`, printed `check.array v43 proven`): once for the outer loop, not once a
+turn. The inner check stays in its block, where `ssa_opt_bounds` reads from it which
+Arrays the inner loop's front block may take the count of; both passes look through all of
+a loop's front blocks for the Arrays checked already (`ssa_opt_hoist.frontChecks`), so a
+round adds no check an earlier one made. This holds for an inner loop that some turns
+skip too (`while (--n >= 0)` is entered through a test): its accesses saw fast Arrays and
+the Array is the same on every turn. A check that fails in front of an outer loop whose
+inner loop would never have run costs one recompile, which leaves the outer loop's trust
+out (`SITE_ARRAY` at its header) and the inner check where it was.
+
+Crypto's `bnpSquareTo` runs two inlined `am` loops on each outer turn, four checks of the
+same two Arrays: its outer turn runs 264 instructions where it ran 296. With the reads
+that borrow through a poll and the accesses trusted on some turns (both above), Crypto at
+scale 20 runs 4.88G instructions where it ran 5.34G (V8: 4.41G).
 
 Crypto's `am3`: 143 instructions an iteration where there were 164; Crypto at scale 4,
 3.26G instructions where there were 3.48G. At scale 20 the optimizer takes 1,019 ms (V8:

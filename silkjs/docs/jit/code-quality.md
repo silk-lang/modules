@@ -152,6 +152,19 @@ latch is not passed by. `tests/baseline/t101.js` lets objects, strings and numbe
 one arm of a branch, in front of a loop and behind one, and leaves compiled code after
 each.
 
+**Conditions of several tests.** `a || b` and `a && b` as a condition, and an inlined
+function that returns one, meet in a block whose parameter is the answer and which only
+branches on it. Each test's flags became a number there (`setne`, a move), and the number
+was tested again. Once the borrows are made (the block after an inlined call releases what
+the call held until then), each jump into such a block goes where the branch would send it
+(`ssa_ownership.threadBranches`): straight to one side when the block before the jump
+branched on the argument (the `||` that was already true), and otherwise the jump becomes
+the branch, on the test made last, whose flags the backend's fused compares then use. A
+parameter anything else reads stays (`var r = a || b`), and so do loop edges. Richards:
+1.618G to 1.583G instructions (its scheduler asks `isHeldOrSuspended()` every turn).
+`tests/baseline/t104.js` has the shapes, the kept answer, operands that are not booleans
+and tests that leave the code.
+
 **Boxes for one exit edge.** A loop's exit edge often passes its numbers boxed, to a block
 whose parameters stay boxed because it is also reached from in front of the loop. Those
 boxes ran on every iteration, between the loop's compare and its branch, which then could

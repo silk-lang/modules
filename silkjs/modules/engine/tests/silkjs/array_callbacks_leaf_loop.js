@@ -127,6 +127,12 @@ class Sub extends Array {}
 var sub = Sub.from([1, 2, 3]);
 rounds("map keeps the species", () => { var r = sub.map((x) => x + 1); return [r instanceof Sub, r.length, r[2]]; }, [true, 3, 4]);
 rounds("filter keeps the species", () => { var r = sub.filter((x) => x > 1); return [r instanceof Sub, r.length, r[1]]; }, [true, 2, 3]);
+// A species constructor that ignores the length it is given: the result keeps
+// the length its own elements gave it, trailing holes and all.
+function shortSpecies(source) { source.constructor = {}; source.constructor[Symbol.species] = function () { return []; }; return source; }
+rounds("map into a species array, source ends in a hole", () => { var r = shortSpecies([1, 2, , ]).map((x) => x); return [r.length, r[1]]; }, [2, 2]);
+rounds("map into a species array, source shrunk on the way", () => { var b = shortSpecies([1, 2, 3, 4]); var r = b.map((x, i) => { if (i === 1) b.length = 2; return x; }); return [r.length, r[1]]; }, [2, 2]);
+rounds("map over a hole at the end", () => { var r = [1, 2, , ].map((x) => x); return [r.length, 2 in r]; }, [3, false]);
 var thousands = numbers(5000);
 rounds("filter that grows its result", () => { var r = thousands.filter((x) => x % 3 !== 0); return [r.length, r[0], r[1], r[r.length - 1]]; }, [3333, 1, 2, 4999]);
 
@@ -139,6 +145,14 @@ rounds("reduceRight over a long array", () => long.reduceRight((acc, x) => (acc 
 rounds("every over a long array", () => long.every((x) => x < 34999), false);
 rounds("some over a long array", () => long.some((x) => x === 34999), true);
 for (var round = 0; round < 3; round++) { seen = 0; long.forEach((x) => { seen = seen + 1; }); check(seen, 35000, "forEach over a long array"); }
+// Longer than 65,536: a dense source still gets a dense result filled in place;
+// a sparse one of the same length keeps its holes and its length.
+var longer = numbers(70000);
+rounds("map over more than 65,536 elements", () => { var r = longer.map((x) => x * 2); return [r.length, r[0], r[65535], r[65536], r[65537], r[69999]]; }, [70000, 0, 131070, 131072, 131074, 139998]);
+rounds("map over more than 65,536 elements, shrunk on the way", () => { var a = numbers(70000); var r = a.map((x, i) => { if (i === 66000) a.length = 66010; return x; }); return [r.length, r[66009], 66010 in r, 69999 in r]; }, [70000, 66009, false, false]);
+var sparse = []; sparse.length = 200000; sparse[5] = 5; sparse[150000] = 7;
+rounds("map over a long sparse array", () => { var r = sparse.map((x) => x + 1); return [r.length, r[5], r[150000], 6 in r, Object.keys(r).length]; }, [200000, 6, 8, false, 2]);
+rounds("filter over more than 65,536 elements", () => { var r = longer.filter((x) => x >= 65530 && x < 65540); return [r.length, r[0], r[9]]; }, [10, 65530, 65539]);
 
 // A callback that stops being a leaf partway: an element whose field is a
 // getter, an element the callback throws on, a callback that calls.

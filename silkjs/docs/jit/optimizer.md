@@ -669,6 +669,20 @@ consumes, asks for `SERVICE_QUICK` as baseline code does, and takes the one valu
 (`STEP_QUICK` in the step entry). What the engine declines changes nothing; the counts go
 again and the interpreter steps it.
 
+A keyed store that gives an Array an element it did not have is quick too (`put_array_el`,
+past the code's own store and its helper): an append that has to grow the Array, and a
+store above a gap, as the first store of a fill from the top down makes it
+(`r[i + n] = a[i]` with `i` counting down). The engine adds the element where only the
+Array can see the store (`js_property_mutations.addArrayElement`): an extensible Array,
+a writable length where the index is past it, no element of that index in the Array, and
+nothing up the prototype chain that could answer it (an exotic object, or the index as a
+property of a prototype that is not the untouched `Array.prototype`). Anything else is
+declined and stepped. A stepped store from optimized code lends the frame twice, about
+3,160 instructions in all; the quick one is about 1,150, most of it the slow Array's new
+property. Crypto at scale 20 makes 76,000 such stores a run (`dlShiftTo`, `lShiftTo`,
+`pkcs1pad2`): 4.88G instructions to 4.67G. `tests/baseline/t99.js` has the fills and every
+case the engine must decline.
+
 ## Checks
 
 - `modules/jit/tests/baseline/*.js` (69 scripts) through

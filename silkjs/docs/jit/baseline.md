@@ -410,7 +410,7 @@ the runtime:
 | `SERVICE_POLL` | The interrupt counter ran out |
 | `SERVICE_OVERFLOW` | No room on the native stack: throw the RangeError |
 | `SERVICE_STEP` | Run the one instruction at the published offset in the interpreter |
-| `SERVICE_QUICK` | An allocating instruction (`object`, `define_field`, `array_from`, `rest`, `fclosure`, `set_proto`, a `put_field` that adds past the object's room or sets an Array's length) without a frame; the engine may decline, and the instruction is a step then |
+| `SERVICE_QUICK` | An allocating instruction (`object`, `define_field`, `array_from`, `rest`, `fclosure`, `set_proto`, a `put_field` that adds past the object's room or sets an Array's length, and for optimized code a `put_array_el` that adds an element to an Array) without a frame; the engine may decline, and the instruction is a step then |
 | `SERVICE_CONCAT` | The `+` of a string and a string or number, without a frame |
 | `SERVICE_RESUME` | Only from a resume entry: fill the new frame from an interpreter activation (below) |
 | `SERVICE_SCOPE` | From the leave tail of a function whose own scope a closure moved to the heap: drop the frame's count of it |

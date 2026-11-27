@@ -1,0 +1,1855 @@
+//! Portable input router, hit-test surface snapshots, wheel gesture parking, and scroll
+//! reconciliation shared between native compositor threads and inline hosts.
+//!
+//! No GPU handles or OS thread primitives live here so this module compiles identically on native
+//! targets and `wasm32`. Cross-thread allocations use [`Allocator.systemAllocatorProvider`].
+import ui_scene.scroll { Placements, ScrollGroup, ScrollPosition }
+import ui_tree.node { Move }
+import ui_transport.channel { UnboundedSender }
+import window.event { Event, Modifiers, Phase, ScrollDelta }
+import window.keys { KeyCode }
+import window.types { WindowId }
+import silk.collections.list { List }
+import silk.concurrency.atomic { Atomic, MemoryOrder }
+import silk.concurrency.sync { Arc }
+import silk.concurrency.thread { Concurrent, Transferable }
+import silk.core.effect { Effect }
+import silk.core.equal { Equal }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.core.result { Result }
+import silk.geometry.point { Point2 }
+import silk.geometry.rect { Rect }
+import silk.geometry.size { Size2 }
+import silk.geometry.vector { Vector2 }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.mem.box { Box }
+import silk.mem.pointer { Pointer }
+import silk.num.f32
+import silk.num.f64
+import silk.num.i32
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+
+/// CSS pixels per wheel notch, matching `adapter.LINE_PIXELS`.
+const WHEEL_LINE_PIXELS: f32 = 40.0
+
+/// Maximum discrete scroll increments coalesced during one parked wheel gesture.
+const MAX_PARKED_SCROLL_EVENTS: u32 = 64
+
+/// A scroll container the user can scroll: on `x`, on `y`, or both, with its `paintOrder` rank.
+pub struct ScrollerAxes {
+  pub node: u32,
+  pub x: bool,
+  pub y: bool,
+  pub order: u32,
+}
+
+impl Copy for ScrollerAxes {}
+
+/// An offset the compositor gave node `node`, in device pixels, as its `seq`th scroll.
+pub struct FastScrolled {
+  pub node: u32,
+  pub x: f32,
+  pub y: f32,
+  pub seq: u64,
+}
+
+impl Copy for FastScrolled {}
+impl Transferable for FastScrolled {}
+
+/// Which scrollers of a frame the compositor may scroll, and where it must not.
+pub struct FastScroll {
+  /// The scroll containers the user can scroll, with the axes they scroll on.
+  pub scrollers: List<ScrollerAxes>,
+  /// Window rectangles, in device pixels, where a non-passive wheel listener must see the event first.
+  pub blocked: List<Rect<f32>>,
+  /// Window rectangles, in device pixels, where `PREVENT_SCROLL` suppresses compositor default scroll.
+  pub prevented: List<Rect<f32>>,
+  /// Whether at least one live node has an active passive `wheel` listener.
+  pub hasPassiveWheel: bool,
+  /// The `translate` transitions of the frame (`UiTree.moves`), in device pixels.
+  pub moves: List<Move>,
+}
+
+impl Transferable for FastScroll {}
+
+impl FastScroll {
+  pub fn make() -> FastScroll {
+    return FastScroll {
+      scrollers: List<ScrollerAxes>.make(),
+      blocked: List<Rect<f32>>.make(),
+      prevented: List<Rect<f32>>.make(),
+      hasPassiveWheel: false,
+      moves: List<Move>.make(),
+    }
+  }
+
+  pub fn axes(self: &Self, node: u32) -> ScrollerAxes {
+    let list = self.scrollers.asSlice()
+    let mut i: usize = 0
+    while i < list.length {
+      if list[i].node == node {
+        return list[i]
+      }
+      i = i + 1
+    }
+    return ScrollerAxes { node: node, x: false, y: false, order: u32.MAX }
+  }
+
+  /// Whether device point (`x`, `y`) hits a non-passive wheel listener rectangle.
+  pub fn isBlocked(self: &Self, x: f32, y: f32) -> bool {
+    return rectListContains(self.blocked.asSlice(), x, y)
+  }
+
+  /// Whether device point (`x`, `y`) hits a `PREVENT_SCROLL` suppression rectangle.
+  pub fn isPrevented(self: &Self, x: f32, y: f32) -> bool {
+    return rectListContains(self.prevented.asSlice(), x, y)
+  }
+
+  pub effect fn copy(self: &Self) -> FastScroll
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut scrollers = List<ScrollerAxes>.make()
+    run scrollers.appendSlice(self.scrollers.asSlice())
+    let mut blocked = List<Rect<f32>>.make()
+    run blocked.appendSlice(self.blocked.asSlice())
+    let mut prevented = List<Rect<f32>>.make()
+    run prevented.appendSlice(self.prevented.asSlice())
+    let mut moves = List<Move>.make()
+    run moves.appendSlice(self.moves.asSlice())
+    return FastScroll {
+      scrollers: move scrollers,
+      blocked: move blocked,
+      prevented: move prevented,
+      hasPassiveWheel: self.hasPassiveWheel,
+      moves: move moves,
+    }
+  }
+}
+
+/// Event paired with the window's logical-to-device scale factor when captured by the platform thread.
+pub struct PlatformInput {
+  pub event: Event,
+  pub scale: f64,
+}
+
+impl Transferable for PlatformInput {}
+
+/// Lock-free atomic counters incremented on GPU frame present and polled by test drivers.
+pub struct FrameCounters {
+  presentedBox: Box<u64>,
+  presentedPtr: *mut u64,
+  paintedBox: Box<u64>,
+  paintedPtr: *mut u64,
+}
+
+impl Transferable for FrameCounters {}
+impl Concurrent for FrameCounters {}
+
+impl FrameCounters {
+  pub effect fn make() -> Arc<FrameCounters>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut presentedBox = run Box<u64>.make(0)
+    let presentedPtr = Pointer.fromMutRef(&mut presentedBox.getMut()[0])
+    let mut paintedBox = run Box<u64>.make(0)
+    let paintedPtr = Pointer.fromMutRef(&mut paintedBox.getMut()[0])
+    return run Arc<FrameCounters>.make(
+      FrameCounters {
+        presentedBox: move presentedBox,
+        presentedPtr: presentedPtr,
+        paintedBox: move paintedBox,
+        paintedPtr: paintedPtr,
+      },
+    )
+  }
+
+  pub fn presented(self: &Self) -> u64 {
+    return unsafe Atomic.load<u64>(self.presentedPtr, MemoryOrder.Acquire)
+  }
+
+  pub fn painted(self: &Self) -> u64 {
+    return unsafe Atomic.load<u64>(self.paintedPtr, MemoryOrder.Acquire)
+  }
+
+  pub fn recordPresent(self: &Self, painted: bool) -> () {
+    let _prevPresented = unsafe Atomic.fetchAdd<u64>(self.presentedPtr, 1, MemoryOrder.Release)
+    if painted {
+      let _prevPainted = unsafe Atomic.fetchAdd<u64>(self.paintedPtr, 1, MemoryOrder.Release)
+    }
+  }
+}
+
+/// Platform-thread push sink into the compositor thread's lock-free input queue.
+pub struct PlatformInputSink {
+  tx: UnboundedSender<PlatformInput>,
+  counters: Arc<FrameCounters>,
+}
+
+impl Transferable for PlatformInputSink {}
+impl Concurrent for PlatformInputSink {}
+
+impl PlatformInputSink {
+  pub fn make(tx: UnboundedSender<PlatformInput>, counters: Arc<FrameCounters>) -> PlatformInputSink {
+    return PlatformInputSink { tx: move tx, counters: move counters }
+  }
+
+  pub fn clone(self: &Self) -> PlatformInputSink {
+    return PlatformInputSink { tx: self.tx.clone(), counters: self.counters.clone() }
+  }
+
+  /// Enqueues an OS input event without taking any GPU or router mutex. Returns whether queued.
+  pub fn push(self: &Self, event: Event, scale: f64) -> bool {
+    let sent = run Effect.result(self.tx.send(PlatformInput { event: move event, scale: scale }))
+    return match move sent {
+      Result.Success { value } => match move value {
+        Result.Success { .. } => true
+        Result.Failure { .. } => false
+      }
+      Result.Failure { .. } => false
+    }
+  }
+
+  pub fn presented(self: &Self) -> u64 {
+    return self.counters.get().presented()
+  }
+
+  pub fn painted(self: &Self) -> u64 {
+    return self.counters.get().painted()
+  }
+}
+
+/// Distinguishes document content regions from host chrome (docks, overlays, splitters).
+pub enum RegionKind {
+  Document,
+  Chrome,
+}
+
+impl Equal for RegionKind {
+  fn equals(left: &Self, right: &Self) -> bool {
+    return match left.* {
+      RegionKind.Document => match right.* {
+        RegionKind.Document => true
+        RegionKind.Chrome => false
+      }
+      RegionKind.Chrome => match right.* {
+        RegionKind.Document => false
+        RegionKind.Chrome => true
+      }
+    }
+  }
+}
+
+/// One hit-testable sub-region within a presented surface, in surface-local logical CSS points.
+pub struct HitRegion {
+  pub window: WindowId,
+  pub root: u32,
+  pub groupId: u32,
+  pub kind: RegionKind,
+  pub bounds: Rect<f32>,
+  pub zOrder: i32,
+  pub opaque: bool,
+  pub wheelListener: bool,
+  pub wheelPassive: bool,
+  pub preventScroll: bool,
+}
+
+impl Copy for HitRegion {}
+
+/// A global keyboard shortcut routed by the compositor before document focus dispatch.
+pub struct GlobalShortcut {
+  pub id: u32,
+  pub code: KeyCode,
+  pub modifiers: Modifiers,
+  pub groupId: u32,
+}
+
+impl Copy for GlobalShortcut {}
+
+/// Immutable snapshot of what a surface shows for hit-testing and fast compositor scrolling.
+/// Pending commits wait in `InputRouter` until `FramePresented` promotes their `commitEpoch`.
+pub struct HitTestSurface {
+  pub window: WindowId,
+  pub groupId: u32,
+  pub commitEpoch: u64,
+  pub targetGeneration: u64,
+  pub scale: f32,
+  pub size: Size2<f32>,
+  /// Highest global `inputSeq` reflected in `painted` scroll offsets and layout.
+  pub consumedInputSeq: u64,
+  /// Surface-local regions in CSS points; hit testing picks the highest `zOrder` match.
+  pub regions: List<HitRegion>,
+  /// Committed scroll group tree and initial offsets in device pixels.
+  pub groups: List<ScrollGroup>,
+  pub painted: List<ScrollPosition>,
+  pub fast: FastScroll,
+}
+
+impl Transferable for HitTestSurface {}
+
+impl HitTestSurface {
+  pub fn empty(window: WindowId, groupId: u32) -> HitTestSurface {
+    return HitTestSurface {
+      window: window,
+      groupId: groupId,
+      commitEpoch: 0,
+      targetGeneration: 0,
+      scale: 1.0,
+      size: Size2<f32>.new(0.0, 0.0),
+      consumedInputSeq: 0,
+      regions: List<HitRegion>.make(),
+      groups: List<ScrollGroup>.make(),
+      painted: List<ScrollPosition>.make(),
+      fast: FastScroll.make(),
+    }
+  }
+}
+
+/// Routing metadata attached to each `Event` delivered from the compositor to a window group.
+pub struct RoutedTarget {
+  pub window: WindowId,
+  pub groupId: u32,
+  pub root: u32,
+  pub hitGeneration: u64,
+  pub commitEpoch: u64,
+  pub inputSeq: u64,
+  /// Non-zero on the first event of a non-passive wheel gesture awaiting `GestureAck`.
+  pub gestureId: u64,
+  pub passive: bool,
+  pub captureRetargeted: bool,
+  /// True when the compositor already scrolled for this event so the host must not scroll again.
+  pub scrolledOnCompositor: bool,
+}
+
+impl Copy for RoutedTarget {}
+
+/// Input event stamped with its target group and global sequence number.
+pub struct RoutedEvent {
+  pub target: RoutedTarget,
+  pub event: Event,
+}
+
+impl Transferable for RoutedEvent {}
+
+/// Owning group's response letting the compositor start or cancel a parked wheel gesture.
+pub struct GestureAck {
+  pub gestureId: u64,
+  pub inputSeq: u64,
+  pub window: WindowId,
+  pub groupId: u32,
+  pub consumed: bool,
+}
+
+impl Copy for GestureAck {}
+impl Transferable for GestureAck {}
+
+/// Fast-scroll result sent back to the owning group so DOM offsets catch up lazily.
+pub struct ScrollUpdate {
+  pub window: WindowId,
+  pub groupId: u32,
+  pub scrolled: FastScrolled,
+  pub position: ScrollPosition,
+  pub consumedInputSeq: u64,
+}
+
+impl Copy for ScrollUpdate {}
+impl Transferable for ScrollUpdate {}
+
+/// Full reconciled scroll override list pushed directly to the GPU thread for one window.
+pub struct WindowScrollPositions {
+  pub window: WindowId,
+  pub positions: List<ScrollPosition>,
+}
+
+impl Transferable for WindowScrollPositions {}
+
+/// Batch of outputs emitted by a single `InputRouter` turn.
+pub struct RouterOutput {
+  pub events: List<RoutedEvent>,
+  pub scrolls: List<ScrollUpdate>,
+  pub gpuScrolls: List<WindowScrollPositions>,
+}
+
+impl RouterOutput {
+  pub fn make() -> RouterOutput {
+    return RouterOutput {
+      events: List<RoutedEvent>.make(),
+      scrolls: List<ScrollUpdate>.make(),
+      gpuScrolls: List<WindowScrollPositions>.make(),
+    }
+  }
+
+  pub fn clear(self: &mut Self) -> () {
+    self.events.clear()
+    self.scrolls.clear()
+    self.gpuScrolls.clear()
+  }
+}
+
+struct HitChoice {
+  groupId: u32,
+  root: u32,
+  wheelListener: bool,
+  wheelPassive: bool,
+  preventScroll: bool,
+}
+
+impl Copy for HitChoice {}
+
+struct ScrollDeltaRecord {
+  seq: u64,
+  node: u32,
+  dx: f32,
+  dy: f32,
+}
+
+impl Copy for ScrollDeltaRecord {}
+
+struct SurfaceMeta {
+  gen: u64,
+  epoch: u64,
+}
+
+impl Copy for SurfaceMeta {}
+
+struct ScrollVec {
+  dx: f32,
+  dy: f32,
+}
+
+impl Copy for ScrollVec {}
+
+struct ScrollPolicy {
+  blocked: bool,
+  prevented: bool,
+  passiveAny: bool,
+}
+
+impl Copy for ScrollPolicy {}
+
+union RoutedInputKind {
+  MouseMoved { window: WindowId, position: Point2<f64> },
+  MouseDown { window: WindowId, position: Point2<f64> },
+  MouseUp { window: WindowId, position: Point2<f64> },
+  MouseExited { window: WindowId },
+  Scroll { window: WindowId, position: Point2<f64>, delta: ScrollDelta, phase: Phase },
+  KeyDown { window: WindowId, code: KeyCode, modifiers: Modifiers, imeHandled: bool },
+  FocusEvent { window: WindowId },
+  Focused { window: WindowId, focused: bool },
+  ScaleFactorChanged { window: WindowId, scaleFactor: f64 },
+  WindowEvent { window: WindowId },
+  GlobalShortcut { id: u32 },
+  Other,
+}
+
+impl Copy for RoutedInputKind {}
+
+struct SurfaceSlot {
+  window: WindowId,
+  groupId: u32,
+  scale: f32,
+  presented: Option<HitTestSurface>,
+  pending: List<HitTestSurface>,
+  /// Reconciled scroll offsets (in device pixels) for this surface on screen.
+  newer: List<ScrollPosition>,
+  newerSeq: List<u64>,
+  /// Device-pixel scroll deltas applied by the compositor after the presented commit's seq.
+  unackedDeltas: List<ScrollDeltaRecord>,
+  placements: Placements,
+  activeGesture: Option<ActiveGesture>,
+}
+
+struct ActiveGesture {
+  gestureId: u64,
+  window: WindowId,
+  groupId: u32,
+  root: u32,
+  firstSeq: u64,
+  lastSeq: u64,
+  px: f32,
+  py: f32,
+  pendingDx: f32,
+  pendingDy: f32,
+  /// `None` while parked awaiting `GestureAck`; `Some(true)` prevented; `Some(false)` fast-scrolls.
+  consumed: Option<bool>,
+  scrollPrevented: bool,
+  ended: bool,
+  bufferedCount: u32,
+  pendingEvent: Option<Event>,
+}
+
+/// Pure stateful input router running on the compositor thread (or inline in tests/wasm32).
+pub struct InputRouter {
+  nextInputSeq: u64,
+  nextGestureId: u64,
+  surfaces: List<SurfaceSlot>,
+  focusedWindow: WindowId,
+  focusedRoot: u32,
+  focusedGroup: u32,
+  hoverWindow: WindowId,
+  hoverRoot: u32,
+  hoverGroup: u32,
+  captureWindow: WindowId,
+  captureRoot: u32,
+  captureNode: u32,
+  captureGroup: u32,
+  captureExplicit: bool,
+  pressWindow: WindowId,
+  pressRoot: u32,
+  pressGroup: u32,
+  shortcuts: List<GlobalShortcut>,
+}
+
+impl InputRouter {
+  pub fn make() -> InputRouter {
+    return InputRouter {
+      nextInputSeq: 0,
+      nextGestureId: 0,
+      surfaces: List<SurfaceSlot>.make(),
+      focusedWindow: WindowId { value: 0 },
+      focusedRoot: 0,
+      focusedGroup: 0,
+      hoverWindow: WindowId { value: 0 },
+      hoverRoot: 0,
+      hoverGroup: 0,
+      captureWindow: WindowId { value: 0 },
+      captureRoot: 0,
+      captureNode: 0,
+      captureGroup: 0,
+      captureExplicit: false,
+      pressWindow: WindowId { value: 0 },
+      pressRoot: 0,
+      pressGroup: 0,
+      shortcuts: List<GlobalShortcut>.make(),
+    }
+  }
+
+  /// Registers a window owned by `groupId` if not already known.
+  pub effect fn registerSurface(self: &mut Self, window: WindowId, groupId: u32) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let at = self.slotIndex(window)
+    if at != usize.MAX {
+      let list = self.surfaces.asMutSlice()
+      list[at].groupId = groupId
+      return ()
+    }
+    run self.surfaces.append(
+      SurfaceSlot {
+        window: window,
+        groupId: groupId,
+        scale: 1.0,
+        presented: Option<HitTestSurface>.None,
+        pending: List<HitTestSurface>.make(),
+        newer: List<ScrollPosition>.make(),
+        newerSeq: List<u64>.make(),
+        unackedDeltas: List<ScrollDeltaRecord>.make(),
+        placements: Placements.make(),
+        activeGesture: Option<ActiveGesture>.None,
+      },
+    )
+    if self.focusedWindow.value == 0 {
+      self.focusedWindow = window
+      self.focusedGroup = groupId
+    }
+  }
+
+  /// Updates the cached device-pixel scale factor for `window`.
+  pub fn setScale(self: &mut Self, window: WindowId, scale: f32) -> () {
+    if scale <= 0.0 {
+      return ()
+    }
+    let at = self.slotIndex(window)
+    if at != usize.MAX {
+      let list = self.surfaces.asMutSlice()
+      list[at].scale = scale
+    }
+  }
+
+  /// Queues a hit-test commit for `surface.window` waiting until `promoteCommit` is called on
+  /// `FramePresented`. Unpresented pending commits never alter hit-testing or fast-scroll routing.
+  pub effect fn commitPending(self: &mut Self, surface: HitTestSurface) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let window = surface.window
+    let groupId = surface.groupId
+    run self.registerSurface(window, groupId)
+    let at = self.slotIndex(window)
+    let slot = &mut self.surfaces.asMutSlice()[at]
+    if surface.scale > 0.0 {
+      slot.scale = surface.scale
+    }
+    // Replace any unpresented commit with the same epoch and cap queue depth if stalled.
+    let mut i: usize = 0
+    while i < slot.pending.length() {
+      if slot.pending.asSlice()[i].commitEpoch == surface.commitEpoch {
+        drop slot.pending.remove(i)
+      } else {
+        i = i + 1
+      }
+    }
+    while slot.pending.length() >= 8 {
+      drop slot.pending.remove(0)
+    }
+    run slot.pending.append(move surface)
+  }
+
+  /// Promotes the pending commit matching (`window`, `commitEpoch`) to be the immutable
+  /// presented hit-test surface and reconciles any unacknowledged compositor scroll deltas.
+  pub effect fn promoteCommit(
+    self: &mut Self,
+    window: WindowId,
+    commitEpoch: u64,
+    reconciledOut: &mut List<ScrollPosition>,
+  ) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let at = self.slotIndex(window)
+    if at == usize.MAX {
+      return false
+    }
+    let slot = &mut self.surfaces.asMutSlice()[at]
+    let mut matchIndex = usize.MAX
+    let mut i: usize = 0
+    while i < slot.pending.length() {
+      if slot.pending.asSlice()[i].commitEpoch == commitEpoch {
+        matchIndex = i
+        break
+      }
+      i = i + 1
+    }
+    if matchIndex == usize.MAX {
+      return false
+    }
+    let next = slot.pending.remove(matchIndex)
+    let mut remaining = List<HitTestSurface>.make()
+    while slot.pending.length() != 0 {
+      let candidate = slot.pending.remove(0)
+      if candidate.commitEpoch > commitEpoch {
+        run remaining.append(move candidate)
+      }
+    }
+    slot.pending = move remaining
+    run activatePresented(&mut slot, move next, &mut reconciledOut)
+    return true
+  }
+
+  /// Immediately adopts `surface` as presented (for first frame or direct unit/synthetic tests)
+  /// and reconciles any unacknowledged compositor scroll deltas against `surface.consumedInputSeq`.
+  pub effect fn commitPresented(
+    self: &mut Self,
+    surface: HitTestSurface,
+    reconciledOut: &mut List<ScrollPosition>,
+  ) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let window = surface.window
+    let groupId = surface.groupId
+    run self.registerSurface(window, groupId)
+    let at = self.slotIndex(window)
+    let slot = &mut self.surfaces.asMutSlice()[at]
+    slot.pending.clear()
+    run activatePresented(&mut slot, move surface, &mut reconciledOut)
+  }
+
+  /// Retires `window` and clears any focus, hover, capture, or parked gesture pointing into it.
+  pub fn removeSurface(self: &mut Self, window: WindowId) -> () {
+    let at = self.slotIndex(window)
+    if at != usize.MAX {
+      drop self.surfaces.remove(at)
+    }
+    if self.hoverWindow.value == window.value {
+      self.hoverWindow = WindowId { value: 0 }
+      self.hoverRoot = 0
+      self.hoverGroup = 0
+    }
+    if self.captureWindow.value == window.value {
+      self.clearCapture()
+    }
+    if self.pressWindow.value == window.value {
+      self.pressWindow = WindowId { value: 0 }
+      self.pressRoot = 0
+      self.pressGroup = 0
+    }
+    if self.focusedWindow.value == window.value {
+      if self.surfaces.length() != 0 {
+        let fallback = &self.surfaces.asSlice()[0]
+        self.focusedWindow = fallback.window
+        self.focusedRoot = 0
+        self.focusedGroup = fallback.groupId
+      } else {
+        self.focusedWindow = WindowId { value: 0 }
+        self.focusedRoot = 0
+        self.focusedGroup = 0
+      }
+    }
+  }
+
+  pub fn setFocus(self: &mut Self, window: WindowId, root: u32, groupId: u32) -> () {
+    self.focusedWindow = window
+    self.focusedRoot = root
+    self.focusedGroup = groupId
+  }
+
+  pub fn setCapture(self: &mut Self, window: WindowId, root: u32, node: u32, groupId: u32) -> () {
+    if node == 0 && root == 0 && groupId == 0 {
+      self.clearCapture()
+      return ()
+    }
+    self.captureWindow = window
+    self.captureRoot = root
+    self.captureNode = node
+    self.captureGroup = groupId
+    self.captureExplicit = true
+  }
+
+  pub effect fn setShortcuts(self: &mut Self, shortcuts: &[GlobalShortcut]) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    self.shortcuts.clear()
+    run self.shortcuts.appendSlice(shortcuts)
+  }
+
+  /// Current active compositor scroll offset for `node` on `window` (reconciled if moved).
+  pub fn currentScroll(self: &Self, window: WindowId, node: u32) -> Option<ScrollPosition> {
+    let at = self.slotIndex(window)
+    if at == usize.MAX {
+      return Option<ScrollPosition>.None
+    }
+    let slot = &self.surfaces.asSlice()[at]
+    if let Option<ScrollPosition>.Some { value } = findPosition(slot.newer.asSlice(), node) {
+      return Option<ScrollPosition>.some(value)
+    }
+    if let Option<HitTestSurface>.Some { value: pres } = &slot.presented {
+      return findPosition(pres.painted.asSlice(), node)
+    }
+    return Option<ScrollPosition>.None
+  }
+
+  pub fn hasPresentedSurface(self: &Self, window: WindowId) -> bool {
+    let at = self.slotIndex(window)
+    if at == usize.MAX {
+      return false
+    }
+    return self.surfaces.asSlice()[at].presented.isSome()
+  }
+
+  pub fn hasActiveGesture(self: &Self) -> bool {
+    let list = self.surfaces.asSlice()
+    let mut i: usize = 0
+    while i < list.length {
+      if list[i].activeGesture.isSome() {
+        return true
+      }
+      i = i + 1
+    }
+    return false
+  }
+
+  pub fn lastInputSeq(self: &Self) -> u64 {
+    return self.nextInputSeq
+  }
+
+  /// Routes an OS event against the immutable presented hit-test surface.
+  pub effect fn route(self: &mut Self, event: Event, out: &mut RouterOutput) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    match classifyEvent(&event) {
+      RoutedInputKind.MouseMoved { window, position } => {
+        let slotAt = self.slotIndex(window)
+        if slotAt == usize.MAX {
+          drop event
+          return ()
+        }
+        let hit = hitTestSlot(&self.surfaces.asSlice()[slotAt], position)
+        let mut routedGroup = hit.groupId
+        let mut routedRoot = hit.root
+        let mut retargeted = false
+        if self.captureExplicit && self.captureWindow.value == window.value {
+          if rootMissingFromSlot(&self.surfaces.asSlice()[slotAt], self.captureRoot) {
+            self.clearCapture()
+            retargeted = true
+          } else {
+            routedGroup = self.captureGroup
+            routedRoot = self.captureRoot
+          }
+        } else if self.pressWindow.value == window.value && self.pressGroup != 0 {
+          if rootMissingFromSlot(&self.surfaces.asSlice()[slotAt], self.pressRoot) {
+            self.pressWindow = WindowId { value: 0 }
+            self.pressRoot = 0
+            self.pressGroup = 0
+            retargeted = true
+          } else {
+            routedGroup = self.pressGroup
+            routedRoot = self.pressRoot
+          }
+        }
+        run self.emitHoverExitIfChanged(window, routedGroup, routedRoot, &mut out)
+        self.hoverWindow = window
+        self.hoverGroup = routedGroup
+        self.hoverRoot = routedRoot
+        let target = self.makeTarget(slotAt, routedGroup, routedRoot, 0, true, retargeted)
+        run out.events.append(RoutedEvent { target: target, event: move event })
+      }
+      RoutedInputKind.MouseDown { window, position } => {
+        let slotAt = self.slotIndex(window)
+        if slotAt == usize.MAX {
+          drop event
+          return ()
+        }
+        let hit = hitTestSlot(&self.surfaces.asSlice()[slotAt], position)
+        run self.emitHoverExitIfChanged(window, hit.groupId, hit.root, &mut out)
+        self.hoverWindow = window
+        self.hoverGroup = hit.groupId
+        self.hoverRoot = hit.root
+        self.focusedWindow = window
+        self.focusedGroup = hit.groupId
+        self.focusedRoot = hit.root
+        self.pressWindow = window
+        self.pressGroup = hit.groupId
+        self.pressRoot = hit.root
+        let target = self.makeTarget(slotAt, hit.groupId, hit.root, 0, true, false)
+        run out.events.append(RoutedEvent { target: target, event: move event })
+      }
+      RoutedInputKind.MouseUp { window, position } => {
+        let slotAt = self.slotIndex(window)
+        if slotAt == usize.MAX {
+          drop event
+          return ()
+        }
+        let hit = hitTestSlot(&self.surfaces.asSlice()[slotAt], position)
+        let mut routedGroup = hit.groupId
+        let mut routedRoot = hit.root
+        let mut retargeted = false
+        if self.captureExplicit && self.captureWindow.value == window.value {
+          if rootMissingFromSlot(&self.surfaces.asSlice()[slotAt], self.captureRoot) {
+            self.clearCapture()
+            retargeted = true
+          } else {
+            routedGroup = self.captureGroup
+            routedRoot = self.captureRoot
+          }
+        } else if self.pressWindow.value == window.value && self.pressGroup != 0 {
+          if rootMissingFromSlot(&self.surfaces.asSlice()[slotAt], self.pressRoot) {
+            retargeted = true
+          } else {
+            routedGroup = self.pressGroup
+            routedRoot = self.pressRoot
+          }
+        }
+        self.pressWindow = WindowId { value: 0 }
+        self.pressRoot = 0
+        self.pressGroup = 0
+        let target = self.makeTarget(slotAt, routedGroup, routedRoot, 0, true, retargeted)
+        run out.events.append(RoutedEvent { target: target, event: move event })
+      }
+      RoutedInputKind.MouseExited { window } => {
+        let slotAt = self.slotIndex(window)
+        if slotAt == usize.MAX {
+          drop event
+          return ()
+        }
+        if self.hoverWindow.value == window.value {
+          self.hoverWindow = WindowId { value: 0 }
+          self.hoverRoot = 0
+          self.hoverGroup = 0
+        }
+        let groupId = self.surfaces.asSlice()[slotAt].groupId
+        let target = self.makeTarget(slotAt, groupId, 0, 0, true, false)
+        run out.events.append(RoutedEvent { target: target, event: move event })
+      }
+      RoutedInputKind.Scroll { window, position, delta, phase } => {
+        run self.routeScroll(window, position, delta, phase, move event, &mut out)
+      }
+      RoutedInputKind.KeyDown { window, code, modifiers, imeHandled } => {
+        if !imeHandled {
+          if let Option<GlobalShortcut>.Some { value: shortcut } = findShortcut(self.shortcuts.asSlice(), code, modifiers) {
+            let slotAt = self.slotIndex(self.focusedWindow)
+            let focusWin = if self.focusedWindow.value != 0 { self.focusedWindow } else { window }
+            let seq = self.allocSeq()
+            let meta = snapshotMeta(&self.surfaces, slotAt)
+            let target = RoutedTarget {
+              window: focusWin,
+              groupId: shortcut.groupId,
+              root: self.focusedRoot,
+              hitGeneration: meta.gen,
+              commitEpoch: meta.epoch,
+              inputSeq: seq,
+              gestureId: 0,
+              passive: true,
+              captureRetargeted: false,
+              scrolledOnCompositor: false,
+            }
+            run out.events.append(RoutedEvent { target: target, event: move event })
+            return ()
+          }
+        }
+        run self.routeFocusEvent(window, move event, &mut out)
+      }
+      RoutedInputKind.FocusEvent { window } => {
+        run self.routeFocusEvent(window, move event, &mut out)
+      }
+      RoutedInputKind.Focused { window, focused } => {
+        let slotAt = self.slotIndex(window)
+        if slotAt == usize.MAX {
+          drop event
+          return ()
+        }
+        let groupId = self.surfaces.asSlice()[slotAt].groupId
+        if focused {
+          if self.focusedWindow.value != window.value {
+            self.focusedWindow = window
+            self.focusedGroup = groupId
+            self.focusedRoot = 0
+          }
+        }
+        let target = self.makeTarget(slotAt, groupId, 0, 0, true, false)
+        run out.events.append(RoutedEvent { target: target, event: move event })
+      }
+      RoutedInputKind.ScaleFactorChanged { window, scaleFactor } => {
+        let factor = f64.toF32(scaleFactor)
+        self.setScale(window, factor)
+        run self.routeWindowEvent(window, move event, &mut out)
+      }
+      RoutedInputKind.WindowEvent { window } => {
+        run self.routeWindowEvent(window, move event, &mut out)
+      }
+      RoutedInputKind.GlobalShortcut { id } => {
+        let mut groupId = self.primaryGroup()
+        let shortcuts = self.shortcuts.asSlice()
+        let mut s: usize = 0
+        while s < shortcuts.length {
+          if shortcuts[s].id == id {
+            groupId = shortcuts[s].groupId
+            break
+          }
+          s = s + 1
+        }
+        run self.routePrimaryEvent(groupId, move event, &mut out)
+      }
+      RoutedInputKind.Other => {
+        let primary = self.primaryGroup()
+        run self.routePrimaryEvent(primary, move event, &mut out)
+      }
+    }
+  }
+
+  /// Resolves a parked non-passive wheel gesture upon receiving the owning group's `GestureAck`.
+  /// Ignores stale, mismatched-owner, or already-acknowledged `GestureAck`s cleanly.
+  pub effect fn ackGesture(self: &mut Self, ack: GestureAck, out: &mut RouterOutput) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let slotAt = self.slotIndex(ack.window)
+    if slotAt == usize.MAX {
+      return ()
+    }
+    let mut clearAfter = false
+    let mut replayWindow = WindowId { value: 0 }
+    let mut replayGroup: u32 = 0
+    let mut replayRoot: u32 = 0
+    let mut replayPx: f32 = 0.0
+    let mut replayPy: f32 = 0.0
+    let mut replayDx: f32 = 0.0
+    let mut replayDy: f32 = 0.0
+    let mut replaySeq: u64 = 0
+    let mut pendingEvent = Option<Event>.None
+    let mut shouldReplayScroll = false
+    let mut matched = false
+    let list = self.surfaces.asMutSlice()
+    let gestureSlot = &mut list[slotAt].activeGesture
+    if let Option<ActiveGesture>.Some { value } = &mut gestureSlot.* {
+      if value.gestureId == ack.gestureId
+        && value.window.value == ack.window.value
+        && value.groupId == ack.groupId
+        && value.consumed.isNone() {
+        value.consumed = Option<bool>.some(ack.consumed)
+        matched = true
+        replayWindow = value.window
+        replayGroup = value.groupId
+        replayRoot = value.root
+        replayPx = value.px
+        replayPy = value.py
+        replaySeq = value.lastSeq
+        pendingEvent = Intrinsic.replace(value.pendingEvent, Option<Event>.None)
+        if !ack.consumed && !value.scrollPrevented && (value.pendingDx != 0.0 || value.pendingDy != 0.0) {
+          shouldReplayScroll = true
+          replayDx = value.pendingDx
+          replayDy = value.pendingDy
+          value.pendingDx = 0.0
+          value.pendingDy = 0.0
+        }
+        clearAfter = value.ended
+      }
+    }
+    if !matched {
+      drop pendingEvent
+      return ()
+    }
+    let mut replayed = false
+    if shouldReplayScroll && replayWindow.value != 0 {
+      replayed = run self.fastScrollSlot(
+        slotAt,
+        replayGroup,
+        replayPx,
+        replayPy,
+        replayDx,
+        replayDy,
+        replaySeq,
+        &mut out,
+      )
+    }
+    if let Option<Event>.Some { value: ev } = move pendingEvent {
+      let target = self.makeTargetWithSeq(
+        slotAt,
+        replayGroup,
+        replayRoot,
+        replaySeq,
+        0,
+        false,
+        false,
+        replayed,
+      )
+      run out.events.append(RoutedEvent { target: target, event: move ev })
+    }
+    if clearAfter {
+      let mutList = self.surfaces.asMutSlice()
+      mutList[slotAt].activeGesture = Option<ActiveGesture>.None
+    }
+  }
+
+  effect fn routeScroll(
+    self: &mut Self,
+    window: WindowId,
+    position: Point2<f64>,
+    delta: ScrollDelta,
+    phase: Phase,
+    event: Event,
+    out: &mut RouterOutput,
+  ) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let slotAt = self.slotIndex(window)
+    if slotAt == usize.MAX {
+      drop event
+      return ()
+    }
+    let slotScale = self.surfaces.asSlice()[slotAt].scale
+    let presOpt = &self.surfaces.asSlice()[slotAt].presented
+    let scale = match &presOpt.* {
+      Option<HitTestSurface>.Some { value } => if value.scale > 0.0 { value.scale } else { slotScale }
+      Option<HitTestSurface>.None => slotScale
+    }
+    let px = f64.toF32(position.x) * scale
+    let py = f64.toF32(position.y) * scale
+    let svec = scrollDeltaDevice(delta, scale)
+    let dx = svec.dx
+    let dy = svec.dy
+    let isContinuation = isGestureContinuation(phase)
+    let isEnding = isGestureEnding(phase)
+
+    // Continuation (or extra event coalesced onto a parked gesture on this surface).
+    let mut matchesActive = false
+    let activeCheck = &self.surfaces.asSlice()[slotAt].activeGesture
+    if let Option<ActiveGesture>.Some { value } = &activeCheck.* {
+      if value.window.value == window.value && (isContinuation || value.consumed.isNone()) {
+        matchesActive = true
+      }
+    }
+    if matchesActive {
+      let seq = self.allocSeq()
+      let mut parkedWaiting = false
+      let mut storeCoalesced = false
+      let mut consumedNow = false
+      let mut scrollPreventedNow = false
+      let mut ownerGroup: u32 = 0
+      let mut ownerRoot: u32 = 0
+      let mut coalescePrev = Option<Event>.None
+      let activeList = self.surfaces.asMutSlice()
+      let activeSlot = &mut activeList[slotAt]
+      if let Option<ActiveGesture>.Some { value } = &mut activeSlot.activeGesture {
+        ownerGroup = value.groupId
+        ownerRoot = value.root
+        value.lastSeq = seq
+        if isEnding {
+          value.ended = true
+        }
+        match value.consumed {
+          Option<bool>.None => {
+            parkedWaiting = true
+            if value.bufferedCount < MAX_PARKED_SCROLL_EVENTS {
+              if !value.scrollPrevented {
+                value.pendingDx = value.pendingDx + dx
+                value.pendingDy = value.pendingDy + dy
+              }
+              value.bufferedCount = value.bufferedCount + 1
+              coalescePrev = Intrinsic.replace(value.pendingEvent, Option<Event>.None)
+              storeCoalesced = true
+            }
+          }
+          Option<bool>.Some { value: consumed } => {
+            consumedNow = consumed
+            scrollPreventedNow = value.scrollPrevented
+          }
+        }
+      }
+      if parkedWaiting {
+        if storeCoalesced {
+          let merged = match move coalescePrev {
+            Option<Event>.Some { value: prev } => coalesceScrollEvent(move prev, move event)
+            Option<Event>.None => move event
+          }
+          let mutList = self.surfaces.asMutSlice()
+          let mutSlot = &mut mutList[slotAt]
+          if let Option<ActiveGesture>.Some { value } = &mut mutSlot.activeGesture {
+            value.pendingEvent = Option<Event>.some(move merged)
+          }
+        } else {
+          drop coalescePrev
+          drop event
+        }
+        return ()
+      }
+      drop coalescePrev
+      let mut moved = false
+      if !consumedNow && !scrollPreventedNow {
+        moved = run self.fastScrollSlot(slotAt, ownerGroup, px, py, dx, dy, seq, &mut out)
+      }
+      let target = self.makeTargetWithSeq(slotAt, ownerGroup, ownerRoot, seq, 0, false, false, moved)
+      run out.events.append(RoutedEvent { target: target, event: move event })
+      if isEnding {
+        let mutList = self.surfaces.asMutSlice()
+        mutList[slotAt].activeGesture = Option<ActiveGesture>.None
+      }
+      return ()
+    }
+
+    // Switching to a new scroll gesture clears any leftover latched gesture state on this surface.
+    let resetList = self.surfaces.asMutSlice()
+    resetList[slotAt].activeGesture = Option<ActiveGesture>.None
+    let seq = self.allocSeq()
+    let hit = hitTestSlot(&self.surfaces.asSlice()[slotAt], position)
+    let presOpt2 = &self.surfaces.asSlice()[slotAt].presented
+    let policy = match &presOpt2.* {
+      Option<HitTestSurface>.Some { value: pres } => ScrollPolicy {
+        blocked: pres.fast.isBlocked(px, py) || (hit.wheelListener && !hit.wheelPassive),
+        prevented: pres.fast.isPrevented(px, py) || hit.preventScroll,
+        passiveAny: hit.wheelListener || pres.fast.hasPassiveWheel,
+      }
+      Option<HitTestSurface>.None => ScrollPolicy {
+        blocked: hit.wheelListener && !hit.wheelPassive,
+        prevented: hit.preventScroll,
+        passiveAny: hit.wheelListener,
+      }
+    }
+    let hasBlocked = policy.blocked
+    let hasPrevented = policy.prevented
+    let hasPassiveAny = policy.passiveAny
+
+    if hasPrevented {
+      // PREVENT_SCROLL suppresses compositor fast scroll unconditionally without waiting for ack.
+      let target = self.makeTargetWithSeq(slotAt, hit.groupId, hit.root, seq, 0, false, false, false)
+      run out.events.append(RoutedEvent { target: target, event: move event })
+      return ()
+    }
+
+    if hasBlocked {
+      let gid = self.allocGestureId()
+      let immediateEnd = isDiscreteOrEnding(phase)
+      let mutList = self.surfaces.asMutSlice()
+      mutList[slotAt].activeGesture = Option<ActiveGesture>.some(
+        ActiveGesture {
+          gestureId: gid,
+          window: window,
+          groupId: hit.groupId,
+          root: hit.root,
+          firstSeq: seq,
+          lastSeq: seq,
+          px: px,
+          py: py,
+          pendingDx: 0.0,
+          pendingDy: 0.0,
+          consumed: Option<bool>.None,
+          scrollPrevented: false,
+          ended: immediateEnd,
+          bufferedCount: 1,
+          pendingEvent: Option<Event>.None,
+        },
+      )
+      let target = self.makeTargetWithSeq(slotAt, hit.groupId, hit.root, seq, gid, false, false, false)
+      run out.events.append(RoutedEvent { target: target, event: move event })
+      return ()
+    }
+
+    // Passive fast path: scroll immediately on compositor.
+    let moved = run self.fastScrollSlot(slotAt, hit.groupId, px, py, dx, dy, seq, &mut out)
+    if !moved || hasPassiveAny {
+      let target = self.makeTargetWithSeq(slotAt, hit.groupId, hit.root, seq, 0, true, false, moved)
+      run out.events.append(RoutedEvent { target: target, event: move event })
+    } else {
+      drop event
+    }
+  }
+
+  /// Fast-scrolls scrollers on `slotAt`'s presented scene under device point (`px`, `py`).
+  effect fn fastScrollSlot(
+    self: &mut Self,
+    slotAt: usize,
+    groupId: u32,
+    px: f32,
+    py: f32,
+    dx: f32,
+    dy: f32,
+    seq: u64,
+    out: &mut RouterOutput,
+  ) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let slot = &mut self.surfaces.asMutSlice()[slotAt]
+    let window = slot.window
+    let consumedSeq = match &slot.presented {
+      Option<HitTestSurface>.Some { value: pres } => {
+        run slot.placements.resolve(
+          pres.groups.asSlice(),
+          pres.painted.asSlice(),
+          slot.newer.asSlice(),
+        )
+        pres.consumedInputSeq
+      }
+      Option<HitTestSurface>.None => {
+        return false
+      }
+    }
+    let count = match &slot.presented {
+      Option<HitTestSurface>.Some { value: pres } => pres.groups.length()
+      Option<HitTestSurface>.None => 0
+    }
+    if count <= 1 {
+      return false
+    }
+    let mut at = count
+    let mut bestOrder: u32 = 0
+    let mut hasBest = false
+    if let Option<HitTestSurface>.Some { value: pres } = &slot.presented {
+      let groups = pres.groups.asSlice()
+      let mut g: usize = 1
+      while g < count {
+        let group = groups[g]
+        if isContentGroup(&group) {
+          let clip = slot.placements.get(usize.toU32(g)).clip
+          if containsPoint(clip, px, py) {
+            let axes = pres.fast.axes(group.link.node)
+            if (axes.x || axes.y) && axes.order != u32.MAX && (!hasBest || axes.order > bestOrder) {
+              bestOrder = axes.order
+              at = g
+              hasBest = true
+            }
+          }
+        }
+        g = g + 1
+      }
+    }
+    if at == count {
+      return false
+    }
+    let mut restX = dx
+    let mut restY = dy
+    let mut any = false
+    while at != 0 && (restX != 0.0 || restY != 0.0) {
+      let mut node: u32 = 0
+      let mut parent: u32 = 0
+      let mut curPos = Option<ScrollPosition>.None
+      let mut axes = ScrollerAxes { node: 0, x: false, y: false, order: u32.MAX }
+      if let Option<HitTestSurface>.Some { value: pres } = &slot.presented {
+        let group = pres.groups.asSlice()[at]
+        parent = group.parent
+        if isContentGroup(&group) {
+          node = group.link.node
+          axes = pres.fast.axes(node)
+          curPos = slotCurrentPosition(slot.newer.asSlice(), pres.painted.asSlice(), node)
+        }
+      }
+      if node != 0 {
+        if let Option<ScrollPosition>.Some { value: position } = curPos {
+          let wantX: f32 = if axes.x { restX } else { 0.0 }
+          let wantY: f32 = if axes.y { restY } else { 0.0 }
+          let next = position.movedBy(wantX, wantY)
+          let stepX = next.x - position.x
+          let stepY = next.y - position.y
+          if stepX != 0.0 || stepY != 0.0 {
+            restX = restX - stepX
+            restY = restY - stepY
+            run setSlotNewer(&mut slot, next, seq)
+            run slot.unackedDeltas.append(
+              ScrollDeltaRecord { seq: seq, node: node, dx: stepX, dy: stepY },
+            )
+            let effectiveConsumed = if seq > consumedSeq { seq } else { consumedSeq }
+            run out.scrolls.append(
+              ScrollUpdate {
+                window: window,
+                groupId: groupId,
+                scrolled: FastScrolled { node: node, x: next.x, y: next.y, seq: seq },
+                position: next,
+                consumedInputSeq: effectiveConsumed,
+              },
+            )
+            any = true
+          }
+        }
+      }
+      at = u32.toUsize(parent)
+    }
+    if !any {
+      return false
+    }
+    run upsertGpuScrolls(&mut out.gpuScrolls, window, slot.newer.asSlice())
+    return true
+  }
+
+  effect fn routeFocusEvent(self: &mut Self, eventWindow: WindowId, event: Event, out: &mut RouterOutput) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let targetWin = if self.focusedWindow.value != 0 { self.focusedWindow } else { eventWindow }
+    let slotAt = self.slotIndex(targetWin)
+    let groupId = if self.focusedWindow.value != 0 {
+      self.focusedGroup
+    } else if slotAt != usize.MAX {
+      self.surfaces.asSlice()[slotAt].groupId
+    } else {
+      self.primaryGroup()
+    }
+    let root = if self.focusedWindow.value != 0 { self.focusedRoot } else { 0 }
+    let target = self.makeTarget(slotAt, groupId, root, 0, true, false)
+    run out.events.append(RoutedEvent { target: target, event: move event })
+  }
+
+  effect fn routeWindowEvent(self: &mut Self, window: WindowId, event: Event, out: &mut RouterOutput) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let slotAt = self.slotIndex(window)
+    if slotAt == usize.MAX {
+      drop event
+      return ()
+    }
+    let groupId = self.surfaces.asSlice()[slotAt].groupId
+    let target = self.makeTarget(slotAt, groupId, 0, 0, true, false)
+    run out.events.append(RoutedEvent { target: target, event: move event })
+  }
+
+  effect fn routePrimaryEvent(self: &mut Self, groupId: u32, event: Event, out: &mut RouterOutput) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let win = if self.focusedWindow.value != 0 {
+      self.focusedWindow
+    } else if self.surfaces.length() != 0 {
+      self.surfaces.asSlice()[0].window
+    } else {
+      WindowId { value: 0 }
+    }
+    let slotAt = self.slotIndex(win)
+    let target = self.makeTarget(slotAt, groupId, 0, 0, true, false)
+    run out.events.append(RoutedEvent { target: target, event: move event })
+  }
+
+  effect fn emitHoverExitIfChanged(
+    self: &mut Self,
+    nextWindow: WindowId,
+    nextGroup: u32,
+    nextRoot: u32,
+    out: &mut RouterOutput,
+  ) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let prevWin = self.hoverWindow
+    if prevWin.value == 0 {
+      return ()
+    }
+    if prevWin.value == nextWindow.value && self.hoverGroup == nextGroup && self.hoverRoot == nextRoot {
+      return ()
+    }
+    if prevWin.value != nextWindow.value || self.hoverGroup != nextGroup {
+      let prevSlot = self.slotIndex(prevWin)
+      let hoverGroup = self.hoverGroup
+      let hoverRoot = self.hoverRoot
+      let target = self.makeTarget(prevSlot, hoverGroup, hoverRoot, 0, true, false)
+      run out.events.append(RoutedEvent { target: target, event: Event.MouseExited { window: prevWin } })
+    }
+  }
+
+  fn clearCapture(self: &mut Self) -> () {
+    self.captureWindow = WindowId { value: 0 }
+    self.captureRoot = 0
+    self.captureNode = 0
+    self.captureGroup = 0
+    self.captureExplicit = false
+  }
+
+  fn allocSeq(self: &mut Self) -> u64 {
+    self.nextInputSeq = self.nextInputSeq + 1
+    return self.nextInputSeq
+  }
+
+  fn allocGestureId(self: &mut Self) -> u64 {
+    self.nextGestureId = self.nextGestureId + 1
+    if self.nextGestureId == 0 {
+      self.nextGestureId = 1
+    }
+    return self.nextGestureId
+  }
+
+  fn makeTarget(
+    self: &mut Self,
+    slotAt: usize,
+    groupId: u32,
+    root: u32,
+    gestureId: u64,
+    passive: bool,
+    captureRetargeted: bool,
+  ) -> RoutedTarget {
+    let seq = self.allocSeq()
+    return self.makeTargetWithSeq(slotAt, groupId, root, seq, gestureId, passive, captureRetargeted, false)
+  }
+
+  fn makeTargetWithSeq(
+    self: &Self,
+    slotAt: usize,
+    groupId: u32,
+    root: u32,
+    seq: u64,
+    gestureId: u64,
+    passive: bool,
+    captureRetargeted: bool,
+    scrolledOnCompositor: bool,
+  ) -> RoutedTarget {
+    let win = if slotAt != usize.MAX { self.surfaces.asSlice()[slotAt].window } else { WindowId { value: 0 } }
+    let meta = snapshotMeta(&self.surfaces, slotAt)
+    return RoutedTarget {
+      window: win,
+      groupId: groupId,
+      root: root,
+      hitGeneration: meta.gen,
+      commitEpoch: meta.epoch,
+      inputSeq: seq,
+      gestureId: gestureId,
+      passive: passive,
+      captureRetargeted: captureRetargeted,
+      scrolledOnCompositor: scrolledOnCompositor,
+    }
+  }
+
+  fn primaryGroup(self: &Self) -> u32 {
+    if self.focusedWindow.value != 0 {
+      return self.focusedGroup
+    }
+    if self.surfaces.length() != 0 {
+      return self.surfaces.asSlice()[0].groupId
+    }
+    return 0
+  }
+
+  fn slotIndex(self: &Self, window: WindowId) -> usize {
+    if window.value == 0 {
+      return usize.MAX
+    }
+    let list = self.surfaces.asSlice()
+    let mut i: usize = 0
+    while i < list.length {
+      if list[i].window.value == window.value {
+        return i
+      }
+      i = i + 1
+    }
+    return usize.MAX
+  }
+}
+
+effect fn activatePresented(
+  slot: &mut SurfaceSlot,
+  nextSurface: HitTestSurface,
+  reconciledOut: &mut List<ScrollPosition>,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  slot.groupId = nextSurface.groupId
+  if nextSurface.scale > 0.0 {
+    slot.scale = nextSurface.scale
+  }
+  let consumed = nextSurface.consumedInputSeq
+  let mut i: usize = 0
+  while i < slot.unackedDeltas.length() {
+    if slot.unackedDeltas.asSlice()[i].seq <= consumed {
+      drop slot.unackedDeltas.remove(i)
+    } else {
+      i = i + 1
+    }
+  }
+  slot.newer.clear()
+  slot.newerSeq.clear()
+  let deltaCount = slot.unackedDeltas.length()
+  let mut r: usize = 0
+  while r < deltaCount {
+    let rec = slot.unackedDeltas.asSlice()[r]
+    if let Option<ScrollPosition>.Some { value: cur } = slotCurrentPosition(
+      slot.newer.asSlice(),
+      nextSurface.painted.asSlice(),
+      rec.node,
+    ) {
+      let updated = cur.movedBy(rec.dx, rec.dy)
+      run setSlotNewer(&mut slot, updated, rec.seq)
+    }
+    r = r + 1
+  }
+  reconciledOut.clear()
+  run reconciledOut.appendSlice(slot.newer.asSlice())
+  slot.presented = Option<HitTestSurface>.some(move nextSurface)
+}
+
+fn snapshotMeta(surfaces: &List<SurfaceSlot>, slotAt: usize) -> SurfaceMeta {
+  if slotAt == usize.MAX {
+    return SurfaceMeta { gen: 0, epoch: 0 }
+  }
+  return match &surfaces.asSlice()[slotAt].presented {
+    Option<HitTestSurface>.Some { value } => SurfaceMeta {
+      gen: value.targetGeneration,
+      epoch: value.commitEpoch,
+    }
+    Option<HitTestSurface>.None => SurfaceMeta { gen: 0, epoch: 0 }
+  }
+}
+
+fn hitTestSlot(slot: &SurfaceSlot, point: Point2<f64>) -> HitChoice {
+  let x = f64.toF32(point.x)
+  let y = f64.toF32(point.y)
+  match &slot.presented {
+    Option<HitTestSurface>.Some { value: pres } => {
+      let regions = pres.regions.asSlice()
+      let mut found = false
+      let mut bestZ: i32 = 0
+      let mut best = HitChoice {
+        groupId: pres.groupId,
+        root: 0,
+        wheelListener: false,
+        wheelPassive: true,
+        preventScroll: false,
+      }
+      let mut i: usize = 0
+      while i < regions.length {
+        let r = regions[i]
+        if containsPoint(r.bounds, x, y) && (!found || r.zOrder >= bestZ) {
+          found = true
+          bestZ = r.zOrder
+          best = HitChoice {
+            groupId: r.groupId,
+            root: r.root,
+            wheelListener: r.wheelListener,
+            wheelPassive: r.wheelPassive,
+            preventScroll: r.preventScroll,
+          }
+        }
+        i = i + 1
+      }
+      return best
+    }
+    Option<HitTestSurface>.None => {
+      return HitChoice {
+        groupId: slot.groupId,
+        root: 0,
+        wheelListener: false,
+        wheelPassive: true,
+        preventScroll: false,
+      }
+    }
+  }
+}
+
+fn rootMissingFromSlot(slot: &SurfaceSlot, root: u32) -> bool {
+  if root == 0 {
+    return false
+  }
+  return match &slot.presented {
+    Option<HitTestSurface>.Some { value: pres } => {
+      let regions = pres.regions.asSlice()
+      if regions.length == 0 {
+        return false
+      }
+      let mut i: usize = 0
+      while i < regions.length {
+        if regions[i].root == root {
+          return false
+        }
+        i = i + 1
+      }
+      return true
+    }
+    Option<HitTestSurface>.None => false
+  }
+}
+
+fn findShortcut(shortcuts: &[GlobalShortcut], code: KeyCode, modifiers: Modifiers) -> Option<GlobalShortcut> {
+  let mut i: usize = 0
+  while i < shortcuts.length {
+    let s = shortcuts[i]
+    if s.code == code && &s.modifiers == &modifiers {
+      return Option<GlobalShortcut>.some(s)
+    }
+    i = i + 1
+  }
+  return Option<GlobalShortcut>.None
+}
+
+fn containsPoint(r: Rect<f32>, x: f32, y: f32) -> bool {
+  return x >= r.xMin && x < r.xMax && y >= r.yMin && y < r.yMax
+}
+
+fn rectListContains(list: &[Rect<f32>], x: f32, y: f32) -> bool {
+  let mut i: usize = 0
+  while i < list.length {
+    if containsPoint(list[i], x, y) {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+fn isContentGroup(group: &ScrollGroup) -> bool {
+  return group.link.x.factor == -1.0 && group.link.y.factor == -1.0
+}
+
+fn findPosition(list: &[ScrollPosition], node: u32) -> Option<ScrollPosition> {
+  let mut i: usize = 0
+  while i < list.length {
+    if list[i].node == node {
+      return Option<ScrollPosition>.some(list[i])
+    }
+    i = i + 1
+  }
+  return Option<ScrollPosition>.None
+}
+
+fn slotCurrentPosition(newer: &[ScrollPosition], painted: &[ScrollPosition], node: u32) -> Option<ScrollPosition> {
+  if let Option<ScrollPosition>.Some { value } = findPosition(newer, node) {
+    return Option<ScrollPosition>.some(value)
+  }
+  return findPosition(painted, node)
+}
+
+effect fn setSlotNewer(slot: &mut SurfaceSlot, position: ScrollPosition, seq: u64) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let newer = slot.newer.asMutSlice()
+  let mut i: usize = 0
+  while i < newer.length {
+    if newer[i].node == position.node {
+      newer[i] = position
+      slot.newerSeq.set(i, seq)
+      return ()
+    }
+    i = i + 1
+  }
+  run slot.newer.append(position)
+  run slot.newerSeq.append(seq)
+}
+
+effect fn upsertGpuScrolls(
+  out: &mut List<WindowScrollPositions>,
+  window: WindowId,
+  positions: &[ScrollPosition],
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut copied = List<ScrollPosition>.make()
+  run copied.appendSlice(positions)
+  let list = out.asMutSlice()
+  let mut i: usize = 0
+  while i < list.length {
+    if list[i].window.value == window.value {
+      list[i].positions = move copied
+      return ()
+    }
+    i = i + 1
+  }
+  run out.append(WindowScrollPositions { window: window, positions: move copied })
+}
+
+/// Returns the owning `WindowId` of per-window platform events, or `WindowId { value: 0 }` for
+/// app-wide events.
+pub fn windowOf(event: &Event) -> WindowId {
+  return match &event.* {
+    Event.RequestFrame { window, .. } => window
+    Event.Resized { window, .. } => window
+    Event.ScaleFactorChanged { window, .. } => window
+    Event.Moved { window, .. } => window
+    Event.Focused { window, .. } => window
+    Event.Occluded { window, .. } => window
+    Event.CloseRequested { window } => window
+    Event.FullScreenChanged { window, .. } => window
+    Event.KeyDown { window, .. } => window
+    Event.KeyUp { window, .. } => window
+    Event.TextInput { window, .. } => window
+    Event.ImePreedit { window, .. } => window
+    Event.MouseMoved { window, .. } => window
+    Event.MouseDown { window, .. } => window
+    Event.MouseUp { window, .. } => window
+    Event.MouseEntered { window, .. } => window
+    Event.MouseExited { window } => window
+    Event.Scroll { window, .. } => window
+    Event.Pinch { window, .. } => window
+    Event.Touch { window, .. } => window
+    Event.FileDragEntered { window, .. } => window
+    Event.FileDragMoved { window, .. } => window
+    Event.FileDragLeft { window } => window
+    Event.FileDropped { window, .. } => window
+    Event.ContextMenuClosed { window } => window
+    Event.EditCommand { window, .. } => window
+    _ => WindowId { value: 0 }
+  }
+}
+
+fn classifyEvent(event: &Event) -> RoutedInputKind {
+  return match &event.* {
+    Event.MouseMoved { window, position, .. } => RoutedInputKind.MouseMoved {
+      window: window,
+      position: position,
+    }
+    Event.MouseDown { window, position, .. } => RoutedInputKind.MouseDown {
+      window: window,
+      position: position,
+    }
+    Event.MouseUp { window, position, .. } => RoutedInputKind.MouseUp {
+      window: window,
+      position: position,
+    }
+    Event.MouseExited { window } => RoutedInputKind.MouseExited { window: window }
+    Event.Scroll { window, position, delta, phase, .. } => RoutedInputKind.Scroll {
+      window: window,
+      position: position,
+      delta: delta,
+      phase: phase,
+    }
+    Event.KeyDown { window, code, modifiers, imeHandled, .. } => RoutedInputKind.KeyDown {
+      window: window,
+      code: code,
+      modifiers: modifiers,
+      imeHandled: imeHandled,
+    }
+    Event.KeyUp { window, .. } => RoutedInputKind.FocusEvent { window: window }
+    Event.TextInput { window, .. } => RoutedInputKind.FocusEvent { window: window }
+    Event.ImePreedit { window, .. } => RoutedInputKind.FocusEvent { window: window }
+    Event.ModifiersChanged { window, .. } => RoutedInputKind.FocusEvent { window: window }
+    Event.EditCommand { window, .. } => RoutedInputKind.FocusEvent { window: window }
+    Event.Focused { window, focused } => RoutedInputKind.Focused { window: window, focused: focused }
+    Event.ScaleFactorChanged { window, scaleFactor } => RoutedInputKind.ScaleFactorChanged {
+      window: window,
+      scaleFactor: scaleFactor,
+    }
+    Event.RequestFrame { window, .. } => RoutedInputKind.WindowEvent { window: window }
+    Event.Resized { window, .. } => RoutedInputKind.WindowEvent { window: window }
+    Event.Moved { window, .. } => RoutedInputKind.WindowEvent { window: window }
+    Event.Occluded { window, .. } => RoutedInputKind.WindowEvent { window: window }
+    Event.CloseRequested { window } => RoutedInputKind.WindowEvent { window: window }
+    Event.FullScreenChanged { window, .. } => RoutedInputKind.WindowEvent { window: window }
+    Event.MouseEntered { window, .. } => RoutedInputKind.WindowEvent { window: window }
+    Event.Pinch { window, .. } => RoutedInputKind.WindowEvent { window: window }
+    Event.Touch { window, .. } => RoutedInputKind.WindowEvent { window: window }
+    Event.FileDragEntered { window, .. } => RoutedInputKind.WindowEvent { window: window }
+    Event.FileDragMoved { window, .. } => RoutedInputKind.WindowEvent { window: window }
+    Event.FileDragLeft { window } => RoutedInputKind.WindowEvent { window: window }
+    Event.FileDropped { window, .. } => RoutedInputKind.WindowEvent { window: window }
+    Event.ContextMenuClosed { window } => RoutedInputKind.WindowEvent { window: window }
+    Event.GlobalShortcut { id } => RoutedInputKind.GlobalShortcut { id: id }
+    _ => RoutedInputKind.Other
+  }
+}
+
+fn coalesceScrollEvent(prev: Event, next: Event) -> Event {
+  let prevDelta = match move prev {
+    Event.Scroll { delta, .. } => Option<ScrollDelta>.some(delta)
+    _ => Option<ScrollDelta>.None
+  }
+  return match move next {
+    Event.Scroll { window, position, delta, phase, modifiers } => match prevDelta {
+      Option<ScrollDelta>.Some { value: d1 } => Event.Scroll {
+        window: window,
+        position: position,
+        delta: combineScrollDeltas(d1, delta),
+        phase: phase,
+        modifiers: modifiers,
+      }
+      Option<ScrollDelta>.None => Event.Scroll {
+        window: window,
+        position: position,
+        delta: delta,
+        phase: phase,
+        modifiers: modifiers,
+      }
+    }
+    Event other => move other
+  }
+}
+
+fn combineScrollDeltas(first: ScrollDelta, second: ScrollDelta) -> ScrollDelta {
+  return match first {
+    ScrollDelta.Lines { delta: a } => match second {
+      ScrollDelta.Lines { delta: b } => ScrollDelta.Lines {
+        delta: Vector2<f64>.new(a.x + b.x, a.y + b.y),
+      }
+      ScrollDelta.Points { delta: b } => ScrollDelta.Points {
+        delta: Vector2<f64>.new(a.x * f32.toF64(WHEEL_LINE_PIXELS) + b.x, a.y * f32.toF64(WHEEL_LINE_PIXELS) + b.y),
+      }
+    }
+    ScrollDelta.Points { delta: a } => match second {
+      ScrollDelta.Points { delta: b } => ScrollDelta.Points {
+        delta: Vector2<f64>.new(a.x + b.x, a.y + b.y),
+      }
+      ScrollDelta.Lines { delta: b } => ScrollDelta.Points {
+        delta: Vector2<f64>.new(a.x + b.x * f32.toF64(WHEEL_LINE_PIXELS), a.y + b.y * f32.toF64(WHEEL_LINE_PIXELS)),
+      }
+    }
+  }
+}
+
+fn scrollDeltaDevice(delta: ScrollDelta, scale: f32) -> ScrollVec {
+  return match delta {
+    ScrollDelta.Lines { delta: lines } => ScrollVec {
+      dx: -f64.toF32(lines.x) * WHEEL_LINE_PIXELS * scale,
+      dy: -f64.toF32(lines.y) * WHEEL_LINE_PIXELS * scale,
+    }
+    ScrollDelta.Points { delta: points } => ScrollVec {
+      dx: -f64.toF32(points.x) * scale,
+      dy: -f64.toF32(points.y) * scale,
+    }
+  }
+}
+
+fn isGestureContinuation(phase: Phase) -> bool {
+  return match phase {
+    Phase.Changed => true
+    Phase.Ended => true
+    Phase.Cancelled => true
+    Phase.Momentum => true
+    Phase.MomentumEnded => true
+    Phase.None => false
+    Phase.Began => false
+  }
+}
+
+fn isGestureEnding(phase: Phase) -> bool {
+  return match phase {
+    Phase.Ended => true
+    Phase.Cancelled => true
+    Phase.MomentumEnded => true
+    _ => false
+  }
+}
+
+fn isDiscreteOrEnding(phase: Phase) -> bool {
+  return match phase {
+    Phase.None => true
+    Phase.Ended => true
+    Phase.Cancelled => true
+    Phase.MomentumEnded => true
+    _ => false
+  }
+}

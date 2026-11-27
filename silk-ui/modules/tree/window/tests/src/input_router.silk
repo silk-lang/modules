@@ -1,0 +1,666 @@
+//! Stage 2 compositor/input router validation spike tests: multi-window routing isolation while
+//! stalled, scroll reconciliation preserving unacked deltas, non-passive wheel parking/coalescing
+//! vs PREVENT_SCROLL bypass, and surface teardown ordering/state cleanup.
+import ui_tree_window.input_router {
+  FastScroll,
+  GestureAck,
+  HitRegion,
+  HitTestSurface,
+  InputRouter,
+  RegionKind,
+  RouterOutput,
+  ScrollerAxes,
+}
+import ui_tree_window.compositor_thread { CompositorThread, CompositorToGroup, GroupWake }
+import ui_tree_window.platform_thread { HostPlatform }
+import ui_tree_window.render_thread { GpuCommand, GpuEvent, GpuHandle }
+import ui_transport.channel { UnboundedChannel, UnboundedPair }
+import ui_transport.wake { WakeHandle }
+import ui_scene.radii { Radii }
+import ui_scene.scroll { ScrollAxis, ScrollGroup, ScrollLink, ScrollPosition }
+import window.event { Event, Key, Modifiers, Phase, ScrollDelta }
+import window.keys { KeyCode }
+import window.types { WindowId }
+import webgpu.runtime { GpuError }
+import silk.collections.list { List }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.geometry.point { Point2 }
+import silk.geometry.rect { Rect }
+import silk.geometry.size { Size2 }
+import silk.geometry.vector { Vector2 }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f32
+import silk.num.u32
+import silk.num.u64
+import silk.testing.testing { AssertionError, Testing }
+import silk.text.string { String }
+
+fn win(id: u32) -> WindowId {
+  return WindowId { value: id }
+}
+
+fn pt(x: f64, y: f64) -> Point2<f64> {
+  return Point2<f64>.new(x, y)
+}
+
+fn keyA(window: WindowId) -> Event {
+  let mut heap = Allocator.systemAllocatorProvider()
+  let text = match run Effect.result(String.copy("a")) |> Effect.provideMut<Allocator>(&mut heap) {
+    Result.Success { value } => move value
+    Result.Failure { .. } => String.make()
+  }
+  return Event.KeyDown {
+    window: window,
+    key: Key.Character { text: move text },
+    code: KeyCode.KeyA,
+    modifiers: Modifiers.none(),
+    repeat: false,
+    imeHandled: false,
+  }
+}
+
+effect fn makeScrollerSurface(
+  window: WindowId,
+  groupId: u32,
+  epoch: u64,
+  consumedInputSeq: u64,
+  paintedY: f32,
+  blockedWheel: bool,
+  preventScroll: bool,
+  passiveWheel: bool,
+) -> HitTestSurface
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut regions = List<HitRegion>.make()
+  run regions.append(
+    HitRegion {
+      window: window,
+      root: 0,
+      groupId: groupId,
+      kind: RegionKind.Document,
+      bounds: Rect<f32>.new(0.0, 0.0, 400.0, 300.0),
+      zOrder: 0,
+      opaque: true,
+      wheelListener: blockedWheel || passiveWheel,
+      wheelPassive: !blockedWheel,
+      preventScroll: preventScroll,
+    },
+  )
+  let mut groups = List<ScrollGroup>.make()
+  run groups.append(
+    ScrollGroup {
+      parent: 0,
+      link: ScrollLink { node: 0, x: ScrollAxis.fixed(), y: ScrollAxis.fixed() },
+      clip: Rect<f32>.new(0.0, 0.0, 400.0, 300.0),
+      clipRadii: Radii.zero(),
+      bounds: Rect<f32>.new(0.0, 0.0, 400.0, 300.0),
+    },
+  )
+  run groups.append(
+    ScrollGroup {
+      parent: 0,
+      link: ScrollLink { node: 10, x: ScrollAxis.content(), y: ScrollAxis.content() },
+      clip: Rect<f32>.new(0.0, 0.0, 400.0, 300.0),
+      clipRadii: Radii.zero(),
+      bounds: Rect<f32>.new(0.0, 0.0, 400.0, 1300.0),
+    },
+  )
+  let mut painted = List<ScrollPosition>.make()
+  run painted.append(
+    ScrollPosition { node: 10, x: 0.0, y: paintedY, minX: 0.0, maxX: 0.0, minY: 0.0, maxY: 1000.0 },
+  )
+  let mut fast = FastScroll.make()
+  run fast.scrollers.append(ScrollerAxes { node: 10, x: false, y: true, order: 1 })
+  fast.hasPassiveWheel = passiveWheel
+  if blockedWheel {
+    run fast.blocked.append(Rect<f32>.new(0.0, 0.0, 200.0, 200.0))
+  }
+  if preventScroll {
+    run fast.prevented.append(Rect<f32>.new(0.0, 0.0, 200.0, 200.0))
+  }
+  return HitTestSurface {
+    window: window,
+    groupId: groupId,
+    commitEpoch: epoch,
+    targetGeneration: epoch,
+    scale: 1.0,
+    size: Size2<f32>.new(400.0, 300.0),
+    consumedInputSeq: consumedInputSeq,
+    regions: move regions,
+    groups: move groups,
+    painted: move painted,
+    fast: move fast,
+  }
+}
+
+test effect fn windowBStaysResponsiveWhileWindowAStalled() -> ()
+  ! AssertionError<'static> | OutOfMemoryError {
+  let mut heap = Allocator.systemAllocatorProvider()
+  let mut router = InputRouter.make()
+  let mut reconciled = List<ScrollPosition>.make()
+  let mut out = RouterOutput.make()
+
+  let winA = win(1)
+  let winB = win(2)
+  run router.registerSurface(winA, 1) |> Effect.provideMut<Allocator>(&mut heap)
+  run router.registerSurface(winB, 2) |> Effect.provideMut<Allocator>(&mut heap)
+
+  let surfA1 = run makeScrollerSurface(winA, 1, 1, 0, 0.0, true, false, false)
+    |> Effect.provideMut<Allocator>(&mut heap)
+  let surfB1 = run makeScrollerSurface(winB, 2, 1, 0, 0.0, false, false, true)
+    |> Effect.provideMut<Allocator>(&mut heap)
+  run router.commitPresented(move surfA1, &mut reconciled) |> Effect.provideMut<Allocator>(&mut heap)
+  run router.commitPresented(move surfB1, &mut reconciled) |> Effect.provideMut<Allocator>(&mut heap)
+
+  // Park non-passive wheel on Window A (simulating a busy/stalled Window A group).
+  out.clear()
+  run router.route(
+    Event.Scroll {
+      window: winA,
+      position: pt(50.0, 50.0),
+      delta: ScrollDelta.Points { delta: Vector2<f64>.new(0.0, -30.0) },
+      phase: Phase.Began,
+      modifiers: Modifiers.none(),
+    },
+    &mut out,
+  )
+    |> Effect.provideMut<Allocator>(&mut heap)
+  run Testing.expect(out.events.length() == 1, "Window A wheel emitted first non-passive event")
+  let seqA1 = out.events.asSlice()[0].target.inputSeq
+  run Testing.expect(out.events.asSlice()[0].target.gestureId != 0, "Window A wheel parked with gestureId")
+  run Testing.expect(out.events.asSlice()[0].target.commitEpoch == 1, "Window A routes against presented epoch 1")
+  run Testing.expect(router.hasActiveGesture(), "Window A gesture is parked")
+
+  // Queue an unpresented pending commit (epoch 2, group 99) for Window A while A is stalled.
+  let surfA2Pending = run makeScrollerSurface(winA, 99, 2, seqA1, 0.0, false, false, false)
+    |> Effect.provideMut<Allocator>(&mut heap)
+  run router.commitPending(move surfA2Pending) |> Effect.provideMut<Allocator>(&mut heap)
+
+  // Window B keeps receiving pointer, fast-scroll, and focus/key input with monotonic global inputSeq.
+  out.clear()
+  run router.route(
+    Event.MouseMoved { window: winB, position: pt(20.0, 20.0), modifiers: Modifiers.none() },
+    &mut out,
+  )
+    |> Effect.provideMut<Allocator>(&mut heap)
+  run Testing.expect(out.events.length() == 1, "Window B pointer routed immediately")
+  let seqB1 = out.events.asSlice()[0].target.inputSeq
+  run Testing.expect(seqB1 > seqA1, "global inputSeq strictly increases across Window A and B")
+  run Testing.expect(out.events.asSlice()[0].target.groupId == 2, "Window B pointer targeted group 2")
+
+  out.clear()
+  run router.route(
+    Event.Scroll {
+      window: winB,
+      position: pt(50.0, 50.0),
+      delta: ScrollDelta.Points { delta: Vector2<f64>.new(0.0, -25.0) },
+      phase: Phase.None,
+      modifiers: Modifiers.none(),
+    },
+    &mut out,
+  )
+    |> Effect.provideMut<Allocator>(&mut heap)
+  run Testing.expect(out.scrolls.length() == 1, "Window B fast-scrolled while Window A was parked")
+  let seqB2 = out.scrolls.get(0).scrolled.seq
+  run Testing.expect(seqB2 > seqB1, "Window B fast-scroll advanced global inputSeq")
+  run Testing.expect(router.hasActiveGesture(), "Window B scroll did not clear Window A parked gesture")
+
+  router.setFocus(winB, 0, 2)
+  out.clear()
+  run router.route(keyA(winB), &mut out) |> Effect.provideMut<Allocator>(&mut heap)
+  run Testing.expect(out.events.length() == 1, "Window B keys routed immediately")
+  let seqB3 = out.events.asSlice()[0].target.inputSeq
+  run Testing.expect(seqB3 > seqB2 && out.events.asSlice()[0].target.groupId == 2, "Window B key kept group 2 and monotonic seq")
+
+  // Pending epoch 2 on Window A must not alter routing until FramePresented calls promoteCommit.
+  // Moving hover from Window B back to Window A first emits MouseExited for Window B, then MouseMoved for Window A.
+  out.clear()
+  run router.route(
+    Event.MouseMoved { window: winA, position: pt(60.0, 60.0), modifiers: Modifiers.none() },
+    &mut out,
+  )
+    |> Effect.provideMut<Allocator>(&mut heap)
+  run Testing.expect(out.events.length() == 2, "moving hover back to Window A emits Window B exit then Window A move")
+  let movedA1 = &out.events.asSlice()[1]
+  run Testing.expect(
+    movedA1.target.window.value == winA.value
+      && movedA1.target.commitEpoch == 1
+      && movedA1.target.groupId == 1,
+    "unpresented pending commit never hijacks hit-testing",
+  )
+
+  let promoted = run router.promoteCommit(winA, 2, &mut reconciled)
+    |> Effect.provideMut<Allocator>(&mut heap)
+  run Testing.expect(promoted, "FramePresented promoted epoch 2 on Window A")
+  out.clear()
+  run router.route(
+    Event.MouseMoved { window: winA, position: pt(60.0, 60.0), modifiers: Modifiers.none() },
+    &mut out,
+  )
+    |> Effect.provideMut<Allocator>(&mut heap)
+  run Testing.expect(
+    out.events.length() == 2 && out.events.asSlice()[0].target.groupId == 1,
+    "promoting a new group under hover exits old group 1 before routing to new group 99",
+  )
+  let movedA2 = &out.events.asSlice()[1]
+  run Testing.expect(
+    movedA2.target.window.value == winA.value
+      && movedA2.target.commitEpoch == 2
+      && movedA2.target.groupId == 99,
+    "promoted hit-test surface takes effect immediately after promoteCommit",
+  )
+}
+
+test effect fn scrollReconciliationPreservesUnackedDeltas() -> ()
+  ! AssertionError<'static> | OutOfMemoryError {
+  let mut heap = Allocator.systemAllocatorProvider()
+  let mut router = InputRouter.make()
+  let mut reconciled = List<ScrollPosition>.make()
+  let mut out = RouterOutput.make()
+
+  let winA = win(1)
+  run router.registerSurface(winA, 1) |> Effect.provideMut<Allocator>(&mut heap)
+  let surf1 = run makeScrollerSurface(winA, 1, 1, 0, 0.0, false, false, false)
+    |> Effect.provideMut<Allocator>(&mut heap)
+  run router.commitPresented(move surf1, &mut reconciled) |> Effect.provideMut<Allocator>(&mut heap)
+
+  out.clear()
+  run router.route(
+    Event.Scroll {
+      window: winA,
+      position: pt(50.0, 50.0),
+      delta: ScrollDelta.Points { delta: Vector2<f64>.new(0.0, -60.0) },
+      phase: Phase.None,
+      modifiers: Modifiers.none(),
+    },
+    &mut out,
+  )
+    |> Effect.provideMut<Allocator>(&mut heap)
+  run Testing.expect(out.scrolls.length() == 1, "first passive scroll produced compositor update")
+  let seq1 = out.scrolls.get(0).scrolled.seq
+  run Testing.expect(f32.abs(out.scrolls.get(0).position.y - 60.0) < 0.01, "first scroll moved to y=60")
+
+  out.clear()
+  run router.route(
+    Event.Scroll {
+      window: winA,
+      position: pt(50.0, 50.0),
+      delta: ScrollDelta.Points { delta: Vector2<f64>.new(0.0, -40.0) },
+      phase: Phase.None,
+      modifiers: Modifiers.none(),
+    },
+    &mut out,
+  )
+    |> Effect.provideMut<Allocator>(&mut heap)
+  run Testing.expect(out.scrolls.length() == 1, "second passive scroll produced compositor update")
+  let seq2 = out.scrolls.get(0).scrolled.seq
+  run Testing.expect(seq2 > seq1 && f32.abs(out.scrolls.get(0).position.y - 100.0) < 0.01, "second scroll moved to y=100")
+
+  // Late commit reflects only seq1 (y=60); compositor must preserve unacked +40 delta from seq2 => y=100.
+  let lateSurf = run makeScrollerSurface(winA, 1, 2, seq1, 60.0, false, false, false)
+    |> Effect.provideMut<Allocator>(&mut heap)
+  run router.commitPending(move lateSurf) |> Effect.provideMut<Allocator>(&mut heap)
+  let promotedLate = run router.promoteCommit(winA, 2, &mut reconciled)
+    |> Effect.provideMut<Allocator>(&mut heap)
+  run Testing.expect(promotedLate, "promoted late commit")
+  run Testing.expect(reconciled.length() == 1, "reconciliation emitted preserved offset")
+  run Testing.expect(f32.abs(reconciled.get(0).y - 100.0) < 0.01, "late commit preserved unacked delta to y=100")
+  let posAfterLate = router.currentScroll(winA, 10)
+  let lateOk = match posAfterLate {
+    Option<ScrollPosition>.Some { value } => f32.abs(value.y - 100.0) < 0.01
+    Option<ScrollPosition>.None => false
+  }
+  run Testing.expect(lateOk, "currentScroll reports y=100 after partial commit")
+
+  // Caught-up commit reflects seq2 (y=100); unacked deltas clear cleanly.
+  let syncedSurf = run makeScrollerSurface(winA, 1, 3, seq2, 100.0, false, false, false)
+    |> Effect.provideMut<Allocator>(&mut heap)
+  run router.commitPending(move syncedSurf) |> Effect.provideMut<Allocator>(&mut heap)
+  let promotedSync = run router.promoteCommit(winA, 3, &mut reconciled)
+    |> Effect.provideMut<Allocator>(&mut heap)
+  run Testing.expect(promotedSync && reconciled.length() == 0, "caught-up commit has zero unacked deltas")
+  let posAfterSync = router.currentScroll(winA, 10)
+  let syncOk = match posAfterSync {
+    Option<ScrollPosition>.Some { value } => f32.abs(value.y - 100.0) < 0.01
+    Option<ScrollPosition>.None => false
+  }
+  run Testing.expect(syncOk, "currentScroll stays at y=100 after full catch-up")
+}
+
+test effect fn nonPassiveWheelParksCoalescesAndPreventScrollBypasses() -> ()
+  ! AssertionError<'static> | OutOfMemoryError {
+  let mut heap = Allocator.systemAllocatorProvider()
+  let mut router = InputRouter.make()
+  let mut reconciled = List<ScrollPosition>.make()
+  let mut out = RouterOutput.make()
+
+  let winA = win(1)
+  run router.registerSurface(winA, 1) |> Effect.provideMut<Allocator>(&mut heap)
+  let blockedSurf = run makeScrollerSurface(winA, 1, 1, 0, 0.0, true, false, false)
+    |> Effect.provideMut<Allocator>(&mut heap)
+  run router.commitPresented(move blockedSurf, &mut reconciled)
+    |> Effect.provideMut<Allocator>(&mut heap)
+
+  // 1. Non-passive wheel parks on Began and coalesces Changed events while awaiting GestureAck.
+  out.clear()
+  run router.route(
+    Event.Scroll {
+      window: winA,
+      position: pt(50.0, 50.0),
+      delta: ScrollDelta.Points { delta: Vector2<f64>.new(0.0, -20.0) },
+      phase: Phase.Began,
+      modifiers: Modifiers.none(),
+    },
+    &mut out,
+  )
+    |> Effect.provideMut<Allocator>(&mut heap)
+  run Testing.expect(out.events.length() == 1 && out.scrolls.length() == 0, "non-passive Began emits event without fast scroll")
+  let t1 = out.events.asSlice()[0].target
+  run Testing.expect(t1.gestureId != 0 && !t1.passive && !t1.scrolledOnCompositor, "non-passive Began carries gestureId")
+
+  out.clear()
+  run router.route(
+    Event.Scroll {
+      window: winA,
+      position: pt(50.0, 50.0),
+      delta: ScrollDelta.Points { delta: Vector2<f64>.new(0.0, -15.0) },
+      phase: Phase.Changed,
+      modifiers: Modifiers.none(),
+    },
+    &mut out,
+  )
+    |> Effect.provideMut<Allocator>(&mut heap)
+  run router.route(
+    Event.Scroll {
+      window: winA,
+      position: pt(50.0, 50.0),
+      delta: ScrollDelta.Points { delta: Vector2<f64>.new(0.0, -25.0) },
+      phase: Phase.Changed,
+      modifiers: Modifiers.none(),
+    },
+    &mut out,
+  )
+    |> Effect.provideMut<Allocator>(&mut heap)
+  run Testing.expect(out.events.length() == 0 && out.scrolls.length() == 0, "parked follow-ups coalesce without buffering leak")
+
+  // Keys stay unblocked while gesture is parked.
+  run router.route(keyA(winA), &mut out) |> Effect.provideMut<Allocator>(&mut heap)
+  run Testing.expect(out.events.length() == 1, "keys route immediately while non-passive wheel is parked")
+
+  // Wrong gestureId / window / group acks must be ignored.
+  out.clear()
+  run router.ackGesture(
+    GestureAck { gestureId: t1.gestureId + 99, inputSeq: t1.inputSeq, window: winA, groupId: 1, consumed: false },
+    &mut out,
+  )
+    |> Effect.provideMut<Allocator>(&mut heap)
+  run router.ackGesture(
+    GestureAck { gestureId: t1.gestureId, inputSeq: t1.inputSeq, window: winA, groupId: 77, consumed: false },
+    &mut out,
+  )
+    |> Effect.provideMut<Allocator>(&mut heap)
+  run Testing.expect(router.hasActiveGesture() && out.scrolls.length() == 0 && out.events.length() == 0, "mismatched GestureAck is ignored")
+
+  // Valid GestureAck(consumed: false) replays coalesced +40 scroll and emits coalesced event with scrolledOnCompositor=true.
+  out.clear()
+  run router.ackGesture(
+    GestureAck { gestureId: t1.gestureId, inputSeq: t1.inputSeq, window: winA, groupId: 1, consumed: false },
+    &mut out,
+  )
+    |> Effect.provideMut<Allocator>(&mut heap)
+  run Testing.expect(out.scrolls.length() == 1 && f32.abs(out.scrolls.get(0).position.y - 40.0) < 0.01, "unconsumed ack replays coalesced delta")
+  run Testing.expect(out.events.length() == 1, "unconsumed ack delivers coalesced follow-up event")
+  let coalescedTarget = out.events.asSlice()[0].target
+  run Testing.expect(coalescedTarget.scrolledOnCompositor, "coalesced replay marks scrolledOnCompositor=true to prevent double scroll")
+
+  // Follow-up Ended after ack fast-scrolls and closes gesture.
+  out.clear()
+  run router.route(
+    Event.Scroll {
+      window: winA,
+      position: pt(50.0, 50.0),
+      delta: ScrollDelta.Points { delta: Vector2<f64>.new(0.0, -10.0) },
+      phase: Phase.Ended,
+      modifiers: Modifiers.none(),
+    },
+    &mut out,
+  )
+    |> Effect.provideMut<Allocator>(&mut heap)
+  run Testing.expect(out.scrolls.length() == 1 && f32.abs(out.scrolls.get(0).position.y - 50.0) < 0.01, "unconsumed continuation fast-scrolls")
+  run Testing.expect(out.events.length() == 1 && out.events.asSlice()[0].target.scrolledOnCompositor, "unconsumed continuation sets scrolledOnCompositor=true")
+  run Testing.expect(!router.hasActiveGesture(), "Ended clears active gesture")
+
+  // 2. GestureAck(consumed: true) cancels compositor scroll AND delivers coalesced follow-up event with combined delta.
+  out.clear()
+  run router.route(
+    Event.Scroll {
+      window: winA,
+      position: pt(50.0, 50.0),
+      delta: ScrollDelta.Points { delta: Vector2<f64>.new(0.0, -12.0) },
+      phase: Phase.Began,
+      modifiers: Modifiers.none(),
+    },
+    &mut out,
+  )
+    |> Effect.provideMut<Allocator>(&mut heap)
+  let gid2 = out.events.asSlice()[0].target.gestureId
+  let seq2 = out.events.asSlice()[0].target.inputSeq
+  out.clear()
+  run router.route(
+    Event.Scroll {
+      window: winA,
+      position: pt(50.0, 50.0),
+      delta: ScrollDelta.Points { delta: Vector2<f64>.new(0.0, -18.0) },
+      phase: Phase.Changed,
+      modifiers: Modifiers.none(),
+    },
+    &mut out,
+  )
+    |> Effect.provideMut<Allocator>(&mut heap)
+  run router.route(
+    Event.Scroll {
+      window: winA,
+      position: pt(50.0, 50.0),
+      delta: ScrollDelta.Points { delta: Vector2<f64>.new(0.0, -30.0) },
+      phase: Phase.Ended,
+      modifiers: Modifiers.none(),
+    },
+    &mut out,
+  )
+    |> Effect.provideMut<Allocator>(&mut heap)
+  run router.ackGesture(
+    GestureAck { gestureId: gid2, inputSeq: seq2, window: winA, groupId: 1, consumed: true },
+    &mut out,
+  )
+    |> Effect.provideMut<Allocator>(&mut heap)
+  run Testing.expect(out.scrolls.length() == 0, "consumed GestureAck must not fast-scroll")
+  run Testing.expect(out.events.length() == 1 && !out.events.asSlice()[0].target.scrolledOnCompositor, "consumed GestureAck forwards coalesced follow-up event")
+  let combinedY = match &out.events.asSlice()[0].event {
+    Event.Scroll { delta, .. } => match delta {
+      ScrollDelta.Points { delta: v } => v.y
+      ScrollDelta.Lines { delta: v } => v.y
+    }
+    _ => 0.0
+  }
+  run Testing.expect(combinedY < -47.9 && combinedY > -48.1, "coalesced follow-up carries summed -48 delta")
+  run Testing.expect(!router.hasActiveGesture(), "Ended+acked clears gesture")
+
+  // 3. PREVENT_SCROLL bypasses non-passive parking and suppresses fast-scroll completely.
+  let prevSurf = run makeScrollerSurface(winA, 1, 2, seq2, 50.0, true, true, false)
+    |> Effect.provideMut<Allocator>(&mut heap)
+  run router.commitPresented(move prevSurf, &mut reconciled)
+    |> Effect.provideMut<Allocator>(&mut heap)
+  out.clear()
+  run router.route(
+    Event.Scroll {
+      window: winA,
+      position: pt(50.0, 50.0),
+      delta: ScrollDelta.Points { delta: Vector2<f64>.new(0.0, -20.0) },
+      phase: Phase.Began,
+      modifiers: Modifiers.none(),
+    },
+    &mut out,
+  )
+    |> Effect.provideMut<Allocator>(&mut heap)
+  run Testing.expect(out.scrolls.length() == 0 && !router.hasActiveGesture(), "PREVENT_SCROLL skips parking and fast-scroll")
+  run Testing.expect(out.events.length() == 1 && out.events.asSlice()[0].target.gestureId == 0 && !out.events.asSlice()[0].target.scrolledOnCompositor, "PREVENT_SCROLL routes unparked without compositor scroll")
+
+  // 4. Passive wheel listener fast-scrolls immediately and marks passive + scrolledOnCompositor.
+  let passiveSurf = run makeScrollerSurface(winA, 1, 3, seq2, 50.0, false, false, true)
+    |> Effect.provideMut<Allocator>(&mut heap)
+  run router.commitPresented(move passiveSurf, &mut reconciled)
+    |> Effect.provideMut<Allocator>(&mut heap)
+  out.clear()
+  run router.route(
+    Event.Scroll {
+      window: winA,
+      position: pt(50.0, 50.0),
+      delta: ScrollDelta.Points { delta: Vector2<f64>.new(0.0, -30.0) },
+      phase: Phase.None,
+      modifiers: Modifiers.none(),
+    },
+    &mut out,
+  )
+    |> Effect.provideMut<Allocator>(&mut heap)
+  run Testing.expect(out.scrolls.length() == 1 && f32.abs(out.scrolls.get(0).position.y - 80.0) < 0.01, "passive wheel fast-scrolls at once")
+  run Testing.expect(out.events.length() == 1 && out.events.asSlice()[0].target.passive && out.events.asSlice()[0].target.scrolledOnCompositor, "passive wheel forwards event marked scrolledOnCompositor=true")
+}
+
+test effect fn closeSurfaceClearsRouterStateAndOrdersTeardown() -> ()
+  ! AssertionError<'static> | OutOfMemoryError | GpuError {
+  let mut heap = Allocator.systemAllocatorProvider()
+  let mut router = InputRouter.make()
+  let mut reconciled = List<ScrollPosition>.make()
+  let mut out = RouterOutput.make()
+
+  let winA = win(1)
+  let winB = win(2)
+  run router.registerSurface(winA, 1) |> Effect.provideMut<Allocator>(&mut heap)
+  run router.registerSurface(winB, 2) |> Effect.provideMut<Allocator>(&mut heap)
+  let sA = run makeScrollerSurface(winA, 1, 1, 0, 0.0, true, false, false)
+    |> Effect.provideMut<Allocator>(&mut heap)
+  let sB = run makeScrollerSurface(winB, 2, 1, 0, 0.0, false, false, true)
+    |> Effect.provideMut<Allocator>(&mut heap)
+  run router.commitPresented(move sA, &mut reconciled) |> Effect.provideMut<Allocator>(&mut heap)
+  run router.commitPresented(move sB, &mut reconciled) |> Effect.provideMut<Allocator>(&mut heap)
+
+  router.setFocus(winA, 0, 1)
+  router.setCapture(winA, 0, 42, 1)
+  out.clear()
+  run router.route(
+    Event.MouseMoved { window: winA, position: pt(40.0, 40.0), modifiers: Modifiers.none() },
+    &mut out,
+  )
+    |> Effect.provideMut<Allocator>(&mut heap)
+  out.clear()
+  run router.route(
+    Event.Scroll {
+      window: winA,
+      position: pt(40.0, 40.0),
+      delta: ScrollDelta.Points { delta: Vector2<f64>.new(0.0, -10.0) },
+      phase: Phase.Began,
+      modifiers: Modifiers.none(),
+    },
+    &mut out,
+  )
+    |> Effect.provideMut<Allocator>(&mut heap)
+  let parkedGid = out.events.asSlice()[0].target.gestureId
+  let parkedSeq = out.events.asSlice()[0].target.inputSeq
+  run Testing.expect(router.hasPresentedSurface(winA) && router.hasActiveGesture(), "Window A active before close")
+
+  router.removeSurface(winA)
+  run Testing.expect(!router.hasPresentedSurface(winA) && !router.hasActiveGesture(), "removeSurface clears presented surface and active gesture")
+
+  out.clear()
+  run router.ackGesture(
+    GestureAck { gestureId: parkedGid, inputSeq: parkedSeq, window: winA, groupId: 1, consumed: false },
+    &mut out,
+  )
+    |> Effect.provideMut<Allocator>(&mut heap)
+  run Testing.expect(out.events.length() == 0 && out.scrolls.length() == 0, "stale GestureAck for closed window is ignored")
+
+  out.clear()
+  run router.route(keyA(winB), &mut out) |> Effect.provideMut<Allocator>(&mut heap)
+  run Testing.expect(
+    out.events.length() == 1 && out.events.asSlice()[0].target.window.value == winB.value && out.events.asSlice()[0].target.groupId == 2,
+    "focus falls back cleanly to remaining Window B",
+  )
+
+  // Live CompositorThread processes GpuEvent.SurfaceClosed, forwards CompositorToGroup.SurfaceClosed, and keeps Window B alive.
+  let platform = HostPlatform.headless()
+  let cmdPair = run UnboundedChannel.make<GpuCommand>(WakeHandle.noop())
+  let UnboundedPair<GpuCommand> { sender: cmdTx, receiver: cmdRxInit } = move cmdPair
+  let mut cmdRx = move cmdRxInit
+  let mut comp = run CompositorThread.start(GpuHandle.make(move cmdTx), GroupWake.make(platform.nudge()))
+  comp.registerSurface(winA, 1)
+  comp.registerSurface(winB, 2)
+  let liveA = run makeScrollerSurface(winA, 1, 1, 0, 0.0, false, false, true)
+    |> Effect.provideMut<Allocator>(&mut heap)
+  let liveB = run makeScrollerSurface(winB, 2, 1, 0, 0.0, false, false, false)
+    |> Effect.provideMut<Allocator>(&mut heap)
+  comp.commitHitSurface(move liveA, true)
+  comp.commitHitSurface(move liveB, true)
+
+  let gpuTx = comp.gpuEventSink()
+  drop run Effect.result(gpuTx.send(GpuEvent.SurfaceClosed { surface: 1, window: winA }))
+
+  let mut inbox = List<CompositorToGroup>.make()
+  let mut gotClosed = false
+  let mut spins: u32 = 0
+  while !gotClosed && spins < 50000 {
+    drop run comp.poll(&mut inbox) |> Effect.provideMut<Allocator>(&mut heap)
+    while inbox.length() != 0 {
+      if let CompositorToGroup.SurfaceClosed { surface: sid, window: swin } = inbox.remove(0) {
+        if sid == 1 && swin.value == winA.value {
+          gotClosed = true
+        }
+      }
+    }
+    spins = spins + 1
+  }
+  run Testing.expect(gotClosed, "CompositorThread forwarded GpuEvent.SurfaceClosed to window group")
+
+  let sink = comp.platformInputSink()
+  drop sink.push(Event.MouseMoved { window: winA, position: pt(10.0, 10.0), modifiers: Modifiers.none() }, 1.0)
+  drop sink.push(
+    Event.Scroll {
+      window: winB,
+      position: pt(50.0, 50.0),
+      delta: ScrollDelta.Points { delta: Vector2<f64>.new(0.0, -35.0) },
+      phase: Phase.None,
+      modifiers: Modifiers.none(),
+    },
+    1.0,
+  )
+
+  let mut sawGpuScrollB = false
+  let mut sawWinAInput = false
+  let mut waitSpins: u32 = 0
+  while !sawGpuScrollB && waitSpins < 50000 {
+    drop run comp.poll(&mut inbox) |> Effect.provideMut<Allocator>(&mut heap)
+    while inbox.length() != 0 {
+      if let CompositorToGroup.Input { routed } = inbox.remove(0) {
+        if routed.target.window.value == winA.value {
+          sawWinAInput = true
+        }
+      }
+    }
+    while true {
+      match cmdRx.tryRecv() {
+        Result.Success { value: cmd } => {
+          if let GpuCommand.ApplyScroll { window: gwin, positions, .. } = move cmd {
+            if gwin.value == winB.value && positions.length() == 1 && f32.abs(positions.get(0).y - 35.0) < 0.01 {
+              sawGpuScrollB = true
+            }
+          }
+        }
+        Result.Failure { .. } => { break }
+      }
+    }
+    waitSpins = waitSpins + 1
+  }
+  run Testing.expect(!sawWinAInput && sawGpuScrollB, "closed Window A drops further input while Window B scrolls to GPU")
+  comp.stop()
+}

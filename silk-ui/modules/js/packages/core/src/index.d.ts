@@ -47,7 +47,7 @@ export interface ListenerSignal {
   readonly aborted: boolean;
   addEventListener(type: "abort", listener: () => void, options?: { once?: boolean }): void;
 }
-export type ListenerOptions = boolean | { capture?: boolean; once?: boolean; signal?: ListenerSignal };
+export type ListenerOptions = boolean | { capture?: boolean; once?: boolean; passive?: boolean; signal?: ListenerSignal };
 
 /** Live tokens in a node's class attribute. */
 export class ClassList implements Iterable<string> {

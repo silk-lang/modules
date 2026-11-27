@@ -117,11 +117,15 @@ class OuterTarget {
   addEventListener(type, listener, options) {
     if (listener == null || options?.signal?.aborted) return;
     const capture = options === true || !!options?.capture;
+    const passive =
+      options !== undefined && options !== null && typeof options === "object" && options.passive !== undefined
+        ? !!options.passive
+        : DEFAULT_PASSIVE_TYPES.has(type);
     let list = this.#listeners.get(type);
     if (!list) this.#listeners.set(type, (list = []));
     if (list.some((entry) => entry.listener === listener && entry.capture === capture)) return;
-    list.push({ listener, capture, once: !!options?.once });
-    if (list.length === 1) this._listening(type, true);
+    list.push({ listener, capture, once: !!options?.once, passive });
+    this._listening(type, true, passive);
     options?.signal?.addEventListener("abort", () => this.removeEventListener(type, listener, capture), { once: true });
   }
 
@@ -131,12 +135,13 @@ class OuterTarget {
     const capture = options === true || !!options?.capture;
     const index = list.findIndex((entry) => entry.listener === listener && entry.capture === capture);
     if (index < 0) return;
-    list.splice(index, 1);
-    if (list.length === 0) this._listening(type, false);
+    const [removed] = list.splice(index, 1);
+    if (list.length === 0) this.#listeners.delete(type);
+    this._listening(type, false, removed.passive);
   }
 
-  _listening(type, on) {
-    relay(type, on);
+  _listening(type, on, passive) {
+    relay(type, on, passive);
   }
 
   _has(type) {
@@ -150,11 +155,14 @@ class OuterTarget {
       if (event._immediate) return;
       if (entry.capture !== capture) continue;
       if (entry.once) this.removeEventListener(event.type, entry.listener, entry.capture);
+      if (entry.passive) event._inPassive = (event._inPassive || 0) + 1;
       try {
         if (typeof entry.listener === "function") entry.listener.call(this === windowTarget ? global : this, event);
         else entry.listener.handleEvent(event);
       } catch (error) {
         global.reportError?.(error);
+      } finally {
+        if (entry.passive) event._inPassive--;
       }
     }
     // `onresize`, `onkeydown` and the rest, as handler properties.
@@ -184,6 +192,16 @@ class OuterTarget {
       Object.defineProperty(event, "_immediate", { get: () => stopped, configurable: true });
       Object.defineProperty(event, "stopImmediatePropagation", { value() { stopped = true; stopNow?.call(event); }, configurable: true });
     }
+    if (!("_inPassive" in event)) {
+      const prevent = event.preventDefault;
+      Object.defineProperties(event, {
+        _inPassive: { value: 0, writable: true, configurable: true },
+        preventDefault: {
+          value() { if (!event._inPassive) prevent?.call(event); },
+          configurable: true,
+        },
+      });
+    }
     set("target", self);
     set("currentTarget", self);
     set("eventPhase", 2);
@@ -196,15 +214,27 @@ class OuterTarget {
 }
 
 // A document or window listener for a tree event needs the tree to send that event: the root
-// listens for it with a listener that does nothing.
+// listens for it with a listener that does nothing. Wait: keep `{ passive: false }` only while
+// at least one non-passive outer listener is registered for `type`.
+const DEFAULT_PASSIVE_TYPES = new Set(["wheel", "mousewheel", "touchstart", "touchmove"]);
 const relayed = new Map();
 const nothing = () => {};
-function relay(type, on) {
+function relay(type, on, passive) {
   if (type === "resize") return watchSize(on);
-  const count = (relayed.get(type) ?? 0) + (on ? 1 : -1);
-  relayed.set(type, count);
-  if (on && count === 1) documentElement.addEventListener(type, nothing);
-  if (!on && count === 0) documentElement.removeEventListener(type, nothing);
+  let state = relayed.get(type);
+  if (!state) {
+    state = { total: 0, nonPassive: 0, mode: null };
+    relayed.set(type, state);
+  }
+  const delta = on ? 1 : -1;
+  state.total = Math.max(0, state.total + delta);
+  if (!passive) state.nonPassive = Math.max(0, state.nonPassive + delta);
+  const desired = state.total === 0 ? null : state.nonPassive > 0 ? "active" : "passive";
+  if (desired === state.mode) return;
+  if (state.mode !== null) documentElement.removeEventListener(type, nothing);
+  if (desired !== null) documentElement.addEventListener(type, nothing, { passive: desired === "passive" });
+  state.mode = desired;
+  if (desired === null) relayed.delete(type);
 }
 
 const windowTarget = new OuterTarget();

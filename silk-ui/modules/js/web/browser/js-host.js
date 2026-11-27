@@ -27,7 +27,7 @@ const OP = {
   fontFamily: 16, defineIcon: 17, source: 18, release: 19, keyframe: 20, keyframes: 21,
   richText: 22, mark: 23, atomStyle: 24, format: 25, insertAtom: 26, styleSheet: 27, load: 28,
   capture: 29, svgInsert: 30, svgRemove: 31, svgAttribute: 32, surface: 33, canvasFrame: 34,
-  virtualList: 35, virtualItems: 36, clearVirtualList: 37,
+  virtualList: 35, virtualItems: 36, clearVirtualList: 37, listenPassive: 38,
 };
 
 // The attribute names the tree has besides `role` and `aria-*` (ui-js-calls `attributeOf`):
@@ -201,6 +201,7 @@ export class JsHost {
       root(id) { write(OP.root, id); },
       setText(id, value) { write(OP.setText, id); calls.text(value); },
       listen(id, flags) { write(OP.listen, id); calls.u32(flags); },
+      listenPassive(id, flags) { write(OP.listenPassive, id); calls.u32(flags); },
       style(id, css, state) { write(OP.style, id); calls.u32(state); calls.text(css); },
       styleSheet(operation, id, bytes) {
         if (operation < 0 || operation > 3 || (operation !== 0 && (id < 1 || id >= 0x80000000))) throw new TypeError('invalid stylesheet operation');

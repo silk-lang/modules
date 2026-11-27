@@ -731,6 +731,17 @@ that yield -0, compared through `1 / x`.
   (`enter`, after the copying path joins), not each time the loop passes it. Richards:
   1.451G to 1.417G.
 
+- **RegExp's natives and literals.** A native call from compiled code
+  (`js_vm.baselineNative`) answers `re.exec(s)`, `re.test(s)`, `s.replace(re, x)` and
+  `Object.keys(o)` through the quick paths the interpreter's `leanInline` takes
+  (`quickExec`, `quickReplace`, `quickKeys`); before, their call kinds sat above the test
+  that let the quick paths in, and every call built a full native frame. A regular
+  expression literal is made by the quick service (`js_regexp_intrinsics.literal`, as the
+  service makes object literals) where compiled code stepped the interpreter for it (two
+  frame exits and an interpreter entry each), and `length` of a flat string is read in
+  optimized code, where the helper was called for anything but an Array. RegExp: 16.74G to
+  12.26G instructions (the interpreter runs 14.76G).
+
 ## What it is checked with
 
 - `tests/baseline/t105.js`: fields and closure variables read as integers by `&`, `==`,

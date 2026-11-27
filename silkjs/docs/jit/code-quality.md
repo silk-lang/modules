@@ -447,6 +447,23 @@ straight from the array (below). Only a borrowed `v` (an owned one is moved by t
 the ownership rules count that), and only exits one instruction uses: an exit shared with an
 instruction in front of the unbox (the front block of a hoist) runs before `u` exists.
 
+**The unbox moves up to its read.** `(this.state & HELD) != 0` reads the field and the
+variable before it unboxes either, so each boxed value crossed its frame slot on the way to
+its number. A plain `unbox.i32` (and an `unbox.f64`) that is the one reader of a borrowed
+read in its block, with nothing between that changes or reads the value
+(`safeBetweenUnbox`), is moved right behind the read (`ssa_opt_unboxed.hoistUnboxes`): of a
+field, a trusted element, and for integers a closure variable's cell in an inlined body.
+It takes a copy of the first exit after the read, and the exits behind it name the number.
+A value that is not a number then leaves one instruction earlier than its operation would
+have; where the function's own code already left at an instruction between the two (the
+compile's deopt sites), an integer's unbox stays, so that the exit taken is the one the
+next compile learns from. A double's moves all the same, as it did before integers were
+moved: the exits behind an `unbox.f64` hand the interpreter its number as a Float64, also
+when it was an Int, and which of two operands is unboxed first decides whether a division
+that leaves at a string divisor is redone on `100` or on `100.0` (RayTrace's
+`canvasHeight /= pixelHeight`; a Float64 height then fails the integer test of
+`y < canvasHeight` in the render loop).
+
 ## Exits leave dead locals out
 
 An exit writes every local to the interpreter's frame, so every local was live at every
@@ -683,7 +700,31 @@ that yield -0, compared through `1 / x`.
   register and the unbox is skipped; anything else is copied to its frame slot as before
   and the unbox refuses it. No exit changes.
 
+- **A field or a variable followed by its unbox.** As for elements: when the one reader of
+  a keyed `get.field` (a known shape, no prototype steps) or of an owned variable's cell is
+  the plain `unbox.i32` next to it, the tag byte is compared in the object (or the cell)
+  and the number loaded from there (`fusedUnboxI32`, `loadInt`). Anything but an Int is
+  copied to the value's frame slot by a piece after the blocks, which then takes the
+  unbox's exit. Richards: 1.583G to 1.533G.
+- **`==` with a number known.** Two boxed operands make a generic `equals`, since a guard
+  that both are integers would leave at the first object. Where an earlier unbox that
+  dominates the test proved one operand an Int (`this.state & HELD` in front of
+  `this.state == RUNNABLE`: both read the same field, `ssa_shapes.sameAs`), the test first
+  compares the other operand's tag byte with Int and then the two numbers, and only another
+  kind of value goes on to the generic code (`knownInts`, kept alive for the test by
+  `Shortcuts.keeps`; `equalsFlags`). When the other operand is an owned variable's cell
+  read right in front, the compare reads the cell and the boxed copy is made only on the
+  generic path (`fusedEqualsVar`). Richards: 1.533G to 1.473G.
+- **A null test of a fresh value** is `lea r8d, [rax - low]; cmp r8b, 1` where it was a
+  byte load, a subtraction and a compare; `&`, `|` and `^` of two registers compute in the
+  result's register (`mov; and; mov` became `and`). Richards: 1.473G to 1.451G.
+
 ## What it is checked with
+
+- `tests/baseline/t105.js`: fields and closure variables read as integers by `&`, `==`,
+  `===` and compares in inlined methods, then changed to doubles, strings, null,
+  undefined, booleans and an object with `valueOf`, so every fused read and every hinted
+  test takes its other path and leaves compiled code.
 
 - `ssa_tests.goldenBorrowedElements`, `goldenHoistedLength`, `goldenHoistedInLoopEntry`: the
   form after the passes.

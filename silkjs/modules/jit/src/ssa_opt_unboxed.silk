@@ -17,7 +17,8 @@ import silk.num.u32
 import silk.num.usize
 import silkjs.js_class_data as classes
 import silkjs.js_feedback as feedback
-import ssa { Function, Exit, Inst, Own, Op, RootKind, Slot, SlotMode, Type, NONE, readsK, isNumberOp }
+import ssa { Function, Exit, Inst, Own, Op, RootKind, Slot, SlotMode, Type, NONE, VAR_OWNED, readsK, isNumberOp }
+import ssa_opt_hoist { has }
 import ssa_ownership { Forward }
 import ssa_verify { readsA, readsB }
 
@@ -37,14 +38,14 @@ fn pureNoExit(f: &Function, inst: Inst) -> bool {
     || op == Op.Removed
 }
 
-/// Whether `inst` is an expression-level instruction safe to hoist an `Op.UnboxF64` across.
-fn safeBetweenUnboxF64(f: &Function, inst: Inst) -> bool {
+/// Whether `inst` is an expression-level instruction safe to hoist an unbox across.
+fn safeBetweenUnbox(f: &Function, inst: Inst) -> bool {
   if pureNoExit(f, inst) { return true }
   let op = inst.op
   if op == Op.GetElem { return inst.trusted && inst.k == 0 }
   if op == Op.GetField { return inst.k == 0 }
   return op == Op.Add || op == Op.Sub || op == Op.Mul || op == Op.Mod || op == Op.Neg || op == Op.Shr
-    || op == Op.Unbox || op == Op.UnboxF64 || op == Op.UnboxBool || op == Op.ExactI32
+    || op == Op.GetVar || op == Op.Unbox || op == Op.UnboxF64 || op == Op.UnboxBool || op == Op.ExactI32
     || op == Op.CheckTag || op == Op.CheckArray || op == Op.CheckBound || op == Op.CheckShape || op == Op.CheckWatched
     || op == Op.GetLength
 }
@@ -57,16 +58,32 @@ fn definedByOrder(f: &Function, v: u32, b: u32, maxOrder: u32) -> bool {
   return f.inst(info.def).order <= maxOrder
 }
 
-/// Hoists a single-use `Op.UnboxF64` immediately after its same-block borrowed `Op.GetField`
-/// (keyed, non-stepping) or trusted `Op.GetElem` producer so `x64_backend.fusedUnboxF64` can
-/// load the double directly from the slot. Clones the first exit after the producer (preserving
-/// exact post-read state and getter ordering) and rewrites later exits from `Dup(v)` to `F64(u)`.
-effect fn hoistUnboxF64(f: &mut Function) -> bool ! OutOfMemoryError ? &mut Allocator {
+/// Whether the read `read` is one the backend loads a number straight from, for the unbox
+/// `unbox` right after it (x64_backend.fusedUnboxF64, fusedUnboxI32): a keyed field or a
+/// trusted element, and for an Int also a variable cell the body's closure owns for good.
+fn fusedProducer(read: Inst, unbox: Op) -> bool {
+  if read.exit == NONE { return false }
+  if (read.op == Op.GetField && read.k == 0) || (read.op == Op.GetElem && read.trusted && read.k == 0) { return true }
+  return unbox == Op.Unbox && read.op == Op.GetVar && (read.k & VAR_OWNED) != 0 && read.frame != 0
+}
+
+/// Hoists a single-use `Op.UnboxF64` or plain `Op.Unbox` immediately after its same-block
+/// borrowed producer (`fusedProducer`) so the backend can load the number directly from the
+/// slot (`a.x & b` reads both operands before it unboxes either). Clones the first exit after
+/// the producer (preserving exact post-read state and getter ordering) and rewrites later exits
+/// from `Dup(v)` to `F64(u)` or `Int(u)`. A number that is not one then leaves at the
+/// instruction after the read, not at its operation: a function's own instruction that left
+/// before (`sites`) keeps its integer unboxes where they are, so the operation's exit is the
+/// one taken next and the next compile learns from it. (An `Op.UnboxF64` moves all the same:
+/// the exits behind it name its number as a Float64, and the order of two operands' unboxes
+/// decides which of them the interpreter is handed so when the other is not a number.)
+effect fn hoistUnboxes(f: &mut Function, sites: &List<u32>) -> bool ! OutOfMemoryError ? &mut Allocator {
   let values = f.values.length()
   let mut hasUnbox = false
   let mut i: usize = 0
   while i < f.insts.length() {
-    if f.insts.get(i).op == Op.UnboxF64 { hasUnbox = true break }
+    let op = f.insts.get(i).op
+    if op == Op.UnboxF64 || op == Op.Unbox { hasUnbox = true break }
     i = i + 1
   }
   if !hasUnbox { return false }
@@ -118,32 +135,34 @@ effect fn hoistUnboxF64(f: &mut Function) -> bool ! OutOfMemoryError ? &mut Allo
     let mut at = block.firstInst
     while at < end {
       let mut u = f.inst(at)
-      if u.op == Op.UnboxF64 && u.result != NONE && u.exit != NONE && u32.toUsize(u.a) < values {
+      if (u.op == Op.UnboxF64 || (u.op == Op.Unbox && u.k == 0)) && u.result != NONE && u.exit != NONE && u32.toUsize(u.a) < values {
         let v = u.a
         let vInfo = f.value(v)
         if vInfo.block == b && vInfo.def != NONE && vInfo.own == Own.Borrowed && user.get(u32.toUsize(v)) == at {
           let defIdx = vInfo.def
           let vInst = f.inst(defIdx)
-          let producerOk = vInst.exit != NONE
-            && ((vInst.op == Op.GetField && vInst.k == 0) || (vInst.op == Op.GetElem && vInst.trusted && vInst.k == 0))
-          if producerOk && defIdx < at {
+          if fusedProducer(vInst, u.op) && defIdx < at {
             let mut between: u32 = 0
             let mut safe = true
             let mut firstExit = NONE
+            let mut left = false
             let mut j = defIdx + 1
             while j < at && safe {
               let mid = f.inst(j)
               if mid.op != Op.Removed && mid.order > vInst.order {
                 between = between + 1
-                if !safeBetweenUnboxF64(&f.*, mid) { safe = false break }
+                if !safeBetweenUnbox(&f.*, mid) { safe = false break }
                 if firstExit == NONE {
-                  if mid.exit != NONE { firstExit = mid.exit }
+                  if mid.exit != NONE { firstExit = mid.exit left = u.op == Op.Unbox && mid.frame == 0 && has(sites, mid.pc) }
                   else if !pureNoExit(&f.*, mid) { safe = false break }
                 }
               }
               j = j + 1
             }
             if firstExit == NONE { firstExit = u.exit }
+            // The exit's instruction left before (the function's own: an inlined body's
+            // are not among `sites`), and the unbox is an integer's.
+            if left { safe = false }
             if safe && between > 0 && firstExit != NONE {
               let src = f.exit(firstExit)
               let srcFirst = src.firstSlot
@@ -173,7 +192,7 @@ effect fn hoistUnboxF64(f: &mut Function) -> bool ! OutOfMemoryError ? &mut Allo
                   let mut slot = f.slots.get(u32.toUsize(srcFirst + s))
                   if slot.mode != SlotMode.Virtual && u32.toUsize(slot.value) < values {
                     let hv = hoisted.get(u32.toUsize(slot.value))
-                    if hv != NONE { slot = Slot { value: hv, mode: SlotMode.F64, root: NONE } }
+                    if hv != NONE { slot = Slot { value: hv, mode: numberMode(&f.*, hv), root: NONE } }
                   }
                   run f.slots.append(slot)
                   s = s + 1
@@ -196,7 +215,7 @@ effect fn hoistUnboxF64(f: &mut Function) -> bool ! OutOfMemoryError ? &mut Allo
     b = b + 1
   }
   if !moved { return false }
-  // Rewrite every exit slot referencing a hoisted `v` (except its own unbox exit) to F64(u).
+  // Rewrite every exit slot referencing a hoisted `v` (except its own unbox exit) to its number.
   let mut e: usize = 0
   while e < f.exits.length() {
     let exit = f.exits.get(e)
@@ -208,7 +227,8 @@ effect fn hoistUnboxF64(f: &mut Function) -> bool ! OutOfMemoryError ? &mut Allo
       if slot.mode != SlotMode.Virtual && u32.toUsize(slot.value) < values {
         let uVal = hoisted.get(u32.toUsize(slot.value))
         if uVal != NONE && keepExit.get(u32.toUsize(slot.value)) != usize.toU32(e) {
-          f.setSlot(idx, Slot { value: uVal, mode: SlotMode.F64, root: NONE })
+          let mode = numberMode(&f.*, uVal)
+          f.setSlot(idx, Slot { value: uVal, mode: mode, root: NONE })
         }
       }
       s = s + 1
@@ -219,10 +239,14 @@ effect fn hoistUnboxF64(f: &mut Function) -> bool ! OutOfMemoryError ? &mut Allo
   return true
 }
 
-/// Rewrites the exit slots described above (and hoists non-adjacent `Op.UnboxF64` next to
-/// their same-block field/element producers); answers whether any changed.
-pub effect fn unboxedSlots(f: &mut Function) -> bool ! OutOfMemoryError ? &mut Allocator {
-  let mut changed = run hoistUnboxF64(&mut f)
+/// The mode an exit slot names the unboxed number `u` by.
+fn numberMode(f: &Function, u: u32) -> SlotMode { if f.value(u).ty == Type.F64 { return SlotMode.F64 } return SlotMode.Int }
+
+/// Rewrites the exit slots described above (and hoists non-adjacent unboxes next to their
+/// same-block producers, `hoistUnboxes`); answers whether any changed. `sites` as
+/// ssa_opt_hoist.hoist takes them.
+pub effect fn unboxedSlots(f: &mut Function, sites: &List<u32>) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let mut changed = run hoistUnboxes(&mut f, sites)
   let values = f.values.length()
   // How many instructions use each exit.
   let mut users = List<u32>.make()

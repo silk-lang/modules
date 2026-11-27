@@ -140,14 +140,54 @@ costs more than 6 times the work, or when the work per bytecode byte exceeds twi
 was when written (78; the bound is 160). Before the one-pass unboxing the larger function
 cost 13 times the smaller and 1,220 per byte.
 
+## Whole benchmarks on a baseline frame
+
+Measured on Octane Crypto and DeltaBlue at scale 20, `--jit --jit-calls --jit-opt=20
+--jit-threshold=20`, whole run under callgrind: compiling optimized code was 432M of
+Crypto's 4,663M instructions (65 compilations, 15 of them after an unlink) and about 17
+percent of DeltaBlue. What was found there, largest first, and what was done:
+
+- `Function.compact` ran 625 times a Crypto run, about ten a compilation, at 137K
+  instructions each. A pass that only removes instructions leaves nothing stale that a
+  later pass reads (they skip `Op.Removed`), so `simplifyFrom`, `handOver` and
+  `borrowFields` now answer whether they left removed instructions instead of compacting,
+  and the pipeline compacts once in front of the first pass that needs block ranges
+  (`ssa_ownership.optimizeLoose`). Inside a round only an insertion, a changed edge, or
+  `passEmpty` forces one, and `unboxParams` runs last in the round so that its compaction
+  is the next round's. `borrowArguments` runs to its fixed point before the function is
+  simplified again. 392 compactions a run are left: 163 in `simplifyFrom` rounds, 65 each
+  after the translator and at the start of the pipeline, 45 in hoisting, 26 in bounds.
+- `ssa_opt_hoist.closureOf` searched the loop for the inlined frame of every frame read:
+  quadratic in a loop with many inlined bodies. One pass per loop now lists them
+  (`framesOf`).
+- `ssa_shapes.fieldAtom` built an `InlinedSite` to read one atom (`inlinedAtom`).
+- `asm_x64.relaxAndCompact` moved the code a byte at a time; it copies the runs between
+  short references. `Assembler.room` tests the capacity inline.
+
+Ran: Crypto 4,663M to 4,595M instructions, DeltaBlue 4,360M to 4,155M, optimized
+compilation on Crypto 432M to about 369M. `--jit-stats` (`inlined`, `ssa-translated`,
+`ssa-optimized`, `optimized`, `optimize-backed`, `frame-exits`) is the same on the eight
+benchmarks but for `ssa-optimized` on Crypto (one instruction more, in bnToString) and
+EarleyBoyer (twelve more): common values are found before parameters are unboxed now, so a
+box that only one arm reads is made on that arm instead of in front of the branch (the
+`KEEP` golden moved the same way). RayTrace's and DeltaBlue's `optimized-bytes` vary by
+a few hundred bytes between runs of one binary (addresses in the code), so they do not
+tell two builds apart.
+
 ## What is left
 
 - Exits times locals is still the unit of cost. Sharing one snapshot of the locals between
   exits where no local changed would cut the slots about four times on box2d (82,211 to
   19,808, counted from the dumps). It changes `Function.slot` and every pass that walks
   slots, and the calls stream is extending exits now, so it is not done here.
-- Compaction costs about 350 instructions per SSA instruction and still runs about eight
-  times per compilation.
+- Compaction costs about 350 instructions per SSA instruction and still runs about six
+  times per compilation (see the section above). The translator's and the first round's
+  could be one.
+- On Crypto after the above (369M compiling): the pipeline 173M (`simplifyFrom` 113M with
+  its compactions), the backend 95M (exit tables 25M, the register allocator 20M, the
+  assembler's `memForm` 15M and label ranks 7M), the translator 46M, the verifier 28M.
+  `fixSlots`, `Forward.apply`, `deadCode` and `copySlots` each walk every exit slot
+  (47,593 for 9,867 instructions): the shared snapshot above is what would cut them.
 - Code that is compiled and then unlinked is still the largest waste where the cause is not a
   number guess: see the last paragraph of "Recording before the first compilation". Those
   sites need a slow path in compiled code instead of an exit.

@@ -13,16 +13,6 @@ struct MonoSprite {
 }
 @group(0) @binding(1) var<storage, read> sprites: array<MonoSprite>;
 
-// Where a scroll group draws: what it holds is moved by `offset.xy` and cut to `clip` with
-// corners `clipRadii`. Sprites keep the bounds and mask they were painted with and name their
-// group, so a scroll writes these and no sprite. Entry 0, outside every group, moves nothing.
-struct Placement {
-  offset: vec4f,
-  clip: vec4f,
-  clipRadii: Radii,
-}
-@group(0) @binding(9) var<storage, read> placements: array<Placement>;
-
 @vertex fn vs(@builtin(vertex_index) v: u32, @builtin(instance_index) index: u32) -> Varying {
   let s = sprites[index];
   let g = placements[u32(s.extra.y)];

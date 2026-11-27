@@ -44,6 +44,17 @@ struct Transform {
 }
 @group(0) @binding(8) var<storage, read> transforms: array<Transform>;
 
+// Where a scroll group draws: what it holds is moved by `offset.xy` (with integer-quantized
+// `offset.zw` for paths) and cut to `clip` with corners `clipRadii`. Primitives keep the bounds
+// and mask they were painted with and name their group, so scrolling or property updates only
+// rewrite this buffer (and `transforms`). Entry 0, outside every group, moves nothing.
+struct Placement {
+  offset: vec4f,
+  clip: vec4f,
+  clipRadii: Radii,
+}
+@group(0) @binding(9) var<storage, read> placements: array<Placement>;
+
 const CORNERS = array<vec2f, 6>(vec2f(0.0, 0.0), vec2f(1.0, 0.0), vec2f(0.0, 1.0), vec2f(0.0, 1.0), vec2f(1.0, 0.0), vec2f(1.0, 1.0));
 
 // Clip space for corner `index` of the pixel rectangle `r` (xMin, yMin, xMax, yMax).

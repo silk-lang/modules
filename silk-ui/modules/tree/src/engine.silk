@@ -171,7 +171,7 @@ import node {
   FaceSlot,
   Pending
 }
-import paint { TextInk, Painter, paintRoots, cacheFragments, foldLiftedRoots, repairFragments, borderBox }
+import paint { TextInk, Painter, paintRoots, cacheFragments, foldLiftedRoots, repairFragments, borderBox, styleSlot }
 import stacking { Stacking }
 import resources { Families, Resources, Resource, ResourceError, CSS_IMAGE_BASE, CssImageState, CursorPixels, IconVariables }
 import codec.image { Image as DecodedImage }
@@ -186,8 +186,13 @@ import svg_fonts.database { FaceStyle as RuleStyle, Range as RuleRange }
 import svg_fonts.names { same as sameFamilyName }
 import font_collection.lib { FontCollection, Family, Request, Style as FaceStyle }
 import font_raster.cache { GlyphCache }
+import font_raster.color { PaletteChoice }
 import font_raster.face { FontFace }
-import atlas.atlas { Atlas, AtlasOptions, AtlasTile }
+import font_raster.key { GlyphKey, PenPosition }
+import font_types.lib { F2Dot14 }
+import atlas.atlas { Atlas, AtlasError, AtlasOptions, AtlasTile }
+import engine_raster { GlyphFontCopy, GlyphJob, clonePalette, preRasterizeGlyphs }
+import ui_transport.pool { WorkPoolHandle }
 import ui_scene.scene { Scene }
 import ui_scene.scroll { ScrollPosition }
 import ui_scene.primitives { ContentMask, Quad, GlyphSprite, ImageSprite, Shadow, PathSprite, Underline, LayerSprite }
@@ -203,7 +208,8 @@ import layout.lib {
   Style as CssStyle,
   SizeValue,
   FloatShape,
-  FragmentKind
+  FragmentKind,
+  TextFragmentKind
 }
 import layout.lib as Engine
 import silk.collections.bytes { Bytes }
@@ -992,6 +998,8 @@ pub struct UiTree<'a> {
   /// The bitmaps of large canvases' commands (see `canvas_raster`).
   pub canvasRasters: CanvasRasters,
   pub atlas: Atlas,
+  enginePool: Option<WorkPoolHandle>,
+  engineGroupId: u32,
   pub glyphs: GlyphCache,
   pub paths: PathCache,
   pub sceneA: Scene,
@@ -1727,6 +1735,8 @@ impl<'a> UiTree<'a> {
       canvas2d: Canvas2d<'a>.make(),
       canvasRasters: CanvasRasters.make(),
       atlas: Atlas.make(AtlasOptions.default()),
+      enginePool: Option<WorkPoolHandle>.None,
+      engineGroupId: 0,
       glyphs: GlyphCache.make(),
       paths: PathCache.make(),
       sceneA: Scene.make(),
@@ -10194,6 +10204,184 @@ impl<'a> UiTree<'a> {
     return layers.visual(&values[index], self.shiftOf(index))
   }
 
+  /// Attaches an `EnginePool` worker handle and group id for parallel off-thread pre-rasterization.
+  pub fn setEnginePool(self: &mut Self, pool: WorkPoolHandle, groupId: u32) -> () {
+    self.enginePool = Option<WorkPoolHandle>.some(move pool)
+    self.engineGroupId = groupId
+  }
+
+  /// Controls whether the atlas pins tiles until GPU execution retires their frame.
+  pub fn enableAtlasEpochPinning(self: &mut Self, enabled: bool) -> () {
+    self.atlas.enableEpochPinning(enabled)
+  }
+
+  /// Advances the highest atlas frame known to have completed GPU execution.
+  pub fn setGpuFinishedAtlasFrame(self: &mut Self, frame: u64) -> () {
+    self.atlas.setGpuFinishedFrame(frame)
+  }
+
+  /// Returns the current monotonic frame number of the shared glyph/icon/image atlas.
+  pub fn atlasFrame(self: &Self) -> u64 {
+    return self.atlas.frame()
+  }
+
+  effect fn preRasterizeFrame(self: &mut Self, pool: &WorkPoolHandle) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let count = self.output.fragments.values.length()
+    let s = self.input.scale
+    let mut fonts = List<GlyphFontCopy>.make()
+    let mut fontKeys = List<usize>.make()
+    let mut seenKeys = HashMap<GlyphKey, u8>.make(Hash.seed(0x707265))
+    let mut jobs = List<GlyphJob>.make()
+
+    let mut fi: usize = 0
+    while fi < count {
+      let f = self.output.fragments.values.asSlice()[fi]
+      if f.kind != FragmentKind.Text || f.textData == NO_INDEX {
+        fi = fi + 1
+        continue
+      }
+      let slot = styleSlot(&self.slotOfCss, &self.layout, &self.nodes, f.source)
+      if slot == NONE {
+        fi = fi + 1
+        continue
+      }
+      let c = self.nodes.asSlice()[u32.toUsize(slot)].computed().*
+      if !c.text.visible || c.text.writingMode != WritingMode.HorizontalTb
+        || self.nodes.asSlice()[u32.toUsize(slot)].kind == NodeKind.Input {
+        fi = fi + 1
+        continue
+      }
+      let extras = c.text.features.extras
+      let aliased = text_fonts.extrasField(extras, text_fonts.EXTRAS_SMOOTH) == 1
+      let paletteHandle = text_fonts.extrasField(extras, text_fonts.EXTRAS_PALETTE)
+      let mut runs = self.output.fragments.textRuns(fi)
+      while runs.next() {
+        let t = runs.current
+        if t.kind != TextFragmentKind.Glyphs || self.provider.text.fonts.blocked(t.fontKey) {
+          continue
+        }
+        if t.fontKey >= self.faces.length() {
+          continue
+        }
+        let info = self.provider.text.fonts.key(t.fontKey)
+        if info.face == usize.MAX {
+          continue
+        }
+        let shaped = self.provider.text.glyphRun(t.shapeKey)
+        if shaped.size * s >= 256.0 {
+          continue
+        }
+        let mut palette: u32 = 0
+        if paletteHandle != 0 {
+          let hasColor = match self.faces.asSlice()[t.fontKey].face.get() {
+            Option<&FontFace>.Some { value: face } => face.colorTables().any()
+            Option<&FontFace>.None => false
+          }
+          if hasColor {
+            let family = font_rules.familyName(
+              &self.sheetFaces,
+              self.provider.text.fonts.keyFamily(t.fontKey),
+            )
+            let choice = run self.fontRules.palette(self.current, paletteHandle, family)
+            palette = run self.glyphs.palette(move choice)
+          }
+        }
+        let instanceId = match self.faces.asSlice()[t.fontKey].face.get() {
+          Option<&FontFace>.Some { value: face } => face.id
+          Option<&FontFace>.None => {
+            continue
+          }
+        }
+        let baseline = t.location.y + f.firstBaselines.alphabetic
+        let glyphs = self.provider.text.runGlyphs(t.shapeKey)
+        let mut fontSlot = usize.MAX
+        let mut gi: usize = 0
+        while gi < glyphs.length {
+          let g = glyphs[gi]
+          let pen = PenPosition.of(
+            f32.toF64((t.location.x + g.x) * s),
+            f32.toF64((baseline + g.y) * s),
+          )
+          let key = GlyphKey {
+            font: instanceId,
+            glyph: g.glyph,
+            size: shaped.size,
+            scale: s,
+            subpixel: pen.subpixel,
+            color: true,
+            palette: palette,
+            aliased: aliased,
+          }
+          if seenKeys.get(key).isNone() && !self.glyphs.isCached(&self.atlas, key) {
+            if fontSlot == usize.MAX {
+              let mut fk: usize = 0
+              while fk < fontKeys.length() {
+                if fontKeys.get(fk) == t.fontKey {
+                  fontSlot = fk
+                  break
+                }
+                fk = fk + 1
+              }
+              if fontSlot == usize.MAX {
+                let raw = self.provider.text.fonts.set.faceData(info.face)
+                let faceIdx = self.provider.text.fonts.set.face(info.face).index
+                let coords = self.provider.text.fonts.coords(t.fontKey)
+                let mut byteCopy = List<u8>.make()
+                run byteCopy.appendSlice(raw)
+                let mut coordCopy = List<F2Dot14>.make()
+                run coordCopy.appendSlice(coords)
+                fontSlot = fonts.length()
+                run fonts.append(
+                  GlyphFontCopy {
+                    id: instanceId,
+                    faceIndex: faceIdx,
+                    bytes: move byteCopy,
+                    coords: move coordCopy,
+                  },
+                )
+                run fontKeys.append(t.fontKey)
+              }
+            }
+            let jobPalette = match self.glyphs.paletteChoice(palette) {
+              Option<&PaletteChoice>.Some { value: found } => run clonePalette(found)
+              Option<&PaletteChoice>.None => PaletteChoice.normal()
+            }
+            drop run seenKeys.insert(key, 1)
+            run jobs.append(GlyphJob { fontSlot: fontSlot, key: key, palette: move jobPalette })
+          }
+          gi = gi + 1
+        }
+      }
+      fi = fi + 1
+    }
+    if jobs.length() == 0 {
+      return ()
+    }
+    let foreground = self.glyphs.foregroundColor()
+    let preRes = run Effect.result(
+      preRasterizeGlyphs(
+        pool,
+        self.engineGroupId,
+        move fonts,
+        move jobs,
+        foreground,
+        &mut self.glyphs,
+        &mut self.atlas,
+      ),
+    )
+    match move preRes {
+      Result<u32, OutOfMemoryError | AtlasError>.Success { value: countDone } => {
+        self.stats.parallelGlyphs = countDone
+      }
+      Result<u32, OutOfMemoryError | AtlasError>.Failure { error } => match move error {
+        OutOfMemoryError oom => { fail move oom }
+        AtlasError _ => ()
+      }
+    }
+  }
+
   effect fn paintFrame(self: &mut Self) -> ()
     ! OutOfMemoryError
     ? &mut Allocator {
@@ -10211,6 +10399,14 @@ impl<'a> UiTree<'a> {
     }
     run self.refreshPaintCaches()
     run self.paths.beginFrame()
+    drop self.atlas.beginFrame()
+    self.stats.parallelGlyphs = 0
+    self.stats.parallelPaths = 0
+    self.stats.parallelIcons = 0
+    if let Option<WorkPoolHandle>.Some { value: pool } = &self.enginePool {
+      let cloned = pool.clone()
+      run self.preRasterizeFrame(&cloned)
+    }
     self.paintOrder.clear()
     let window = ContentMask.new(
       Rect<f32>.new(

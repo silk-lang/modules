@@ -1,0 +1,294 @@
+//! Off-thread parallel pre-rasterization for glyphs, cached vector paths, and SVG icons
+//! using [`ui_transport.pool.WorkPoolHandle`] (caller-helps, zero busy-worker stalls).
+import atlas.atlas { Atlas, AtlasError }
+import font_raster.cache { GlyphCache, PreRasterGlyph, rasterizeStandalone }
+import font_raster.color { PaletteChoice, PaletteOverride }
+import font_raster.face { FontFace }
+import font_raster.key { GlyphKey }
+import font_raster.rasterize { GlyphRasterizer }
+import font_types.lib { F2Dot14 }
+import read_fonts.lib { ReadError }
+import sprites.icons { IconCache, PreparedIcon, PreRasterIcon, rasterizePrepared }
+import ui_scene.path_cache { PathCache, PathWorkItem, PreRasterPath, rasterizeWork }
+import ui_transport.pool { WorkPoolHandle }
+import vector.geometry_error { GeometryError }
+import vector.pixmap { Rgba8 }
+import svg_render.lib { RenderError }
+import silk.collections.list { List }
+import silk.concurrency.sync { Arc, Mutex }
+import silk.concurrency.thread { Concurrent, Transferable }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.usize
+
+/// Owned font data + variation coordinates copied once per unique font per pre-raster batch.
+pub struct GlyphFontCopy {
+  pub id: u32,
+  pub faceIndex: u32,
+  pub bytes: List<u8>,
+  pub coords: List<F2Dot14>,
+}
+
+/// One uncached glyph rasterization job indexing into a [`GlyphFontCopy`] table.
+pub struct GlyphJob {
+  pub fontSlot: usize,
+  pub key: GlyphKey,
+  pub palette: PaletteChoice,
+}
+
+/// Clones a [`PaletteChoice`] into owned storage for worker threads.
+pub effect fn clonePalette(src: &PaletteChoice) -> PaletteChoice
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut overrides = List<PaletteOverride>.make()
+  run overrides.appendSlice(src.overrides.asSlice())
+  return PaletteChoice { base: src.base, overrides: move overrides }
+}
+
+struct GlyphBatch {
+  fonts: List<GlyphFontCopy>,
+  jobs: List<GlyphJob>,
+  foreground: Rgba8,
+  outputs: Mutex<List<Option<PreRasterGlyph>>>,
+}
+
+impl Transferable for GlyphBatch {}
+impl Concurrent for GlyphBatch {}
+
+fn rasterGlyphStep(batch: &GlyphBatch, idx: usize) -> () {
+  let mut heap = Allocator.systemAllocatorProvider()
+  let job = &batch.jobs.asSlice()[idx]
+  let font = &batch.fonts.asSlice()[job.fontSlot]
+  let faceRes = run Effect.result(
+    FontFace.fromBytes(font.id, font.bytes.asSlice(), font.faceIndex, font.coords.asSlice()),
+  )
+    |> Effect.provideMut<Allocator>(&mut heap)
+  let mut out = Option<PreRasterGlyph>.None
+  if let Result<Result<FontFace<'_>, ReadError>, OutOfMemoryError>.Success { value: parsed } = move faceRes {
+    if let Result<FontFace<'_>, ReadError>.Success { value: face } = move parsed {
+      let mut rasterizer = GlyphRasterizer.make()
+      let preRes = run Effect.result(
+        rasterizeStandalone(&face, job.key, batch.foreground, &job.palette, &mut rasterizer),
+      )
+        |> Effect.provideMut<Allocator>(&mut heap)
+      if let Result<PreRasterGlyph, OutOfMemoryError>.Success { value: pre } = move preRes {
+        out = Option<PreRasterGlyph>.some(move pre)
+      }
+    }
+  }
+  let mut guard = batch.outputs.lock()
+  let slice = guard.getMut().asMutSlice()
+  slice[idx] = move out
+}
+
+struct PathBatch {
+  items: List<PathWorkItem>,
+  outputs: Mutex<List<Option<PreRasterPath>>>,
+}
+
+impl Transferable for PathBatch {}
+impl Concurrent for PathBatch {}
+
+fn rasterPathStep(batch: &PathBatch, idx: usize) -> () {
+  let mut heap = Allocator.systemAllocatorProvider()
+  let item = &batch.items.asSlice()[idx]
+  let preRes = run Effect.result(rasterizeWork(item))
+    |> Effect.provideMut<Allocator>(&mut heap)
+  let out = match move preRes {
+    Result<PreRasterPath, GeometryError | OutOfMemoryError>.Success { value } => {
+      Option<PreRasterPath>.some(move value)
+    }
+    Result<PreRasterPath, GeometryError | OutOfMemoryError>.Failure { .. } => {
+      Option<PreRasterPath>.None
+    }
+  }
+  let mut guard = batch.outputs.lock()
+  let slice = guard.getMut().asMutSlice()
+  slice[idx] = move out
+}
+
+struct IconBatch {
+  items: List<PreparedIcon>,
+  outputs: Mutex<List<Option<PreRasterIcon>>>,
+}
+
+impl Transferable for IconBatch {}
+impl Concurrent for IconBatch {}
+
+fn rasterIconStep(batch: &IconBatch, idx: usize) -> () {
+  let mut heap = Allocator.systemAllocatorProvider()
+  let item = &batch.items.asSlice()[idx]
+  let preRes = run Effect.result(rasterizePrepared(item))
+    |> Effect.provideMut<Allocator>(&mut heap)
+  let out = match move preRes {
+    Result<PreRasterIcon, RenderError | OutOfMemoryError>.Success { value } => {
+      Option<PreRasterIcon>.some(move value)
+    }
+    Result<PreRasterIcon, RenderError | OutOfMemoryError>.Failure { .. } => {
+      Option<PreRasterIcon>.None
+    }
+  }
+  let mut guard = batch.outputs.lock()
+  let slice = guard.getMut().asMutSlice()
+  slice[idx] = move out
+}
+
+/// Rasterizes uncached glyphs on `pool` (or inline when < 2 items) and commits them in order.
+pub effect fn preRasterizeGlyphs(
+  pool: &WorkPoolHandle,
+  groupId: u32,
+  fonts: List<GlyphFontCopy>,
+  jobs: List<GlyphJob>,
+  foreground: Rgba8,
+  cache: &mut GlyphCache,
+  atlas: &mut Atlas,
+) -> u32
+  ! OutOfMemoryError | AtlasError
+  ? &mut Allocator {
+  let count = jobs.length()
+  if count == 0 {
+    return 0
+  }
+  let mut outputs = List<Option<PreRasterGlyph>>.make()
+  let mut i: usize = 0
+  while i < count {
+    run outputs.append(Option<PreRasterGlyph>.None)
+    i = i + 1
+  }
+  let batch = run Arc<GlyphBatch>.make(
+    GlyphBatch {
+      fonts: move fonts,
+      jobs: move jobs,
+      foreground: foreground,
+      outputs: run Mutex<List<Option<PreRasterGlyph>>>.make(move outputs),
+    },
+  )
+  if count >= 2 && pool.workerCount() > 1 {
+    run pool.runParallel(groupId, count, batch.clone(), rasterGlyphStep)
+  } else {
+    i = 0
+    while i < count {
+      rasterGlyphStep(batch.get(), i)
+      i = i + 1
+    }
+  }
+  let mut guard = batch.get().outputs.lock()
+  let results = guard.getMut()
+  let mut committed: u32 = 0
+  i = 0
+  while i < results.length() {
+    let slot = &mut results.asMutSlice()[i]
+    let taken = Intrinsic.replace(slot.*, Option<PreRasterGlyph>.None)
+    if let Option<PreRasterGlyph>.Some { value: pre } = move taken {
+      if (run cache.insertPreRasterized(&mut atlas, move pre)).isSome() {
+        committed = committed + 1
+      }
+    }
+    i = i + 1
+  }
+  return committed
+}
+
+/// Rasterizes uncached path fills/strokes on `pool` (or inline) and commits them deterministically.
+pub effect fn preRasterizePaths(
+  pool: &WorkPoolHandle,
+  groupId: u32,
+  items: List<PathWorkItem>,
+  cache: &mut PathCache,
+) -> u32
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let count = items.length()
+  if count == 0 {
+    return 0
+  }
+  let mut outputs = List<Option<PreRasterPath>>.make()
+  let mut i: usize = 0
+  while i < count {
+    run outputs.append(Option<PreRasterPath>.None)
+    i = i + 1
+  }
+  let batch = run Arc<PathBatch>.make(
+    PathBatch {
+      items: move items,
+      outputs: run Mutex<List<Option<PreRasterPath>>>.make(move outputs),
+    },
+  )
+  if count >= 2 && pool.workerCount() > 1 {
+    run pool.runParallel(groupId, count, batch.clone(), rasterPathStep)
+  } else {
+    i = 0
+    while i < count {
+      rasterPathStep(batch.get(), i)
+      i = i + 1
+    }
+  }
+  let mut guard = batch.get().outputs.lock()
+  let results = guard.getMut()
+  let mut committed: u32 = 0
+  i = 0
+  while i < results.length() {
+    let slot = &mut results.asMutSlice()[i]
+    let taken = Intrinsic.replace(slot.*, Option<PreRasterPath>.None)
+    if let Option<PreRasterPath>.Some { value: pre } = move taken {
+      if run cache.insertPreRasterized(move pre) {
+        committed = committed + 1
+      }
+    }
+    i = i + 1
+  }
+  return committed
+}
+
+/// Rasterizes prepared SVG icons on `pool` (or inline) and commits them deterministically.
+pub effect fn preRasterizeIcons(
+  pool: &WorkPoolHandle,
+  groupId: u32,
+  items: List<PreparedIcon>,
+  cache: &mut IconCache,
+  atlas: &mut Atlas,
+) -> u32
+  ! OutOfMemoryError | AtlasError
+  ? &mut Allocator {
+  let count = items.length()
+  if count == 0 {
+    return 0
+  }
+  let mut outputs = List<Option<PreRasterIcon>>.make()
+  let mut i: usize = 0
+  while i < count {
+    run outputs.append(Option<PreRasterIcon>.None)
+    i = i + 1
+  }
+  let batch = run Arc<IconBatch>.make(
+    IconBatch {
+      items: move items,
+      outputs: run Mutex<List<Option<PreRasterIcon>>>.make(move outputs),
+    },
+  )
+  if count >= 2 && pool.workerCount() > 1 {
+    run pool.runParallel(groupId, count, batch.clone(), rasterIconStep)
+  } else {
+    i = 0
+    while i < count {
+      rasterIconStep(batch.get(), i)
+      i = i + 1
+    }
+  }
+  let mut guard = batch.get().outputs.lock()
+  let results = guard.getMut()
+  let mut committed: u32 = 0
+  i = 0
+  while i < results.length() {
+    let slot = &mut results.asMutSlice()[i]
+    let taken = Intrinsic.replace(slot.*, Option<PreRasterIcon>.None)
+    if let Option<PreRasterIcon>.Some { value: pre } = move taken {
+      drop run cache.insertPreRasterized(&mut atlas, move pre)
+      committed = committed + 1
+    }
+    i = i + 1
+  }
+  return committed
+}

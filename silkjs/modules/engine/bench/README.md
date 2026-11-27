@@ -11,7 +11,7 @@ performance regressions.
   upstream revision (MIT, see its header). It reports ns per operation for ~70 tests.
 
 ```sh
-silk build --release
+silk task release                                # one codegen unit, about 6 minutes (see below)
 silk task bench --label baseline                 # record bench/results/baseline.json
 silk task bench --compare bench/results/baseline.json   # exit 1 on >10% regression
 silk task bench --skip-micro --runs 3            # quick macro-only check
@@ -55,6 +55,14 @@ Scores are wall-clock based and noisy on shared hosts. A score gap that the inst
 counts do not show usually comes from memory traffic, such as larger objects or more GC
 cycles.
 
+## Which release build to measure
+
+`silk task release` builds the release CLI as one codegen unit. `silk build --release` writes the
+same file in about 2 minutes, but since Silk dev.102 it splits the program into 8 units and the
+interpreter then runs 5 to 10% more instructions (EarleyBoyer 11.41 against 10.37 billion,
+Typescript 10.23 against 9.66 billion; silk-lang/silk#3327). Measure the one-unit build, and never
+compare a number from one kind of build with a number from the other.
+
 ## Comparison with other engines
 
 The tables that set silkjs beside V8 jitless (Node 24), JSC without its JIT, QuickJS and the two
@@ -62,7 +70,7 @@ WebAssembly builds come from tasks written in Silk: `src/tasks.silk` calls the `
 [`../../benchkit`](../../benchkit). From `modules/engine`:
 
 ```sh
-silk build --release                       # about 6 minutes
+silk task release                          # about 6 minutes
 silk task bench-setup                      # once: jsc, Octane, QuickJS e585640, wasmtime 45, wasi-sdk 33, the wasm builds
 silk task bench-octane                     # Octane 2, 3 interleaved rounds, best score per engine
 silk task bench-octane richards splay      # selected benchmarks

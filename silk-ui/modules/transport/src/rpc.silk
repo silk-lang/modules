@@ -1,0 +1,342 @@
+//! Multi-caller tagged RPC over an [`UnboundedChannel`], with per-call reply slots and automatic
+//! wakeups on completion or server shutdown.
+import channel { SendError, TryRecvError, UnboundedChannel, UnboundedReceiver, UnboundedSender }
+import silk.collections.list { List }
+import silk.concurrency.atomic { Atomic, MemoryOrder }
+import silk.concurrency.sync { Arc, Mutex }
+import silk.concurrency.thread { Concurrent, Transferable }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.ownership { Drop }
+import silk.core.result { Result }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.mem.box { Box }
+import silk.mem.pointer { Pointer }
+import silk.num.u64
+import silk.num.usize
+import wake { Waiter, WakeHandle }
+
+/// Failure from an RPC send or call.
+pub enum RpcError {
+  /// The server closed or dropped the request without answering.
+  Closed,
+  /// System-allocator storage for the call could not be allocated.
+  OutOfMemory,
+}
+
+struct ReplyCell<Rep> {
+  value: Option<Rep>,
+  closed: bool,
+  wake: WakeHandle,
+}
+
+impl<Rep: Transferable> Transferable for ReplyCell<Rep> {}
+
+/// One-shot reply handle delivered inside an [`RpcEnvelope`]. Dropping it without calling
+/// [`RpcResponder.reply`] resolves the caller with [`RpcError.Closed`].
+pub struct RpcResponder<Rep> {
+  slot: Arc<Mutex<ReplyCell<Rep>>>,
+  replied: bool,
+}
+
+impl<Rep: Transferable> Transferable for RpcResponder<Rep> {}
+
+impl<Rep> RpcResponder<Rep> {
+  /// Sends `value` to the caller and wakes it without blocking.
+  pub fn reply(self: Self, value: Rep) -> () {
+    let mut owned = move self
+    let mut guard = owned.slot.get().lock()
+    let cell = guard.getMut()
+    cell.value = Option<Rep>.Some { value: move value }
+    let wake = cell.wake.clone()
+    drop guard
+    owned.replied = true
+    wake.wake()
+  }
+}
+
+impl<Rep> Drop for RpcResponder<Rep> {
+  fn drop(self: &mut RpcResponder<Rep>) -> () {
+    if self.replied {
+      return ()
+    }
+    let mut guard = self.slot.get().lock()
+    let cell = guard.getMut()
+    if Option<Rep>.isNone(&cell.value) && !cell.closed {
+      cell.closed = true
+      let wake = cell.wake.clone()
+      drop guard
+      wake.wake()
+    }
+  }
+}
+
+/// Caller's pending handle for an asynchronous or synchronous tagged RPC.
+pub struct RpcReplyHandle<Rep> {
+  slot: Arc<Mutex<ReplyCell<Rep>>>,
+  waiter: Option<Waiter>,
+}
+
+impl<Rep: Transferable> Transferable for RpcReplyHandle<Rep> {}
+
+impl<Rep> RpcReplyHandle<Rep> {
+  /// Polls for the reply without blocking. Returns `None` while pending.
+  pub fn tryTake(self: &mut Self) -> Option<Result<Rep, RpcError>> {
+    let mut guard = self.slot.get().lock()
+    let cell = guard.getMut()
+    let taken = Intrinsic.replace(cell.value, Option<Rep>.None)
+    match move taken {
+      Option<Rep>.Some { value } => {
+        return Option<Result<Rep, RpcError>>.Some {
+          value: Result<Rep, RpcError>.Success { value: move value },
+        }
+      }
+      Option<Rep>.None => {
+        if cell.closed {
+          return Option<Result<Rep, RpcError>>.Some {
+            value: Result<Rep, RpcError>.Failure { error: RpcError.Closed },
+          }
+        }
+        return Option<Result<Rep, RpcError>>.None
+      }
+    }
+  }
+
+  /// Blocks until the server answers or closes.
+  pub fn wait(self: &mut Self) -> Result<Rep, RpcError> {
+    if Option<Waiter>.isNone(&self.waiter) {
+      let created = run Effect.result(Waiter.make())
+      let waiter = match move created {
+        Result<Waiter, OutOfMemoryError>.Success { value } => move value
+        Result<Waiter, OutOfMemoryError>.Failure { error } => {
+          drop error
+          return Result<Rep, RpcError>.Failure { error: RpcError.OutOfMemory }
+        }
+      }
+      let mut guard = self.slot.get().lock()
+      let cell = guard.getMut()
+      if Option<Rep>.isNone(&cell.value) && !cell.closed {
+        cell.wake = waiter.handle()
+      }
+      drop guard
+      self.waiter = Option<Waiter>.Some { value: move waiter }
+    }
+    while true {
+      if let Option<Result<Rep, RpcError>>.Some { value } = move self.tryTake() {
+        return move value
+      }
+      static if Intrinsic.targetArchitecture() == "wasm32" {
+        return Result<Rep, RpcError>.Failure { error: RpcError.Closed }
+      } else {
+        if let Option<Waiter>.Some { value: w } = &self.waiter {
+          w.wait()
+        }
+      }
+    }
+    return Result<Rep, RpcError>.Failure { error: RpcError.Closed }
+  }
+}
+
+/// Request message received by an [`RpcServer`], tagged with a unique monotonic `id`.
+pub struct RpcEnvelope<Req, Rep> {
+  pub id: u64,
+  pub request: Req,
+  pub responder: Option<RpcResponder<Rep>>,
+}
+
+impl<Req: Transferable, Rep: Transferable> Transferable for RpcEnvelope<Req, Rep> {}
+
+struct RpcIdCounter {
+  storage: Box<u64>,
+  ptr: *mut u64,
+}
+
+impl Transferable for RpcIdCounter {}
+impl Concurrent for RpcIdCounter {}
+
+/// Multi-caller handle for sending fire-and-forget requests or tagged RPCs to an [`RpcServer`].
+pub struct RpcClient<Req, Rep> {
+  sender: UnboundedSender<RpcEnvelope<Req, Rep>>,
+  nextId: Arc<RpcIdCounter>,
+}
+
+impl<Req: Transferable, Rep: Transferable> Transferable for RpcClient<Req, Rep> {}
+impl<Req: Transferable, Rep: Transferable> Concurrent for RpcClient<Req, Rep> {}
+
+impl<Req: Transferable, Rep: Transferable> RpcClient<Req, Rep> {
+  /// Returns another client handle sharing the same request channel and monotonic ID counter.
+  pub fn clone(self: &Self) -> RpcClient<Req, Rep> {
+    return RpcClient<Req, Rep> { sender: self.sender.clone(), nextId: self.nextId.clone() }
+  }
+
+  fn allocId(self: &Self) -> u64 {
+    return unsafe Atomic.fetchAdd<u64>(self.nextId.get().ptr, 1, MemoryOrder.Relaxed) + 1
+  }
+
+  /// Enqueues a fire-and-forget request with no reply slot and wakes the server.
+  pub effect fn send(self: &Self, request: Req) -> Result<(), RpcError> {
+    let id = self.allocId()
+    let env = RpcEnvelope<Req, Rep> {
+      id: id,
+      request: move request,
+      responder: Option<RpcResponder<Rep>>.None,
+    }
+    let sent = run Effect.result(self.sender.send(move env))
+    return match move sent {
+      Result<Result<(), SendError<RpcEnvelope<Req, Rep>>>, OutOfMemoryError>.Success { value } => match move value {
+        Result<(), SendError<RpcEnvelope<Req, Rep>>>.Success { .. } => Result<(), RpcError>.Success { value: () }
+        Result<(), SendError<RpcEnvelope<Req, Rep>>>.Failure { .. } => Result<(), RpcError>.Failure { error: RpcError.Closed }
+      }
+      Result<Result<(), SendError<RpcEnvelope<Req, Rep>>>, OutOfMemoryError>.Failure { error } => {
+        drop error
+        Result<(), RpcError>.Failure { error: RpcError.OutOfMemory }
+      }
+    }
+  }
+
+  /// Sends a request with an attached reply slot whose completion wakes `wake`.
+  pub effect fn callAsync(
+    self: &Self,
+    request: Req,
+    wake: WakeHandle,
+  ) -> Result<RpcReplyHandle<Rep>, RpcError> {
+    let mut heap = Allocator.systemAllocatorProvider()
+    let made = run Effect.result(makeSlot<Rep>(move wake))
+      |> Effect.provideMut<Allocator>(&mut heap)
+    let slot = match move made {
+      Result<Arc<Mutex<ReplyCell<Rep>>>, OutOfMemoryError>.Success { value } => move value
+      Result<Arc<Mutex<ReplyCell<Rep>>>, OutOfMemoryError>.Failure { error } => {
+        drop error
+        return Result<RpcReplyHandle<Rep>, RpcError>.Failure { error: RpcError.OutOfMemory }
+      }
+    }
+    let id = self.allocId()
+    let env = RpcEnvelope<Req, Rep> {
+      id: id,
+      request: move request,
+      responder: Option<RpcResponder<Rep>>.Some {
+        value: RpcResponder<Rep> { slot: slot.clone(), replied: false },
+      },
+    }
+    let sent = run Effect.result(self.sender.send(move env))
+    return match move sent {
+      Result<Result<(), SendError<RpcEnvelope<Req, Rep>>>, OutOfMemoryError>.Success { value } => match move value {
+        Result<(), SendError<RpcEnvelope<Req, Rep>>>.Success { .. } => Result<RpcReplyHandle<Rep>, RpcError>.Success {
+          value: RpcReplyHandle<Rep> { slot: move slot, waiter: Option<Waiter>.None },
+        }
+        Result<(), SendError<RpcEnvelope<Req, Rep>>>.Failure { .. } => Result<RpcReplyHandle<Rep>, RpcError>.Failure {
+          error: RpcError.Closed,
+        }
+      }
+      Result<Result<(), SendError<RpcEnvelope<Req, Rep>>>, OutOfMemoryError>.Failure { error } => {
+        drop error
+        Result<RpcReplyHandle<Rep>, RpcError>.Failure { error: RpcError.OutOfMemory }
+      }
+    }
+  }
+
+  /// Sends a request and blocks only this caller's waiter until the tagged reply arrives.
+  pub effect fn call(self: &Self, request: Req) -> Result<Rep, RpcError> {
+    let waiterRes = run Effect.result(Waiter.make())
+    let waiter = match move waiterRes {
+      Result<Waiter, OutOfMemoryError>.Success { value } => move value
+      Result<Waiter, OutOfMemoryError>.Failure { error } => {
+        drop error
+        return Result<Rep, RpcError>.Failure { error: RpcError.OutOfMemory }
+      }
+    }
+    let wake = waiter.handle()
+    let mut handle = match move run self.callAsync(move request, move wake) {
+      Result<RpcReplyHandle<Rep>, RpcError>.Success { value } => move value
+      Result<RpcReplyHandle<Rep>, RpcError>.Failure { error } => {
+        return Result<Rep, RpcError>.Failure { error: error }
+      }
+    }
+    handle.waiter = Option<Waiter>.Some { value: move waiter }
+    return move handle.wait()
+  }
+
+  /// Closes the request channel.
+  pub fn close(self: &Self) -> () {
+    self.sender.close()
+  }
+
+  /// Returns whether the request channel is closed.
+  pub fn isClosed(self: &Self) -> bool {
+    return self.sender.isClosed()
+  }
+}
+
+effect fn makeSlot<Rep: Transferable>(wake: WakeHandle) -> Arc<Mutex<ReplyCell<Rep>>>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mutex = run Mutex<ReplyCell<Rep>>.make(
+    ReplyCell<Rep> { value: Option<Rep>.None, closed: false, wake: move wake },
+  )
+  return run Arc<Mutex<ReplyCell<Rep>>>.make(move mutex)
+}
+
+/// Server end of a tagged RPC channel.
+pub struct RpcServer<Req, Rep> {
+  receiver: UnboundedReceiver<RpcEnvelope<Req, Rep>>,
+}
+
+impl<Req: Transferable, Rep: Transferable> Transferable for RpcServer<Req, Rep> {}
+
+impl<Req: Transferable, Rep: Transferable> RpcServer<Req, Rep> {
+  /// Receives the next request envelope without blocking.
+  pub fn tryRecv(self: &mut Self) -> Result<RpcEnvelope<Req, Rep>, TryRecvError> {
+    return move self.receiver.tryRecv()
+  }
+
+  /// Drains up to `max` queued request envelopes (`0` = all available) into `out`.
+  pub effect fn drain(
+    self: &mut Self,
+    out: &mut List<RpcEnvelope<Req, Rep>>,
+    max: usize,
+  ) -> usize
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return run self.receiver.drain(&mut out, max)
+  }
+
+  /// Closes the server channel.
+  pub fn close(self: &mut Self) -> () {
+    self.receiver.close()
+  }
+
+  /// Returns whether the server channel is closed.
+  pub fn isClosed(self: &Self) -> bool {
+    return self.receiver.isClosed()
+  }
+}
+
+/// Paired client and server returned by [`RpcChannel.make`].
+pub struct RpcPair<Req, Rep> {
+  pub client: RpcClient<Req, Rep>,
+  pub server: RpcServer<Req, Rep>,
+}
+
+/// Constructor for multi-caller tagged RPC channels.
+pub struct RpcChannel {}
+
+impl RpcChannel {
+  /// Creates an RPC channel whose incoming requests wake `wake`.
+  pub effect fn make<Req: Transferable, Rep: Transferable>(
+    wake: WakeHandle,
+  ) -> RpcPair<Req, Rep>
+    ! OutOfMemoryError {
+    let mut heap = Allocator.systemAllocatorProvider()
+    let pair = run UnboundedChannel.make<RpcEnvelope<Req, Rep>>(move wake)
+    let mut storage = run Box<u64>.make(0) |> Effect.provideMut<Allocator>(&mut heap)
+    let slot = storage.getMut()
+    let ptr = Pointer.fromMutRef(&mut slot[0])
+    drop slot
+    let counter = run Arc<RpcIdCounter>.make(RpcIdCounter { storage: move storage, ptr: ptr })
+      |> Effect.provideMut<Allocator>(&mut heap)
+    return RpcPair<Req, Rep> {
+      client: RpcClient<Req, Rep> { sender: move pair.sender, nextId: move counter },
+      server: RpcServer<Req, Rep> { receiver: move pair.receiver },
+    }
+  }
+}

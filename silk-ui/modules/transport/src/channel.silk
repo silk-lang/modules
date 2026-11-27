@@ -1,0 +1,759 @@
+//! Cross-thread MPSC channels (`BoundedChannel` and lock-free `UnboundedChannel`), backed by
+//! the system allocator and integrated with [`WakeHandle`].
+import silk.collections.list { List }
+import silk.concurrency.atomic { Atomic, MemoryOrder }
+import silk.concurrency.sync { Arc, Condition, Mutex }
+import silk.concurrency.thread { Concurrent, Transferable }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.ownership { Drop }
+import silk.core.result { Result }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.mem.box { Box }
+import silk.mem.pointer { Pointer }
+import silk.num.i64
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+import wake { WakeHandle }
+
+static if Intrinsic.targetArchitecture() != "wasm32" {
+  import silk.concurrency.thread_native { NativeThread }
+  import silk.concurrency.work_queue { Mailbox, MailboxReceiver, MailboxSender }
+  import silk.system.monotonic_clock { MonotonicClock }
+  import silk.system.monotonic_clock_native { OsMonotonicClock }
+  import silk.time.duration { Duration }
+}
+
+/// Error returned by [`BoundedSender.trySend`], returning the unsent `value`.
+pub union TrySendError<T> {
+  Full { pub value: T },
+  Closed { pub value: T },
+}
+
+/// Error returned when sending to a closed channel, returning the unsent `value`.
+pub union SendError<T> {
+  Closed { pub value: T },
+}
+
+/// Error returned by non-blocking receives (`tryRecv`).
+pub enum TryRecvError {
+  Empty,
+  Closed,
+}
+
+// ---------------------------------------------------------------------------
+// BoundedChannel<T>: pre-allocated ring under Mutex + Conditions + WakeHandle
+// ---------------------------------------------------------------------------
+
+struct BoundedRing<T> {
+  slots: List<Option<T>>,
+  head: usize,
+  count: usize,
+  capacity: usize,
+  senders: usize,
+  closed: bool,
+  wake: WakeHandle,
+}
+
+struct BoundedShared<T> {
+  ring: Mutex<BoundedRing<T>>,
+  notFull: Condition,
+  notEmpty: Condition,
+}
+
+impl<T: Transferable> Transferable for BoundedShared<T> {}
+impl<T: Transferable> Concurrent for BoundedShared<T> {}
+
+/// The two endpoints of a [`BoundedChannel`].
+pub struct BoundedPair<T> {
+  pub sender: BoundedSender<T>,
+  pub receiver: BoundedReceiver<T>,
+}
+
+/// Constructor for bounded cross-thread MPSC channels.
+pub struct BoundedChannel {}
+
+impl BoundedChannel {
+  /// Creates a bounded channel with room for at least 1 (`max(1, capacity)`) values, waking
+  /// `wake` whenever the channel transitions from empty to non-empty or closes.
+  pub effect fn make<T: Transferable>(capacity: usize, wake: WakeHandle) -> BoundedPair<T>
+    ! OutOfMemoryError {
+    let cap = if capacity == 0 { usize.ONE } else { capacity }
+    let mut heap = Allocator.systemAllocatorProvider()
+    let mut slots = List<Option<T>>.make()
+    run slots.reserveExact(cap) |> Effect.provideMut<Allocator>(&mut heap)
+    let mut i: usize = 0
+    while i < cap {
+      run slots.append(Option<T>.None) |> Effect.provideMut<Allocator>(&mut heap)
+      i = i + 1
+    }
+    let ring = BoundedRing<T> {
+      slots: move slots,
+      head: 0,
+      count: 0,
+      capacity: cap,
+      senders: 1,
+      closed: false,
+      wake: move wake,
+    }
+    let mutex = run Mutex<BoundedRing<T>>.make(move ring) |> Effect.provideMut<Allocator>(&mut heap)
+    let notFull = run Condition.make() |> Effect.provideMut<Allocator>(&mut heap)
+    let notEmpty = run Condition.make() |> Effect.provideMut<Allocator>(&mut heap)
+    let shared = run Arc<BoundedShared<T>>.make(
+      BoundedShared<T> { ring: move mutex, notFull: move notFull, notEmpty: move notEmpty },
+    )
+      |> Effect.provideMut<Allocator>(&mut heap)
+    return BoundedPair<T> {
+      sender: BoundedSender<T> { shared: shared.clone() },
+      receiver: BoundedReceiver<T> { shared: move shared },
+    }
+  }
+}
+
+/// Sending half of a [`BoundedChannel`]. Many threads may hold clones concurrently.
+pub struct BoundedSender<T> {
+  shared: Arc<BoundedShared<T>>,
+}
+
+impl<T: Transferable> Transferable for BoundedSender<T> {}
+impl<T: Transferable> Concurrent for BoundedSender<T> {}
+
+impl<T> BoundedSender<T> {
+  /// Returns another sender handle to the same channel.
+  pub fn clone(self: &Self) -> BoundedSender<T> {
+    let mut guard = self.shared.get().ring.lock()
+    let ring = guard.getMut()
+    ring.senders = ring.senders + 1
+    drop guard
+    return BoundedSender<T> { shared: self.shared.clone() }
+  }
+
+  /// Sends `value` without blocking. Fails with `Full` if at capacity or `Closed` if closed.
+  pub fn trySend(self: &Self, value: T) -> Result<(), TrySendError<T>> {
+    let shared = self.shared.get()
+    let mut guard = shared.ring.lock()
+    let ring = guard.getMut()
+    if ring.closed {
+      return Result<(), TrySendError<T>>.Failure {
+        error: TrySendError<T>.Closed { value: move value },
+      }
+    }
+    if ring.count == ring.capacity {
+      return Result<(), TrySendError<T>>.Failure {
+        error: TrySendError<T>.Full { value: move value },
+      }
+    }
+    let wasEmpty = ring.count == 0
+    let tail = (ring.head + ring.count) % ring.capacity
+    let slots = ring.slots.asMutSlice()
+    drop Intrinsic.replace(slots[tail], Option<T>.Some { value: move value })
+    ring.count = ring.count + 1
+    let wake = if wasEmpty { ring.wake.clone() } else { WakeHandle.noop() }
+    drop guard
+    shared.notEmpty.notifyOne()
+    if wasEmpty {
+      wake.wake()
+    }
+    return Result<(), TrySendError<T>>.Success { value: () }
+  }
+
+  /// Sends `value`, waiting until space is available or the channel closes.
+  pub fn send(self: &Self, value: T) -> Result<(), SendError<T>> {
+    let shared = self.shared.get()
+    let mut guard = shared.ring.lock()
+    while guard.get().count == guard.get().capacity && !guard.get().closed {
+      shared.notFull.wait(&mut guard)
+    }
+    let ring = guard.getMut()
+    if ring.closed {
+      return Result<(), SendError<T>>.Failure {
+        error: SendError<T>.Closed { value: move value },
+      }
+    }
+    let wasEmpty = ring.count == 0
+    let tail = (ring.head + ring.count) % ring.capacity
+    let slots = ring.slots.asMutSlice()
+    drop Intrinsic.replace(slots[tail], Option<T>.Some { value: move value })
+    ring.count = ring.count + 1
+    let wake = if wasEmpty { ring.wake.clone() } else { WakeHandle.noop() }
+    drop guard
+    shared.notEmpty.notifyOne()
+    if wasEmpty {
+      wake.wake()
+    }
+    return Result<(), SendError<T>>.Success { value: () }
+  }
+
+  /// Closes the channel immediately and wakes any waiting receiver or senders.
+  pub fn close(self: &Self) -> () {
+    let shared = self.shared.get()
+    let mut guard = shared.ring.lock()
+    let ring = guard.getMut()
+    let firstClose = !ring.closed
+    ring.closed = true
+    let wake = if firstClose { ring.wake.clone() } else { WakeHandle.noop() }
+    drop guard
+    shared.notEmpty.notifyAll()
+    shared.notFull.notifyAll()
+    if firstClose {
+      wake.wake()
+    }
+  }
+
+  /// Returns whether the channel is closed.
+  pub fn isClosed(self: &Self) -> bool {
+    return self.shared.get().ring.lock().get().closed
+  }
+}
+
+impl<T> Drop for BoundedSender<T> {
+  fn drop(self: &mut BoundedSender<T>) -> () {
+    let shared = self.shared.get()
+    let mut guard = shared.ring.lock()
+    let ring = guard.getMut()
+    if ring.senders > 0 {
+      ring.senders = ring.senders - 1
+    }
+    let lastSender = ring.senders == 0 && !ring.closed
+    if lastSender {
+      ring.closed = true
+    }
+    let wake = if lastSender { ring.wake.clone() } else { WakeHandle.noop() }
+    drop guard
+    if lastSender {
+      shared.notEmpty.notifyAll()
+      shared.notFull.notifyAll()
+      wake.wake()
+    }
+  }
+}
+
+/// Receiving half of a [`BoundedChannel`]. Owned by a single consumer thread.
+pub struct BoundedReceiver<T> {
+  shared: Arc<BoundedShared<T>>,
+}
+
+impl<T: Transferable> Transferable for BoundedReceiver<T> {}
+
+fn popRing<T>(ring: &mut BoundedRing<T>) -> Option<T> {
+  if ring.count == 0 {
+    return Option<T>.None
+  }
+  let head = ring.head
+  let slots = ring.slots.asMutSlice()
+  let taken = Intrinsic.replace(slots[head], Option<T>.None)
+  ring.head = (head + 1) % ring.capacity
+  ring.count = ring.count - 1
+  return move taken
+}
+
+impl<T> BoundedReceiver<T> {
+  /// Updates the [`WakeHandle`] signaled when items arrive.
+  pub fn setWake(self: &mut Self, wake: WakeHandle) -> () {
+    let mut guard = self.shared.get().ring.lock()
+    let ring = guard.getMut()
+    ring.wake = move wake
+  }
+
+  /// Takes the oldest queued value without blocking.
+  pub fn tryRecv(self: &mut Self) -> Result<T, TryRecvError> {
+    let shared = self.shared.get()
+    let mut guard = shared.ring.lock()
+    let ring = guard.getMut()
+    let wasFull = ring.count == ring.capacity
+    let item = popRing(&mut ring.*)
+    let closed = ring.closed
+    drop guard
+    return match move item {
+      Option<T>.Some { value } => {
+        if wasFull {
+          shared.notFull.notifyAll()
+        }
+        Result<T, TryRecvError>.Success { value: move value }
+      }
+      Option<T>.None => Result<T, TryRecvError>.Failure {
+        error: if closed { TryRecvError.Closed } else { TryRecvError.Empty },
+      }
+    }
+  }
+
+  /// Drains up to `max` items (`0` = all currently queued) into `out` under one lock acquisition.
+  pub effect fn drain(self: &mut Self, out: &mut List<T>, max: usize) -> usize
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let shared = self.shared.get()
+    let mut guard = shared.ring.lock()
+    let ring = guard.getMut()
+    let wasFull = ring.count == ring.capacity
+    let limit = if max == 0 || max > ring.count { ring.count } else { max }
+    let mut taken: usize = 0
+    while taken < limit {
+      match move popRing(&mut ring.*) {
+        Option<T>.Some { value } => {
+          run out.append(move value)
+          taken = taken + 1
+        }
+        Option<T>.None => {
+          break
+        }
+      }
+    }
+    drop guard
+    if taken > 0 && wasFull {
+      shared.notFull.notifyAll()
+    }
+    return taken
+  }
+
+  /// Waits until a value is available or the channel closes and drains empty.
+  pub fn recv(self: &mut Self) -> Option<T> {
+    let shared = self.shared.get()
+    let mut guard = shared.ring.lock()
+    while guard.get().count == 0 && !guard.get().closed {
+      static if Intrinsic.targetArchitecture() == "wasm32" {
+        return Option<T>.None
+      } else {
+        shared.notEmpty.wait(&mut guard)
+      }
+    }
+    let ring = guard.getMut()
+    let wasFull = ring.count == ring.capacity
+    let item = popRing(&mut ring.*)
+    drop guard
+    if Option<T>.isSome(&item) && wasFull {
+      shared.notFull.notifyAll()
+    }
+    return move item
+  }
+
+  /// Waits up to `timeoutNanos` nanoseconds for a value. Returns `None` on timeout or close.
+  pub fn recvTimeout(self: &mut Self, timeoutNanos: u64) -> Option<T> {
+    static if Intrinsic.targetArchitecture() == "wasm32" {
+      drop timeoutNanos
+      return match move self.tryRecv() {
+        Result<T, TryRecvError>.Success { value } => Option<T>.Some { value: move value }
+        Result<T, TryRecvError>.Failure { .. } => Option<T>.None
+      }
+    } else {
+      let shared = self.shared.get()
+      let mut guard = shared.ring.lock()
+      if guard.get().count == 0 && !guard.get().closed {
+        if timeoutNanos == 0 {
+          return Option<T>.None
+        }
+        let mut clock = OsMonotonicClock.make()
+        let start = run MonotonicClock.now() |> Effect.provideMut<MonotonicClock>(&mut clock)
+        let maxDelayU64: u64 = 9223372036854775807
+        let maxDelayI64: i64 = 9223372036854775807
+        let capped: i64 = if timeoutNanos > maxDelayU64 {
+          maxDelayI64
+        } else {
+          u64.toI64(timeoutNanos)
+        }
+        let deadline = start + Duration.fromNanoseconds(capped)
+        while guard.get().count == 0 && !guard.get().closed {
+          let now = run MonotonicClock.now() |> Effect.provideMut<MonotonicClock>(&mut clock)
+          if &now >= &deadline {
+            break
+          }
+          let left = deadline.since(now)
+          let waitNs = match left.toNanoseconds() {
+            Option<i64>.Some { value } => if value > 0 { i64.toU64(value) } else { 0 }
+            Option<i64>.None => u64.MAX
+          }
+          if waitNs == 0 {
+            break
+          }
+          drop shared.notEmpty.waitTimeout(&mut guard, waitNs)
+        }
+      }
+      let ring = guard.getMut()
+      let wasFull = ring.count == ring.capacity
+      let item = popRing(&mut ring.*)
+      drop guard
+      if Option<T>.isSome(&item) && wasFull {
+        shared.notFull.notifyAll()
+      }
+      return move item
+    }
+  }
+
+  /// Closes the channel, unblocking any waiting senders. Queued items remain readable.
+  pub fn close(self: &mut Self) -> () {
+    let shared = self.shared.get()
+    let mut guard = shared.ring.lock()
+    let ring = guard.getMut()
+    ring.closed = true
+    drop guard
+    shared.notFull.notifyAll()
+    shared.notEmpty.notifyAll()
+  }
+
+  /// Returns whether the channel is closed.
+  pub fn isClosed(self: &Self) -> bool {
+    return self.shared.get().ring.lock().get().closed
+  }
+
+  /// Returns the number of items currently buffered.
+  pub fn len(self: &Self) -> usize {
+    return self.shared.get().ring.lock().get().count
+  }
+
+  /// Returns the fixed capacity of the channel.
+  pub fn capacity(self: &Self) -> usize {
+    return self.shared.get().ring.lock().get().capacity
+  }
+}
+
+impl<T> Drop for BoundedReceiver<T> {
+  fn drop(self: &mut BoundedReceiver<T>) -> () {
+    self.close()
+  }
+}
+
+// ---------------------------------------------------------------------------
+// UnboundedChannel<T>: lock-free Vyukov MPSC on native, Mutex queue on wasm32
+// ---------------------------------------------------------------------------
+
+/// The two endpoints of an [`UnboundedChannel`].
+pub struct UnboundedPair<T> {
+  pub sender: UnboundedSender<T>,
+  pub receiver: UnboundedReceiver<T>,
+}
+
+/// Constructor for lock-free unbounded cross-thread MPSC channels.
+pub struct UnboundedChannel {}
+
+static if Intrinsic.targetArchitecture() == "wasm32" {
+  struct WasmQueue<T> {
+    items: List<T>,
+    senders: usize,
+    closed: bool,
+    wake: WakeHandle,
+  }
+
+  struct WasmMeta<T> {
+    queue: Mutex<WasmQueue<T>>,
+  }
+
+  impl<T: Transferable> Transferable for WasmMeta<T> {}
+  impl<T: Transferable> Concurrent for WasmMeta<T> {}
+
+  pub struct UnboundedSender<T> {
+    meta: Arc<WasmMeta<T>>,
+  }
+
+  impl<T: Transferable> Transferable for UnboundedSender<T> {}
+  impl<T: Transferable> Concurrent for UnboundedSender<T> {}
+
+  pub struct UnboundedReceiver<T> {
+    meta: Arc<WasmMeta<T>>,
+  }
+
+  impl<T: Transferable> Transferable for UnboundedReceiver<T> {}
+
+  impl UnboundedChannel {
+    pub effect fn make<T: Transferable>(wake: WakeHandle) -> UnboundedPair<T>
+      ! OutOfMemoryError {
+      let mut heap = Allocator.systemAllocatorProvider()
+      let queue = WasmQueue<T> {
+        items: List<T>.make(),
+        senders: 1,
+        closed: false,
+        wake: move wake,
+      }
+      let mutex = run Mutex<WasmQueue<T>>.make(move queue) |> Effect.provideMut<Allocator>(&mut heap)
+      let meta = run Arc<WasmMeta<T>>.make(WasmMeta<T> { queue: move mutex })
+        |> Effect.provideMut<Allocator>(&mut heap)
+      return UnboundedPair<T> {
+        sender: UnboundedSender<T> { meta: meta.clone() },
+        receiver: UnboundedReceiver<T> { meta: move meta },
+      }
+    }
+  }
+
+  impl<T> UnboundedSender<T> {
+    pub fn clone(self: &Self) -> UnboundedSender<T> {
+      let mut guard = self.meta.get().queue.lock()
+      let q = guard.getMut()
+      q.senders = q.senders + 1
+      drop guard
+      return UnboundedSender<T> { meta: self.meta.clone() }
+    }
+
+    pub effect fn send(self: &Self, value: T) -> Result<(), SendError<T>>
+      ! OutOfMemoryError {
+      let mut heap = Allocator.systemAllocatorProvider()
+      let mut guard = self.meta.get().queue.lock()
+      let q = guard.getMut()
+      if q.closed {
+        return Result<(), SendError<T>>.Failure { error: SendError<T>.Closed { value: move value } }
+      }
+      run q.items.append(move value) |> Effect.provideMut<Allocator>(&mut heap)
+      let wake = q.wake.clone()
+      drop guard
+      wake.wake()
+      return Result<(), SendError<T>>.Success { value: () }
+    }
+
+    pub fn close(self: &Self) -> () {
+      let mut guard = self.meta.get().queue.lock()
+      let q = guard.getMut()
+      q.closed = true
+      let wake = q.wake.clone()
+      drop guard
+      wake.wake()
+    }
+
+    pub fn isClosed(self: &Self) -> bool {
+      return self.meta.get().queue.lock().get().closed
+    }
+  }
+
+  impl<T> Drop for UnboundedSender<T> {
+    fn drop(self: &mut UnboundedSender<T>) -> () {
+      let mut guard = self.meta.get().queue.lock()
+      let q = guard.getMut()
+      if q.senders > 0 {
+        q.senders = q.senders - 1
+      }
+      let last = q.senders == 0 && !q.closed
+      if last {
+        q.closed = true
+      }
+      let wake = if last { q.wake.clone() } else { WakeHandle.noop() }
+      drop guard
+      if last {
+        wake.wake()
+      }
+    }
+  }
+
+  impl<T> UnboundedReceiver<T> {
+    pub fn tryRecv(self: &mut Self) -> Result<T, TryRecvError> {
+      let mut guard = self.meta.get().queue.lock()
+      let q = guard.getMut()
+      if q.items.length() != 0 {
+        return Result<T, TryRecvError>.Success { value: q.items.remove(0) }
+      }
+      return Result<T, TryRecvError>.Failure {
+        error: if q.closed { TryRecvError.Closed } else { TryRecvError.Empty },
+      }
+    }
+
+    pub effect fn drain(self: &mut Self, out: &mut List<T>, max: usize) -> usize
+      ! OutOfMemoryError
+      ? &mut Allocator {
+      let mut taken: usize = 0
+      while max == 0 || taken < max {
+        match move self.tryRecv() {
+          Result<T, TryRecvError>.Success { value } => {
+            run out.append(move value)
+            taken = taken + 1
+          }
+          Result<T, TryRecvError>.Failure { .. } => {
+            break
+          }
+        }
+      }
+      return taken
+    }
+
+    pub fn close(self: &mut Self) -> () {
+      let mut guard = self.meta.get().queue.lock()
+      let q = guard.getMut()
+      q.closed = true
+    }
+
+    pub fn isClosed(self: &Self) -> bool {
+      return self.meta.get().queue.lock().get().closed
+    }
+  }
+
+  impl<T> Drop for UnboundedReceiver<T> {
+    fn drop(self: &mut UnboundedReceiver<T>) -> () {
+      self.close()
+    }
+  }
+} else {
+  struct UnboundedCounters {
+    sent: usize,
+    senders: usize,
+    closed: u32,
+  }
+
+  struct UnboundedMeta {
+    storage: Box<UnboundedCounters>,
+    sent: *mut usize,
+    senders: *mut usize,
+    closed: *mut u32,
+    wake: WakeHandle,
+  }
+
+  impl Transferable for UnboundedMeta {}
+  impl Concurrent for UnboundedMeta {}
+
+  /// Lock-free sending half of an [`UnboundedChannel`].
+  pub struct UnboundedSender<T> {
+    mailbox: MailboxSender<T>,
+    meta: Arc<UnboundedMeta>,
+  }
+
+  impl<T: Transferable> Transferable for UnboundedSender<T> {}
+  impl<T: Transferable> Concurrent for UnboundedSender<T> {}
+
+  /// Single-consumer receiving half of an [`UnboundedChannel`].
+  pub struct UnboundedReceiver<T> {
+    mailbox: MailboxReceiver<T>,
+    meta: Arc<UnboundedMeta>,
+    received: usize,
+  }
+
+  impl<T: Transferable> Transferable for UnboundedReceiver<T> {}
+
+  impl UnboundedChannel {
+    /// Creates an unbounded lock-free MPSC channel whose sends signal `wake`.
+    pub effect fn make<T: Transferable>(wake: WakeHandle) -> UnboundedPair<T>
+      ! OutOfMemoryError {
+      let mut heap = Allocator.systemAllocatorProvider()
+      let receiver = run Mailbox.make<T>() |> Effect.provideMut<Allocator>(&mut heap)
+      let sender = receiver.sender()
+      let mut storage = run Box<UnboundedCounters>.make(
+        UnboundedCounters { sent: 0, senders: 1, closed: 0 },
+      )
+        |> Effect.provideMut<Allocator>(&mut heap)
+      let slot = storage.getMut()
+      let sent = Pointer.fromMutRef(&mut slot[0].sent)
+      let senders = Pointer.fromMutRef(&mut slot[0].senders)
+      let closed = Pointer.fromMutRef(&mut slot[0].closed)
+      drop slot
+      let meta = run Arc<UnboundedMeta>.make(
+        UnboundedMeta {
+          storage: move storage,
+          sent: sent,
+          senders: senders,
+          closed: closed,
+          wake: move wake,
+        },
+      )
+        |> Effect.provideMut<Allocator>(&mut heap)
+      return UnboundedPair<T> {
+        sender: UnboundedSender<T> { mailbox: move sender, meta: meta.clone() },
+        receiver: UnboundedReceiver<T> { mailbox: move receiver, meta: move meta, received: 0 },
+      }
+    }
+  }
+
+  impl<T> UnboundedSender<T> {
+    /// Returns another sender handle to the same channel.
+    pub fn clone(self: &Self) -> UnboundedSender<T> {
+      let meta = self.meta.get()
+      let _prev = unsafe Atomic.fetchAdd<usize>(meta.senders, 1, MemoryOrder.Relaxed)
+      return UnboundedSender<T> { mailbox: self.mailbox.clone(), meta: self.meta.clone() }
+    }
+
+    /// Pushes `value` without acquiring any mutex and wakes the consumer.
+    pub effect fn send(self: &Self, value: T) -> Result<(), SendError<T>>
+      ! OutOfMemoryError {
+      let meta = self.meta.get()
+      if unsafe Atomic.load<u32>(meta.closed, MemoryOrder.Acquire) != 0 {
+        return Result<(), SendError<T>>.Failure { error: SendError<T>.Closed { value: move value } }
+      }
+      let mut heap = Allocator.systemAllocatorProvider()
+      run self.mailbox.send(move value) |> Effect.provideMut<Allocator>(&mut heap)
+      // Release pairs with receiver's Acquire load of `sent` so the Vyukov link is committed.
+      let _prev = unsafe Atomic.fetchAdd<usize>(meta.sent, 1, MemoryOrder.Release)
+      meta.wake.wake()
+      return Result<(), SendError<T>>.Success { value: () }
+    }
+
+    /// Marks the channel closed and wakes the consumer.
+    pub fn close(self: &Self) -> () {
+      let meta = self.meta.get()
+      unsafe Atomic.store<u32>(meta.closed, 1, MemoryOrder.Release)
+      meta.wake.wake()
+    }
+
+    /// Returns whether the channel is closed.
+    pub fn isClosed(self: &Self) -> bool {
+      return unsafe Atomic.load<u32>(self.meta.get().closed, MemoryOrder.Acquire) != 0
+    }
+  }
+
+  impl<T> Drop for UnboundedSender<T> {
+    fn drop(self: &mut UnboundedSender<T>) -> () {
+      let meta = self.meta.get()
+      if unsafe Atomic.fetchSubtract<usize>(meta.senders, 1, MemoryOrder.AcquireRelease) == 1 {
+        unsafe Atomic.store<u32>(meta.closed, 1, MemoryOrder.Release)
+        meta.wake.wake()
+      }
+    }
+  }
+
+  impl<T> UnboundedReceiver<T> {
+    /// Takes the next sent item without blocking on empty; resolves transient multi-producer
+    /// Vyukov link gaps using `sent` count ordering.
+    pub fn tryRecv(self: &mut Self) -> Result<T, TryRecvError> {
+      let meta = self.meta.get()
+      let sent = unsafe Atomic.load<usize>(meta.sent, MemoryOrder.Acquire)
+      if self.received == sent {
+        let closed = unsafe Atomic.load<u32>(meta.closed, MemoryOrder.Acquire) != 0
+        // Re-check `sent` once after reading `closed` so a send right before last-sender close isn't missed.
+        let sentAgain = unsafe Atomic.load<usize>(meta.sent, MemoryOrder.Acquire)
+        if self.received == sentAgain {
+          return Result<T, TryRecvError>.Failure {
+            error: if closed { TryRecvError.Closed } else { TryRecvError.Empty },
+          }
+        }
+      }
+      while true {
+        match move self.mailbox.receive() {
+          Option<T>.Some { value } => {
+            self.received = self.received + 1
+            return Result<T, TryRecvError>.Success { value: move value }
+          }
+          Option<T>.None => {
+            NativeThread.yieldNow()
+          }
+        }
+      }
+      return Result<T, TryRecvError>.Failure { error: TryRecvError.Empty }
+    }
+
+    /// Drains up to `max` available items (`0` = all currently available) into `out`.
+    pub effect fn drain(self: &mut Self, out: &mut List<T>, max: usize) -> usize
+      ! OutOfMemoryError
+      ? &mut Allocator {
+      let mut taken: usize = 0
+      while max == 0 || taken < max {
+        match move self.tryRecv() {
+          Result<T, TryRecvError>.Success { value } => {
+            run out.append(move value)
+            taken = taken + 1
+          }
+          Result<T, TryRecvError>.Failure { .. } => {
+            break
+          }
+        }
+      }
+      return taken
+    }
+
+    /// Marks the channel closed. Queued items remain readable.
+    pub fn close(self: &mut Self) -> () {
+      unsafe Atomic.store<u32>(self.meta.get().closed, 1, MemoryOrder.Release)
+    }
+
+    /// Returns whether the channel is closed.
+    pub fn isClosed(self: &Self) -> bool {
+      return unsafe Atomic.load<u32>(self.meta.get().closed, MemoryOrder.Acquire) != 0
+    }
+  }
+
+  impl<T> Drop for UnboundedReceiver<T> {
+    fn drop(self: &mut UnboundedReceiver<T>) -> () {
+      self.close()
+    }
+  }
+}

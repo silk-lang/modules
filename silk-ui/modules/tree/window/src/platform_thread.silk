@@ -28,7 +28,7 @@ import window.keys { KeyCode }
 import window.shell { Notification, Tray, TrayIcon }
 import window.clipboard { ClipboardEntry }
 import window.menu { MenuBar, MenuEntry, OpenDialog, SaveDialog }
-import window.native { NativePlatform, Waker }
+import window.native { initialAppearance, NativePlatform, Waker }
 import window.headless { HeadlessPlatform }
 
 static if Intrinsic.targetArchitecture() != "wasm32" {
@@ -51,9 +51,8 @@ import window.types {
 }
 import silk.collections.bytes { Bytes }
 import silk.collections.list { List }
-import silk.collections.bytes { Bytes }
-import silk.concurrency.sync { Arc, Mutex, Parker, Unparker }
-import silk.concurrency.thread { Transferable }
+import silk.concurrency.sync { Arc, Mutex }
+import silk.concurrency.thread { Concurrent, Transferable }
 import silk.concurrency.thread_native { NativeThread, SpawnError }
 import silk.core.effect { Effect }
 import silk.core.option { Option }
@@ -70,6 +69,16 @@ import silk.system.monotonic_clock_native { OsMonotonicClock }
 import silk.text.string { String }
 import silk.num.f64
 import ui_inspect_server.channel { Wake }
+import ui_transport.rpc {
+  RpcChannel,
+  RpcClient,
+  RpcEnvelope,
+  RpcError,
+  RpcPair,
+  RpcResponder,
+  RpcServer,
+}
+import ui_transport.wake { Waiter, WakeHandle }
 import webview.native { NativeWebViews }
 import webview.types { Placement }
 import webview.wire { WireViews, WireEvent, OP_OPEN }
@@ -159,6 +168,11 @@ union Reply {
   Failed { error: WindowError },
 }
 
+// The raw surface handles in a reply belong to the window, which outlives both threads' use
+// of them: the platform thread closes it only when the UI thread asks.
+impl Transferable for Command {}
+impl Transferable for Reply {}
+
 /// An accessibility action and the window it is for.
 struct WindowAction {
   window: u32,
@@ -200,9 +214,6 @@ struct Metrics {
 struct Link {
   /// OS events for the UI thread, oldest first.
   events: List<Event>,
-  /// Commands for the platform thread, oldest first.
-  commands: List<Command>,
-  reply: Option<Reply>,
   /// Accessibility actions the OS asked for, for the UI thread.
   actions: List<WindowAction>,
   /// The windows whose elements assistive technology asked for.
@@ -236,20 +247,28 @@ struct Link {
 // of them: the platform thread closes it only when the UI thread asks.
 impl Transferable for Link {}
 
+static if Intrinsic.targetArchitecture() != "wasm32" {
+  export "C" fn wakePlatformCallback(token: usize) -> () {
+    drop token
+    Waker.make().wake()
+  }
+}
+
 /// The platform side of a launched app, passed to the app's entry. Put it in
 /// `RunOptions.platform` so the window host runs through the platform thread.
 pub struct Launched {
   link: Arc<Mutex<Link>>,
   waker: Waker,
   /// The UI thread sleeps here; the platform thread wakes it.
-  parker: Parker,
+  waiter: Waiter,
+  rpc: RpcClient<Command, Reply>,
 }
 
 impl Transferable for Launched {}
 
 impl Launched {
-  /// The appearance the platform thread last reported: Light until the window system has
-  /// started (about 90 ms after launch on macOS), then the system's.
+  /// The appearance the platform thread last reported: read from the OS before AppKit starts on
+  /// macOS (Light elsewhere), then updated once the window system starts.
   pub fn appearance(self: &Self) -> Appearance {
     return self.link.get().lock().get().appearance
   }
@@ -265,7 +284,7 @@ impl Launched {
 /// has a result.
 pub union Nudge {
   Direct { waker: Waker },
-  Proxied { link: Arc<Mutex<Link>>, wake: Unparker },
+  Proxied { link: Arc<Mutex<Link>>, wake: WakeHandle },
 }
 
 impl Transferable for Nudge {}
@@ -290,7 +309,7 @@ impl Nudge {
         let state = guard.getMut()
         state.nudged = true
         drop guard
-        wake.unpark()
+        wake.wake()
         wakeAlso(&link)
       }
     }
@@ -436,10 +455,18 @@ pub effect fn launch<
     // The UI thread starts before the window system, which takes about 100 ms on macOS: the
     // app loads its fonts, script and GPU meanwhile. Its first command waits for the platform.
     let mut heap = Allocator.systemAllocatorProvider()
-    let shared = run makeLink(Appearance.Light) |> Effect.provideMut<Allocator>(&mut heap)
-    let uiParker = run Parker.make() |> Effect.provideMut<Allocator>(&mut heap)
-    let wakeUi = uiParker.unparker()
-    let launched = Launched { link: shared.clone(), waker: Waker.make(), parker: move uiParker }
+    let shared = run makeLink(initialAppearance()) |> Effect.provideMut<Allocator>(&mut heap)
+    let uiWaiter = run Waiter.make()
+    let wakeUi = uiWaiter.handle()
+    let rpcPair = run RpcChannel.make<Command, Reply>(WakeHandle.callback(wakePlatformCallback, 0))
+    let RpcPair<Command, Reply> { client: rpcClient, server: rpcServerInit } = move rpcPair
+    let mut rpcServer = move rpcServerInit
+    let launched = Launched {
+      link: shared.clone(),
+      waker: Waker.make(),
+      waiter: move uiWaiter,
+      rpc: move rpcClient,
+    }
     let finishedLink = shared.clone()
     let spawned = run Effect.result(
       NativeThread.spawn(
@@ -473,12 +500,13 @@ pub effect fn launch<
       Result.Success { value } => move value
       Result.Failure { error } => {
         // No window system: the app's calls fail, and it reports that itself.
-        run refuse(&shared, &wakeUi, move error)
+        run refuse(&shared, &mut rpcServer, move error)
         return thread.join()
       }
     }
     setAppearance(&shared, platform.appearance())
-    run servePlatform(&mut platform, &shared, &wakeUi) |> Effect.provideMut<Allocator>(&mut heap)
+    run servePlatform(&mut platform, &shared, &wakeUi, &mut rpcServer)
+      |> Effect.provideMut<Allocator>(&mut heap)
     return thread.join()
   }
 }
@@ -488,8 +516,6 @@ effect fn makeLink(appearance: Appearance) -> Arc<Mutex<Link>>
   ? &mut Allocator {
   let link = Link {
     events: List<Event>.make(),
-    commands: List<Command>.make(),
-    reply: Option<Reply>.None,
     actions: List<WindowAction>.make(),
     accessWanted: List<u32>.make(),
     window: 0,
@@ -514,18 +540,32 @@ fn setAppearance(link: &Arc<Mutex<Link>>, appearance: Appearance) -> () {
   state.appearance = appearance
 }
 
+fn sendReply(responder: Option<RpcResponder<Reply>>, reply: Reply) -> () {
+  if let Option<RpcResponder<Reply>>.Some { value: r } = move responder {
+    r.reply(move reply)
+  }
+}
+
 /// Answers each call of the UI thread with `error` until it is done, when there is no window
 /// system to serve it.
-effect fn refuse(link: &Arc<Mutex<Link>>, wakeUi: &Unparker, error: WindowError) -> () {
+effect fn refuse(
+  link: &Arc<Mutex<Link>>,
+  rpc: &mut RpcServer<Command, Reply>,
+  error: WindowError,
+) -> () {
+  let mut heap = Allocator.systemAllocatorProvider()
   let mut clock = OsMonotonicClock.make()
   while !isDone(link) {
-    let commands = takeCommands(link)
-    if commands.length() != 0 {
-      answer(link, wakeUi, Reply.Failed { error: error })
+    let mut envelopes = List<RpcEnvelope<Command, Reply>>.make()
+    drop run Effect.result(rpc.drain(&mut envelopes, 0))
+      |> Effect.provideMut<Allocator>(&mut heap)
+    while envelopes.length() != 0 {
+      let env = envelopes.remove(0)
+      sendReply(move env.responder, Reply.Failed { error: error })
     }
-    drop commands
     run Effect.sleep(1000000) |> Effect.provideMut<MonotonicClock>(&mut clock)
   }
+  rpc.close()
 }
 
 fn markDone(link: &Arc<Mutex<Link>>) -> () {
@@ -538,49 +578,35 @@ fn isDone(link: &Arc<Mutex<Link>>) -> bool {
   return link.get().lock().get().done
 }
 
-fn takeCommands(link: &Arc<Mutex<Link>>) -> List<Command> {
-  let mut guard = link.get().lock()
-  return Intrinsic.replace(guard.getMut().commands, List<Command>.make())
-}
-
-fn answer(link: &Arc<Mutex<Link>>, wakeUi: &Unparker, reply: Reply) -> () {
-  let mut guard = link.get().lock()
-  let state = guard.getMut()
-  state.reply = Option<Reply>.some(move reply)
-  drop guard
-  wakeUi.unpark()
-}
-
 /// The platform thread's loop: wait for OS events, run the UI thread's commands, hand the
 /// events over, until the app is done.
 effect fn servePlatform(
   platform: &mut NativePlatform,
   link: &Arc<Mutex<Link>>,
-  wakeUi: &Unparker,
+  wakeUi: &WakeHandle,
+  rpc: &mut RpcServer<Command, Reply>,
 ) -> ()
   ! OutOfMemoryError
   ? &mut Allocator {
   let mut bridges = List<WindowBridge>.make()
   let mut views = WireViews<NativeWebViews>.make(NativeWebViews.make())
   while true {
-    let mut commands = takeCommands(link)
-    let list = commands.asMutSlice()
-    let mut i: usize = 0
-    while i < list.length {
-      let command = Intrinsic.replace(list[i], Command.ReadClipboard)
-      match move command {
+    let mut envelopes = List<RpcEnvelope<Command, Reply>>.make()
+    drop run rpc.drain(&mut envelopes, 0)
+    while envelopes.length() != 0 {
+      let env = envelopes.remove(0)
+      let RpcEnvelope<Command, Reply> { id: _, request, responder } = move env
+      match move request {
         Command.WebView { op, window, text } => {
           let value = run views.serve(op, window, String.view(&text))
           if op == OP_OPEN {
-            answer(link, wakeUi, Reply.Done { ok: value != 0.0 })
+            sendReply(move responder, Reply.Done { ok: value != 0.0 })
           }
         }
         Command.PlaceWebView { view, placement } => views.place(view, placement)
-        Command other => run execute(&mut platform, link, wakeUi, &mut bridges, move other)
+        Command other => run execute(&mut platform, link, &mut bridges, move other, move responder)
       }
-      i = i + 1
     }
-    drop commands
     run handOverWebViewEvents(&mut views, link, wakeUi)
     if isDone(link) {
       break
@@ -699,17 +725,18 @@ effect fn servePlatform(
     }
     drop guard
     if forUi {
-      wakeUi.unpark()
+      wakeUi.wake()
       wakeAlso(link)
     }
   }
+  rpc.close()
 }
 
 /// Moves what the web views reported to the UI thread, and wakes it when there was something.
 effect fn handOverWebViewEvents(
   views: &mut WireViews<NativeWebViews>,
   link: &Arc<Mutex<Link>>,
-  wakeUi: &Unparker,
+  wakeUi: &WakeHandle,
 ) -> ()
   ! OutOfMemoryError
   ? &mut Allocator {
@@ -724,12 +751,12 @@ effect fn handOverWebViewEvents(
     run state.webViewEvents.append(events.remove(0))
   }
   drop guard
-  wakeUi.unpark()
+  wakeUi.wake()
   wakeAlso(link)
 }
 
 /// Handles the events a [`Driver`] made as OS events.
-effect fn serveSynthetic(link: &Arc<Mutex<Link>>, wakeUi: &Unparker) -> ()
+effect fn serveSynthetic(link: &Arc<Mutex<Link>>, wakeUi: &WakeHandle) -> ()
   ! OutOfMemoryError
   ? &mut Allocator {
   let mut guard = link.get().lock()
@@ -748,7 +775,7 @@ effect fn serveSynthetic(link: &Arc<Mutex<Link>>, wakeUi: &Unparker) -> ()
     }
     i = i + 1
   }
-  wakeUi.unpark()
+  wakeUi.wake()
   wakeAlso(link)
 }
 
@@ -839,9 +866,9 @@ effect fn fastScroll(link: &Arc<Mutex<Link>>, event: &Event) -> bool
 effect fn execute(
   platform: &mut NativePlatform,
   link: &Arc<Mutex<Link>>,
-  wakeUi: &Unparker,
   bridges: &mut List<WindowBridge>,
   command: Command,
+  responder: Option<RpcResponder<Reply>>,
 ) -> ()
   ! OutOfMemoryError
   ? &mut Allocator {
@@ -885,9 +912,8 @@ effect fn execute(
             run state.others.append(Metrics { window: value.value, size: size, scale: scale })
           }
           drop guard
-          answer(
-            link,
-            wakeUi,
+          sendReply(
+            move responder,
             Reply.Window {
               window: value,
               size: size,
@@ -897,9 +923,9 @@ effect fn execute(
           )
         }
         Result.Failure { error } => match move error {
-          WindowError failure => answer(link, wakeUi, Reply.Failed { error: failure })
+          WindowError failure => sendReply(move responder, Reply.Failed { error: failure })
           OutOfMemoryError failure => {
-            answer(link, wakeUi, Reply.Failed { error: WindowError.CreationFailed })
+            sendReply(move responder, Reply.Failed { error: WindowError.CreationFailed })
             fail move failure
           }
         }
@@ -981,7 +1007,7 @@ effect fn execute(
         parent: parent,
       }
       let opened = run Effect.result(platform.openFileDialog(&options))
-      run answerDialog(link, wakeUi, move opened)
+      run answerDialog(move opened, move responder)
     }
     Command.SaveFileDialog { title, directory, name, extensions, parent } => {
       let options = SaveDialog {
@@ -995,22 +1021,22 @@ effect fn execute(
         parent: parent,
       }
       let opened = run Effect.result(platform.saveFileDialog(&options))
-      run answerDialog(link, wakeUi, move opened)
+      run answerDialog(move opened, move responder)
     }
     Command.ReadClipboard => {
       let text = run platform.readClipboard()
-      answer(link, wakeUi, Reply.Clipboard { text: move text })
+      sendReply(move responder, Reply.Clipboard { text: move text })
     }
     Command.WriteClipboard { text } => {
       run platform.writeClipboard(String.view(&text))
     }
     Command.ClipboardTypes => {
       let types = run platform.clipboardTypes()
-      answer(link, wakeUi, Reply.ClipboardTypes { types: move types })
+      sendReply(move responder, Reply.ClipboardTypes { types: move types })
     }
     Command.ReadClipboardType { mime } => {
       let data = run platform.readClipboardType(String.view(&mime))
-      answer(link, wakeUi, Reply.ClipboardData { data: move data })
+      sendReply(move responder, Reply.ClipboardData { data: move data })
     }
     Command.WriteClipboardItem { entries } => {
       run platform.writeClipboardItem(entries.asSlice())
@@ -1027,12 +1053,12 @@ effect fn execute(
         menu: &menu,
       }
       let shown = run platform.setTray(&tray)
-      answer(link, wakeUi, Reply.Done { ok: shown })
+      sendReply(move responder, Reply.Done { ok: shown })
     }
     Command.RemoveTray => platform.removeTray()
     Command.RegisterShortcut { id, code, modifiers } => {
       let held = run platform.registerShortcut(id, code, modifiers)
-      answer(link, wakeUi, Reply.Done { ok: held })
+      sendReply(move responder, Reply.Done { ok: held })
     }
     Command.UnregisterShortcut { id } => platform.unregisterShortcut(id)
     Command.Notify { title, body } => {
@@ -1041,27 +1067,27 @@ effect fn execute(
         body: String.view(&body),
       }
       let id = run platform.notify(&notification)
-      answer(link, wakeUi, Reply.Notified { id: id })
+      sendReply(move responder, Reply.Notified { id: id })
     }
     Command.SetBadge { text } => {
       let shown = run platform.setBadge(String.view(&text))
-      answer(link, wakeUi, Reply.Done { ok: shown })
+      sendReply(move responder, Reply.Done { ok: shown })
     }
     Command.SetProgress { fraction } => {
       let shown = run platform.setProgress(fraction)
-      answer(link, wakeUi, Reply.Done { ok: shown })
+      sendReply(move responder, Reply.Done { ok: shown })
     }
     Command.OpenUrl { url } => {
       let opened = run platform.openUrl(String.view(&url))
-      answer(link, wakeUi, Reply.Done { ok: opened })
+      sendReply(move responder, Reply.Done { ok: opened })
     }
     Command.RevealPath { path } => {
       let shown = run platform.revealPath(String.view(&path))
-      answer(link, wakeUi, Reply.Done { ok: shown })
+      sendReply(move responder, Reply.Done { ok: shown })
     }
     Command.StartFileDrag { window, paths } => {
       let started = run platform.startFileDrag(window, paths.asSlice())
-      answer(link, wakeUi, Reply.Done { ok: started })
+      sendReply(move responder, Reply.Done { ok: started })
     }
     Command.Accessibility { window, update } => {
       let at = bridgeOf(&platform.*, &mut bridges, window.value)
@@ -1075,17 +1101,16 @@ effect fn execute(
 }
 
 effect fn answerDialog(
-  link: &Arc<Mutex<Link>>,
-  wakeUi: &Unparker,
   opened: Result<DialogId, WindowError | OutOfMemoryError>,
+  responder: Option<RpcResponder<Reply>>,
 ) -> ()
   ! OutOfMemoryError {
   match move opened {
-    Result.Success { value } => answer(link, wakeUi, Reply.Dialog { dialog: value })
+    Result.Success { value } => sendReply(move responder, Reply.Dialog { dialog: value })
     Result.Failure { error } => match move error {
-      WindowError failure => answer(link, wakeUi, Reply.Failed { error: failure })
+      WindowError failure => sendReply(move responder, Reply.Failed { error: failure })
       OutOfMemoryError failure => {
-        answer(link, wakeUi, Reply.Failed { error: WindowError.CreationFailed })
+        sendReply(move responder, Reply.Failed { error: WindowError.CreationFailed })
         fail move failure
       }
     }
@@ -1097,56 +1122,177 @@ effect fn seconds(clock: &mut Clock) -> f64 {
   return run clock.seconds()
 }
 
+struct WindowRaw {
+  window: u32,
+  raw: RawSurface,
+}
+
+effect fn rpcSend(rpc: &RpcClient<Command, Reply>, command: Command) -> ()
+  ! OutOfMemoryError {
+  match move run rpc.send(move command) {
+    Result<(), RpcError>.Success { .. } => ()
+    Result<(), RpcError>.Failure { error } => match error {
+      RpcError.OutOfMemory => {
+        fail OutOfMemoryError {}
+      }
+      RpcError.Closed => ()
+    }
+  }
+}
+
+effect fn rpcCall(rpc: &RpcClient<Command, Reply>, command: Command) -> Reply
+  ! OutOfMemoryError {
+  return match move run rpc.call(move command) {
+    Result<Reply, RpcError>.Success { value } => move value
+    Result<Reply, RpcError>.Failure { error } => match error {
+      RpcError.OutOfMemory => {
+        fail OutOfMemoryError {}
+      }
+      RpcError.Closed => Reply.Failed { error: WindowError.Unsupported }
+    }
+  }
+}
+
+effect fn recordSurface(surfaces: &mut List<WindowRaw>, window: u32, raw: RawSurface) -> ()
+  ! OutOfMemoryError {
+  let slice = surfaces.asMutSlice()
+  let mut i: usize = 0
+  while i < slice.length {
+    if slice[i].window == window {
+      slice[i].raw = raw
+      return ()
+    }
+    i = i + 1
+  }
+  let mut heap = Allocator.systemAllocatorProvider()
+  run surfaces.append(WindowRaw { window: window, raw: raw })
+    |> Effect.provideMut<Allocator>(&mut heap)
+}
+
+fn removeSurface(surfaces: &mut List<WindowRaw>, window: u32) -> () {
+  let mut i: usize = 0
+  while i < surfaces.length() {
+    if surfaces.asSlice()[i].window == window {
+      drop surfaces.remove(i)
+    } else {
+      i = i + 1
+    }
+  }
+}
+
+fn findSurface(surfaces: &[WindowRaw], window: u32, fallback: RawSurface) -> RawSurface {
+  let mut i: usize = 0
+  while i < surfaces.length {
+    if surfaces[i].window == window {
+      return surfaces[i].raw
+    }
+    i = i + 1
+  }
+  return fallback
+}
+
+/// Thread-safe multi-caller handle for sending platform commands from secondary threads or
+/// multiple window-group threads without owning the main [`PlatformProxy`].
+pub struct PlatformClient {
+  rpc: RpcClient<Command, Reply>,
+}
+
+impl Transferable for PlatformClient {}
+impl Concurrent for PlatformClient {}
+
+impl PlatformClient {
+  /// Returns another handle to the same platform RPC channel.
+  pub fn clone(self: &Self) -> PlatformClient {
+    return PlatformClient { rpc: self.rpc.clone() }
+  }
+
+  /// Returns whether the platform command channel has closed.
+  pub fn isClosed(self: &Self) -> bool {
+    return self.rpc.isClosed()
+  }
+
+  /// Closes `window` on the platform thread.
+  pub fn closeWindow(self: &Self, window: WindowId) -> () {
+    drop run Effect.result(self.rpc.send(Command.CloseWindow { window: window }))
+  }
+
+  /// Requests a frame callback for `window`.
+  pub fn requestFrame(self: &Self, window: WindowId) -> () {
+    drop run Effect.result(self.rpc.send(Command.RequestFrame { window: window }))
+  }
+
+  /// Sets `window`'s title.
+  pub effect fn setTitle(self: &Self, window: WindowId, title: string) -> ()
+    ! OutOfMemoryError {
+    let owned = run PlatformProxy.copyOf(title)
+    run rpcSend(&self.rpc, Command.SetTitle { window: window, title: move owned })
+  }
+
+  /// Sets `window`'s mouse cursor.
+  pub fn setCursor(self: &Self, window: WindowId, cursor: Cursor) -> () {
+    drop run Effect.result(self.rpc.send(Command.SetCursor { window: window, cursor: cursor }))
+  }
+
+  /// Reads plain text from the OS clipboard, waiting only for this call's tagged reply.
+  pub effect fn readClipboard(self: &Self) -> Option<String>
+    ! OutOfMemoryError {
+    let reply = run rpcCall(&self.rpc, Command.ReadClipboard)
+    return match move reply {
+      Reply.Clipboard { text } => move text
+      _ => Option<String>.None
+    }
+  }
+
+  /// Writes plain text to the OS clipboard.
+  pub effect fn writeClipboard(self: &Self, text: string) -> ()
+    ! OutOfMemoryError {
+    let owned = run PlatformProxy.copyOf(text)
+    run rpcSend(&self.rpc, Command.WriteClipboard { text: move owned })
+  }
+}
+
 /// The UI thread's view of the platform: a `Platform` whose calls go to the platform thread.
 pub struct PlatformProxy {
   link: Arc<Mutex<Link>>,
   waker: Waker,
-  parker: Parker,
+  waiter: Waiter,
+  rpc: RpcClient<Command, Reply>,
   clock: Clock,
-  /// The surface of the window the proxy opened.
+  /// Open window raw surfaces keyed by `window.value`.
+  surfaces: List<WindowRaw>,
+  /// Fallback raw surface of the last window the proxy opened.
   lastRaw: RawSurface,
 }
 
 impl PlatformProxy {
   /// The proxy for a launched app.
   pub fn make(launched: Launched) -> PlatformProxy {
-    let Launched { link, waker, parker } = move launched
+    let Launched { link, waker, waiter, rpc } = move launched
     return PlatformProxy {
       link: move link,
       waker: waker,
-      parker: move parker,
+      waiter: move waiter,
+      rpc: move rpc,
       clock: Clock.make(),
+      surfaces: List<WindowRaw>.make(),
       lastRaw: RawSurface.None,
     }
   }
 
-  effect fn send(self: &mut Self, command: Command) -> ()
-    ! OutOfMemoryError {
-    let mut heap = Allocator.systemAllocatorProvider()
-    let mut guard = self.link.get().lock()
-    run guard.getMut().commands.append(move command) |> Effect.provideMut<Allocator>(&mut heap)
-    drop guard
-    self.waker.wake()
+  /// Returns a transferable multi-caller handle sharing this proxy's tagged RPC channel.
+  pub fn client(self: &Self) -> PlatformClient {
+    return PlatformClient { rpc: self.rpc.clone() }
   }
 
-  /// Sends `command` and waits for the platform thread's reply.
-  effect fn call(self: &mut Self, command: Command) -> Reply
+  effect fn send(self: &Self, command: Command) -> ()
     ! OutOfMemoryError {
-    run self.send(move command)
-    while true {
-      let mut guard = self.link.get().lock()
-      let taken = Intrinsic.replace(guard.getMut().reply, Option<Reply>.None)
-      drop guard
-      match move taken {
-        Option<Reply>.Some { value } => {
-          return move value
-        }
-        Option<Reply>.None => {
-          self.parker.park()
-        }
-      }
-    }
-    return Reply.Failed { error: WindowError.Unsupported }
+    run rpcSend(&self.rpc, move command)
+  }
+
+  /// Sends `command` and waits for this call's tagged reply from the platform thread.
+  effect fn call(self: &Self, command: Command) -> Reply
+    ! OutOfMemoryError {
+    return run rpcCall(&self.rpc, move command)
   }
 
   /// Sends wheel events to `compositor` first.
@@ -1175,7 +1321,7 @@ impl PlatformProxy {
 
   /// The accessibility side of the link.
   pub fn accessLink(self: &Self) -> AccessLink {
-    return AccessLink { link: self.link.clone(), waker: self.waker }
+    return AccessLink { link: self.link.clone(), rpc: self.rpc.clone() }
   }
 
   /// Whether the platform thread left offsets or actions for the UI thread.
@@ -1187,7 +1333,7 @@ impl PlatformProxy {
   }
 
   fn nudge(self: &Self) -> Nudge {
-    return Nudge.Proxied { link: self.link.clone(), wake: self.parker.unparker() }
+    return Nudge.Proxied { link: self.link.clone(), wake: self.waiter.handle() }
   }
 
   fn takeNudged(self: &Self) -> bool {
@@ -1250,6 +1396,7 @@ impl Platform for PlatformProxy {
     )
     return match move reply {
       Reply.Window { window, raw, .. } => {
+        run recordSurface(&mut self.surfaces, window.value, raw)
         self.lastRaw = raw
         window
       }
@@ -1263,6 +1410,7 @@ impl Platform for PlatformProxy {
   }
 
   fn closeWindow(self: &mut Self, window: WindowId) -> () {
+    removeSurface(&mut self.surfaces, window.value)
     drop run Effect.result(self.send(Command.CloseWindow { window: window }))
   }
 
@@ -1282,13 +1430,13 @@ impl Platform for PlatformProxy {
         Wait.Poll => {
           return Option<Event>.None
         }
-        Wait.Forever => self.parker.park()
+        Wait.Forever => self.waiter.wait()
         Wait.Seconds { seconds: limit } => {
           let left = limit - ((run seconds(&mut self.clock)) - start)
           if left <= 0.0 {
             return Option<Event>.None
           }
-          drop self.parker.parkTimeout(f64.toU64(left * 1000000000.0))
+          drop self.waiter.waitTimeout(f64.toU64(left * 1000000000.0))
         }
       }
 
@@ -1334,7 +1482,7 @@ impl Platform for PlatformProxy {
   }
 
   fn rawSurface(self: &Self, window: WindowId) -> RawSurface {
-    return self.lastRaw
+    return findSurface(self.surfaces.asSlice(), window.value, self.lastRaw)
   }
 
   effect fn setTitle(self: &mut Self, window: WindowId, title: string) -> ()
@@ -1795,6 +1943,15 @@ impl HostPlatform {
       _ => Option<AccessLink>.None
     }
   }
+
+  /// Returns a transferable multi-caller handle to the platform RPC channel when running with a
+  /// platform thread.
+  pub fn platformClient(self: &Self) -> Option<PlatformClient> {
+    return match &self.* {
+      HostPlatform.Proxied { proxy } => Option<PlatformClient>.some(proxy.client())
+      _ => Option<PlatformClient>.None
+    }
+  }
 }
 
 impl Platform for HostPlatform {
@@ -2148,7 +2305,7 @@ impl Platform for HostPlatform {
 /// The accessibility side of the link, held by the window host's `HostState`.
 pub struct AccessLink {
   link: Arc<Mutex<Link>>,
-  waker: Waker,
+  rpc: RpcClient<Command, Reply>,
 }
 
 impl AccessLink {
@@ -2156,14 +2313,7 @@ impl AccessLink {
   /// use the system allocator.
   pub effect fn publish(self: &Self, window: WindowId, update: TreeUpdate) -> ()
     ! OutOfMemoryError {
-    let mut heap = Allocator.systemAllocatorProvider()
-    let mut guard = self.link.get().lock()
-    run guard.getMut().commands.append(
-      Command.Accessibility { window: window, update: move update },
-    )
-      |> Effect.provideMut<Allocator>(&mut heap)
-    drop guard
-    self.waker.wake()
+    run rpcSend(&self.rpc, Command.Accessibility { window: window, update: move update })
   }
 
   /// Whether assistive technology asked for `window`'s elements.

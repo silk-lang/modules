@@ -1,18 +1,31 @@
-//! The standard window host with owned blocking commands executed on native workers.
-//! Commands implement `Perform<M, never, never>` and construct their own file/network services
-//! on the worker. Encode operational failures as messages. Captures and returned messages must
-//! be Transferable and own process-heap storage. At most four jobs execute concurrently.
+//! The standard window host with owned blocking commands executed on native workers or the
+//! process-wide `AppPool`. Commands implement `Perform<M, never, never>` and construct their own
+//! file/network services on the worker. Encode operational failures as messages. Captures and
+//! returned messages must be Transferable and own process-heap storage. At most four jobs execute
+//! concurrently.
 import lib { WindowContent }
 import background { Background }
 import loom.app { App, Perform }
 import loom.runtime { Runtime, drain }
 import ui_tree.legacy { UiTree, TreeError }
+import ui_transport.cancel { CancellationToken }
+import ui_transport.channel {
+  TryRecvError,
+  UnboundedChannel,
+  UnboundedPair,
+  UnboundedReceiver,
+  UnboundedSender
+}
+import ui_transport.pool { ClaimHandle, WorkPoolHandle }
+import ui_transport.wake { WakeHandle }
+import ui_tree_window.platform_thread { Nudge }
 import window.types { WindowError }
 import silk.concurrency.thread { Transferable }
 import silk.concurrency.thread_native { SpawnError }
 import silk.collections.list { List }
 import silk.core.option { Option }
 import silk.core.effect { Effect }
+import silk.core.result { Result }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 
 struct Job<M> {
@@ -20,13 +33,78 @@ struct Job<M> {
   work: Background<M>,
 }
 
+struct CompletedCommand<M> {
+  ticket: u64,
+  message: M,
+}
+
+impl<M: Transferable> Transferable for CompletedCommand<M> {}
+
+struct PooledCommandWork<M, C> {
+  ticket: u64,
+  command: C,
+  doneTx: UnboundedSender<CompletedCommand<M>>,
+  wake: Nudge,
+}
+
+impl<M: Transferable, C: Transferable> Transferable for PooledCommandWork<M, C> {}
+
+fn executePooledCommand<
+  M: 'static + Transferable,
+  C: 'static + Transferable + Perform<M, never, never>
+>(
+  work: PooledCommandWork<M, C>,
+  cancel: &CancellationToken,
+) -> () {
+  drop cancel
+  let PooledCommandWork<M, C> { ticket, command, doneTx, wake } = move work
+  let message = run Perform<M, never, never>.perform(move command)
+  drop run Effect.result(doneTx.send(CompletedCommand<M> { ticket: ticket, message: move message }))
+  wake.nudge()
+}
+
 pub struct Commands<A, M, C> {
-  jobs: List<Job<M>>
+  jobs: List<Job<M>>,
+  appPool: Option<WorkPoolHandle>,
+  groupId: u32,
+  wake: Option<Nudge>,
+  doneTx: Option<UnboundedSender<CompletedCommand<M>>>,
+  doneRx: Option<UnboundedReceiver<CompletedCommand<M>>>,
+  inFlight: usize,
+  claims: List<ClaimHandle>,
 }
 
 impl<A, M, C> Commands<A, M, C> {
   pub fn make() -> Commands<A, M, C> {
-    return Commands<A, M, C> { jobs: List<Job<M>>.make() }
+    return Commands<A, M, C> {
+      jobs: List<Job<M>>.make(),
+      appPool: Option<WorkPoolHandle>.None,
+      groupId: 0,
+      wake: Option<Nudge>.None,
+      doneTx: Option<UnboundedSender<CompletedCommand<M>>>.None,
+      doneRx: Option<UnboundedReceiver<CompletedCommand<M>>>.None,
+      inFlight: 0,
+      claims: List<ClaimHandle>.make(),
+    }
+  }
+}
+
+impl<A, M: 'static + Transferable, C> Commands<A, M, C> {
+  /// Attaches the shared `AppPool`, group id, and event-loop wake handle for zero-polling execution.
+  pub effect fn attachRuntime(
+    self: &mut Self,
+    appPool: WorkPoolHandle,
+    groupId: u32,
+    wake: Nudge,
+  ) -> ()
+    ! OutOfMemoryError {
+    let pair = run UnboundedChannel.make<CompletedCommand<M>>(WakeHandle.noop())
+    let UnboundedPair<CompletedCommand<M>> { sender, receiver } = move pair
+    self.appPool = Option<WorkPoolHandle>.some(move appPool)
+    self.groupId = groupId
+    self.wake = Option<Nudge>.some(move wake)
+    self.doneTx = Option<UnboundedSender<CompletedCommand<M>>>.some(move sender)
+    self.doneRx = Option<UnboundedReceiver<CompletedCommand<M>>>.some(move receiver)
   }
 }
 
@@ -42,7 +120,10 @@ impl<
   C: 'static + Transferable + Perform<M, never, never>
 > Commands<A, M, C> {
   pub fn wakeAfter(self: &Self) -> Option<f64> {
-    return if self.jobs.length() > 0 {
+    if self.wake.isSome() {
+      return Option<f64>.None
+    }
+    return if self.jobs.length() > 0 || self.inFlight > 0 {
       Option<f64>.some(0.008)
     } else {
       Option<f64>.None
@@ -58,6 +139,34 @@ impl<
     ! WindowError | TreeError | OutOfMemoryError
     ? &mut Allocator {
     let mut changed = false
+    if let Option<UnboundedReceiver<CompletedCommand<M>>>.Some { value: rx } = &mut self.doneRx {
+      while true {
+        match rx.tryRecv() {
+          Result.Success { value: done } => {
+            if self.inFlight > 0 {
+              self.inFlight = self.inFlight - 1
+            }
+            let CompletedCommand<M> { ticket, message } = move done
+            // A cancelled command's message is dropped here.
+            if app.finish(ticket, move message) {
+              changed = true
+            }
+          }
+          Result.Failure { error } => match error {
+            TryRecvError.Empty => { break }
+            TryRecvError.Closed => { break }
+          }
+        }
+      }
+    }
+    let mut c: usize = 0
+    while c < self.claims.length() {
+      if self.claims.asSlice()[c].isDone() {
+        drop self.claims.remove(c)
+      } else {
+        c = c + 1
+      }
+    }
     let mut i: usize = 0
     while i < self.jobs.length() {
       if self.jobs.asSlice()[i].work.ready() {
@@ -75,19 +184,49 @@ impl<
     if changed {
       run drain(&mut app, &mut tree)
     }
-    while self.jobs.length() < 4 && app.deferredOn(false) > 0 {
+    while self.jobs.length() + self.inFlight < 4 && app.deferredOn(false) > 0 {
       let held = run app.takeWorkOn(false)
       let ticket = held.ticket
       let command = move held.command
-      let work = run Effect.catch<SpawnError>(
-        Background<M>.start(
-          || -> M {
-            return run Perform<M, never, never>.perform(move command)
-          },
-        ),
-        spawnFailed,
-      )
-      run self.jobs.append(Job<M> { ticket: ticket, work: move work })
+      let mut fallback = Option<C>.None
+      if let Option<WorkPoolHandle>.Some { value: pool } = &self.appPool {
+        if let Option<UnboundedSender<CompletedCommand<M>>>.Some { value: tx } = &self.doneTx {
+          if let Option<Nudge>.Some { value: wake } = &self.wake {
+            let work = PooledCommandWork<M, C> {
+              ticket: ticket,
+              command: move command,
+              doneTx: tx.clone(),
+              wake: wake.clone(),
+            }
+            let claim = run pool.submitWith(
+              self.groupId,
+              move work,
+              executePooledCommand<M, C>,
+              run CancellationToken.make(),
+              WakeHandle.noop(),
+            )
+            run self.claims.append(move claim)
+            self.inFlight = self.inFlight + 1
+          } else {
+            fallback = Option<C>.some(move command)
+          }
+        } else {
+          fallback = Option<C>.some(move command)
+        }
+      } else {
+        fallback = Option<C>.some(move command)
+      }
+      if let Option<C>.Some { value: fallbackCmd } = move fallback {
+        let work = run Effect.catch<SpawnError>(
+          Background<M>.start(
+            || -> M {
+              return run Perform<M, never, never>.perform(move fallbackCmd)
+            },
+          ),
+          spawnFailed,
+        )
+        run self.jobs.append(Job<M> { ticket: ticket, work: move work })
+      }
     }
     return changed
   }
@@ -104,6 +243,17 @@ impl<
 
   fn runsCommands(self: &Self) -> bool {
     return true
+  }
+
+  effect fn attachRuntime(
+    self: &mut Self,
+    appPool: WorkPoolHandle,
+    groupId: u32,
+    wake: Nudge,
+  ) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run Commands<A, M, C>.attachRuntime(&mut self, move appPool, groupId, move wake)
   }
 
   effect fn poll(

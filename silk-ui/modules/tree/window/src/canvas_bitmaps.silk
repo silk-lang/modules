@@ -25,12 +25,16 @@ import silk.core.result { Result }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.num.u32
 import silk.num.usize
+import ui_transport.pool { WorkPoolHandle }
 import silk.trace { Trace as Prof }
 import vector.pixmap { Pixmap }
 
 static if Intrinsic.targetArchitecture() != "wasm32" {
   import background { Cancellation }
   import platform_thread { Nudge }
+  import ui_transport.cancel { CancellationToken }
+  import ui_transport.pool { ClaimHandle }
+  import ui_transport.wake { WakeHandle }
   import silk.concurrency.sync { Arc, Mutex }
   import silk.concurrency.thread { Transferable }
   import silk.concurrency.thread_native { NativeThread, JoinHandle }
@@ -76,21 +80,75 @@ static if Intrinsic.targetArchitecture() != "wasm32" {
     }
   }
 
+  struct RasterPayload {
+    input: RasterInput,
+    result: Arc<Mutex<Option<RasterOutput>>>,
+    wake: Option<Nudge>,
+  }
+
+  impl Transferable for RasterPayload {}
+
+  fn runPooledRaster(payload: RasterPayload, token: &CancellationToken) -> () {
+    let RasterPayload { input, result, wake } = move payload
+    let output = if token.check() || input.cancel.cancelled() {
+      Option<RasterOutput>.None
+    } else {
+      Option<RasterOutput>.some(runRasterJob(move input))
+    }
+    let mut guard = result.get().lock()
+    let slot = guard.getMut()
+    slot.* = move output
+    drop guard
+    if let Option<Nudge>.Some { value: w } = &wake {
+      w.nudge()
+    }
+  }
+
   struct RunningJob {
     node: u32,
     key: u64,
     content: u64,
     cancel: Cancellation,
-    done: Arc<Mutex<bool>>,
+    token: Option<CancellationToken>,
+    claim: Option<ClaimHandle>,
+    pooled: Option<Arc<Mutex<Option<RasterOutput>>>>,
+    done: Option<Arc<Mutex<bool>>>,
     handle: Option<JoinHandle<RasterOutput>>,
   }
 
   impl RunningJob {
     fn ready(self: &Self) -> bool {
-      return self.done.get().lock().get().*
+      if let Option<ClaimHandle>.Some { value: claim } = &self.claim {
+        return claim.isDone()
+      }
+      if let Option<Arc<Mutex<bool>>>.Some { value: done } = &self.done {
+        return done.get().lock().get().*
+      }
+      return true
+    }
+
+    fn cancelJob(self: &Self) -> () {
+      self.cancel.cancel()
+      if let Option<CancellationToken>.Some { value: t } = &self.token {
+        t.request()
+      }
+      if let Option<ClaimHandle>.Some { value: c } = &self.claim {
+        c.cancel()
+      }
     }
 
     fn join(self: &mut Self) -> Option<RasterOutput> {
+      if let Option<ClaimHandle>.Some { value: c } = move Intrinsic.replace(
+        self.claim,
+        Option<ClaimHandle>.None,
+      ) {
+        c.wait()
+        if let Option<Arc<Mutex<Option<RasterOutput>>>>.Some { value: res } = &self.pooled {
+          let mut guard = res.get().lock()
+          return Intrinsic.replace(guard.getMut().*, Option<RasterOutput>.None)
+        }
+        return Option<RasterOutput>.None
+      }
       return match move Intrinsic.replace(self.handle, Option<JoinHandle<RasterOutput>>.None) {
         Option<JoinHandle<RasterOutput>>.Some { value } => Option<RasterOutput>.some(value.join())
         Option<JoinHandle<RasterOutput>>.None => Option<RasterOutput>.None
@@ -150,15 +208,27 @@ static if Intrinsic.targetArchitecture() != "wasm32" {
   struct WorkerPool {
     running: List<RunningJob>,
     nudge: Option<Nudge>,
+    appPool: Option<WorkPoolHandle>,
+    groupId: u32,
   }
 
   impl WorkerPool {
     fn make() -> WorkerPool {
-      return WorkerPool { running: List<RunningJob>.make(), nudge: Option<Nudge>.None }
+      return WorkerPool {
+        running: List<RunningJob>.make(),
+        nudge: Option<Nudge>.None,
+        appPool: Option<WorkPoolHandle>.None,
+        groupId: 1,
+      }
     }
 
     fn wakeWith(self: &mut Self, nudge: Nudge) -> () {
       self.nudge = Option<Nudge>.some(move nudge)
+    }
+
+    fn attachPool(self: &mut Self, appPool: WorkPoolHandle, groupId: u32) -> () {
+      self.appPool = Option<WorkPoolHandle>.some(move appPool)
+      self.groupId = groupId
     }
 
     fn runningCount(self: &Self) -> usize {
@@ -198,7 +268,7 @@ static if Intrinsic.targetArchitecture() != "wasm32" {
       let mut i: usize = 0
       while i < list.length {
         if list[i].node == node && list[i].key != key {
-          list[i].cancel.cancel()
+          list[i].cancelJob()
         }
         i = i + 1
       }
@@ -209,7 +279,7 @@ static if Intrinsic.targetArchitecture() != "wasm32" {
       let mut i: usize = 0
       while i < list.length {
         if !list[i].cancel.cancelled() && !tree.acceptsRaster(list[i].node, list[i].content, list[i].key) {
-          list[i].cancel.cancel()
+          list[i].cancelJob()
         }
         i = i + 1
       }
@@ -276,14 +346,47 @@ static if Intrinsic.targetArchitecture() != "wasm32" {
       let content = job.content
       let mut heap = Allocator.systemAllocatorProvider()
       let cancel = run Cancellation.make() |> Effect.provideMut<Allocator>(&mut heap)
-      let done = run Arc<Mutex<bool>>.make(run Mutex<bool>.make(false))
-        |> Effect.provideMut<Allocator>(&mut heap)
-      let signal = done.clone()
       let wake = match &self.nudge {
         Option<Nudge>.Some { value } => Option<Nudge>.some(value.clone())
         Option<Nudge>.None => Option<Nudge>.None
       }
       let input = RasterInput { job: move job, cancel: cancel.clone() }
+      if let Option<WorkPoolHandle>.Some { value: pool } = &self.appPool {
+        let token = run CancellationToken.make()
+        let resultCell = run Mutex<Option<RasterOutput>>.make(Option<RasterOutput>.None)
+          |> Effect.provideMut<Allocator>(&mut heap)
+        let resultBox = run Arc<Mutex<Option<RasterOutput>>>.make(move resultCell)
+          |> Effect.provideMut<Allocator>(&mut heap)
+        let payload = RasterPayload {
+          input: move input,
+          result: resultBox.clone(),
+          wake: move wake,
+        }
+        let claim = run pool.submitWith(
+          self.groupId,
+          move payload,
+          runPooledRaster,
+          token.clone(),
+          WakeHandle.noop(),
+        )
+        run self.running.append(
+          RunningJob {
+            node: node,
+            key: key,
+            content: content,
+            cancel: move cancel,
+            token: Option<CancellationToken>.some(move token),
+            claim: Option<ClaimHandle>.some(move claim),
+            pooled: Option<Arc<Mutex<Option<RasterOutput>>>>.some(move resultBox),
+            done: Option<Arc<Mutex<bool>>>.None,
+            handle: Option<JoinHandle<RasterOutput>>.None,
+          },
+        )
+        return false
+      }
+      let done = run Arc<Mutex<bool>>.make(run Mutex<bool>.make(false))
+        |> Effect.provideMut<Allocator>(&mut heap)
+      let signal = done.clone()
       let spawned = run Effect.result(
         NativeThread.spawn(
           || -> RasterOutput {
@@ -311,7 +414,10 @@ static if Intrinsic.targetArchitecture() != "wasm32" {
               key: key,
               content: content,
               cancel: move cancel,
-              done: move done,
+              token: Option<CancellationToken>.None,
+              claim: Option<ClaimHandle>.None,
+              pooled: Option<Arc<Mutex<Option<RasterOutput>>>>.None,
+              done: Option<Arc<Mutex<bool>>>.some(move done),
               handle: Option<JoinHandle<RasterOutput>>.some(move handle),
             },
           )
@@ -327,7 +433,7 @@ static if Intrinsic.targetArchitecture() != "wasm32" {
       let list = self.running.asSlice()
       let mut i: usize = 0
       while i < list.length {
-        list[i].cancel.cancel()
+        list[i].cancelJob()
         i = i + 1
       }
       while self.running.length() > 0 {
@@ -344,6 +450,11 @@ static if Intrinsic.targetArchitecture() == "wasm32" {
   impl WorkerPool {
     fn make() -> WorkerPool {
       return WorkerPool {}
+    }
+
+    fn attachPool(self: &mut Self, appPool: WorkPoolHandle, groupId: u32) -> () {
+      drop appPool
+      drop groupId
     }
 
     fn runningCount(self: &Self) -> usize {
@@ -566,6 +677,11 @@ impl CanvasRasterizer {
   pub fn stop(self: &mut Self) -> () {
     self.queued.clear()
     self.workers.stop()
+  }
+
+  /// Routes background raster jobs through the shared `AppPool` under `groupId`.
+  pub fn attachPool(self: &mut Self, appPool: WorkPoolHandle, groupId: u32) -> () {
+    self.workers.attachPool(move appPool, groupId)
   }
 }
 

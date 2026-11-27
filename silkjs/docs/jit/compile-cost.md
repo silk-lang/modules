@@ -174,6 +174,25 @@ box that only one arm reads is made on that arm instead of in front of the branc
 a few hundred bytes between runs of one binary (addresses in the code), so they do not
 tell two builds apart.
 
+## Scans of every value
+
+RegExp's functions are long (up to 6,000 SSA instructions, hundreds of blocks), and three
+places walked every value once per block or per call:
+
+- `x64_regalloc.allocateIn` extended the interval of each value live at a block's end and
+  start by testing every value's bit; it walks the set bits of the live set's words now
+  (`Live.extendAll`). A loop header's last back edge is found in one pass over the blocks
+  instead of a scan of the later blocks per block.
+- It tested every value against every call for the values a call crosses; the calls'
+  positions are listed in order, and a value crosses one when the first position after its
+  start is no later than its end (`crossesAny`).
+- `ssa_verify.ownership` kept the outstanding owned values as one bool per value, copied and
+  compared per block and per edge; they are sets of bits now, a word per 64 values.
+
+Ran: RegExp 12.26G to 11.92G instructions (the register allocator 211M to 25M, the
+verifier 172M to 33M, compiling 920M to 598M), Richards 1,417M to 1,406M, the other six
+down 0.1 to 0.4 percent.
+
 ## What is left
 
 - Exits times locals is still the unit of cost. Sharing one snapshot of the locals between

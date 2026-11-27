@@ -719,6 +719,18 @@ that yield -0, compared through `1 / x`.
   byte load, a subtraction and a compare; `&`, `|` and `^` of two registers compute in the
   result's register (`mov; and; mov` became `and`). Richards: 1.473G to 1.451G.
 
+- **Rare paths out of the straight line.** The assembler can set a stretch of code apart
+  (`Assembler.beginOutlined`, `endOutlined`): `finish` moves it behind the hot blocks, in
+  front of the cold region, with its labels, references and relocations, so the code around
+  it runs on where it jumped over the stretch. A stretch is entered only by jumps and ends
+  with one. Behind a known-method read the read for any other shape (and the `check.callee`
+  after it) is one; behind `==` with a number known the generic test is one; and a store's
+  release of the old value is `sub [count], 1; jle` with the count put back in a stretch
+  on the way to the last-count path, where it was a compare, a jump and the subtraction.
+  An integer constant that lives in a stack slot is written once where the function begins
+  (`enter`, after the copying path joins), not each time the loop passes it. Richards:
+  1.451G to 1.417G.
+
 ## What it is checked with
 
 - `tests/baseline/t105.js`: fields and closure variables read as integers by `&`, `==`,

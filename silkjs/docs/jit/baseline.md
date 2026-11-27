@@ -290,6 +290,17 @@ must allocate and the `+` of a string with a string or a number go through servi
 no frame (`SERVICE_QUICK`, `SERVICE_CONCAT`): they only allocate, so nothing can read the frame
 chain meanwhile.
 
+A literal is the allocation compiled code makes most, so the two take the cell as the
+interpreter's own instructions do (`js_vm_object_ops.literalAt`, `arrayAt`): an object whose
+fields fit one of the two cell sizes and an array of up to fifteen elements come straight from
+the spare cells (`ordinaryFromPlanFast`, `literalArrayFast`), and only a miss goes the general
+way. Before either allocates, the service frees what compiled code dropped
+(`gc.drainPending`). The helpers compiled code releases through have no hooks to free a cell
+with, so they queue it (`gc.releaseDeferred`); a queue left alone is freed all at once at the
+next collection, long after the cells left the cache, where freeing first hands the literal the
+cell that was just dropped. On Splay at scale 20 the lean paths take the optimizer from 273 to
+261 ms of user time and freeing first from 261 to 212 (V8 230, the interpreter 248).
+
 `to_object` on an object is nothing, and strict code reads `this` as the cell it was passed;
 only a conversion (a primitive, or a sloppy function's missing receiver) is a step.
 

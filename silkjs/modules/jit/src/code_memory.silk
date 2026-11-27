@@ -1,0 +1,523 @@
+//! Executable memory for generated machine code on Linux x86-64.
+//!
+//! `CodeMemory.reserve` reserves an inaccessible address range. `allocate` hands out whole pages of
+//! it as a `CodeWriter`, which is readable and writable but not executable; `allocatePacked`
+//! hands out the bytes after the last packed block instead, so that blocks share pages.
+//! `CodeWriter.finish` publishes the written bytes as a `CodeBlock`, which is readable and
+//! executable but not writable. No page is ever writable and executable at once. A page of
+//! `allocate` belongs to one writer or block; a packed page is shared by the packed blocks on
+//! it, and while a packed writer writes there those blocks are not executable: the code that
+//! writes must not be running from them (one thread, see CodeMemory).
+import silk.core.ownership { Drop }
+import silk.core.option { Option }
+import silk.mem.pointer { Pointer }
+import silk.mem.layout { Layout }
+import silk.num.usize
+import silk.num.i32
+import silk.num.u8
+import silk.text.format { Debug, Format, Formatter }
+import silk.io.writer { Writer, WriterError }
+
+fn requireTarget() -> () {
+  static if Intrinsic.targetObjectFormat() == "wasm" {
+    compileError("silkjs-jit requires native executable memory; WebAssembly is unsupported")
+  } else {
+    static if Intrinsic.targetOperatingSystem() == "linux" && Intrinsic.targetArchitecture() == "x86_64" {
+      // x86-64 keeps instruction and data caches coherent; mprotect publishes completed writes.
+    } else {
+      // Not implemented and not tested: Linux arm64 needs an instruction-cache flush before
+      // publication, macOS arm64 needs MAP_JIT with pthread_jit_write_protect_np, and Windows
+      // needs VirtualAlloc/VirtualProtect.
+      compileError("silkjs-jit executable memory is implemented for Linux x86-64 only")
+    }
+  }
+}
+
+unsafe extern "C" fn mmap(address: ?*mut u8, size: usize, protection: i32, flags: i32, fd: i32, offset: i64) -> ?*mut u8
+unsafe extern "C" fn mprotect(address: *mut u8, size: usize, protection: i32) -> i32
+unsafe extern "C" fn madvise(address: *mut u8, size: usize, advice: i32) -> i32
+unsafe extern "C" fn munmap(address: *mut u8, size: usize) -> i32
+unsafe extern "C" fn getpagesize() -> i32
+unsafe extern "C" fn calloc(count: usize, size: usize) -> ?*mut u8
+unsafe extern "C" fn free(address: *mut u8) -> ()
+unsafe extern "C" fn memcpy(target: *mut u8, source: *const u8, size: usize) -> *mut u8
+unsafe extern "C" fn memset(target: *mut u8, value: i32, size: usize) -> *mut u8
+unsafe extern "C" fn errnoAddress() -> *const i32 as "__errno_location"
+
+const PROT_NONE: i32 = 0
+const PROT_READ_WRITE: i32 = 3
+const PROT_READ_EXECUTE: i32 = 5
+/// MAP_PRIVATE | MAP_ANONYMOUS.
+const MAP_PRIVATE_ANONYMOUS: i32 = 34
+const MADV_DONTNEED: i32 = 4
+/// The x86-64 `int3` opcode. Unused bytes of a published page hold it, so a stray jump traps.
+const TRAP_BYTE: i32 = 0xCC
+/// The alignment of a packed block's first byte: a cache line.
+pub const PACKED_ALIGN: usize = 64
+/// Packed sub-ranges within one `CodeMemory` mapping for `allocatePackedIn`:
+/// optimized hot code (`0..25%`), baseline code (`25%..50%`), and cold tails/exits (`50%..100%`).
+pub const PACK_OPT_HOT: usize = 0
+pub const PACK_BASE_HOT: usize = 1
+pub const PACK_COLD: usize = 2
+const PACK_LANES: usize = 3
+const LANE_DEFAULT: u8 = 255
+/// State.used of a page whose protection could not be revoked: never reused.
+const PINNED: u8 = 255
+
+/// `MemoryError.code` when the region has no run of free pages long enough for an allocation,
+/// or a control allocation failed (Linux `ENOMEM`).
+pub const OUT_OF_MEMORY: i32 = 12
+/// `MemoryError.code` for a zero-sized reservation or allocation, an allocation larger than the
+/// region, or publishing a writer that holds no bytes (Linux `EINVAL`).
+pub const INVALID_ARGUMENT: i32 = 22
+/// `MemoryError.code` when `CodeWriter.append` is given more bytes than the capacity the writer
+/// was allocated with has left (Linux `ENOSPC`).
+pub const NO_SPACE: i32 = 28
+
+/// Why an executable-memory operation failed. `code` is a Linux `errno` value: one of
+/// `OUT_OF_MEMORY`, `INVALID_ARGUMENT` or `NO_SPACE` when this package rejects the request, or
+/// the value the kernel set when `mmap` or `mprotect` failed.
+pub struct MemoryError { pub code: i32 }
+impl Debug for MemoryError {
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer {
+    let mut record = run Format.debugRecord("MemoryError", &mut formatter)
+    run Format.debugField(&mut record, "code", &self.code, &mut formatter)
+    return run Format.debugFinish(record, &mut formatter)
+  }
+}
+fn osError() -> MemoryError { return MemoryError { code: unsafe Pointer.read<i32>(unsafe errnoAddress()) } }
+
+/// The control record of one reserved region. It is heap-allocated and lives until the region's
+/// `CodeMemory` and every writer and block allocated from it have dropped; `references` counts
+/// those owners. `used` has one byte per page: how many writers and blocks own it (one for a
+/// page of `allocate`), or PINNED after its protection could not be revoked. `packed` has one
+/// byte per page, 1 while it holds `allocatePacked` blocks or `lane + 2` for `allocatePackedIn`.
+/// `bump` is the region offset after the last packed allocation (usize.MAX before the first),
+/// and `writing` whether a packed writer is out: a second one gets pages of its own.
+struct State {
+  base: *mut u8, bytes: usize, page: usize, pages: usize, references: usize,
+  used: [*]mut u8, packed: [*]mut u8, bump: usize, writing: bool,
+  laneBump: [usize; 3], laneWriting: [bool; 3]
+}
+
+/// A reserved range of address space that generated code is allocated from.
+///
+/// `reserve` maps the range with no access; `allocate` makes whole pages of it writable for one
+/// `CodeWriter`. Dropping the `CodeMemory` does not unmap pages that writers or blocks still own:
+/// the range is unmapped when the last of them drops. A `CodeMemory` and everything allocated
+/// from it must stay on one thread, because their shared bookkeeping is not synchronized.
+pub struct CodeMemory { state: *mut State }
+
+/// Ownership of a run of pages in a region, from byte `offset` of the first (0 but for packed
+/// blocks). Dropping it gives up each page; a page no one owns then loses all access, returns
+/// its physical memory to the kernel and is free again. `writing`: a packed writer's, whose
+/// shared pages get their execute access back when it drops unfinished.
+struct Lease { state: *mut State, first: usize, pages: usize, offset: usize, packed: bool, writing: bool, lane: u8 }
+
+/// Writable, non-executable pages being filled with machine code.
+///
+/// `append` copies bytes in; `finish` consumes the writer and publishes the bytes as an
+/// executable `CodeBlock`. Dropping a writer without finishing it discards its bytes and frees
+/// its pages. The writer never exposes a writable pointer.
+pub struct CodeWriter { lease: Lease, count: usize, limit: usize }
+
+/// Published machine code: readable and executable, never writable.
+///
+/// The code stays mapped for as long as the block lives, even after the `CodeMemory` it came from
+/// has dropped. Dropping the block removes all access to its pages and frees them for reuse, so
+/// every call into the block and every function pointer derived from `entry` must end first.
+pub struct CodeBlock { lease: Lease, count: usize }
+
+unsafe fn pageAddress(state: *mut State, index: usize) -> *mut u8 {
+  let anchor = ()
+  let s = unsafe Pointer.borrow(&anchor, state)
+  return unsafe Pointer.atMut<u8>(unsafe Pointer.assumeManyMut<u8>(s.base), index * s.page)
+}
+
+/// Gives up one owner of each of `pages` pages starting at page `first`. A page no one owns
+/// then loses all access, drops its contents and is free; one still owned keeps its access,
+/// but for `executable`: it is made readable and executable again (the shared page of a
+/// packed writer that drops unfinished). If the kernel refuses to revoke access a page stays
+/// PINNED for the rest of the region's life: a page that may still be executable must never
+/// be handed out as writable.
+unsafe fn revoke(state: *mut State, first: usize, pages: usize, executable: bool) -> () {
+  let anchor = ()
+  let s = unsafe Pointer.borrow(&anchor, state)
+  let mut index = first
+  while index < first + pages {
+    let at = unsafe Pointer.atMut<u8>(s.used, index)
+    let owners = unsafe Pointer.read<u8>(at)
+    let address = unsafe pageAddress(state, index)
+    if owners == PINNED || owners == 0 {
+    } else if owners > 1 {
+      unsafe Pointer.write<u8>(at, owners - 1)
+      if executable && unsafe mprotect(address, s.page, PROT_READ_EXECUTE) != 0 { unsafe Pointer.write<u8>(at, PINNED) }
+    } else if unsafe mprotect(address, s.page, PROT_NONE) != 0 {
+      unsafe Pointer.write<u8>(at, PINNED)
+    } else {
+      // The next owner of the page reads zeroes, and the old code no longer costs memory.
+      // If the advice fails the stale bytes remain; `allocate` hands the page out all the
+      // same, and `finish` overwrites whatever a published page does not use.
+      drop unsafe madvise(address, s.page, MADV_DONTNEED)
+      unsafe Pointer.write<u8>(at, 0)
+      unsafe Pointer.write<u8>(unsafe Pointer.atMut<u8>(s.packed, index), 0)
+    }
+    index = index + 1
+  }
+}
+
+unsafe fn release(state: *mut State) -> () {
+  let mut anchor = ()
+  let s = unsafe Pointer.borrowMut(&mut anchor, state)
+  s.references = s.references - 1
+  if s.references != 0 { return () }
+  drop unsafe munmap(s.base, s.bytes)
+  unsafe free(unsafe Intrinsic.pointerRequalify<[*]mut u8, *mut u8>(s.used))
+  unsafe free(unsafe Intrinsic.pointerRequalify<[*]mut u8, *mut u8>(s.packed))
+  drop s
+  unsafe free(unsafe Intrinsic.pointerReinterpret<*mut State, *mut u8>(state))
+}
+
+impl Drop for CodeMemory { fn drop(self: &mut Self) -> () { unsafe release(self.state) } }
+impl Drop for Lease {
+  fn drop(self: &mut Self) -> () {
+    if self.writing {
+      let mut anchor = ()
+      let s = unsafe Pointer.borrowMut(&mut anchor, self.state)
+      if self.lane < 3 { s.laneWriting[u8.toUsize(self.lane)] = false }
+      else { s.writing = false }
+    }
+    unsafe revoke(self.state, self.first, self.pages, self.writing)
+    unsafe release(self.state)
+  }
+}
+
+impl CodeMemory {
+  /// Reserves at least `bytes` bytes of address space, rounded up to whole pages, with no access.
+  /// Reserved pages cost no physical memory until a writer touches them.
+  ///
+  /// Fails with `INVALID_ARGUMENT` when `bytes` is zero or rounding it up overflows, with
+  /// `OUT_OF_MEMORY` when the bookkeeping cannot be allocated, and with the kernel's error code
+  /// when the range cannot be mapped.
+  pub effect fn reserve(bytes: usize) -> CodeMemory ! MemoryError {
+    requireTarget()
+    let page = i32.toUsize(unsafe getpagesize())
+    if bytes == 0 || bytes > usize.MAX - (page - 1) { fail MemoryError { code: INVALID_ARGUMENT } }
+    let pages = (bytes + page - 1) / page
+    let size = pages * page
+    let raw = unsafe mmap(Pointer.null<u8>(), size, PROT_NONE, MAP_PRIVATE_ANONYMOUS, -1, 0)
+    // MAP_FAILED is the all-ones address.
+    if Pointer.address<u8>(raw) == usize.MAX || Pointer.isNull<u8>(raw) { fail osError() }
+    let base = unsafe Intrinsic.pointerRequalify<?*mut u8, *mut u8>(raw)
+    let control = unsafe calloc(1, Layout.of<State>().bytes)
+    if Pointer.isNull<u8>(control) {
+      drop unsafe munmap(base, size)
+      fail MemoryError { code: OUT_OF_MEMORY }
+    }
+    let bitmap = unsafe calloc(pages, 1)
+    let packed = unsafe calloc(pages, 1)
+    if Pointer.isNull<u8>(bitmap) || Pointer.isNull<u8>(packed) {
+      if !Pointer.isNull<u8>(bitmap) { unsafe free(unsafe Intrinsic.pointerRequalify<?*mut u8, *mut u8>(bitmap)) }
+      if !Pointer.isNull<u8>(packed) { unsafe free(unsafe Intrinsic.pointerRequalify<?*mut u8, *mut u8>(packed)) }
+      unsafe free(unsafe Intrinsic.pointerRequalify<?*mut u8, *mut u8>(control))
+      drop unsafe munmap(base, size)
+      fail MemoryError { code: OUT_OF_MEMORY }
+    }
+    let state = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut State>(unsafe Intrinsic.pointerRequalify<?*mut u8, *mut u8>(control))
+    unsafe Pointer.put<State>(state, State {
+      base: base, bytes: size, page: page, pages: pages, references: 1,
+      used: unsafe Intrinsic.pointerRequalify<?*mut u8, [*]mut u8>(bitmap),
+      packed: unsafe Intrinsic.pointerRequalify<?*mut u8, [*]mut u8>(packed), bump: usize.MAX, writing: false,
+      laneBump: [usize.MAX, usize.MAX, usize.MAX], laneWriting: [false, false, false] })
+    return CodeMemory { state: state }
+  }
+
+  /// The size of one page in bytes. Every writer and block occupies a whole number of pages.
+  pub fn pageSize(self: &Self) -> usize {
+    let anchor = ()
+    let s = unsafe Pointer.borrow(&anchor, self.state)
+    return s.page
+  }
+
+  /// The number of pages in the region, free or not.
+  pub fn pageCount(self: &Self) -> usize {
+    let anchor = ()
+    let s = unsafe Pointer.borrow(&anchor, self.state)
+    return s.pages
+  }
+
+  /// The number of pages currently owned by writers or blocks, plus any page whose protection
+  /// the kernel refused to revoke and which is therefore never reused.
+  pub fn usedPages(self: &Self) -> usize {
+    let anchor = ()
+    let s = unsafe Pointer.borrow(&anchor, self.state)
+    let mut used: usize = 0
+    let mut index: usize = 0
+    while index < s.pages {
+      if unsafe Pointer.read<u8>(unsafe Pointer.at<u8>(s.used, index)) != 0 { used = used + 1 }
+      index = index + 1
+    }
+    return used
+  }
+
+  /// Makes the first run of free pages that holds `capacity` bytes readable and writable, and
+  /// returns a writer that accepts up to `capacity` bytes. The pages read as zero.
+  ///
+  /// Fails with `INVALID_ARGUMENT` when `capacity` is zero or larger than the region, with
+  /// `OUT_OF_MEMORY` when no run of free pages is long enough, and with the kernel's error code
+  /// when the pages cannot be made writable.
+  pub effect fn allocate(self: &mut Self, capacity: usize) -> CodeWriter ! MemoryError {
+    let mut anchor = ()
+    let s = unsafe Pointer.borrowMut(&mut anchor, self.state)
+    if capacity == 0 || capacity > s.bytes { fail MemoryError { code: INVALID_ARGUMENT } }
+    let pages = (capacity + s.page - 1) / s.page
+    let mut start: usize = 0
+    let mut found: usize = 0
+    let mut index: usize = 0
+    while index < s.pages {
+      if unsafe Pointer.read<u8>(unsafe Pointer.at<u8>(s.used, index)) == 0 { found = found + 1 }
+      else { found = 0 start = index + 1 }
+      if found == pages { break }
+      index = index + 1
+    }
+    if found != pages { fail MemoryError { code: OUT_OF_MEMORY } }
+    let address = unsafe pageAddress(self.state, start)
+    if unsafe mprotect(address, pages * s.page, PROT_READ_WRITE) != 0 { fail osError() }
+    drop unsafe memset(unsafe Pointer.atMut<u8>(s.used, start), 1, pages)
+    s.references = s.references + 1
+    return CodeWriter { lease: Lease { state: self.state, first: start, pages: pages, offset: 0, packed: false, writing: false, lane: LANE_DEFAULT }, count: 0, limit: capacity }
+  }
+
+  /// A writer for `capacity` bytes right after the last packed block (at the next multiple of
+  /// PACKED_ALIGN), on the page that block ends on when it fits there, else at the start of a
+  /// run of free pages. Many small blocks then share pages: fewer pages and translation
+  /// entries for the code that runs, and entry points spread over cache sets instead of
+  /// all at a page's start. While it writes, the blocks on the pages it shares are not
+  /// executable. With a packed writer already out it gets pages of its own (`allocate`).
+  ///
+  /// Fails as `allocate` does.
+  pub effect fn allocatePacked(self: &mut Self, capacity: usize) -> CodeWriter ! MemoryError {
+    let mut anchor = ()
+    let s = unsafe Pointer.borrowMut(&mut anchor, self.state)
+    if s.writing { drop s return run self.allocate(capacity) }
+    if capacity == 0 || capacity > s.bytes { fail MemoryError { code: INVALID_ARGUMENT } }
+    let mut start = usize.MAX
+    if s.bump != usize.MAX && s.bump <= s.bytes - PACKED_ALIGN {
+      let at = (s.bump + PACKED_ALIGN - 1) / PACKED_ALIGN * PACKED_ALIGN
+      if capacity <= s.bytes - at {
+        let firstPage = at / s.page
+        let lastPage = (at + capacity - 1) / s.page
+        let owners = unsafe Pointer.read<u8>(unsafe Pointer.at<u8>(s.used, firstPage))
+        let shared = unsafe Pointer.read<u8>(unsafe Pointer.at<u8>(s.packed, firstPage)) == 1
+        let mut fits = owners == 0 || (shared && owners < PINNED - 1)
+        let mut index = firstPage + 1
+        while fits && index <= lastPage {
+          if unsafe Pointer.read<u8>(unsafe Pointer.at<u8>(s.used, index)) != 0 { fits = false }
+          index = index + 1
+        }
+        if fits { start = at }
+      }
+    }
+    if start == usize.MAX {
+      let pages = (capacity + s.page - 1) / s.page
+      let mut found: usize = 0
+      let mut index: usize = 0
+      while index < s.pages {
+        if unsafe Pointer.read<u8>(unsafe Pointer.at<u8>(s.used, index)) == 0 { found = found + 1 }
+        else { found = 0 }
+        if found == pages { start = (index + 1 - pages) * s.page break }
+        index = index + 1
+      }
+      if start == usize.MAX { fail MemoryError { code: OUT_OF_MEMORY } }
+    }
+    let first = start / s.page
+    let pages = (start + capacity - 1) / s.page + 1 - first
+    if unsafe mprotect(unsafe pageAddress(self.state, first), pages * s.page, PROT_READ_WRITE) != 0 { fail osError() }
+    let mut index = first
+    while index < first + pages {
+      let at = unsafe Pointer.atMut<u8>(s.used, index)
+      unsafe Pointer.write<u8>(at, unsafe Pointer.read<u8>(at) + 1)
+      unsafe Pointer.write<u8>(unsafe Pointer.atMut<u8>(s.packed, index), 1)
+      index = index + 1
+    }
+    s.bump = start + capacity
+    s.writing = true
+    s.references = s.references + 1
+    return CodeWriter { lease: Lease { state: self.state, first: first, pages: pages, offset: start - first * s.page, packed: true, writing: true, lane: LANE_DEFAULT }, count: 0, limit: capacity }
+  }
+
+  /// Packed allocation within one of three disjoint sub-ranges of the same mapping:
+  /// `PACK_OPT_HOT` (`0..12.5%`), `PACK_BASE_HOT` (`12.5%..25%`), or `PACK_COLD` (`25%..100%`).
+  /// Because each lane owns disjoint pages, writers in different lanes (e.g. hot and cold)
+  /// may be open simultaneously. Falls back to `allocate` if the lane's sub-range is full
+  /// or already has an open writer.
+  pub effect fn allocatePackedIn(self: &mut Self, lane: usize, capacity: usize) -> CodeWriter ! MemoryError {
+    if lane >= PACK_LANES { return run self.allocatePacked(capacity) }
+    let mut anchor = ()
+    let s = unsafe Pointer.borrowMut(&mut anchor, self.state)
+    if capacity == 0 || capacity > s.bytes { fail MemoryError { code: INVALID_ARGUMENT } }
+    if s.laneWriting[lane] { drop s return run self.allocate(capacity) }
+    let mut loPage: usize = 0
+    let mut hiPage: usize = s.pages
+    if s.pages >= 8 {
+      let eighth = s.pages / 8
+      if lane == PACK_OPT_HOT { loPage = 0 hiPage = eighth }
+      else if lane == PACK_BASE_HOT { loPage = eighth hiPage = eighth * 2 }
+      else { loPage = eighth * 2 hiPage = s.pages }
+    } else if s.pages >= 4 {
+      let quarter = s.pages / 4
+      if lane == PACK_OPT_HOT { loPage = 0 hiPage = quarter }
+      else if lane == PACK_BASE_HOT { loPage = quarter hiPage = quarter * 2 }
+      else { loPage = quarter * 2 hiPage = s.pages }
+    }
+    let loBytes = loPage * s.page
+    let hiBytes = hiPage * s.page
+    let tag = usize.toU8(lane + 2)
+    let mut start = usize.MAX
+    let bump = s.laneBump[lane]
+    if bump != usize.MAX && bump >= loBytes && bump <= hiBytes - PACKED_ALIGN {
+      let at = (bump + PACKED_ALIGN - 1) / PACKED_ALIGN * PACKED_ALIGN
+      if capacity <= hiBytes - at {
+        let firstPage = at / s.page
+        let lastPage = (at + capacity - 1) / s.page
+        let owners = unsafe Pointer.read<u8>(unsafe Pointer.at<u8>(s.used, firstPage))
+        let shared = unsafe Pointer.read<u8>(unsafe Pointer.at<u8>(s.packed, firstPage)) == tag
+        let mut fits = owners == 0 || (shared && owners < PINNED - 1)
+        let mut index = firstPage + 1
+        while fits && index <= lastPage {
+          if unsafe Pointer.read<u8>(unsafe Pointer.at<u8>(s.used, index)) != 0 { fits = false }
+          index = index + 1
+        }
+        if fits { start = at }
+      }
+    }
+    if start == usize.MAX {
+      let pages = (capacity + s.page - 1) / s.page
+      let mut found: usize = 0
+      let mut index = loPage
+      while index < hiPage {
+        if unsafe Pointer.read<u8>(unsafe Pointer.at<u8>(s.used, index)) == 0 { found = found + 1 }
+        else { found = 0 }
+        if found == pages { start = (index + 1 - pages) * s.page break }
+        index = index + 1
+      }
+      if start == usize.MAX {
+        drop s
+        return run self.allocate(capacity)
+      }
+    }
+    let first = start / s.page
+    let pages = (start + capacity - 1) / s.page + 1 - first
+    if unsafe mprotect(unsafe pageAddress(self.state, first), pages * s.page, PROT_READ_WRITE) != 0 { fail osError() }
+    let mut index = first
+    while index < first + pages {
+      let at = unsafe Pointer.atMut<u8>(s.used, index)
+      unsafe Pointer.write<u8>(at, unsafe Pointer.read<u8>(at) + 1)
+      unsafe Pointer.write<u8>(unsafe Pointer.atMut<u8>(s.packed, index), tag)
+      index = index + 1
+    }
+    s.laneBump[lane] = start + capacity
+    s.laneWriting[lane] = true
+    s.references = s.references + 1
+    return CodeWriter { lease: Lease { state: self.state, first: first, pages: pages, offset: start - first * s.page, packed: true, writing: true, lane: usize.toU8(lane) }, count: 0, limit: capacity }
+  }
+}
+
+impl Lease {
+  /// The lease's first byte.
+  fn address(self: &Self) -> *mut u8 { return unsafe Pointer.atMut<u8>(unsafe Pointer.assumeManyMut<u8>(unsafe pageAddress(self.state, self.first)), self.offset) }
+  fn pageSize(self: &Self) -> usize {
+    let anchor = ()
+    let s = unsafe Pointer.borrow(&anchor, self.state)
+    return s.page
+  }
+  /// Gives back every page after the first `keep`.
+  fn trim(self: &mut Self, keep: usize) -> () {
+    if keep >= self.pages { return () }
+    unsafe revoke(self.state, self.first + keep, self.pages - keep, false)
+    self.pages = keep
+  }
+}
+
+impl CodeWriter {
+  /// The number of bytes appended so far.
+  pub fn length(self: &Self) -> usize { return self.count }
+  /// The capacity this writer was allocated with: the most bytes `append` accepts in total.
+  pub fn capacity(self: &Self) -> usize { return self.limit }
+  /// The address the first appended byte has, now and after `finish`. Code can therefore embed
+  /// absolute addresses of its own bytes before it is published. The address is an integer, not
+  /// a pointer: the writer's pages are not executable and must not be written through it.
+  pub fn address(self: &Self) -> usize { return Pointer.address<u8>(self.lease.address()) }
+
+  /// Copies `bytes` to the end of the code written so far.
+  ///
+  /// Fails with `NO_SPACE`, writing nothing, when fewer than `bytes.length` bytes of the
+  /// writer's capacity remain.
+  pub effect fn append(self: &mut Self, bytes: &[u8]) -> () ! MemoryError {
+    if bytes.length > self.limit - self.count { fail MemoryError { code: NO_SPACE } }
+    match Pointer.nonNullMany<u8>(Pointer.fromSlice<u8>(bytes)) {
+      Option<[*]const u8>.Some { value: source } => {
+        let target = unsafe Pointer.atMut<u8>(unsafe Pointer.assumeManyMut<u8>(self.lease.address()), self.count)
+        drop unsafe memcpy(target, unsafe Pointer.at<u8>(source, 0), bytes.length)
+      }
+      Option<[*]const u8>.None => {}
+    }
+    self.count = self.count + bytes.length
+  }
+
+  /// Publishes the appended bytes: the pages holding them become readable and executable and
+  /// stop being writable, pages the bytes did not reach go back to the region, and the unused
+  /// rest of the last page is filled with trapping `int3` instructions.
+  ///
+  /// Fails with `INVALID_ARGUMENT` when nothing was appended, and with the kernel's error code
+  /// when the protection cannot be changed. On failure the writer's pages are freed.
+  pub effect fn finish(self: Self) -> CodeBlock ! MemoryError {
+    return match move self {
+      CodeWriter { lease, count, limit } => {
+        let mut lease = move lease
+        if count == 0 { fail MemoryError { code: INVALID_ARGUMENT } }
+        let page = lease.pageSize()
+        let end = lease.offset + count
+        let keep = (end + page - 1) / page
+        lease.trim(keep)
+        let base = unsafe pageAddress(lease.state, lease.first)
+        // Past the code to the end of its last page nothing is anyone's (a packed block's
+        // successor is written after it is published).
+        if end < keep * page {
+          let tail = unsafe Pointer.atMut<u8>(unsafe Pointer.assumeManyMut<u8>(base), end)
+          drop unsafe memset(tail, TRAP_BYTE, keep * page - end)
+        }
+        if unsafe mprotect(base, keep * page, PROT_READ_EXECUTE) != 0 { fail osError() }
+        if lease.packed {
+          let mut anchor = ()
+          let s = unsafe Pointer.borrowMut(&mut anchor, lease.state)
+          // The capacity this block did not use goes back to the next packed one.
+          if lease.lane < 3 {
+            let l = u8.toUsize(lease.lane)
+            if s.laneBump[l] == lease.first * page + lease.offset + limit { s.laneBump[l] = lease.first * page + end }
+            s.laneWriting[l] = false
+          } else {
+            if s.bump == lease.first * page + lease.offset + limit { s.bump = lease.first * page + end }
+            s.writing = false
+          }
+          drop s
+          lease.writing = false
+        }
+        return CodeBlock { lease: move lease, count: count }
+      }
+    }
+  }
+}
+
+impl CodeBlock {
+  /// The number of bytes of code in the block.
+  pub fn length(self: &Self) -> usize { return self.count }
+  /// The number of whole pages the block occupies.
+  pub fn pages(self: &Self) -> usize { return self.lease.pages }
+  /// The address of the block's first byte.
+  ///
+  /// The address is valid only while this block lives. Calling it is unsafe: the caller must use
+  /// the exact C ABI signature the code implements, and the code must preserve callee-saved
+  /// registers, keep the stack aligned, and return normally. Nothing can unwind through it.
+  pub fn entry(self: &Self) -> *const u8 { return self.lease.address() }
+}

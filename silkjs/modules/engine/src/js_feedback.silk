@@ -1,0 +1,590 @@
+//! Call and type feedback for an optional tier above the interpreter. An
+//! embedder starts recording a function, usually from its hot function report
+//! (js_hotness); while any function records, RuntimeState.observeInstructions is
+//! on and the observed dispatch loop calls observe before every instruction, so
+//! the plain loop carries no recording code. Each recorded function has one Site
+//! per arithmetic, comparison, call and named property instruction, found by one
+//! scan of its bytecode when recording starts; observe only updates them.
+//! Sites hold no pointer: call targets live in a separate table (Target) and
+//! shapes are named by ShapeData.version. Design and measurements: docs/jit/feedback.md.
+import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.mem.pointer { Pointer }
+import silk.num.i32
+import silk.num.i64
+import silk.num.u8
+import silk.num.u16
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+import js_heap { HeapCell, HeapHeader }
+import js_value { ValueBits }
+import js_core_types { FunctionBytecode, RuntimeState, ObjectData, ObjectPayload, ShapeData, NativeFunctionId, refreshObservation }
+import js_vm_state { Machine }
+import js_gc { HeapHooks }
+import js_gc as gc
+import js_opcode_data as op
+import js_class_data as classes
+
+/// Site kinds.
+pub const KIND_BINARY: u8 = 1
+pub const KIND_UNARY: u8 = 2
+pub const KIND_CALL: u8 = 3
+pub const KIND_PROPERTY: u8 = 4
+/// if_false, if_true (and their 8-bit and keep forms) and lnot: left is the class of the value
+/// tested, SEEN_NOT_BOOL says whether it was ever something other than a boolean.
+pub const KIND_BRANCH: u8 = 5
+/// get_array_el (2, 3), put_array_el and the fused local and argument element reads: left is
+/// the receiver's class, right the element kind (ELEMENT_*).
+pub const KIND_ELEMENT: u8 = 6
+/// Element kinds of a KIND_ELEMENT site's right: none yet, a fast array, a typed array (plus
+/// its class minus JS_CLASS_UINT8C_ARRAY), or more than one kind.
+pub const ELEMENT_NONE: u8 = 0
+pub const ELEMENT_FAST: u8 = 1
+pub const ELEMENT_TYPED: u8 = 2
+/// An ordinary object read with a flat string, symbol or nonnegative integer key.
+pub const ELEMENT_ORDINARY: u8 = 254
+pub const ELEMENT_MIXED: u8 = 255
+/// Operand classes, ORed into Site.left and Site.right. For a property site,
+/// left is the receiver's class.
+pub const SEEN_INT: u8 = 1
+pub const SEEN_DOUBLE: u8 = 2
+pub const SEEN_STRING: u8 = 4
+pub const SEEN_OBJECT: u8 = 8
+pub const SEEN_OTHER: u8 = 16
+/// Site.flags: int32 operands whose result is not an int32 (overflow, -0, a
+/// fraction, a shift past the int32 range).
+pub const SEEN_OVERFLOW: u8 = 1
+/// Site.flags of a KIND_BRANCH site: the value tested was not a boolean.
+pub const SEEN_NOT_BOOL: u8 = 2
+/// Site.targets and Site.shapeCount past their inline capacity.
+pub const MEGAMORPHIC_TARGETS: u8 = 3
+pub const MEGAMORPHIC_SHAPES: u8 = 5
+pub const NO_TARGET: u32 = 0xffffffff
+/// Target kinds.
+pub const TARGET_BYTECODE: u8 = 1
+pub const TARGET_NATIVE: u8 = 2
+pub const TARGET_OTHER: u8 = 3
+/// Observed instructions a function records before it stops by itself. Every
+/// recording also stops once all functions together ran WINDOW_FACTOR times the
+/// latest start's budget in the observed loop, so a recorded function that
+/// stops running cannot keep the whole runtime there.
+pub const DEFAULT_FUNCTION_BUDGET: u32 = 20000
+pub const WINDOW_FACTOR: u64 = 4
+
+/// One feedback site: the instruction at offset in its function's code.
+pub struct Site {
+  pub offset: u32,
+  pub opcode: u8,
+  pub kind: u8,
+  pub left: u8,
+  pub right: u8,
+  pub flags: u8,
+  /// Distinct call targets seen: 0, 1, 2, or MEGAMORPHIC_TARGETS for more.
+  pub targets: u8,
+  /// Distinct receiver shapes seen: 0 to 4, or MEGAMORPHIC_SHAPES for more.
+  pub shapeCount: u8,
+  pub count: u32,
+  /// The first two targets: indexes into the targets of the same Record or Snapshot.
+  pub first: u32,
+  pub second: u32,
+  /// ShapeData.version of the first receiver shapes: runtime ids, not pointers,
+  /// meaningful only in the process that recorded them.
+  pub shapes: [u64; 4]
+}
+impl Copy for Site {}
+/// A call target. function is a FunctionBytecode for TARGET_BYTECODE: retained
+/// by the recorder, borrowed in a Snapshot. native and magic name a builtin or
+/// host function by its id, which does not depend on the process.
+pub struct Target { pub kind: u8, pub function: ValueBits, pub native: NativeFunctionId, pub magic: u16 }
+impl Copy for Target {}
+/// One recorded function: its sites are sites[firstSite..firstSite + siteCount].
+pub struct Record {
+  pub function: ValueBits,
+  pub recording: bool,
+  pub left: u32,
+  pub observed: u64,
+  pub firstSite: usize,
+  pub siteCount: usize
+}
+impl Copy for Record {}
+pub struct State {
+  /// Records with recording set; observation stays on while nonzero.
+  pub recording: u32,
+  pub windowLeft: u64,
+  /// Instructions the observed loop ran while anything recorded, and how many
+  /// of them were in recorded functions.
+  pub observedTotal: u64,
+  pub observedRecorded: u64,
+  records: List<Record>,
+  sites: List<Site>,
+  /// Retained targets of every record, appended within the capacity start reserved.
+  targets: List<Target>,
+  cached: usize,
+  cachedAddress: usize
+}
+impl State {
+  pub fn make() -> Self {
+    return Self { recording: 0, windowLeft: 0, observedTotal: 0, observedRecorded: 0, records: List<Record>.make(), sites: List<Site>.make(),
+      targets: List<Target>.make(), cached: 0, cachedAddress: 0 }
+  }
+}
+/// What a reader gets: a copy of one record, with targets renumbered into its own table.
+pub struct Snapshot {
+  pub recording: bool,
+  pub observed: u64,
+  pub sites: List<Site>,
+  pub targets: List<Target>
+}
+
+/// The site kind of a final-code opcode, or 0.
+pub fn siteKind(opcode: u8) -> u8 {
+  // add_loc_loc8 .. mul_top_loc8, add_top_arg8 .. mul_top_arg8, the immediates.
+  if (opcode >= 152 && opcode <= 164) || (opcode >= 167 && opcode <= 173) || opcode == 146 { return KIND_BINARY }
+  if (opcode >= 187 && opcode <= 192) || (opcode >= 217 && opcode <= 219) || (opcode >= 231 && opcode <= 234) || opcode == 211 { return KIND_BINARY }
+  if opcode == 71 || opcode == 72 { return KIND_BINARY }
+  if (opcode >= 138 && opcode <= 145) || opcode == 209 || opcode == 210 { if opcode != 139 { return KIND_UNARY } }
+  if (opcode >= 33 && opcode <= 37) || (opcode >= 242 && opcode <= 245) { return KIND_CALL }
+  if opcode == op.OP_get_field || opcode == op.OP_get_field2 || opcode == op.OP_put_field || opcode == op.OP_get_length
+    || opcode == op.OP_get_loc_field8 || opcode == op.OP_get_arg_field8 || opcode == op.OP_put_loc_field_loc8 || opcode == op.OP_put_loc_field_arg8 {
+    return KIND_PROPERTY
+  }
+  if opcode == op.OP_if_false || opcode == op.OP_if_true || opcode == op.OP_if_false8 || opcode == op.OP_if_true8
+    || opcode == op.OP_if_true_keep8 || opcode == op.OP_if_false_keep8 || opcode == op.OP_lnot { return KIND_BRANCH }
+  if opcode == op.OP_get_array_el || opcode == op.OP_get_array_el2 || opcode == op.OP_get_array_el3 || opcode == op.OP_put_array_el
+    || opcode == op.OP_get_loc_el8 || opcode == op.OP_get_arg_el8 || opcode == op.OP_get_loc_el_arg8 || opcode == op.OP_get_arg_el_arg8 { return KIND_ELEMENT }
+  return 0
+}
+fn classOf(value: ValueBits) -> u8 {
+  return match value {
+    ValueBits.Int { .. } => SEEN_INT
+    ValueBits.Float64 { .. } => SEEN_DOUBLE
+    ValueBits.String { .. } => SEEN_STRING
+    ValueBits.Rope { .. } => SEEN_STRING
+    ValueBits.Object { .. } => SEEN_OBJECT
+    _ => SEEN_OTHER
+  }
+}
+fn fitsInt(value: i64) -> bool { return value >= -2147483648 && value <= 2147483647 }
+/// Whether int32 operands a and b of opcode give a result that is not an int32.
+fn overflows(opcode: u8, a: i32, b: i32) -> bool {
+  let x = i32.toI64(a) let y = i32.toI64(b)
+  if opcode == op.OP_add || opcode == op.OP_add_loc || opcode == op.OP_add_loc_loc8 || opcode == op.OP_add_top_loc8 || opcode == op.OP_add_top_arg8 || opcode == op.OP_add_imm { return !fitsInt(x + y) }
+  if opcode == op.OP_sub || opcode == op.OP_sub_loc_loc8 || opcode == op.OP_sub_top_loc8 || opcode == op.OP_sub_top_arg8 { return !fitsInt(x - y) }
+  if opcode == op.OP_mul || opcode == op.OP_mul_loc_loc8 || opcode == op.OP_mul_top_loc8 || opcode == op.OP_mul_top_arg8 {
+    // A zero product of a negative operand is -0.
+    return !fitsInt(x * y) || (x * y == 0 && (x < 0 || y < 0))
+  }
+  if opcode == op.OP_div { return y == 0 || x % y != 0 || (x == 0 && y < 0) || !fitsInt(x / y) }
+  if opcode == op.OP_mod { return y == 0 || (x < 0 && x % y == 0) }
+  if opcode == op.OP_shr { return x < 0 && (y & 31) == 0 }
+  return false
+}
+fn unaryOverflows(opcode: u8, a: i32, mode: u8) -> bool {
+  if opcode == op.OP_neg { return a == 0 || a == -2147483648 }
+  if opcode == op.OP_inc || opcode == op.OP_post_inc || opcode == op.OP_inc_loc { return a == 2147483647 }
+  if opcode == op.OP_dec || opcode == op.OP_post_dec || opcode == op.OP_dec_loc { return a == -2147483648 }
+  // step_loc8, step_arg8: mode bit 2 steps down.
+  if opcode == op.OP_step_loc8 || opcode == op.OP_step_arg8 {
+    if (mode & 2) != 0 { return a == -2147483648 }
+    return a == 2147483647
+  }
+  return false
+}
+/// The signed 16-bit immediate right after the opcode.
+unsafe fn immediate16(machine: &Machine) -> i32 {
+  let raw = u16.toI32(unsafe machine.peekU16At(1))
+  if raw >= 32768 { return raw - 65536 }
+  return raw
+}
+fn addressOf(function: ValueBits) -> usize {
+  return match function { ValueBits.FunctionBytecode { reference } => Pointer.address<HeapHeader>(reference) _ => 0 }
+}
+fn indexOf(state: &State, address: usize) -> usize {
+  if state.cachedAddress == address { return state.cached }
+  let mut index: usize = 0
+  while index < state.records.length() {
+    if addressOf(state.records.asSlice()[index].function) == address { return index }
+    index = index + 1
+  }
+  return index
+}
+/// The site of record at offset, or sites.length() when the instruction has none.
+fn siteAt(state: &State, record: &Record, offset: usize) -> usize {
+  let mut low = record.firstSite let mut high = record.firstSite + record.siteCount
+  while low < high {
+    let middle = low + (high - low) / 2
+    if u32.toUsize(state.sites.get(middle).offset) < offset { low = middle + 1 } else { high = middle }
+  }
+  if low < record.firstSite + record.siteCount && u32.toUsize(state.sites.get(low).offset) == offset { return low }
+  return state.sites.length()
+}
+
+/// Starts recording bytecode (a FunctionBytecode cell) for budget observed
+/// instructions of its own, or resumes a stopped record with a fresh budget.
+/// False when bytecode is still a stub, or when it is recording already.
+pub unsafe effect fn start(runtime: *mut HeapHeader, bytecode: *mut HeapHeader, budget: u32) -> bool
+  ! OutOfMemoryError ? &mut Allocator {
+  let mut anchor = ()
+  let address = Pointer.address<HeapHeader>(bytecode)
+  let current = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
+  let found = indexOf(&current.feedback, address)
+  let known = found < current.feedback.records.length()
+  drop current
+  if known {
+    let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+    let mut record = state.feedback.records.get(found)
+    if record.recording { return false }
+    record.recording = true record.left = budget
+    state.feedback.records.set(found, record)
+    unsafe begin(&mut state, budget)
+    return true
+  }
+  let code = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, bytecode)
+  if code.pending.isSome() { return false }
+  let bytes = unsafe code.code.asSlice()
+  let mut sites = List<Site>.make()
+  let mut calls: usize = 0
+  let mut pc: usize = 0
+  while pc < bytes.length {
+    let opcode = bytes[pc]
+    let kind = siteKind(opcode)
+    if kind != 0 {
+      run sites.append(Site { offset: usize.toU32(pc), opcode: opcode, kind: kind, left: 0, right: 0, flags: 0,
+        targets: 0, shapeCount: 0, count: 0, first: NO_TARGET, second: NO_TARGET, shapes: [0; 4] })
+      if kind == KIND_CALL { calls = calls + 1 }
+    }
+    let size = u8.toUsize(op.opcodeInfo(opcode, true).size)
+    pc = pc + if size == 0 { 1 } else { size }
+  }
+  drop code
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  run state.feedback.records.reserve(1)
+  run state.feedback.sites.reserve(sites.length())
+  // Room for two targets at every call site of every record: an earlier record's sites
+  // may still take theirs.
+  // (Counted here, not kept: machine code reads RuntimeState fields by offset.)
+  let mut earlier: usize = 0
+  let mut seen: usize = 0
+  while seen < state.feedback.sites.length() { if state.feedback.sites.get(seen).kind == KIND_CALL { earlier = earlier + 1 } seen = seen + 1 }
+  let room = (earlier + calls) * 2
+  let held = state.feedback.targets.length()
+  if room > held { run state.feedback.targets.reserve(room - held) }
+  let first = state.feedback.sites.length()
+  let mut index: usize = 0
+  while index < sites.length() { drop state.feedback.sites.appendWithinCapacity(sites.get(index)) index = index + 1 }
+  let function = unsafe (ValueBits.FunctionBytecode { reference: bytecode }).retained()
+  drop state.feedback.records.appendWithinCapacity(Record { function: function, recording: true, left: budget,
+    observed: 0, firstSite: first, siteCount: sites.length() })
+  state.feedback.cachedAddress = 0
+  unsafe begin(&mut state, budget)
+  return true
+}
+unsafe fn begin(state: &mut RuntimeState, budget: u32) -> () {
+  state.feedback.recording = state.feedback.recording + 1
+  let window = u32.toU64(budget) * WINDOW_FACTOR
+  if state.feedback.windowLeft < window { state.feedback.windowLeft = window }
+  refreshObservation(&mut state)
+}
+/// Stops recording bytecode, keeping what it recorded. False when it was not recording.
+pub unsafe fn stop(runtime: *mut HeapHeader, bytecode: *mut HeapHeader) -> bool {
+  let mut anchor = () let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  let found = indexOf(&state.feedback, Pointer.address<HeapHeader>(bytecode))
+  if found >= state.feedback.records.length() { return false }
+  return stopRecord(&mut state, found)
+}
+fn stopRecord(state: &mut RuntimeState, index: usize) -> bool {
+  let mut record = state.feedback.records.get(index)
+  if !record.recording { return false }
+  record.recording = false
+  state.feedback.records.set(index, record)
+  state.feedback.recording = state.feedback.recording - 1
+  if state.feedback.recording == 0 { state.feedback.windowLeft = 0 }
+  refreshObservation(&mut state)
+  return true
+}
+fn stopAll(state: &mut RuntimeState) -> () {
+  let mut index: usize = 0
+  while index < state.feedback.records.length() { drop stopRecord(&mut state, index) index = index + 1 }
+  state.feedback.windowLeft = 0
+}
+/// Whether bytecode is recording now.
+pub unsafe fn isRecording(runtime: *mut HeapHeader, bytecode: *mut HeapHeader) -> bool {
+  let anchor = () let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
+  let found = indexOf(&state.feedback, Pointer.address<HeapHeader>(bytecode))
+  if found >= state.feedback.records.length() { return false }
+  return state.feedback.records.get(found).recording
+}
+/// A copy of what bytecode recorded so far, or None when it never recorded. The
+/// copy's TARGET_BYTECODE functions are borrowed from the recorder: valid until
+/// releaseAll.
+pub unsafe effect fn snapshot(runtime: *mut HeapHeader, bytecode: *mut HeapHeader) -> Option<Snapshot>
+  ! OutOfMemoryError ? &mut Allocator {
+  let anchor = () let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
+  let found = indexOf(&state.feedback, Pointer.address<HeapHeader>(bytecode))
+  if found >= state.feedback.records.length() { return Option<Snapshot>.none() }
+  let record = state.feedback.records.get(found)
+  let mut copy = Snapshot { recording: record.recording, observed: record.observed, sites: List<Site>.make(), targets: List<Target>.make() }
+  run copy.sites.reserveExact(record.siteCount)
+  let mut index: usize = 0
+  while index < record.siteCount {
+    let mut site = state.feedback.sites.get(record.firstSite + index)
+    if site.first != NO_TARGET {
+      run copy.targets.append(state.feedback.targets.get(u32.toUsize(site.first)))
+      site.first = usize.toU32(copy.targets.length() - 1)
+    }
+    if site.second != NO_TARGET {
+      run copy.targets.append(state.feedback.targets.get(u32.toUsize(site.second)))
+      site.second = usize.toU32(copy.targets.length() - 1)
+    }
+    run copy.sites.append(site)
+    index = index + 1
+  }
+  return Option<Snapshot>.some(move copy)
+}
+/// Stops every recording and releases everything the recorder holds; before
+/// runtime destruction too. Release happens outside the runtime borrow.
+pub unsafe fn releaseAll<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader) -> () {
+  let mut anchor = () let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  stopAll(&mut state)
+  let records = Intrinsic.replace(state.feedback.records, List<Record>.make())
+  let targets = Intrinsic.replace(state.feedback.targets, List<Target>.make())
+  state.feedback.sites.clearAndFree()
+  state.feedback.cachedAddress = 0
+  drop state
+  let mut index: usize = 0
+  while index < records.length() { unsafe gc.release(&mut hooks, runtime, records.get(index).function) index = index + 1 }
+  index = 0
+  while index < targets.length() { unsafe gc.release(&mut hooks, runtime, targets.get(index).function) index = index + 1 }
+}
+
+/// Feedback counts over every record, for reports.
+pub struct Summary {
+  pub functions: usize,
+  pub observedTotal: u64,
+  pub observedRecorded: u64,
+  pub sites: usize,
+  /// Sites that ran at least once while recording, by kind.
+  pub binaryRun: usize, pub unaryRun: usize, pub callRun: usize, pub propertyRun: usize,
+  /// Arithmetic and comparison sites (binary and unary) that ran: every operand an
+  /// int32 and no overflow; int32 with overflow; numbers with a double; a string
+  /// operand; anything else.
+  pub intOnly: usize, pub intOverflow: usize, pub numeric: usize, pub stringy: usize, pub mixed: usize,
+  /// Call sites that ran, by distinct targets, and monomorphic ones by target kind.
+  pub monomorphic: usize, pub polymorphic: usize, pub megamorphic: usize,
+  pub monoBytecode: usize, pub monoNative: usize,
+  /// Property sites that ran: only object receivers of 1 shape, 2 to 4, more; any primitive receiver.
+  pub shapeMono: usize, pub shapePoly: usize, pub shapeMega: usize, pub primitiveReceiver: usize
+}
+pub unsafe fn summary(runtime: *mut HeapHeader) -> Summary {
+  let anchor = () let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
+  let mut s = Summary { functions: state.feedback.records.length(), observedTotal: state.feedback.observedTotal, observedRecorded: state.feedback.observedRecorded, sites: state.feedback.sites.length(),
+    binaryRun: 0, unaryRun: 0, callRun: 0, propertyRun: 0,
+    intOnly: 0, intOverflow: 0, numeric: 0, stringy: 0, mixed: 0,
+    monomorphic: 0, polymorphic: 0, megamorphic: 0, monoBytecode: 0, monoNative: 0,
+    shapeMono: 0, shapePoly: 0, shapeMega: 0, primitiveReceiver: 0 }
+  let mut index: usize = 0
+  while index < state.feedback.sites.length() {
+    let site = state.feedback.sites.get(index)
+    index = index + 1
+    if site.count == 0 { continue }
+    if site.kind == KIND_BINARY || site.kind == KIND_UNARY {
+      if site.kind == KIND_BINARY { s.binaryRun = s.binaryRun + 1 } else { s.unaryRun = s.unaryRun + 1 }
+      let seen = site.left | site.right
+      if seen == SEEN_INT && site.flags == 0 { s.intOnly = s.intOnly + 1 }
+      else if seen == SEEN_INT { s.intOverflow = s.intOverflow + 1 }
+      else if (seen & (SEEN_INT | SEEN_DOUBLE)) == seen { s.numeric = s.numeric + 1 }
+      else if (seen & SEEN_STRING) != 0 { s.stringy = s.stringy + 1 }
+      else { s.mixed = s.mixed + 1 }
+    } else if site.kind == KIND_CALL {
+      s.callRun = s.callRun + 1
+      if site.targets == 1 {
+        s.monomorphic = s.monomorphic + 1
+        let kind = state.feedback.targets.get(u32.toUsize(site.first)).kind
+        if kind == TARGET_BYTECODE { s.monoBytecode = s.monoBytecode + 1 } else if kind == TARGET_NATIVE { s.monoNative = s.monoNative + 1 }
+      }
+      else if site.targets == 2 { s.polymorphic = s.polymorphic + 1 }
+      else { s.megamorphic = s.megamorphic + 1 }
+    } else if site.kind == KIND_PROPERTY {
+      s.propertyRun = s.propertyRun + 1
+      if site.left != SEEN_OBJECT { s.primitiveReceiver = s.primitiveReceiver + 1 }
+      else if site.shapeCount == 1 { s.shapeMono = s.shapeMono + 1 }
+      else if site.shapeCount == MEGAMORPHIC_SHAPES { s.shapeMega = s.shapeMega + 1 }
+      else { s.shapePoly = s.shapePoly + 1 }
+    }
+  }
+  return move s
+}
+
+/// Before the instruction at machine's pc, from js_vm.observeInstruction while
+/// recording is nonzero. Reads operands in place; allocates nothing and runs no JS.
+@inlineNever
+pub unsafe fn observe(machine: &Machine) -> () {
+  let mut anchor = () let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, machine.runtime)
+  if state.feedback.windowLeft == 0 { stopAll(&mut state) return }
+  state.feedback.windowLeft = state.feedback.windowLeft - 1
+  state.feedback.observedTotal = state.feedback.observedTotal + 1
+  let address = Pointer.address<HeapHeader>(machine.bytecode)
+  let found = indexOf(&state.feedback, address)
+  state.feedback.cached = found state.feedback.cachedAddress = address
+  if found >= state.feedback.records.length() { return }
+  let mut record = state.feedback.records.get(found)
+  if !record.recording { return }
+  record.observed = record.observed + 1
+  state.feedback.observedRecorded = state.feedback.observedRecorded + 1
+  record.left = record.left - 1
+  state.feedback.records.set(found, record)
+  if record.left == 0 { drop stopRecord(&mut state, found) }
+  let at = siteAt(&state.feedback, &record, machine.pc())
+  if at >= state.feedback.sites.length() { return }
+  let mut site = state.feedback.sites.get(at)
+  site.count = u32.saturatingAdd(site.count, 1)
+  let opcode = site.opcode
+  if site.kind == KIND_BINARY { unsafe binary(machine, &mut site, opcode) }
+  else if site.kind == KIND_UNARY { unsafe unary(machine, &mut site, opcode) }
+  else if site.kind == KIND_CALL { unsafe call(&mut state.feedback, machine, &mut site, opcode) }
+  else if site.kind == KIND_PROPERTY { unsafe property(machine, &mut site, opcode) }
+  else if site.kind == KIND_ELEMENT { unsafe element(machine, &mut site, opcode) }
+  else {
+    let tested = unsafe machine.top(1)
+    site.left = site.left | classOf(tested)
+    match tested { ValueBits.Bool { .. } => {} _ => { site.flags = site.flags | SEEN_NOT_BOOL } }
+  }
+  state.feedback.sites.set(at, site)
+}
+unsafe fn binary(machine: &Machine, site: &mut Site, opcode: u8) -> () {
+  let mut left = ValueBits.Undefined let mut right = ValueBits.Undefined
+  if opcode >= op.OP_add_loc_loc8 && opcode <= op.OP_mul_loc_loc8 {
+    left = unsafe machine.local(u8.toUsize(unsafe machine.peekU8(1))) right = unsafe machine.local(u8.toUsize(unsafe machine.peekU8(2)))
+  } else if opcode >= op.OP_add_top_loc8 && opcode <= op.OP_mul_top_loc8 {
+    left = unsafe machine.top(1) right = unsafe machine.local(u8.toUsize(unsafe machine.peekU8(1)))
+  } else if opcode >= op.OP_add_top_arg8 && opcode <= op.OP_mul_top_arg8 {
+    left = unsafe machine.top(1) right = unsafe machine.argument(u8.toUsize(unsafe machine.peekU8(1)))
+  } else if opcode == op.OP_add_loc {
+    left = unsafe machine.local(u8.toUsize(unsafe machine.peekU8(1))) right = unsafe machine.top(1)
+  } else if (opcode >= op.OP_add_imm && opcode <= op.OP_or_imm) || opcode == op.OP_shl_imm {
+    left = unsafe machine.top(1) right = ValueBits.Int { value: unsafe immediate16(machine) }
+  } else if opcode == op.OP_strict_eq_imm8 || opcode == op.OP_strict_neq_imm8 {
+    left = unsafe machine.top(1) right = ValueBits.Int { value: unsafe machine.peekI8At(1) }
+  } else {
+    left = unsafe machine.top(2) right = unsafe machine.top(1)
+  }
+  site.left = site.left | classOf(left) site.right = site.right | classOf(right)
+  match left { ValueBits.Int { value: a } => { match right { ValueBits.Int { value: b } => {
+    if overflows(opcode, a, b) { site.flags = site.flags | SEEN_OVERFLOW }
+  } _ => {} } } _ => {} }
+}
+unsafe fn unary(machine: &Machine, site: &mut Site, opcode: u8) -> () {
+  let mut mode: u8 = 0
+  let mut value = ValueBits.Undefined
+  if opcode == op.OP_inc_loc || opcode == op.OP_dec_loc { value = unsafe machine.local(u8.toUsize(unsafe machine.peekU8(1))) }
+  else if opcode == op.OP_step_loc8 { value = unsafe machine.local(u8.toUsize(unsafe machine.peekU8(1))) mode = unsafe machine.peekU8(2) }
+  else if opcode == op.OP_step_arg8 { value = unsafe machine.argument(u8.toUsize(unsafe machine.peekU8(1))) mode = unsafe machine.peekU8(2) }
+  else { value = unsafe machine.top(1) }
+  site.left = site.left | classOf(value)
+  match value { ValueBits.Int { value: a } => { if unaryOverflows(opcode, a, mode) { site.flags = site.flags | SEEN_OVERFLOW } } _ => {} }
+}
+/// The target the callee value names; function is borrowed.
+unsafe fn targetOf(callee: ValueBits) -> Target {
+  let none = NativeFunctionId.Host { id: 0 }
+  let reference = match callee {
+    ValueBits.FunctionBytecode { .. } => { return Target { kind: TARGET_BYTECODE, function: callee, native: none, magic: 0 } }
+    ValueBits.Object { reference } => reference
+    _ => { return Target { kind: TARGET_OTHER, function: ValueBits.Undefined, native: none, magic: 0 } }
+  }
+  let anchor = () let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, reference)
+  return match &object.payload {
+    ObjectPayload.BytecodeFunction { function: closure } => Target { kind: TARGET_BYTECODE, function: ValueBits.FunctionBytecode { reference: closure.bytecode }, native: none, magic: 0 }
+    ObjectPayload.NativeFunction { function: native } => Target { kind: TARGET_NATIVE, function: ValueBits.Undefined, native: native.function, magic: native.magicBits }
+    _ => Target { kind: TARGET_OTHER, function: ValueBits.Undefined, native: none, magic: 0 }
+  }
+}
+fn sameNative(a: NativeFunctionId, b: NativeFunctionId) -> bool {
+  return match a {
+    NativeFunctionId.Builtin { family: f, method: m } => match b { NativeFunctionId.Builtin { family: g, method: n } => f == g && m == n _ => false }
+    NativeFunctionId.Host { id: i } => match b { NativeFunctionId.Host { id: j } => i == j _ => false }
+  }
+}
+fn sameTarget(a: Target, b: Target) -> bool {
+  if a.kind != b.kind { return false }
+  if a.kind == TARGET_BYTECODE { return addressOf(a.function) == addressOf(b.function) }
+  if a.kind == TARGET_NATIVE { return a.magic == b.magic && sameNative(a.native, b.native) }
+  return true
+}
+unsafe fn call(feedback: &mut State, machine: &Machine, site: &mut Site, opcode: u8) -> () {
+  let mut count: usize = 0
+  if opcode >= op.OP_call0 && opcode <= op.OP_call3 { count = u8.toUsize(opcode - op.OP_call0) }
+  else { count = u16.toUsize(unsafe machine.peekU16At(1)) }
+  // call_constructor holds new.target above the callee.
+  let depth = if opcode == op.OP_call_constructor { count + 2 } else { count + 1 }
+  let target = unsafe targetOf(unsafe machine.top(depth))
+  if site.targets == MEGAMORPHIC_TARGETS { return }
+  if site.targets >= 1 && sameTarget(feedback.targets.get(u32.toUsize(site.first)), target) { return }
+  if site.targets == 2 && sameTarget(feedback.targets.get(u32.toUsize(site.second)), target) { return }
+  if site.targets == 2 { site.targets = MEGAMORPHIC_TARGETS return }
+  // start reserved two targets per call site, so this never allocates. Retained only once
+  // it is held: nothing here could release it.
+  if !feedback.targets.appendWithinCapacity(target) { site.targets = MEGAMORPHIC_TARGETS return }
+  if target.kind == TARGET_BYTECODE { let _held = unsafe target.function.retained() }
+  let index = usize.toU32(feedback.targets.length() - 1)
+  if site.targets == 0 { site.first = index } else { site.second = index }
+  site.targets = site.targets + 1
+}
+unsafe fn element(machine: &Machine, site: &mut Site, opcode: u8) -> () {
+  let mut receiver = ValueBits.Undefined
+  if opcode == op.OP_get_loc_el8 || opcode == op.OP_get_loc_el_arg8 { receiver = unsafe machine.local(u8.toUsize(unsafe machine.peekU8(1))) }
+  else if opcode == op.OP_get_arg_el8 || opcode == op.OP_get_arg_el_arg8 { receiver = unsafe machine.argument(u8.toUsize(unsafe machine.peekU8(1))) }
+  else if opcode == op.OP_put_array_el { receiver = unsafe machine.top(3) }
+  else { receiver = unsafe machine.top(2) }
+  site.left = site.left | classOf(receiver)
+  let mut kind = ELEMENT_MIXED
+  match receiver {
+    ValueBits.Object { reference } => {
+      let anchor = () let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, reference)
+      let classId = object.classId()
+      match &object.payload {
+        ObjectPayload.FastArray { .. } => { kind = ELEMENT_FAST }
+        ObjectPayload.TypedArray { .. } => {
+          if classId >= classes.JS_CLASS_UINT8C_ARRAY && classId <= classes.JS_CLASS_FLOAT64_ARRAY { kind = ELEMENT_TYPED + u32.toU8(classId - classes.JS_CLASS_UINT8C_ARRAY) }
+        }
+        _ => {
+          if classId == classes.JS_CLASS_OBJECT && !object.isExotic() && opcode != op.OP_put_array_el {
+            let mut key = ValueBits.Undefined
+            if opcode == op.OP_get_loc_el8 || opcode == op.OP_get_arg_el8 { key = unsafe machine.local(u8.toUsize(unsafe machine.peekU8(2))) }
+            else if opcode == op.OP_get_loc_el_arg8 || opcode == op.OP_get_arg_el_arg8 { key = unsafe machine.argument(u8.toUsize(unsafe machine.peekU8(2))) }
+            else { key = unsafe machine.top(1) }
+            match key {
+              ValueBits.String { .. } => { kind = ELEMENT_ORDINARY }
+              ValueBits.Symbol { .. } => { kind = ELEMENT_ORDINARY }
+              ValueBits.Int { value } => { if value >= 0 { kind = ELEMENT_ORDINARY } }
+              _ => {}
+            }
+          }
+        }
+      }
+    }
+    _ => {}
+  }
+  if site.right == ELEMENT_NONE { site.right = kind } else if site.right != kind { site.right = ELEMENT_MIXED }
+}
+unsafe fn property(machine: &Machine, site: &mut Site, opcode: u8) -> () {
+  // Final field opcodes carry the atom and the inline key (12 bytes) before their slots.
+  let mut receiver = ValueBits.Undefined
+  if opcode == op.OP_get_loc_field8 || opcode == op.OP_put_loc_field_loc8 || opcode == op.OP_put_loc_field_arg8 { receiver = unsafe machine.local(u8.toUsize(unsafe machine.peekU8(13))) }
+  else if opcode == op.OP_get_arg_field8 { receiver = unsafe machine.argument(u8.toUsize(unsafe machine.peekU8(13))) }
+  else if opcode == op.OP_put_field { receiver = unsafe machine.top(2) }
+  else { receiver = unsafe machine.top(1) }
+  site.left = site.left | classOf(receiver)
+  let reference = match receiver { ValueBits.Object { reference } => reference _ => { return } }
+  let anchor = () let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, reference)
+  let shape = object.shape drop object
+  let version = (unsafe HeapCell.payload<ShapeData, ()>(&anchor, shape)).version
+  if site.shapeCount == MEGAMORPHIC_SHAPES { return }
+  let mut index: usize = 0
+  while index < u8.toUsize(site.shapeCount) { if site.shapes[index] == version { return } index = index + 1 }
+  if site.shapeCount == 4 { site.shapeCount = MEGAMORPHIC_SHAPES return }
+  site.shapes[u8.toUsize(site.shapeCount)] = version
+  site.shapeCount = site.shapeCount + 1
+}

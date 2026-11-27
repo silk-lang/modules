@@ -1,0 +1,1146 @@
+//! An x86-64 instruction encoder with labels and relocation records.
+//!
+//! `Assembler` appends machine code to a growable byte list. Operands are typed: `Reg` for the
+//! sixteen general registers, `Xmm` for the sixteen SSE registers, `Mem` for a memory operand,
+//! `Label` for a position inside the code being assembled. `finish` resolves label references and
+//! returns `Code`: the bytes plus the `Relocation` records of every reference to something outside
+//! the code. The bytes are position-independent until `Code.link` writes those addresses in, so
+//! the same output can be linked at any address or stored and linked later.
+//!
+//! Every form's bytes are compared with LLVM's assembler in `asm_x64_fixtures.silk`, which
+//! `scripts/encodings.py` generates.
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.core.ownership { Copy }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.i32
+import silk.num.i64
+import silk.num.u8
+import silk.num.u16
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+
+/// A 64-bit general register. `Reg.value` is the hardware register number, 0 through 15.
+/// The same value names the register's 32-bit, 16-bit and 8-bit parts; the instruction's width
+/// selects which part is used.
+pub enum Reg { Rax, Rcx, Rdx, Rbx, Rsp, Rbp, Rsi, Rdi, R8, R9, R10, R11, R12, R13, R14, R15 }
+
+/// An SSE register. `Xmm.value` is the hardware register number, 0 through 15.
+pub enum Xmm { Xmm0, Xmm1, Xmm2, Xmm3, Xmm4, Xmm5, Xmm6, Xmm7, Xmm8, Xmm9, Xmm10, Xmm11, Xmm12, Xmm13, Xmm14, Xmm15 }
+
+/// The operand size of an integer instruction. A `W32` operation on a register clears the upper
+/// 32 bits of that register, as the processor does.
+pub enum Width { W32, W64 }
+
+/// The factor an index register is multiplied by in a memory operand.
+pub enum Scale { One, Two, Four, Eight }
+
+/// A condition tested by `jcc`, `setcc` and `cmovcc`. `Cond.value` is the 4-bit condition code
+/// of the instruction encoding. `Below`, `Above` and their `OrEqual` forms compare unsigned
+/// values; `Less`, `Greater` and theirs compare signed values. After `ucomisd`, `Parity` means
+/// the comparison was unordered (an operand was NaN), and the unsigned conditions order the
+/// two doubles.
+pub enum Cond {
+  Overflow, NoOverflow, Below, AboveOrEqual, Equal, NotEqual, BelowOrEqual, Above,
+  Sign, NoSign, Parity, NoParity, Less, GreaterOrEqual, LessOrEqual, Greater
+}
+
+/// A two-operand integer operation that `alu` and its sibling methods encode. Every one but
+/// `Cmp` writes its result to the first operand; all of them set the flags. `Cmp` subtracts
+/// without storing. `Adc` and `Sbb` add or subtract the carry flag as well.
+pub enum Alu { Add, Or, Adc, Sbb, And, Sub, Xor, Cmp }
+
+/// A shift or rotate that `shiftImm` and `shiftCl` encode. `Shr` shifts in zeroes; `Sar` shifts
+/// in copies of the sign bit.
+pub enum Shift { Rol, Ror, Shl = 4, Shr, Sar = 7 }
+
+/// A one-operand integer operation that `unary` encodes. `Mul`, `Imul`, `Div` and `Idiv` use
+/// the implicit operands of the processor: `Mul` and `Imul` multiply rax (or eax) by the operand
+/// into rdx:rax; `Div` (unsigned) and `Idiv` (signed) divide rdx:rax by the operand, leaving the
+/// quotient in rax and the remainder in rdx, and raise a divide fault on a zero divisor or a
+/// quotient that does not fit.
+pub enum Unary { Not = 2, Neg, Mul, Imul, Div, Idiv }
+
+/// A scalar double-precision operation that `scalar` and `scalarMem` encode: the low double of
+/// the first operand is combined with the second and stored in the first. `Sqrt` stores the
+/// square root of the second operand.
+pub enum ScalarOp { Sqrt = 81, Add = 88, Mul = 89, Sub = 92, Min = 93, Div = 94, Max = 95 }
+
+/// A full-register SSE2 operation that `packed` encodes. `Movapd` copies the whole register.
+/// `Ucomisd` compares the low doubles and sets the integer flags. `Andpd`, `Andnpd`, `Orpd` and
+/// `Xorpd` are bitwise; `Xorpd` of a register with itself is the usual way to make 0.0.
+pub enum PackedOp { Movapd = 40, Ucomisd = 46, Andpd = 84, Andnpd = 85, Orpd = 86, Xorpd = 87 }
+
+/// A memory operand: the address `base + index * scale + displacement`, where the index part is
+/// optional. Make one with `Mem.at` or `Mem.indexed`.
+pub struct Mem { base: Reg, index: Reg, hasIndex: bool, scale: Scale, displacement: i32 }
+impl Copy for Mem {}
+
+impl Mem {
+  /// The memory at `base + displacement`.
+  pub fn at(base: Reg, displacement: i32) -> Mem {
+    return Mem { base: base, index: Reg.Rax, hasIndex: false, scale: Scale.One, displacement: displacement }
+  }
+  /// The memory at `base + index * scale + displacement`. `index` must not be `Reg.Rsp`, which
+  /// the processor cannot use as an index; passing it traps.
+  pub fn indexed(base: Reg, index: Reg, scale: Scale, displacement: i32) -> Mem {
+    if index == Reg.Rsp { Intrinsic.trap("Mem.indexed: rsp cannot be an index register") }
+    return Mem { base: base, index: index, hasIndex: true, scale: scale, displacement: displacement }
+  }
+}
+
+/// A position in the code being assembled that jumps, calls and `leaLabel` can refer to before
+/// or after it is known. Make one with `Assembler.label` and fix its position with
+/// `Assembler.bind`. A label belongs to the assembler that made it.
+pub struct Label { index: usize }
+impl Copy for Label {}
+
+/// How `Code.link` writes a symbol's address into the code.
+pub enum RelocationKind {
+  /// The 8 bytes at `offset` receive the symbol's address plus `addend`.
+  Absolute64,
+  /// The 4 bytes at `offset` receive the symbol's address plus `addend`, minus the address of
+  /// those 4 bytes: the form `call` and `jmp` displacements use. Linking fails when the result
+  /// does not fit in 32 signed bits, which happens when the symbol is more than 2 GiB away.
+  Relative32,
+}
+
+/// One reference from assembled code to an address that is not known until the code is linked.
+/// `offset` is the position in `Code.bytes` of the field to fill in, `symbol` is the caller's
+/// own number for the target (an index into the address table given to `Code.link`), and `kind`
+/// and `addend` say how the address is written.
+pub struct Relocation { pub offset: usize, pub kind: RelocationKind, pub symbol: u32, pub addend: i64 }
+impl Copy for Relocation {}
+
+/// A label reference: the 4-byte field at `offset` gets the label's displacement. A `jmp` or
+/// `jcc` (`kind` JUMP or BRANCH) may shrink to its 2-byte form in `finish`; `short` says whether
+/// it does and `before` how many bytes the shrunk references before it save. `target` is the
+/// label's `rank` among the references, which `finish` finds once.
+struct Fixup { offset: usize, label: usize, kind: u8, short: bool, before: usize, target: usize }
+impl Copy for Fixup {}
+
+const FIXED: u8 = 0
+const JUMP: u8 = 1
+const BRANCH: u8 = 2
+
+/// The bytes a reference saves when it shrinks: `jmp` 5 to 2, `jcc` 6 to 2.
+fn saving(fixup: Fixup) -> usize {
+  if !fixup.short { return 0 }
+  if fixup.kind == JUMP { return 3 }
+  return 4
+}
+
+/// Where the byte at `offset` of the unshrunk code ends up once the short references shrink.
+/// `fixups` are in offset order and their `before` fields are current.
+fn moved(fixups: &List<Fixup>, offset: usize) -> usize {
+  return movedAt(fixups, rank(fixups, offset), offset)
+}
+/// How many references have their field start before `offset`: they shrink before it. This
+/// depends on the unshrunk offsets only, so it is found once and kept while references grow.
+fn rank(fixups: &List<Fixup>, offset: usize) -> usize {
+  let mut low: usize = 0
+  let mut high = fixups.length()
+  while low < high {
+    let middle = (low + high) / 2
+    if fixups.get(middle).offset < offset { low = middle + 1 } else { high = middle }
+  }
+  return low
+}
+/// `moved` for an offset whose `rank` is known.
+fn movedAt(fixups: &List<Fixup>, rank: usize, offset: usize) -> usize {
+  if rank == 0 { return offset }
+  let last = fixups.get(rank - 1)
+  return offset - last.before - saving(last)
+}
+
+/// `Assembler.finish` failed because a jump, call or `leaLabel` refers to a label that was never
+/// bound. `label` is the label's creation order, counting from 0.
+pub struct UnboundLabelError { pub label: usize }
+
+/// Why `Code.link` failed. Nothing is left half-linked that matters: a failed link must be
+/// followed by discarding the code or linking it again in full.
+pub struct LinkError {
+  /// The index in `Code.relocations` of the record that could not be applied.
+  pub relocation: usize,
+  /// True when the record names a symbol number outside the address table; false when a
+  /// `Relative32` distance did not fit in 32 bits.
+  pub unknownSymbol: bool,
+}
+
+/// Finished machine code and its unresolved references.
+pub struct Code {
+  /// The machine code. References between labels are already resolved.
+  pub bytes: List<u8>,
+  /// Every reference to an external address, in the order the instructions were emitted.
+  pub relocations: List<Relocation>,
+}
+
+/// A 32-bit PC-relative displacement in `Code.bytes` whose instruction and target lie on
+/// opposite sides of `SplitInfo.hotBytes`. `at` is the offset of the 4-byte field in the
+/// unsplit bytes, `disp` is its unsplit displacement, and `fromHot` is true when the
+/// instruction is in the hot part and targets the cold part.
+pub struct CrossReloc { pub at: usize, pub disp: i32, pub fromHot: bool }
+impl Copy for CrossReloc {}
+
+/// Hot/cold split metadata produced by `Assembler.finishPlacedSplit`. When unsplit,
+/// `hotBytes` is `usize.MAX` and `crossRelocs` is empty.
+pub struct SplitInfo { pub hotBytes: usize, pub crossRelocs: List<CrossReloc> }
+impl SplitInfo {
+  pub fn none() -> SplitInfo { return SplitInfo { hotBytes: usize.MAX, crossRelocs: List<CrossReloc>.make() } }
+}
+
+/// Finished machine code together with its hot/cold split metadata.
+pub struct SplitCode { pub code: Code, pub split: SplitInfo }
+
+/// The register that carries the integer or pointer argument number `index` (0 through 5) of a
+/// System V AMD64 C call: rdi, rsi, rdx, rcx, r8, r9. Any other `index` traps; later arguments
+/// travel on the stack.
+pub fn argument(index: usize) -> Reg {
+  if index == 0 { return Reg.Rdi }
+  if index == 1 { return Reg.Rsi }
+  if index == 2 { return Reg.Rdx }
+  if index == 3 { return Reg.Rcx }
+  if index == 4 { return Reg.R8 }
+  if index == 5 { return Reg.R9 }
+  Intrinsic.trap("asm_x64.argument: only six integer arguments travel in registers")
+}
+
+/// Whether a System V AMD64 C function must leave `reg` as it found it: true for rbx, rbp, rsp
+/// and r12 through r15. A call may change every other general register and every SSE register.
+pub fn isCalleeSaved(reg: Reg) -> bool {
+  return reg == Reg.Rbx || reg == Reg.Rbp || reg == Reg.Rsp || reg == Reg.R12 || reg == Reg.R13
+    || reg == Reg.R14 || reg == Reg.R15
+}
+
+fn fitsI8(value: i32) -> bool { return value >= -128 && value <= 127 }
+
+/// An x86-64 encoder. Each instruction method appends one instruction and can fail only when
+/// the byte list cannot grow. Labels made by `label` are resolved by `finish`.
+pub struct Assembler { code: List<u8>, labels: List<usize>, fixups: List<Fixup>, relocations: List<Relocation>,
+  /// Per label: how many labels were bound before it (`outline` tells a label bound where a
+  /// stretch starts, in front of it, from one bound inside).
+  seqs: List<usize>,
+  /// The outlined stretches (`beginOutlined`): where each starts and ends, and `binds` at its start.
+  outStarts: List<usize>, outEnds: List<usize>, outSeqs: List<usize>,
+  /// `alias`: operands at rbp + aliasFrom up to 255 bytes on are encoded from rbx.
+  aliased: bool, aliasFrom: i32,
+  /// How many labels `bind` has positioned (`bound`).
+  binds: usize,
+  /// Unshrunk offset of the hot/cold boundary (`markCold`), or `usize.MAX` when unsplit.
+  hotMark: usize }
+
+impl Assembler {
+  /// An assembler with no code.
+  pub fn make() -> Assembler {
+    return Assembler { code: List<u8>.make(), labels: List<usize>.make(), fixups: List<Fixup>.make(),
+      relocations: List<Relocation>.make(), seqs: List<usize>.make(), outStarts: List<usize>.make(), outEnds: List<usize>.make(),
+      outSeqs: List<usize>.make(), aliased: false, aliasFrom: 0, binds: 0, hotMark: usize.MAX }
+  }
+  /// Starts a stretch of code that rarely runs. `finish` moves it behind the rest of the code
+  /// in front of `markCold` (or of the end), so the code around it runs straight through
+  /// where it would jump over the stretch. It is entered only by jumps to labels bound inside
+  /// it and must end with a jump: nothing falls into it or out of it. A label bound where it
+  /// ends belongs to the code after it. Stretches do not nest, and none is open at `markCold`.
+  pub effect fn beginOutlined(self: &mut Self) -> () ! OutOfMemoryError ? &mut Allocator {
+    if self.outStarts.length() != self.outEnds.length() { Intrinsic.trap("Assembler.beginOutlined: a stretch is open") }
+    run self.outStarts.append(self.code.length())
+    run self.outSeqs.append(self.binds)
+  }
+  /// Ends the stretch `beginOutlined` started.
+  pub effect fn endOutlined(self: &mut Self) -> () ! OutOfMemoryError ? &mut Allocator {
+    if self.outStarts.length() == self.outEnds.length() { Intrinsic.trap("Assembler.endOutlined: no stretch is open") }
+    run self.outEnds.append(self.code.length())
+  }
+  /// Marks the start of cold code. Label references crossing this boundary stay 32-bit and are
+  /// recorded in `SplitInfo.crossRelocs` by `finishPlacedSplit`.
+  pub fn markCold(self: &mut Self) -> () {
+    if self.outStarts.length() != self.outEnds.length() { Intrinsic.trap("Assembler.markCold: a stretch is open") }
+    if self.hotMark == usize.MAX { self.hotMark = self.code.length() }
+  }
+  /// From here on, a memory operand rbp + d without an index, for d in from to from + 255,
+  /// is encoded as rbx + (d - from - 128): one displacement byte in place of four. The
+  /// caller's code keeps rbx at rbp + from + 128 wherever such an operand runs.
+  pub fn alias(self: &mut Self, from: i32) -> () { self.aliased = true self.aliasFrom = from }
+  /// Ends `alias`.
+  pub fn unalias(self: &mut Self) -> () { self.aliased = false }
+
+  /// The number of bytes emitted so far, which is the offset the next instruction will have.
+  pub fn offset(self: &Self) -> usize { return self.code.length() }
+  /// The bytes emitted so far. The 4-byte fields of label references hold zeroes until `finish`.
+  pub fn bytes(self: &Self) -> &[u8] { return self.code.asSlice() }
+
+  // The longest x86-64 instruction is 15 bytes. Every instruction method reserves that much
+  // once and then writes without further growth checks.
+  /// Room for one instruction (at most 15 bytes) or data word, so that `byte` never grows the
+  /// list. Every instruction asks: the test is inline, the growth a call.
+  @inlineAlways
+  effect fn room(self: &mut Self) -> () ! OutOfMemoryError ? &mut Allocator { if self.code.capacity() - self.code.length() < 16 { run self.code.reserve(16) } }
+  fn byte(self: &mut Self, value: u8) -> () { drop self.code.appendWithinCapacity(value) }
+  fn imm32(self: &mut Self, value: i32) -> () {
+    let bits = i32.wrappingToU32(value)
+    self.byte(u32.wrappingToU8(bits))
+    self.byte(u32.wrappingToU8(u32.shiftRight(bits, 8)))
+    self.byte(u32.wrappingToU8(u32.shiftRight(bits, 16)))
+    self.byte(u32.wrappingToU8(u32.shiftRight(bits, 24)))
+  }
+  fn imm64(self: &mut Self, value: u64) -> () {
+    let mut shift: u64 = 0
+    while shift < 64 {
+      self.byte(u64.wrappingToU8(u64.shiftRight(value, shift)))
+      shift = shift + 8
+    }
+  }
+
+  // prefix: a mandatory 0x66/0xF2/0xF3 prefix, or 0. force: emit REX even with no bit set,
+  // which selects spl/bpl/sil/dil instead of ah/ch/dh/bh for byte operands.
+  fn head(self: &mut Self, prefix: u8, wide: bool, force: bool, escape: bool, opcode: u8, reg: u8, index: u8, base: u8) -> () {
+    if prefix != 0 { self.byte(prefix) }
+    let mut rex: u8 = 0x40
+    if wide { rex = rex | 8 }
+    if reg >= 8 { rex = rex | 4 }
+    if index >= 8 { rex = rex | 2 }
+    if base >= 8 { rex = rex | 1 }
+    if rex != 0x40 || force { self.byte(rex) }
+    if escape { self.byte(0x0f) }
+    self.byte(opcode)
+  }
+  fn regForm(self: &mut Self, prefix: u8, wide: bool, force: bool, escape: bool, opcode: u8, reg: u8, rm: u8) -> () {
+    self.head(prefix, wide, force, escape, opcode, reg, 0, rm)
+    self.byte(0xc0 | ((reg & 7) * 8) | (rm & 7))
+  }
+  fn memForm(self: &mut Self, prefix: u8, wide: bool, force: bool, escape: bool, opcode: u8, reg: u8, operand: Mem) -> () {
+    let mut mem = operand
+    if self.aliased && !mem.hasIndex && Reg.value(mem.base) == 5 && mem.displacement >= self.aliasFrom && mem.displacement - self.aliasFrom < 256 {
+      mem = Mem.at(Reg.Rbx, mem.displacement - self.aliasFrom - 128)
+    }
+    let base = Reg.value(mem.base)
+    let index = if mem.hasIndex { Reg.value(mem.index) } else { 0 }
+    self.head(prefix, wide, force, escape, opcode, reg, index, base)
+    // rbp and r13 as a base have no displacement-free form: mod 00 with that base means
+    // "no base, disp32" (or rip-relative without a SIB byte).
+    let mode: u8 = if mem.displacement == 0 && (base & 7) != 5 { 0 }
+      else { if fitsI8(mem.displacement) { 0x40 } else { 0x80 } }
+    let field = (reg & 7) * 8
+    if mem.hasIndex {
+      self.byte(mode | field | 4)
+      self.byte(Scale.value(mem.scale) * 64 | ((index & 7) * 8) | (base & 7))
+    } else {
+      if (base & 7) == 4 {
+        // rsp and r12 as a base need a SIB byte that says "no index".
+        self.byte(mode | field | 4)
+        self.byte(0x24)
+      } else { self.byte(mode | field | (base & 7)) }
+    }
+    if mode == 0x40 { self.byte(i32.wrappingToU8(mem.displacement)) }
+    if mode == 0x80 { self.imm32(mem.displacement) }
+  }
+
+  // ---- Integer moves --------------------------------------------------------------------
+
+  /// `mov dst, src`: copies a register.
+  pub effect fn mov(self: &mut Self, width: Width, dst: Reg, src: Reg) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.room()
+    self.regForm(0, width == Width.W64, false, false, 0x89, Reg.value(src), Reg.value(dst))
+  }
+  /// `mov dst32, imm32`: loads a 32-bit constant and clears the upper half of `dst`. 5 or 6 bytes.
+  pub effect fn movImm32(self: &mut Self, dst: Reg, value: u32) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.room()
+    let reg = Reg.value(dst)
+    self.head(0, false, false, false, 0xb8 + (reg & 7), 0, 0, reg)
+    self.imm32(u32.wrappingToI32(value))
+  }
+  /// `mov dst64, imm32`: loads a constant sign-extended from 32 bits. 7 bytes.
+  pub effect fn movImmSigned32(self: &mut Self, dst: Reg, value: i32) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.room()
+    self.regForm(0, true, false, false, 0xc7, 0, Reg.value(dst))
+    self.imm32(value)
+  }
+  /// `movabs dst, imm64`: loads any 64-bit constant. 10 bytes.
+  pub effect fn movImm64(self: &mut Self, dst: Reg, value: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.room()
+    let reg = Reg.value(dst)
+    self.head(0, true, false, false, 0xb8 + (reg & 7), 0, 0, reg)
+    self.imm64(value)
+  }
+  /// Loads `value` into `dst` with the shortest of `movImm32` (values below 2^32),
+  /// `movImmSigned32` (values that sign-extend from 32 bits) and `movImm64`. Flags are unchanged.
+  pub effect fn loadConstant(self: &mut Self, dst: Reg, value: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+    if value <= 0xffffffff { run self.movImm32(dst, u64.wrappingToU32(value)) return () }
+    let signed = u64.wrappingToI64(value)
+    if signed >= -2147483648 && signed < 0 { run self.movImmSigned32(dst, i64.wrappingToI32(signed)) return () }
+    run self.movImm64(dst, value)
+  }
+  /// `movabs dst, imm64` whose constant is the address of `symbol`, filled in by `Code.link`.
+  /// Records an `Absolute64` relocation.
+  pub effect fn movSymbol(self: &mut Self, dst: Reg, symbol: u32) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.room()
+    let reg = Reg.value(dst)
+    self.head(0, true, false, false, 0xb8 + (reg & 7), 0, 0, reg)
+    run self.relocations.append(Relocation { offset: self.code.length(), kind: RelocationKind.Absolute64, symbol: symbol, addend: 0 })
+    self.imm64(0)
+  }
+  /// `mov dst, [mem]`: loads 4 or 8 bytes.
+  pub effect fn load(self: &mut Self, width: Width, dst: Reg, mem: Mem) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.room()
+    self.memForm(0, width == Width.W64, false, false, 0x8b, Reg.value(dst), mem)
+  }
+  /// `mov [mem], src`: stores 4 or 8 bytes.
+  pub effect fn store(self: &mut Self, width: Width, mem: Mem, src: Reg) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.room()
+    self.memForm(0, width == Width.W64, false, false, 0x89, Reg.value(src), mem)
+  }
+  /// `mov [mem], imm32`: stores a constant; a `W64` store sign-extends it to 8 bytes.
+  pub effect fn storeImm(self: &mut Self, width: Width, mem: Mem, value: i32) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.room()
+    self.memForm(0, width == Width.W64, false, false, 0xc7, 0, mem)
+    self.imm32(value)
+  }
+  /// `mov byte ptr [mem], src8`: stores the low byte of `src`.
+  pub effect fn store8(self: &mut Self, mem: Mem, src: Reg) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.room()
+    let reg = Reg.value(src)
+    self.memForm(0, false, reg >= 4 && reg < 8, false, 0x88, reg, mem)
+  }
+  /// `mov word ptr [mem], src16`: stores the low 2 bytes of `src`.
+  pub effect fn store16(self: &mut Self, mem: Mem, src: Reg) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.room()
+    self.memForm(0x66, false, false, false, 0x89, Reg.value(src), mem)
+  }
+  /// `movzx dst32, byte ptr [mem]`: loads one byte, zero-extended to the whole register.
+  pub effect fn loadZero8(self: &mut Self, dst: Reg, mem: Mem) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.room()
+    self.memForm(0, false, false, true, 0xb6, Reg.value(dst), mem)
+  }
+  /// `movzx dst32, word ptr [mem]`: loads 2 bytes, zero-extended to the whole register.
+  pub effect fn loadZero16(self: &mut Self, dst: Reg, mem: Mem) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.room()
+    self.memForm(0, false, false, true, 0xb7, Reg.value(dst), mem)
+  }
+  /// `movsxd dst64, dword ptr [mem]`: loads 4 bytes, sign-extended to 64 bits.
+  pub effect fn loadSigned32(self: &mut Self, dst: Reg, mem: Mem) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.room()
+    self.memForm(0, true, false, false, 0x63, Reg.value(dst), mem)
+  }
+  /// `movsx dst32, byte ptr [mem]`: loads one byte, sign-extended to 32 bits.
+  pub effect fn loadSigned8(self: &mut Self, dst: Reg, mem: Mem) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.room()
+    self.memForm(0, false, false, true, 0xbe, Reg.value(dst), mem)
+  }
+  /// `movsx dst32, word ptr [mem]`: loads 2 bytes, sign-extended to 32 bits.
+  pub effect fn loadSigned16(self: &mut Self, dst: Reg, mem: Mem) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.room()
+    self.memForm(0, false, false, true, 0xbf, Reg.value(dst), mem)
+  }
+  /// `movzx dst32, src8`: the low byte of `src`, zero-extended to the whole register.
+  pub effect fn zeroExtend8(self: &mut Self, dst: Reg, src: Reg) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.room()
+    let reg = Reg.value(src)
+    self.regForm(0, false, reg >= 4 && reg < 8, true, 0xb6, Reg.value(dst), reg)
+  }
+  /// `movsxd dst64, src32`: the low 32 bits of `src`, sign-extended to 64 bits.
+  pub effect fn signExtend32(self: &mut Self, dst: Reg, src: Reg) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.room()
+    self.regForm(0, true, false, false, 0x63, Reg.value(dst), Reg.value(src))
+  }
+  /// `lea dst, [mem]`: computes the operand's address without reading memory or changing flags.
+  pub effect fn lea(self: &mut Self, width: Width, dst: Reg, mem: Mem) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.room()
+    self.memForm(0, width == Width.W64, false, false, 0x8d, Reg.value(dst), mem)
+  }
+  /// `push src`: decrements rsp by 8 and stores `src` there.
+  pub effect fn push(self: &mut Self, src: Reg) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.room()
+    let reg = Reg.value(src)
+    self.head(0, false, false, false, 0x50 + (reg & 7), 0, 0, reg)
+  }
+  /// `pop dst`: loads `dst` from the top of the stack and increments rsp by 8.
+  pub effect fn pop(self: &mut Self, dst: Reg) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.room()
+    let reg = Reg.value(dst)
+    self.head(0, false, false, false, 0x58 + (reg & 7), 0, 0, reg)
+  }
+
+  // ---- Integer arithmetic ---------------------------------------------------------------
+
+  /// `op dst, src` for two registers.
+  pub effect fn alu(self: &mut Self, op: Alu, width: Width, dst: Reg, src: Reg) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.room()
+    self.regForm(0, width == Width.W64, false, false, Alu.value(op) * 8 + 1, Reg.value(src), Reg.value(dst))
+  }
+  /// `op dst, imm`: the constant is sign-extended to the operand width. Uses the 1-byte
+  /// constant form when `value` fits in 8 signed bits.
+  pub effect fn aluImm(self: &mut Self, op: Alu, width: Width, dst: Reg, value: i32) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.room()
+    let wide = width == Width.W64
+    if fitsI8(value) {
+      self.regForm(0, wide, false, false, 0x83, Alu.value(op), Reg.value(dst))
+      self.byte(i32.wrappingToU8(value))
+      return ()
+    }
+    if dst == Reg.Rax {
+      // The accumulator has a form without a ModRM byte.
+      self.head(0, wide, false, false, Alu.value(op) * 8 + 5, 0, 0, 0)
+    } else { self.regForm(0, wide, false, false, 0x81, Alu.value(op), Reg.value(dst)) }
+    self.imm32(value)
+  }
+  /// `op dst, [mem]`: the second operand is read from memory.
+  pub effect fn aluLoad(self: &mut Self, op: Alu, width: Width, dst: Reg, mem: Mem) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.room()
+    self.memForm(0, width == Width.W64, false, false, Alu.value(op) * 8 + 3, Reg.value(dst), mem)
+  }
+  /// `op [mem], src`: the first operand is in memory and, except for `Cmp`, is updated there.
+  pub effect fn aluStore(self: &mut Self, op: Alu, width: Width, mem: Mem, src: Reg) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.room()
+    self.memForm(0, width == Width.W64, false, false, Alu.value(op) * 8 + 1, Reg.value(src), mem)
+  }
+  /// `op [mem], imm`: the first operand is in memory; the constant is sign-extended.
+  pub effect fn aluStoreImm(self: &mut Self, op: Alu, width: Width, mem: Mem, value: i32) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.room()
+    if fitsI8(value) {
+      self.memForm(0, width == Width.W64, false, false, 0x83, Alu.value(op), mem)
+      self.byte(i32.wrappingToU8(value))
+    } else {
+      self.memForm(0, width == Width.W64, false, false, 0x81, Alu.value(op), mem)
+      self.imm32(value)
+    }
+  }
+  /// `cmp left8, imm8`: compares the low byte of `left` with a constant.
+  pub effect fn cmp8Imm(self: &mut Self, left: Reg, value: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.room()
+    let reg = Reg.value(left)
+    // The accumulator has a form without a ModRM byte; spl, bpl, sil and dil need a REX prefix.
+    if reg == 0 { self.byte(0x3c) } else { self.regForm(0, false, reg >= 4 && reg < 8, false, 0x80, 7, reg) }
+    self.byte(value)
+  }
+  /// `cmp byte ptr [mem], imm8`: compares a byte in memory with a constant.
+  pub effect fn cmp8MemImm(self: &mut Self, mem: Mem, value: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.room()
+    self.memForm(0, false, false, false, 0x80, 7, mem)
+    self.byte(value)
+  }
+  /// `test byte ptr [mem], imm8`: the flags of the byte in memory under a mask.
+  pub effect fn test8MemImm(self: &mut Self, mem: Mem, value: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.room()
+    self.memForm(0, false, false, false, 0xf6, 0, mem)
+    self.byte(value)
+  }
+  /// `cmp word ptr [mem], imm`: compares 16 bits in memory with a constant. A constant of
+  /// more than 7 bits takes a 16-bit immediate, which decodes slowly; such callers load first.
+  pub effect fn cmp16MemImm(self: &mut Self, mem: Mem, value: u16) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.room()
+    if value < 128 {
+      self.memForm(0x66, false, false, false, 0x83, 7, mem)
+      self.byte(u16.wrappingToU8(value))
+    } else {
+      self.memForm(0x66, false, false, false, 0x81, 7, mem)
+      self.byte(u16.wrappingToU8(value))
+      self.byte(u16.wrappingToU8(u16.shiftRight(value, 8)))
+    }
+  }
+  /// `test left, right`: sets the flags from `left & right` and stores nothing.
+  pub effect fn test(self: &mut Self, width: Width, left: Reg, right: Reg) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.room()
+    self.regForm(0, width == Width.W64, false, false, 0x85, Reg.value(right), Reg.value(left))
+  }
+  /// `test left, imm32`: sets the flags from `left & value` (sign-extended) and stores nothing.
+  pub effect fn testImm(self: &mut Self, width: Width, left: Reg, value: i32) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.room()
+    if left == Reg.Rax { self.head(0, width == Width.W64, false, false, 0xa9, 0, 0, 0) }
+    else { self.regForm(0, width == Width.W64, false, false, 0xf7, 0, Reg.value(left)) }
+    self.imm32(value)
+  }
+  /// `imul dst, src`: signed multiply keeping the low half; overflow sets the overflow flag.
+  pub effect fn imul(self: &mut Self, width: Width, dst: Reg, src: Reg) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.room()
+    self.regForm(0, width == Width.W64, false, true, 0xaf, Reg.value(dst), Reg.value(src))
+  }
+  /// `imul dst, [mem]`: the same with the second operand in memory.
+  pub effect fn imulLoad(self: &mut Self, width: Width, dst: Reg, mem: Mem) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.room()
+    self.memForm(0, width == Width.W64, false, true, 0xaf, Reg.value(dst), mem)
+  }
+  /// `imul dst, src, imm`: `dst = src * value`, signed, keeping the low half.
+  pub effect fn imulImm(self: &mut Self, width: Width, dst: Reg, src: Reg, value: i32) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.room()
+    if fitsI8(value) {
+      self.regForm(0, width == Width.W64, false, false, 0x6b, Reg.value(dst), Reg.value(src))
+      self.byte(i32.wrappingToU8(value))
+    } else {
+      self.regForm(0, width == Width.W64, false, false, 0x69, Reg.value(dst), Reg.value(src))
+      self.imm32(value)
+    }
+  }
+  /// `not`, `neg`, `mul`, `imul`, `div` or `idiv` with one register operand.
+  pub effect fn unary(self: &mut Self, op: Unary, width: Width, operand: Reg) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.room()
+    self.regForm(0, width == Width.W64, false, false, 0xf7, Unary.value(op), Reg.value(operand))
+  }
+  /// `cdq` (`W32`) or `cqo` (`W64`): sign-extends eax into edx or rax into rdx, as signed
+  /// division needs before `Unary.Idiv`.
+  pub effect fn signExtendAccumulator(self: &mut Self, width: Width) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.room()
+    self.head(0, width == Width.W64, false, false, 0x99, 0, 0, 0)
+  }
+  /// A shift or rotate of `dst` by a constant. The processor uses `count` modulo the operand
+  /// width.
+  pub effect fn shiftImm(self: &mut Self, op: Shift, width: Width, dst: Reg, count: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.room()
+    if count == 1 { self.regForm(0, width == Width.W64, false, false, 0xd1, Shift.value(op), Reg.value(dst)) return () }
+    self.regForm(0, width == Width.W64, false, false, 0xc1, Shift.value(op), Reg.value(dst))
+    self.byte(count)
+  }
+  /// A shift or rotate of `dst` by the count in cl, taken modulo the operand width.
+  pub effect fn shiftCl(self: &mut Self, op: Shift, width: Width, dst: Reg) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.room()
+    self.regForm(0, width == Width.W64, false, false, 0xd3, Shift.value(op), Reg.value(dst))
+  }
+  /// `setcc dst8`: sets the low byte of `dst` to 1 when `cond` holds and to 0 otherwise. The
+  /// rest of the register keeps its value.
+  pub effect fn setcc(self: &mut Self, cond: Cond, dst: Reg) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.room()
+    let reg = Reg.value(dst)
+    self.regForm(0, false, reg >= 4 && reg < 8, true, 0x90 + Cond.value(cond), 0, reg)
+  }
+  /// `cmovcc dst, src`: copies `src` to `dst` when `cond` holds. A `W32` form clears the upper
+  /// half of `dst` whether or not the condition holds.
+  pub effect fn cmov(self: &mut Self, cond: Cond, width: Width, dst: Reg, src: Reg) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.room()
+    self.regForm(0, width == Width.W64, false, true, 0x40 + Cond.value(cond), Reg.value(dst), Reg.value(src))
+  }
+
+  // ---- Doubles --------------------------------------------------------------------------
+
+  /// `movsd dst, qword ptr [mem]`: loads a double and clears the rest of the register.
+  pub effect fn loadDouble(self: &mut Self, dst: Xmm, mem: Mem) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.room()
+    self.memForm(0xf2, false, false, true, 0x10, Xmm.value(dst), mem)
+  }
+  /// `movsd qword ptr [mem], src`: stores the low double of `src`.
+  pub effect fn storeDouble(self: &mut Self, mem: Mem, src: Xmm) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.room()
+    self.memForm(0xf2, false, false, true, 0x11, Xmm.value(src), mem)
+  }
+  /// `cvtss2sd dst, dword ptr [mem]`: loads a float and widens it to a double.
+  pub effect fn loadFloat(self: &mut Self, dst: Xmm, mem: Mem) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.room()
+    self.memForm(0xf3, false, false, true, 0x5a, Xmm.value(dst), mem)
+  }
+  /// `cvtsd2ss dst, src`: rounds the low double of `src` to a float in the low lane of `dst`.
+  pub effect fn doubleToFloat(self: &mut Self, dst: Xmm, src: Xmm) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.room()
+    self.regForm(0xf2, false, false, true, 0x5a, Xmm.value(dst), Xmm.value(src))
+  }
+  /// `movss dword ptr [mem], src`: stores the low float of `src`.
+  pub effect fn storeFloat(self: &mut Self, mem: Mem, src: Xmm) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.room()
+    self.memForm(0xf3, false, false, true, 0x11, Xmm.value(src), mem)
+  }
+  /// A scalar double operation on two registers, such as `addsd dst, src`.
+  pub effect fn scalar(self: &mut Self, op: ScalarOp, dst: Xmm, src: Xmm) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.room()
+    self.regForm(0xf2, false, false, true, ScalarOp.value(op), Xmm.value(dst), Xmm.value(src))
+  }
+  /// A scalar double operation whose second operand is read from memory.
+  pub effect fn scalarLoad(self: &mut Self, op: ScalarOp, dst: Xmm, mem: Mem) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.room()
+    self.memForm(0xf2, false, false, true, ScalarOp.value(op), Xmm.value(dst), mem)
+  }
+  /// A full-register SSE2 operation on two registers, such as `ucomisd left, right`.
+  pub effect fn packed(self: &mut Self, op: PackedOp, dst: Xmm, src: Xmm) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.room()
+    self.regForm(0x66, false, false, true, PackedOp.value(op), Xmm.value(dst), Xmm.value(src))
+  }
+  /// `cvtsi2sd dst, src`: converts a signed integer of the given width to a double.
+  pub effect fn intToDouble(self: &mut Self, width: Width, dst: Xmm, src: Reg) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.room()
+    self.regForm(0xf2, width == Width.W64, false, true, 0x2a, Xmm.value(dst), Reg.value(src))
+  }
+  /// `cvttsd2si dst, src`: converts a double to a signed integer, truncating toward zero. A NaN
+  /// or a value out of range gives the minimum integer of the width.
+  pub effect fn doubleToInt(self: &mut Self, width: Width, dst: Reg, src: Xmm) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.room()
+    self.regForm(0xf2, width == Width.W64, false, true, 0x2c, Reg.value(dst), Xmm.value(src))
+  }
+  /// `movq dst, src`: copies the 64 bits of a general register into an SSE register unchanged.
+  pub effect fn bitsToDouble(self: &mut Self, dst: Xmm, src: Reg) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.room()
+    self.regForm(0x66, true, false, true, 0x6e, Xmm.value(dst), Reg.value(src))
+  }
+  /// `movq dst, src`: copies the low 64 bits of an SSE register into a general register unchanged.
+  pub effect fn doubleToBits(self: &mut Self, dst: Reg, src: Xmm) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.room()
+    self.regForm(0x66, true, false, true, 0x7e, Xmm.value(src), Reg.value(dst))
+  }
+
+  // ---- Control flow ---------------------------------------------------------------------
+
+  /// A new label with no position yet.
+  pub effect fn label(self: &mut Self) -> Label ! OutOfMemoryError ? &mut Allocator {
+    run self.labels.append(usize.MAX)
+    run self.seqs.append(0)
+    return Label { index: self.labels.length() - 1 }
+  }
+  /// Gives `label` the current offset. Binding a label twice traps.
+  pub fn bind(self: &mut Self, label: Label) -> () {
+    if self.labels.get(label.index) != usize.MAX { Intrinsic.trap("Assembler.bind: label is already bound") }
+    self.labels.set(label.index, self.code.length())
+    self.seqs.set(label.index, self.binds)
+    self.binds = self.binds + 1
+  }
+  /// How many labels have been bound so far. With `offset`, it tells a caller whether
+  /// anything, code or a jump target, came after a point it remembered.
+  pub fn bound(self: &Self) -> usize { return self.binds }
+  effect fn reference(self: &mut Self, label: Label) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.referenceOf(label, FIXED)
+  }
+  effect fn referenceOf(self: &mut Self, label: Label, kind: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.fixups.append(Fixup { offset: self.code.length(), label: label.index, kind: kind, short: kind != FIXED, before: 0, target: 0 })
+    self.imm32(0)
+  }
+  /// `jmp label`. Emitted with a 32-bit displacement (5 bytes); `finish` shrinks it to the
+  /// 2-byte form when the displacement fits in 8 bits.
+  pub effect fn jmp(self: &mut Self, label: Label) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.room()
+    self.byte(0xe9)
+    run self.referenceOf(label, JUMP)
+  }
+  /// `jcc label`: jumps when `cond` holds. Emitted with a 32-bit displacement (6 bytes);
+  /// `finish` shrinks it to the 2-byte form when the displacement fits in 8 bits.
+  pub effect fn jcc(self: &mut Self, cond: Cond, label: Label) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.room()
+    self.byte(0x0f)
+    self.byte(0x80 + Cond.value(cond))
+    run self.referenceOf(label, BRANCH)
+  }
+  /// `call label`: calls code in the same assembly.
+  pub effect fn call(self: &mut Self, label: Label) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.room()
+    self.byte(0xe8)
+    run self.reference(label)
+  }
+  /// `lea dst, [rip + label]`: the address the label has when the code runs.
+  pub effect fn leaLabel(self: &mut Self, dst: Reg, label: Label) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.room()
+    let reg = Reg.value(dst)
+    self.head(0, true, false, false, 0x8d, reg, 0, 0)
+    self.byte(((reg & 7) * 8) | 5)
+    run self.reference(label)
+  }
+  /// Appends the four bytes of `value`, low byte first: data among the code, addressed with
+  /// `leaLabel`. Not an instruction; nothing may fall through into it.
+  pub effect fn data32(self: &mut Self, value: u32) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.room()
+    self.imm32(u32.wrappingToI32(value))
+  }
+  /// Appends eight bytes among the code that receive the address of `symbol` when linked
+  /// (`RelocationKind.Absolute64`). Not an instruction; nothing may fall through into it.
+  pub effect fn dataSymbol64(self: &mut Self, symbol: u32) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.room()
+    run self.relocations.append(Relocation { offset: self.code.length(), kind: RelocationKind.Absolute64, symbol: symbol, addend: 0 })
+    self.imm64(0)
+  }
+  /// `call symbol` with a 32-bit displacement that `Code.link` fills in. Records a `Relative32`
+  /// relocation, so the symbol must end up within 2 GiB of the code; use `movSymbol` and
+  /// `callReg` when that is not guaranteed.
+  pub effect fn callSymbol(self: &mut Self, symbol: u32) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.room()
+    self.byte(0xe8)
+    // The displacement is relative to the end of its own 4 bytes.
+    run self.relocations.append(Relocation { offset: self.code.length(), kind: RelocationKind.Relative32, symbol: symbol, addend: -4 })
+    self.imm32(0)
+  }
+  /// `jmp symbol`: a jump to an external address, as `callSymbol` calls one.
+  pub effect fn jmpSymbol(self: &mut Self, symbol: u32) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.room()
+    self.byte(0xe9)
+    run self.relocations.append(Relocation { offset: self.code.length(), kind: RelocationKind.Relative32, symbol: symbol, addend: -4 })
+    self.imm32(0)
+  }
+  /// `jmp target`: jumps to the address in a register.
+  pub effect fn jmpReg(self: &mut Self, target: Reg) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.room()
+    self.regForm(0, false, false, false, 0xff, 4, Reg.value(target))
+  }
+  /// `call target`: calls the address in a register.
+  pub effect fn callReg(self: &mut Self, target: Reg) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.room()
+    self.regForm(0, false, false, false, 0xff, 2, Reg.value(target))
+  }
+  /// `call qword ptr [mem]`: calls the address stored in memory.
+  pub effect fn callMem(self: &mut Self, mem: Mem) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.room()
+    self.memForm(0, false, false, false, 0xff, 2, mem)
+  }
+  /// `jmp qword ptr [mem]`: jumps to the address stored in memory.
+  pub effect fn jmpMem(self: &mut Self, mem: Mem) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.room()
+    self.memForm(0, false, false, false, 0xff, 4, mem)
+  }
+  /// `ret`: returns to the address on top of the stack.
+  pub effect fn ret(self: &mut Self) -> () ! OutOfMemoryError ? &mut Allocator { run self.room() self.byte(0xc3) }
+  /// `int3`: a breakpoint trap.
+  pub effect fn int3(self: &mut Self) -> () ! OutOfMemoryError ? &mut Allocator { run self.room() self.byte(0xcc) }
+  /// `ud2`: an instruction that is guaranteed to raise an invalid-opcode fault.
+  pub effect fn ud2(self: &mut Self) -> () ! OutOfMemoryError ? &mut Allocator { run self.room() self.byte(0x0f) self.byte(0x0b) }
+  /// `nop`: one byte that does nothing.
+  pub effect fn nop(self: &mut Self) -> () ! OutOfMemoryError ? &mut Allocator { run self.room() self.byte(0x90) }
+
+  /// Resolves every label reference and returns the code with its relocation records.
+  ///
+  /// Every `jmp` and `jcc` whose displacement fits in 8 bits takes its 2-byte form, as an
+  /// assembler's branch relaxation does: all start short, and one that does not reach grows,
+  /// until none changes. Offsets taken with `offset` before `finish` do not account for this.
+  ///
+  /// Fails with `UnboundLabelError` when an instruction refers to a label that `bind` never
+  /// positioned.
+  pub effect fn finish(self: Self) -> Code ! OutOfMemoryError | UnboundLabelError ? &mut Allocator {
+    let mut none = List<u32>.make()
+    return run self.finishPlaced(&mut none, 1)
+  }
+  /// `finish`, which also moves the offsets at places[0], places[stride], places[2 * stride],
+  /// ... (each taken with `offset` at an instruction's start) to where those instructions end
+  /// up once the short references shrink.
+  pub effect fn finishPlaced(self: Self, places: &mut List<u32>, stride: usize) -> Code ! OutOfMemoryError | UnboundLabelError ? &mut Allocator {
+    return match move self {
+      Assembler { code: bytes, labels: positions, fixups: references, relocations: records, hotMark, seqs, outStarts, outEnds, outSeqs, .. } => {
+        let mut code = move bytes
+        let mut fixups = move references
+        let mut relocations = move records
+        let mut labels = move positions
+        run outline(&mut code, &mut labels, &seqs, &mut fixups, &mut relocations, &mut places, stride, hotMark, &outStarts, &outEnds, &outSeqs)
+        drop run relaxAndCompact(&mut code, &labels, &mut fixups, &mut relocations, &mut places, stride, hotMark)
+        return Code { bytes: move code, relocations: move relocations }
+      }
+    }
+  }
+  /// `finishPlaced`, also returning hot/cold split metadata (`SplitInfo`) for any `markCold()`
+  /// boundary set during assembly. Every label reference crossing the boundary stays 32-bit and
+  /// is recorded in `split.crossRelocs` for `Code.linkSplit`.
+  pub effect fn finishPlacedSplit(self: Self, places: &mut List<u32>, stride: usize) -> SplitCode ! OutOfMemoryError | UnboundLabelError ? &mut Allocator {
+    return match move self {
+      Assembler { code: bytes, labels: positions, fixups: references, relocations: records, hotMark, seqs, outStarts, outEnds, outSeqs, .. } => {
+        let mut code = move bytes
+        let mut fixups = move references
+        let mut relocations = move records
+        let mut labels = move positions
+        run outline(&mut code, &mut labels, &seqs, &mut fixups, &mut relocations, &mut places, stride, hotMark, &outStarts, &outEnds, &outSeqs)
+        let hotBytes = run relaxAndCompact(&mut code, &labels, &mut fixups, &mut relocations, &mut places, stride, hotMark)
+        let mut crossRelocs = List<CrossReloc>.make()
+        if hotBytes != usize.MAX {
+          let mut index: usize = 0
+          while index < fixups.length() {
+            let fixup = fixups.get(index)
+            if !fixup.short {
+              let field = fixup.offset - fixup.before
+              let movedTarget = movedAt(&fixups, fixup.target, labels.get(fixup.label))
+              let fixupInHot = field < hotBytes
+              let targetInHot = movedTarget < hotBytes
+              if fixupInHot != targetInHot {
+                let disp = i64.wrappingToI32(usize.wrappingToI64(movedTarget) - usize.wrappingToI64(field) - 4)
+                run crossRelocs.append(CrossReloc { at: field, disp: disp, fromHot: fixupInHot })
+              }
+            }
+            index = index + 1
+          }
+        }
+        return SplitCode { code: Code { bytes: move code, relocations: move relocations }, split: SplitInfo { hotBytes: hotBytes, crossRelocs: move crossRelocs } }
+      }
+    }
+  }
+}
+
+/// Where the byte at `offset` (from the first stretch up to the limit `outline` works under)
+/// goes when the stretches move: `inside` says whether an offset at a stretch's start is part
+/// of the stretch. `before` holds the bytes of the stretches in front of each, `total` their
+/// sum and `kept` the bytes below the limit that stay. `at` is the first stretch that may end
+/// after the offset before this one, where the search for this one starts.
+fn outlinedAt(starts: &List<usize>, ends: &List<usize>, before: &List<usize>, total: usize, kept: usize, offset: usize, inside: bool, at: &mut usize) -> usize {
+  let falls = at.* > 0 && ends.get(at.* - 1) > offset
+  if falls || (at.* < ends.length() && ends.get(at.*) <= offset) {
+    // Most offsets fall in the stretch `at` names or the next; others are searched for.
+    let mut low: usize = 0
+    let mut high = at.*
+    if !falls { low = at.* + 1 high = ends.length() }
+    if !falls && low < high && ends.get(low) > offset { high = low }
+    while low < high {
+      let middle = (low + high) / 2
+      if ends.get(middle) <= offset { low = middle + 1 } else { high = middle }
+    }
+    at.* = low
+  }
+  let index = at.*
+  if index == ends.length() { return offset - total }
+  let start = starts.get(index)
+  if offset > start || (offset == start && inside) { return kept + before.get(index) + (offset - start) }
+  return offset - before.get(index)
+}
+
+/// Moves the outlined stretches (`Assembler.beginOutlined`; starts[i] up to ends[i], in
+/// order) behind the rest of the code in front of `hotMark` (of the end without one), and
+/// the labels, references, relocations and places with them. Only what lies from the first
+/// stretch up to that limit moves. A stretch left open stays.
+effect fn outline(code: &mut List<u8>, labels: &mut List<usize>, seqs: &List<usize>, fixups: &mut List<Fixup>, relocations: &mut List<Relocation>, places: &mut List<u32>, stride: usize, hotMark: usize, starts: &List<usize>, ends: &List<usize>, opened: &List<usize>) -> () ! OutOfMemoryError ? &mut Allocator {
+  let count = ends.length()
+  if count == 0 { return () }
+  let mut limit = code.length()
+  if hotMark < limit { limit = hotMark }
+  let mut before = run List<usize>.makeWithCapacity(count)
+  let mut total: usize = 0
+  let mut i: usize = 0
+  while i < count { drop before.appendWithinCapacity(total) total = total + (ends.get(i) - starts.get(i)) i = i + 1 }
+  if total == 0 { return () }
+  let kept = limit - total
+  let first = starts.get(0)
+  // The bytes from the first stretch to the limit: those that stay, then the stretches.
+  let mut packed = run List<u8>.makeWithCapacity(limit - first)
+  let mut from = first
+  i = 0
+  while i < count {
+    let start = starts.get(i)
+    if start > from { drop packed.appendSliceWithinCapacity(Slice.view<u8>(code.asSlice(), from, start - from)) }
+    from = ends.get(i)
+    i = i + 1
+  }
+  if limit > from { drop packed.appendSliceWithinCapacity(Slice.view<u8>(code.asSlice(), from, limit - from)) }
+  i = 0
+  while i < count {
+    let start = starts.get(i)
+    let end = ends.get(i)
+    if end > start { drop packed.appendSliceWithinCapacity(Slice.view<u8>(code.asSlice(), start, end - start)) }
+    i = i + 1
+  }
+  Slice.copyInto<u8>(code.asMutSlice(), first, packed.asSlice())
+  let mut at: usize = 0
+  // A label where a stretch starts is part of it when it was bound after the stretch began.
+  i = 0
+  while i < labels.length() {
+    let offset = labels.get(i)
+    if offset != usize.MAX && offset >= first && offset < limit {
+      let mapped = outlinedAt(starts, ends, &before, total, kept, offset, true, &mut at)
+      if at < count && starts.get(at) == offset && seqs.get(i) < opened.get(at) { labels.set(i, offset - before.get(at)) }
+      else { labels.set(i, mapped) }
+    }
+    i = i + 1
+  }
+  // The references stay in offset order: those in front of the first stretch keep their
+  // places, then come those that stay, those of the stretches and the rest.
+  let mut low: usize = 0
+  while low < fixups.length() && fixups.get(low).offset < first { low = low + 1 }
+  let mut high = low
+  while high < fixups.length() && fixups.get(high).offset < limit { high = high + 1 }
+  if high > low {
+    let mut moved = run List<Fixup>.makeWithCapacity(high - low)
+    let mut write = low
+    at = 0
+    i = low
+    while i < high {
+      let mut fixup = fixups.get(i)
+      fixup.offset = outlinedAt(starts, ends, &before, total, kept, fixup.offset, true, &mut at)
+      if fixup.offset >= kept { drop moved.appendWithinCapacity(fixup) } else { fixups.set(write, fixup) write = write + 1 }
+      i = i + 1
+    }
+    i = 0
+    while i < moved.length() { fixups.set(write, moved.get(i)) write = write + 1 i = i + 1 }
+  }
+  at = 0
+  i = 0
+  while i < relocations.length() {
+    let mut record = relocations.get(i)
+    if record.offset >= first && record.offset < limit {
+      record.offset = outlinedAt(starts, ends, &before, total, kept, record.offset, true, &mut at)
+      relocations.set(i, record)
+    }
+    i = i + 1
+  }
+  at = 0
+  i = 0
+  while i < places.length() {
+    let taken = u32.toUsize(places.get(i))
+    if taken >= first && taken < limit { places.set(i, usize.toU32(outlinedAt(starts, ends, &before, total, kept, taken, false, &mut at))) }
+    i = i + stride
+  }
+}
+
+effect fn relaxAndCompact(code: &mut List<u8>, labels: &List<usize>, fixups: &mut List<Fixup>, relocations: &mut List<Relocation>, places: &mut List<u32>, stride: usize, hotMark: usize) -> usize ! OutOfMemoryError | UnboundLabelError ? &mut Allocator {
+  let mut index: usize = 0
+  while index < fixups.length() {
+    let label = fixups.get(index).label
+    if labels.get(label) == usize.MAX { fail UnboundLabelError { label: label } }
+    index = index + 1
+  }
+  let hasMark = hotMark > 0 && hotMark < code.length()
+  index = 0
+  while index < fixups.length() {
+    let mut fixup = fixups.get(index)
+    let labelAt = labels.get(fixup.label)
+    fixup.target = rank(&fixups, labelAt)
+    // Any reference crossing hotMark must keep its 32-bit displacement so linkSplit can
+    // relocate it across the hot/cold gap.
+    if hasMark && ((fixup.offset < hotMark) != (labelAt < hotMark)) { fixup.short = false }
+    fixups.set(index, fixup)
+    index = index + 1
+  }
+  // Grow the references that do not reach until none changes. A reference only grows,
+  // so this ends; it gives the same sizes as llvm-mc's relaxation.
+  let mut changed = true
+  while changed {
+    changed = false
+    let mut saved: usize = 0
+    index = 0
+    while index < fixups.length() {
+      let mut fixup = fixups.get(index)
+      fixup.before = saved
+      fixups.set(index, fixup)
+      saved = saved + saving(fixup)
+      index = index + 1
+    }
+    index = 0
+    while index < fixups.length() {
+      let mut fixup = fixups.get(index)
+      if fixup.short {
+        // The byte after the field: this reference is the last one in front of it.
+        let end = usize.wrappingToI64(fixup.offset + 4 - fixup.before - saving(fixup))
+        let target = usize.wrappingToI64(movedAt(&fixups, fixup.target, labels.get(fixup.label)))
+        if target - end < -128 || target - end > 127 {
+          fixup.short = false
+          fixups.set(index, fixup)
+          changed = true
+        }
+      }
+      index = index + 1
+    }
+  }
+  // Compact: each short reference's instruction becomes its opcode and an 8-bit field.
+  // The bytes between two of them go to a list of their own in one copy each (the code is
+  // tens of kilobytes; a byte at a time in place was a third of this function).
+  let mut packed = run List<u8>.makeWithCapacity(code.length())
+  let mut from: usize = 0
+  index = 0
+  while index < fixups.length() {
+    let fixup = fixups.get(index)
+    if fixup.short {
+      let start = fixup.offset - 1 - u8.toUsize(fixup.kind - 1)
+      if start > from { drop packed.appendSliceWithinCapacity(Slice.view<u8>(code.asSlice(), from, start - from)) }
+      let mut opcode: u8 = 0xeb
+      if fixup.kind == BRANCH { opcode = code.get(fixup.offset - 1) - 0x10 }
+      drop packed.appendWithinCapacity(opcode)
+      drop packed.appendWithinCapacity(0)
+      from = fixup.offset + 4
+    }
+    index = index + 1
+  }
+  if code.length() > from { drop packed.appendSliceWithinCapacity(Slice.view<u8>(code.asSlice(), from, code.length() - from)) }
+  code.* = move packed
+  index = 0
+  while index < fixups.length() {
+    let fixup = fixups.get(index)
+    let target = usize.wrappingToI64(movedAt(&fixups, fixup.target, labels.get(fixup.label)))
+    if fixup.short {
+      // The field is the instruction's last byte; its start moved by the savings before it.
+      let field = fixup.offset - fixup.before - 1 - u8.toUsize(fixup.kind - 1) + 1
+      code.set(field, i64.wrappingToU8(target - usize.wrappingToI64(field) - 1))
+    } else {
+      // Both offsets are below 2^31: the displacement is relative to the end of its field.
+      let field = fixup.offset - fixup.before
+      patch32(&mut code, field, i64.wrappingToI32(target - usize.wrappingToI64(field) - 4))
+    }
+    index = index + 1
+  }
+  index = 0
+  while index < relocations.length() {
+    let mut record = relocations.get(index)
+    record.offset = moved(&fixups, record.offset)
+    relocations.set(index, record)
+    index = index + 1
+  }
+  index = 0
+  while index < places.length() {
+    let taken = u32.toUsize(places.get(index))
+    places.set(index, usize.toU32(moved(&fixups, taken)))
+    index = index + stride
+  }
+  if !hasMark { return usize.MAX }
+  let hotBytes = moved(&fixups, hotMark)
+  if hotBytes == 0 || hotBytes >= code.length() { return usize.MAX }
+  return hotBytes
+}
+
+fn patch32(bytes: &mut List<u8>, offset: usize, value: i32) -> () {
+  let bits = i32.wrappingToU32(value)
+  bytes.set(offset, u32.wrappingToU8(bits))
+  bytes.set(offset + 1, u32.wrappingToU8(u32.shiftRight(bits, 8)))
+  bytes.set(offset + 2, u32.wrappingToU8(u32.shiftRight(bits, 16)))
+  bytes.set(offset + 3, u32.wrappingToU8(u32.shiftRight(bits, 24)))
+}
+
+impl Code {
+  /// Writes external addresses into the code so that it can run at address `base`.
+  /// `symbols[n]` is the address of the symbol that relocation records call `n`.
+  ///
+  /// Fails with `LinkError` when a record names a symbol outside `symbols`, or when a
+  /// `Relative32` target is more than 2 GiB from the field that refers to it. The records are
+  /// kept, so the same `Code` can be linked again for another address.
+  pub effect fn link(self: &mut Self, base: usize, symbols: &[usize]) -> () ! LinkError {
+    let mut index: usize = 0
+    while index < self.relocations.length() {
+      let record = self.relocations.get(index)
+      let symbol = u32.toUsize(record.symbol)
+      if symbol >= symbols.length { fail LinkError { relocation: index, unknownSymbol: true } }
+      let target = i64.wrappingAdd(usize.wrappingToI64(symbols[symbol]), record.addend)
+      if record.kind == RelocationKind.Absolute64 {
+        let bits = i64.wrappingToU64(target)
+        let mut at: usize = 0
+        while at < 8 {
+          self.bytes.set(record.offset + at, u64.wrappingToU8(u64.shiftRight(bits, usize.toU64(at * 8))))
+          at = at + 1
+        }
+      } else {
+        let field = usize.wrappingToI64(base + record.offset)
+        let distance = i64.wrappingSubtract(target, field)
+        if distance < -2147483648 || distance > 2147483647 { fail LinkError { relocation: index, unknownSymbol: false } }
+        patch32(&mut self.bytes, record.offset, i64.wrappingToI32(distance))
+      }
+      index = index + 1
+    }
+  }
+  /// Links split code whose hot slice `[0..split.hotBytes)` will run at `hotAddr` and cold
+  /// slice `[split.hotBytes..]` will run at `coldAddr`. Patches both external `relocations`
+  /// and internal hot<->cold `split.crossRelocs` in `self.bytes`.
+  pub effect fn linkSplit(self: &mut Self, hotAddr: usize, coldAddr: usize, split: &SplitInfo, symbols: &[usize]) -> () ! LinkError {
+    if split.hotBytes == usize.MAX { run self.link(hotAddr, symbols) return () }
+    let hotBytes = split.hotBytes
+    let mut index: usize = 0
+    while index < self.relocations.length() {
+      let record = self.relocations.get(index)
+      let symbol = u32.toUsize(record.symbol)
+      if symbol >= symbols.length { fail LinkError { relocation: index, unknownSymbol: true } }
+      let target = i64.wrappingAdd(usize.wrappingToI64(symbols[symbol]), record.addend)
+      if record.kind == RelocationKind.Absolute64 {
+        let bits = i64.wrappingToU64(target)
+        let mut at: usize = 0
+        while at < 8 {
+          self.bytes.set(record.offset + at, u64.wrappingToU8(u64.shiftRight(bits, usize.toU64(at * 8))))
+          at = at + 1
+        }
+      } else {
+        let fieldAddr = if record.offset < hotBytes { hotAddr + record.offset } else { coldAddr + (record.offset - hotBytes) }
+        let field = usize.wrappingToI64(fieldAddr)
+        let distance = i64.wrappingSubtract(target, field)
+        if distance < -2147483648 || distance > 2147483647 { fail LinkError { relocation: index, unknownSymbol: false } }
+        patch32(&mut self.bytes, record.offset, i64.wrappingToI32(distance))
+      }
+      index = index + 1
+    }
+    let delta = i64.wrappingSubtract(usize.wrappingToI64(coldAddr), usize.wrappingToI64(hotAddr + hotBytes))
+    index = 0
+    while index < split.crossRelocs.length() {
+      let cr = split.crossRelocs.get(index)
+      let base = i32.toI64(cr.disp)
+      let patched = if cr.fromHot { i64.wrappingAdd(base, delta) } else { i64.wrappingSubtract(base, delta) }
+      if patched < -2147483648 || patched > 2147483647 { fail LinkError { relocation: self.relocations.length(), unknownSymbol: false } }
+      patch32(&mut self.bytes, cr.at, i64.wrappingToI32(patched))
+      index = index + 1
+    }
+  }
+}

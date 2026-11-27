@@ -1,0 +1,160 @@
+//! Deoptimization exits by table (docs/jit/compile-cost.md, "Exit tables"). Compiled code no
+//! longer carries code per exit that writes each interpreter slot: an exit loads the address
+//! of its record, a table among the code bytes, and the function's one common stub calls
+//! `jitExitState`, which writes the state the record describes. A record names its slots in
+//! chunks of CHUNK entries, and equal chunks are stored once, so a function with many locals
+//! and many exits pays for what changes between exits, not exits times locals.
+//!
+//! Record, in u32 words: pc, operand stack depth, code, slot count, entry count, frame count,
+//! then one word per chunk: the chunk's byte offset from the record's first word. The first `slot count`
+//! entries each write one slot; the entries after them write nothing (ENTRY_RELEASE). `code` is the exit status the code
+//! returns (js_compiled.EXIT_*), or CODE_FROM_FRAME plus the frame offset of a u32 holding it
+//! (a call's exit returns the status its result slot holds).
+//! Chunk: CHUNK entries of two words, kind and operand.
+//!
+//! An exit of code on a baseline frame that leaves inlined bodies part way through
+//! (ssa.Exit.frames, x64_frame_exit) has a nonzero frame count in the low 16 bits of word
+//! [5]. After its chunk words come the frame offset of the area the code keeps for such
+//! exits, then five words per frame, outermost first: the offset after the call that began
+//! it, that call's argument count (bit 31: a method call), its locals, its operands and its
+//! pc. The entries after the slots are then each frame's locals and operands, in that order,
+//! before the releases.
+//!
+//! The high 16 bits of word [5] carry `vCount`, the number of virtual (escape-eliminated)
+//! objects live at the exit (0 when none). When nonzero, immediately after any frame trailer
+//! comes the virtual trailer: `vCount` descriptors, each consisting of two words (an
+//! `Absolute64`-relocated `*mut ConstructDesc` pointer), one word `slotCount`, and `slotCount`
+//! field entries of two words `(kind, operand)` each.
+import silk.mem.pointer { Pointer }
+import silk.num.f64
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+import silkjs.js_value { ValueBits }
+import silkjs.js_gc as gc
+
+/// Entries per chunk.
+pub const CHUNK: u32 = 8
+/// Words before a record's chunk offsets.
+pub const RECORD_HEAD: u32 = 6
+/// Words per frame of an exit that leaves inlined bodies, and the bytes the code keeps for
+/// each frame's js_baseline.Inlined (the frames' value cells follow them).
+pub const FRAME_WORDS: u32 = 5
+pub const INLINED_BYTES: u32 = 80
+/// Bit 31 of a frame's argument count word: a method call.
+pub const FRAME_METHOD: u32 = 0x80000000
+pub const CODE_FROM_FRAME: u32 = 0x80000000
+/// In a record's code word on a baseline frame, where x64_frame_exit reads no code: the exit
+/// is a `check.array`'s (ssa_opt_hoist), which jit_runtime.noteLeft remembers apart from the
+/// other exits at the loop's header (ssa.SITE_ARRAY).
+pub const CODE_ARRAY_CHECK: u32 = 0x40000000
+/// The same for a `check.bound`'s exit (ssa_opt_bounds, ssa.SITE_BOUND).
+pub const CODE_BOUND_CHECK: u32 = 0x20000000
+/// In a record's depth word: the function's parameter values follow the stack slots. The
+/// state's depth word carries it as bit 32 (js_compiled.ARGUMENTS_FOLLOW).
+pub const ARGUMENTS_FOLLOW: u32 = 0x80000000
+
+/// Entry kinds. A frame operand is a byte offset from the frame base (the value slots); a
+/// register operand is the register's index in its pool (x64_regalloc), read from the dump.
+pub const ENTRY_NONE: u32 = 0
+/// An i32 at a frame offset or in an integer register: written as an Int.
+pub const ENTRY_INT_FRAME: u32 = 1
+pub const ENTRY_INT_REGISTER: u32 = 2
+/// A bool (0 or 1) at a frame offset or in an integer register: written as a Bool.
+pub const ENTRY_BOOL_FRAME: u32 = 3
+pub const ENTRY_BOOL_REGISTER: u32 = 4
+/// A double's bits at a frame offset or in a double register: written as a Float64.
+pub const ENTRY_F64_FRAME: u32 = 5
+pub const ENTRY_F64_REGISTER: u32 = 6
+/// A ValueBits at a frame offset, handed over as it is (`move`, `imm`).
+pub const ENTRY_VALUE: u32 = 7
+/// A ValueBits at a frame offset with one count added (`dup`: a borrow).
+pub const ENTRY_VALUE_RETAIN: u32 = 8
+/// The operand itself as an Int: a constant has no place of its own to read.
+pub const ENTRY_INT_CONST: u32 = 9
+/// A ValueBits at a frame offset that the exit drops (gc.releaseDeferred); only after the slots.
+pub const ENTRY_RELEASE: u32 = 10
+/// A virtual (escape-eliminated) object materialized on exit (`x64_frame_exit`): operand is
+/// its local index `0 .. vCount - 1` in the record's virtual trailer.
+pub const ENTRY_VIRTUAL: u32 = 11
+
+/// Integer registers the dump holds first, one u64 each; the double registers follow.
+pub const DUMP_INTEGERS: u32 = 8
+pub const DUMP_DOUBLES: u32 = 14
+/// Bytes of the dump, a multiple of 16 so the stack stays aligned at the helper call.
+pub const DUMP_BYTES: i32 = 176
+
+unsafe fn wordAt(words: [*]mut u32, index: usize) -> u32 { return unsafe Pointer.read<u32>(unsafe Pointer.atMut<u32>(words, index)) }
+unsafe fn frame32(bytes: [*]mut u8, offset: u32) -> u32 {
+  return unsafe Pointer.read<u32>(unsafe Intrinsic.pointerReinterpret<*mut u8, *mut u32>(unsafe Pointer.atMut<u8>(bytes, u32.toUsize(offset))))
+}
+unsafe fn frame64(bytes: [*]mut u8, offset: u32) -> u64 {
+  return unsafe Pointer.read<u64>(unsafe Intrinsic.pointerReinterpret<*mut u8, *mut u64>(unsafe Pointer.atMut<u8>(bytes, u32.toUsize(offset))))
+}
+
+/// The value a slot entry names, as it is: the count an ENTRY_VALUE_RETAIN adds is the
+/// caller's to add.
+pub unsafe fn decode(kind: u32, operand: u32, bytes: [*]mut u8, registers: [*]mut u64) -> ValueBits {
+  if kind == ENTRY_INT_CONST { return ValueBits.Int { value: u32.wrappingToI32(operand) } }
+  if kind == ENTRY_INT_FRAME { return ValueBits.Int { value: u32.wrappingToI32(unsafe frame32(bytes, operand)) } }
+  if kind == ENTRY_INT_REGISTER {
+    return ValueBits.Int { value: u32.wrappingToI32(u64.wrappingToU32(unsafe Pointer.read<u64>(unsafe Pointer.atMut<u64>(registers, u32.toUsize(operand))))) }
+  }
+  if kind == ENTRY_BOOL_FRAME { return ValueBits.Bool { value: (unsafe frame32(bytes, operand) & 1) != 0 } }
+  if kind == ENTRY_BOOL_REGISTER {
+    return ValueBits.Bool { value: (u64.wrappingToU32(unsafe Pointer.read<u64>(unsafe Pointer.atMut<u64>(registers, u32.toUsize(operand)))) & 1) != 0 }
+  }
+  if kind == ENTRY_F64_FRAME { return ValueBits.Float64 { value: f64.fromBits(unsafe frame64(bytes, operand)) } }
+  if kind == ENTRY_F64_REGISTER {
+    return ValueBits.Float64 { value: f64.fromBits(unsafe Pointer.read<u64>(unsafe Pointer.atMut<u64>(registers, u32.toUsize(DUMP_INTEGERS + operand)))) }
+  }
+  if kind == ENTRY_VALUE || kind == ENTRY_VALUE_RETAIN {
+    return unsafe Pointer.read<ValueBits>(unsafe Intrinsic.pointerReinterpret<*mut u8, *mut ValueBits>(unsafe Pointer.atMut<u8>(bytes, u32.toUsize(operand))))
+  }
+  return Intrinsic.trap("jit_exit_state: an exit record names no such entry kind")
+}
+
+/// exit_state(env, state, frame, record, dump) -> u32: writes the interpreter state `record`
+/// describes to `state` (pc, depth, one owned ValueBits per slot) from the code's value slots
+/// at `frame` and its registers in `dump`, and returns the exit status.
+pub export "C" fn jitExitState(env: *mut u8, state: *mut u64, frame: *mut u8, record: *mut u32, dump: *mut u64) -> u32 {
+  let words = unsafe Pointer.assumeManyMut<u32>(record)
+  let recordBytes = unsafe Pointer.assumeManyMut<u8>(unsafe Intrinsic.pointerReinterpret<*mut u32, *mut u8>(record))
+  let bytes = unsafe Pointer.assumeManyMut<u8>(frame)
+  let registers = unsafe Pointer.assumeManyMut<u64>(dump)
+  let stateWords = unsafe Pointer.assumeManyMut<u64>(state)
+  let code = unsafe wordAt(words, 2)
+  let slots = u32.toUsize(unsafe wordAt(words, 3))
+  let count = u32.toUsize(unsafe wordAt(words, 4))
+  unsafe Pointer.write<u64>(unsafe Pointer.atMut<u64>(stateWords, 0), u32.toU64(unsafe wordAt(words, 0)))
+  let depth = unsafe wordAt(words, 1)
+  let mut depthWord = u32.toU64(depth & 0x7fffffff)
+  if (depth & ARGUMENTS_FOLLOW) != 0 { depthWord = depthWord | 4294967296 }
+  unsafe Pointer.write<u64>(unsafe Pointer.atMut<u64>(stateWords, 1), depthWord)
+  let out = unsafe Pointer.assumeManyMut<ValueBits>(unsafe Intrinsic.pointerReinterpret<*mut u64, *mut ValueBits>(unsafe Pointer.atMut<u64>(stateWords, 2)))
+  let chunkSize = u32.toUsize(CHUNK)
+  let mut index: usize = 0
+  while index < count {
+    let offset = unsafe wordAt(words, u32.toUsize(RECORD_HEAD) + index / chunkSize)
+    let chunk = unsafe Pointer.assumeManyMut<u32>(unsafe Intrinsic.pointerReinterpret<*mut u8, *mut u32>(unsafe Pointer.atMut<u8>(recordBytes, u32.toUsize(offset))))
+    let mut within: usize = 0
+    while within < chunkSize && index < count {
+      let kind = unsafe wordAt(chunk, within * 2)
+      let operand = unsafe wordAt(chunk, within * 2 + 1)
+      if index >= slots {
+        if kind != ENTRY_RELEASE { Intrinsic.trap("jitExitState: an entry after the slots that is no release") }
+        unsafe gc.releaseDeferred(unsafe Pointer.read<ValueBits>(unsafe Intrinsic.pointerReinterpret<*mut u8, *mut ValueBits>(unsafe Pointer.atMut<u8>(bytes, u32.toUsize(operand)))))
+        within = within + 1
+        index = index + 1
+        continue
+      }
+      let mut value = unsafe decode(kind, operand, bytes, registers)
+      if kind == ENTRY_VALUE_RETAIN { value = unsafe value.retained() }
+      unsafe Pointer.write<ValueBits>(unsafe Pointer.atMut<ValueBits>(out, index), value)
+      within = within + 1
+      index = index + 1
+    }
+  }
+  if (code & CODE_FROM_FRAME) != 0 { return unsafe frame32(bytes, code & 0x7fffffff) }
+  return code
+}

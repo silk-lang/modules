@@ -1,0 +1,441 @@
+//! Exit tables for x64_backend (jit_exit_state has the format and the reason): one record per
+//! exit, chunks shared between records, a two-instruction stub per exit and one common stub
+//! per function that hands the record to the EXIT_STATE helper. In frame mode
+//! (x64_backend.lowerOnFrame) the common stub hands it to FRAME_EXIT, which writes the state
+//! into the baseline frame, and the function's baseline code goes on from there.
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.num.u8
+import silk.num.u32
+import silk.num.i32
+import silk.num.usize
+import asm_x64 { Alu, Cond, Mem, Reg, Width }
+import ssa { Function, Op, Type, Own, SlotMode, NONE }
+import x64_regalloc { GPR, XMM, gprCount, xmmAt }
+import x64_backend { Emitter, SLOT_BYTES, INPUT_ENV, SYMBOL_MOVED, SYMBOL_FINISH }
+import silk.num.u64
+import silkjs.js_baseline as frames
+import baseline_env
+import x64_frame_exit as leaving
+import jit_helpers as helpers
+import jit_exit_state as state
+
+/// js_compiled.EXIT_DEOPT and EXIT_POLL.
+const EXIT_DEOPT: u32 = 1
+const EXIT_POLL: u32 = 2
+
+/// The records and chunks of one function, as u32 words; chunks are told apart by content.
+struct Tables {
+  records: List<u32>,
+  /// Word index in `records` of each exit's record.
+  recordAt: List<u32>,
+  chunks: List<u32>,
+  /// Open addressing over chunk numbers (NONE: empty); its length is a power of two.
+  buckets: List<u32>,
+  chunkCount: u32,
+  /// Partial last chunks, at their own length, emitted after `chunks`; tailAt is where each begins.
+  tails: List<u32>,
+  tailAt: List<u32>
+}
+
+const CHUNK_WORDS: usize = 16
+/// In a record's chunk word before emission: the rest is a word offset into Tables.tails.
+const TAIL: u32 = 2147483648
+/// How many of the latest tails a new one is compared with.
+const TAILS_SEEN: usize = 4
+
+fn hashChunk(words: &[u32]) -> u32 {
+  let mut hash: u32 = 2166136261
+  let mut i: usize = 0
+  while i < words.length { hash = u32.wrappingMultiply(u32.bitXor(hash, words[i]), 16777619) i = i + 1 }
+  return hash
+}
+
+impl Tables {
+  effect fn make() -> Tables ! OutOfMemoryError ? &mut Allocator {
+    let mut buckets = List<u32>.make()
+    run buckets.appendRepeated(NONE, 64)
+    return Tables { records: List<u32>.make(), recordAt: List<u32>.make(), chunks: List<u32>.make(), buckets: move buckets, chunkCount: 0, tails: List<u32>.make(), tailAt: List<u32>.make() }
+  }
+  fn same(self: &Self, chunk: u32, words: &[u32]) -> bool {
+    let base = u32.toUsize(chunk) * CHUNK_WORDS
+    let mut i: usize = 0
+    while i < CHUNK_WORDS { if self.chunks.get(base + i) != words[i] { return false } i = i + 1 }
+    return true
+  }
+  fn place(self: &mut Self, chunk: u32, hash: u32) -> () {
+    let mask = usize.toU32(self.buckets.length()) - 1
+    let mut at = u32.bitAnd(hash, mask)
+    while self.buckets.get(u32.toUsize(at)) != NONE { at = u32.bitAnd(at + 1, mask) }
+    self.buckets.set(u32.toUsize(at), chunk)
+  }
+  /// The word offset in `tails` of the first `used` words of `words`: an exit's last, partial
+  /// chunk, stored at its own length (the helper reads only the entries the record counts).
+  /// Equal to one of the last few tails, it shares that one: neighbouring exits often agree.
+  effect fn tail(self: &mut Self, words: &[u32], used: usize) -> u32 ! OutOfMemoryError ? &mut Allocator {
+    let mut back: usize = 0
+    while back < TAILS_SEEN && back < self.tailAt.length() {
+      let at = u32.toUsize(self.tailAt.get(self.tailAt.length() - 1 - back))
+      let mut end = self.tails.length()
+      if back > 0 { end = u32.toUsize(self.tailAt.get(self.tailAt.length() - back)) }
+      if end - at >= used {
+        let mut i: usize = 0
+        while i < used && self.tails.get(at + i) == words[i] { i = i + 1 }
+        if i == used { return usize.toU32(at) }
+      }
+      back = back + 1
+    }
+    let at = usize.toU32(self.tails.length())
+    run self.tailAt.append(at)
+    let mut i: usize = 0
+    while i < used { run self.tails.append(words[i]) i = i + 1 }
+    return at
+  }
+  /// The number of the chunk holding `words` (CHUNK_WORDS of them), stored once.
+  effect fn intern(self: &mut Self, words: &[u32]) -> u32 ! OutOfMemoryError ? &mut Allocator {
+    let hash = hashChunk(words)
+    let mask = usize.toU32(self.buckets.length()) - 1
+    let mut at = u32.bitAnd(hash, mask)
+    while true {
+      let found = self.buckets.get(u32.toUsize(at))
+      if found == NONE { break }
+      if self.same(found, words) { return found }
+      at = u32.bitAnd(at + 1, mask)
+    }
+    let chunk = self.chunkCount
+    run self.chunks.appendSlice(words)
+    self.chunkCount = chunk + 1
+    // Half full: double and place every chunk again.
+    if u32.toUsize(self.chunkCount) * 2 > self.buckets.length() {
+      let size = self.buckets.length() * 2
+      self.buckets.clear()
+      run self.buckets.appendRepeated(NONE, size)
+      let mut c: u32 = 0
+      while c < self.chunkCount {
+        let base = u32.toUsize(c) * CHUNK_WORDS
+        let mut copy: [u32; 16] = [0; 16]
+        let mut i: usize = 0
+        while i < CHUNK_WORDS { copy[i] = self.chunks.get(base + i) i = i + 1 }
+        self.place(c, hashChunk(&copy))
+        c = c + 1
+      }
+    } else { self.place(chunk, hash) }
+    return chunk
+  }
+}
+
+/// The exit stubs, the common stub and the tables of `function`'s exits, at the end of the
+/// code. Each exit label is bound to its stub.
+pub effect fn emit(e: &mut Emitter, function: &Function) -> () ! OutOfMemoryError ? &mut Allocator {
+  let exitCount = function.exits.length()
+  if exitCount == 0 { return () }
+  // What each exit returns: a poll's is an interrupt, a call's the status in its result slot.
+  let mut codes = List<u32>.make()
+  run codes.appendRepeated(EXIT_DEOPT, exitCount)
+  let mut i: usize = 0
+  while i < function.insts.length() {
+    let inst = function.insts.get(i)
+    if inst.exit != NONE {
+      if inst.op == Op.Poll { codes.set(u32.toUsize(inst.exit), EXIT_POLL) }
+      else if inst.op == Op.Call { codes.set(u32.toUsize(inst.exit), u32.bitOr(state.CODE_FROM_FRAME, inst.result * SLOT_BYTES)) }
+      else if inst.op == Op.CheckArray && e.on { codes.set(u32.toUsize(inst.exit), u32.bitOr(EXIT_DEOPT, state.CODE_ARRAY_CHECK)) }
+      else if (inst.op == Op.CheckBound || inst.op == Op.GrowBound) && e.on { codes.set(u32.toUsize(inst.exit), u32.bitOr(EXIT_DEOPT, state.CODE_BOUND_CHECK)) }
+    }
+    i = i + 1
+  }
+  let mut tables = run Tables.make()
+  let mut vSymAt = List<usize>.make()
+  let mut vSymId = List<u32>.make()
+  let chunkSize = u32.toUsize(state.CHUNK)
+  let mut x: usize = 0
+  while x < exitCount {
+    let exit = function.exits.get(x)
+    let count = function.exitSlots(exit)
+    // Kind and operand per entry: one per slot, one per slot of the inlined frames the exit
+    // leaves part way through, then the releases.
+    let mut entries = List<u32>.make()
+    let mut localVirtuals = List<u32>.make()
+    let mut s: u32 = 0
+    while s < count + exit.inner {
+      let slot = function.slot(exit, s)
+      if slot.mode == SlotMode.Virtual {
+        let voIdx = slot.value
+        let mut li: usize = 0
+        while li < localVirtuals.length() && localVirtuals.get(li) != voIdx { li = li + 1 }
+        if li == localVirtuals.length() { run localVirtuals.append(voIdx) }
+        run entries.append(state.ENTRY_VIRTUAL)
+        run entries.append(usize.toU32(li))
+        s = s + 1
+        continue
+      }
+      let v = slot.value
+      let info = function.value(v)
+      let kind = e.places.kind(v)
+      let mut entry = state.ENTRY_VALUE
+      // An armed method read inside one of its dispatch's arms: the arm's closure slot.
+      let mut operand = e.exitSlotOf(usize.toU32(x), v) * SLOT_BYTES
+      if info.ty == Type.I32 || info.ty == Type.Bool {
+        let boolean = info.ty == Type.Bool
+        match e.constants.get(u32.toUsize(v)) {
+          Option<i32>.Some { value } => { entry = state.ENTRY_INT_CONST operand = i32.wrappingToU32(value) }
+          Option<i32>.None => {
+            if kind == GPR {
+              operand = u8.toU32(e.places.register(v))
+              if boolean { entry = state.ENTRY_BOOL_REGISTER } else { entry = state.ENTRY_INT_REGISTER }
+            } else if boolean { entry = state.ENTRY_BOOL_FRAME } else { entry = state.ENTRY_INT_FRAME }
+          }
+        }
+      } else if info.ty == Type.F64 {
+        if kind == XMM { operand = u8.toU32(e.places.register(v)) entry = state.ENTRY_F64_REGISTER }
+        else { entry = state.ENTRY_F64_FRAME }
+      } else if !(info.own == Own.Imm || slot.mode == SlotMode.Imm || info.own == Own.Owned) {
+        // A move hands its count over; a dup (a borrow) adds the slot's own.
+        entry = state.ENTRY_VALUE_RETAIN
+      } else if info.own == Own.Owned && slot.mode != SlotMode.Imm && (e.presetAt(v, usize.toU32(x)) || e.isBare(v)) {
+        // A known closure the code holds no count of (x64_backend.presets, bareDispatch):
+        // the cell's own.
+        entry = state.ENTRY_VALUE_RETAIN
+      }
+      run entries.append(entry)
+      run entries.append(operand)
+      s = s + 1
+    }
+    // What an inlined body still owned (Exit.drops): released once the state is written.
+    while s < function.slotCount(exit) {
+      let slot = function.slot(exit, s)
+      if slot.mode == SlotMode.Move && !e.presetAt(slot.value, usize.toU32(x)) && !e.isBare(slot.value) {
+        run entries.append(state.ENTRY_RELEASE)
+        run entries.append(e.storage(slot.value) * SLOT_BYTES)
+      }
+      s = s + 1
+    }
+    let vCount = usize.toU32(localVirtuals.length())
+    if vCount > 16 { Intrinsic.trap("x64_exits: too many virtual objects in one exit") }
+    if exit.frames > 0xffff { Intrinsic.trap("x64_exits: too many inlined frames in one exit") }
+    let total = usize.toU32(entries.length() / 2)
+    run tables.recordAt.append(usize.toU32(tables.records.length()))
+    run tables.records.append(exit.pc)
+    // Bit 31 of the depth: parameter values follow the stack (jit_exit_state).
+    if function.argumentSlots != 0 { run tables.records.append(u32.bitOr(exit.stackDepth, state.ARGUMENTS_FOLLOW)) }
+    else { run tables.records.append(exit.stackDepth) }
+    run tables.records.append(codes.get(x))
+    run tables.records.append(count)
+    run tables.records.append(total)
+    run tables.records.append(u32.bitOr(exit.frames, u32.shiftLeft(vCount, 16)))
+    let mut at: usize = 0
+    while at < entries.length() {
+      let mut words: [u32; 16] = [0; 16]
+      let mut within: usize = 0
+      while within < chunkSize * 2 && at < entries.length() {
+        words[within] = entries.get(at)
+        within = within + 1
+        at = at + 1
+      }
+      // The chunk's number for now, or TAIL with a tail's word offset; its byte offset once
+      // the records' size is known.
+      let mut named: u32 = 0
+      if within < chunkSize * 2 { named = u32.bitOr(TAIL, run tables.tail(&words, within)) }
+      else { named = run tables.intern(&words) }
+      run tables.records.append(named)
+    }
+    if exit.frames != 0 {
+      run tables.records.append(i32.wrappingToU32(e.leaveAt))
+      let mut n: u32 = 0
+      while n < exit.frames {
+        let frame = function.exitFrame(exit, n)
+        let mut call = frame.argc
+        if frame.method { call = u32.bitOr(call, state.FRAME_METHOD) }
+        run tables.records.append(frame.after)
+        run tables.records.append(call)
+        run tables.records.append(frame.locals)
+        run tables.records.append(frame.depth)
+        run tables.records.append(frame.pc)
+        n = n + 1
+      }
+    }
+    if vCount != 0 {
+      let mut vi: usize = 0
+      while vi < localVirtuals.length() {
+        let voIdx = localVirtuals.get(vi)
+        let vo = function.virtualObjs.get(u32.toUsize(voIdx))
+        run vSymAt.append(tables.records.length())
+        run vSymId.append(e.constructSymbol(function, vo.constructSite))
+        run tables.records.append(0)
+        run tables.records.append(0)
+        run tables.records.append(vo.slotCount)
+        let mut fk: u32 = 0
+        while fk < vo.slotCount {
+          let fv = vo.fields[u32.toUsize(fk)]
+          let finfo = function.value(fv)
+          let fkind = e.places.kind(fv)
+          let mut fentry = state.ENTRY_VALUE
+          let mut foperand = e.storage(fv) * SLOT_BYTES
+          if finfo.ty == Type.I32 || finfo.ty == Type.Bool {
+            let boolean = finfo.ty == Type.Bool
+            match e.constants.get(u32.toUsize(fv)) {
+              Option<i32>.Some { value } => { fentry = state.ENTRY_INT_CONST foperand = i32.wrappingToU32(value) }
+              Option<i32>.None => {
+                if fkind == GPR {
+                  foperand = u8.toU32(e.places.register(fv))
+                  if boolean { fentry = state.ENTRY_BOOL_REGISTER } else { fentry = state.ENTRY_INT_REGISTER }
+                } else if boolean { fentry = state.ENTRY_BOOL_FRAME } else { fentry = state.ENTRY_INT_FRAME }
+              }
+            }
+          } else if finfo.ty == Type.F64 {
+            if fkind == XMM { foperand = u8.toU32(e.places.register(fv)) fentry = state.ENTRY_F64_REGISTER }
+            else { fentry = state.ENTRY_F64_FRAME }
+          } else if finfo.own != Own.Imm {
+            // Materialized objects always need their own count independent of other exit slots.
+            fentry = state.ENTRY_VALUE_RETAIN
+          }
+          run tables.records.append(fentry)
+          run tables.records.append(foperand)
+          fk = fk + 1
+        }
+        vi = vi + 1
+      }
+    }
+    x = x + 1
+  }
+  // Stubs: the record's address, then the common stub.
+  let common = run e.a.label()
+  x = 0
+  while x < exitCount {
+    let label = e.records.get(x)
+    e.a.bind(e.exitLabels.get(x))
+    if e.on {
+      // A plain deopt; a call or a poll comes in past this with how it left in r8d (rcx
+      // may hold a value the dump writes).
+      run e.a.alu(Alu.Xor, Width.W32, Reg.R8, Reg.R8)
+      e.a.bind(e.exitWith.get(x))
+    }
+    run e.a.leaLabel(Reg.Rax, label)
+    run e.a.jmp(common)
+    x = x + 1
+  }
+  // The common stub: RAX the record, RSI the state. The registers go below the frame, where
+  // the helper reads them; the frame base is then DUMP_BYTES above RSP.
+  e.a.bind(common)
+  run e.a.aluImm(Alu.Sub, Width.W64, Reg.Rsp, state.DUMP_BYTES)
+  let mut r: usize = 0
+  while r < gprCount() {
+    if e.saves(r) { run e.a.store(Width.W64, Mem.at(Reg.Rsp, usize.toI32(r) * 8), e.places.pool.registers[r]) }
+    r = r + 1
+  }
+  let mut doubles: u32 = 0
+  let mut v: u32 = 0
+  while v < function.valueCount() {
+    if e.places.kind(v) == XMM { doubles = u32.bitOr(doubles, u32.shiftLeft(1, u8.toU32(e.places.register(v)))) }
+    v = v + 1
+  }
+  let mut d: u32 = 0
+  while d < state.DUMP_DOUBLES {
+    if u32.bitAnd(u32.shiftRight(doubles, d), 1) != 0 {
+      run e.a.storeDouble(Mem.at(Reg.Rsp, u32.wrappingToI32((state.DUMP_INTEGERS + d) * 8)), xmmAt(u32.toUsize(d)))
+    }
+    d = d + 1
+  }
+  if e.on {
+    // frame_exit(env, record, slots, exit record, dump, how), with how kept in ebx (its
+    // value is in the dump). The answer is where the frame is (js_baseline.moved) for the
+    // baseline code's `moved` tail, or the operand depth for its `finish` tail when the
+    // interpreter takes the frame. Both want the baseline frame: rbx at its cell base and
+    // rsp below its cells.
+    let p = e.plan
+    let finishing = run e.a.label()
+    let throwing = run e.a.label()
+    run e.a.mov(Width.W32, Reg.R9, Reg.R8)
+    run e.a.mov(Width.W32, Reg.Rbx, Reg.R8)
+    run e.a.mov(Width.W64, Reg.Rcx, Reg.Rax)
+    run e.a.mov(Width.W64, Reg.Rdi, Reg.R12)
+    run e.a.lea(Width.W64, Reg.Rsi, p.rec(0))
+    run e.a.lea(Width.W64, Reg.Rdx, Mem.at(Reg.Rsp, state.DUMP_BYTES))
+    run e.a.mov(Width.W64, Reg.R8, Reg.Rsp)
+    run e.a.callMem(Mem.at(Reg.R12, baseline_env.helperOffset(baseline_env.FRAME_EXIT)))
+    if e.leaveBytes != 0 {
+      // The exit left inlined bodies part way through (leaving.INLINED in the answer, with
+      // the operand depth): the frame is at the outermost inlined call and the engine runs
+      // the bodies' activations from the records the helper wrote (SERVICE_INLINED), still
+      // on this frame's stack. The frame then is past the call, or the call threw.
+      let whole = run e.a.label()
+      let threw = run e.a.label()
+      run e.a.test(Width.W64, Reg.Rax, Reg.Rax)
+      run e.a.jcc(Cond.NoSign, whole)
+      run e.a.mov(Width.W32, Reg.R14, Reg.Rax)
+      run e.a.movImm32(Reg.Rcx, u64.wrappingToU32(frames.SERVICE_INLINED))
+      run e.a.lea(Width.W64, Reg.R8, Mem.at(Reg.Rsp, state.DUMP_BYTES + e.leaveAt))
+      run e.a.mov(Width.W64, Reg.R9, Reg.R14)
+      run e.engineCall()
+      run e.a.cmp8Imm(Reg.Rax, u64.wrappingToU8(frames.SERVICE_MOVED))
+      run e.a.jcc(Cond.NotEqual, threw)
+      run e.a.lea(Width.W64, Reg.Rbx, Mem.at(Reg.Rbp, p.localAt(0) + 128))
+      run e.a.lea(Width.W64, Reg.Rsp, Mem.at(Reg.Rbp, 0 - p.below))
+      run e.a.jmpSymbol(SYMBOL_MOVED)
+      e.a.bind(threw)
+      run e.a.mov(Width.W64, Reg.R9, Reg.R14)
+      run e.a.movImm32(Reg.Rcx, u64.wrappingToU32(frames.SERVICE_FINISH | frames.FINISH_THROWING))
+      run e.a.lea(Width.W64, Reg.Rbx, Mem.at(Reg.Rbp, p.localAt(0) + 128))
+      run e.a.lea(Width.W64, Reg.Rsp, Mem.at(Reg.Rbp, 0 - p.below))
+      run e.a.jmpSymbol(SYMBOL_FINISH)
+      e.a.bind(whole)
+    }
+    run e.a.aluImm(Alu.Cmp, Width.W32, Reg.Rbx, u32.wrappingToI32(leaving.HOW_CALL_THREW))
+    run e.a.jcc(Cond.AboveOrEqual, finishing)
+    run e.a.lea(Width.W64, Reg.Rbx, Mem.at(Reg.Rbp, p.localAt(0) + 128))
+    run e.a.lea(Width.W64, Reg.Rsp, Mem.at(Reg.Rbp, 0 - p.below))
+    run e.a.jmpSymbol(SYMBOL_MOVED)
+    e.a.bind(finishing)
+    run e.a.mov(Width.W64, Reg.R9, Reg.Rax)
+    run e.a.movImm32(Reg.Rcx, u64.wrappingToU32(frames.SERVICE_FINISH | frames.FINISH_THROWING))
+    run e.a.aluImm(Alu.Cmp, Width.W32, Reg.Rbx, u32.wrappingToI32(leaving.HOW_OBSERVED))
+    run e.a.jcc(Cond.NotEqual, throwing)
+    run e.a.movImm32(Reg.Rcx, u64.wrappingToU32(frames.SERVICE_FINISH))
+    e.a.bind(throwing)
+    run e.a.lea(Width.W64, Reg.Rbx, Mem.at(Reg.Rbp, p.localAt(0) + 128))
+    run e.a.lea(Width.W64, Reg.Rsp, Mem.at(Reg.Rbp, 0 - p.below))
+    run e.a.jmpSymbol(SYMBOL_FINISH)
+  } else {
+    run e.a.load(Width.W64, Reg.Rdi, Mem.at(Reg.Rsp, state.DUMP_BYTES + e.inputs + u32.wrappingToI32(INPUT_ENV * 8)))
+    run e.a.lea(Width.W64, Reg.Rdx, Mem.at(Reg.Rsp, state.DUMP_BYTES))
+    run e.a.mov(Width.W64, Reg.Rcx, Reg.Rax)
+    run e.a.mov(Width.W64, Reg.R8, Reg.Rsp)
+    run e.a.callMem(Mem.at(Reg.Rdi, helpers.helperOffset(helpers.EXIT_STATE)))
+    run e.a.aluImm(Alu.Add, Width.W64, Reg.Rsp, state.DUMP_BYTES)
+    run e.unwind()
+    run e.a.ret()
+  }
+  // The tables: records, then chunks.
+  let recordWords = usize.toU32(tables.records.length())
+  x = 0
+  let mut word: usize = 0
+  let mut vSymCursor: usize = 0
+  while x < exitCount {
+    let start = tables.recordAt.get(x)
+    e.a.bind(e.records.get(x))
+    let mut end = recordWords
+    if x + 1 < exitCount { end = tables.recordAt.get(x + 1) }
+    // The chunk words, one per CHUNK entries; an exit's frames and virtuals follow them.
+    let chunked = start + state.RECORD_HEAD + (tables.records.get(u32.toUsize(start) + 4) + state.CHUNK - 1) / state.CHUNK
+    while usize.toU32(word) < end {
+      if vSymCursor < vSymAt.length() && word == vSymAt.get(vSymCursor) {
+        run e.a.dataSymbol64(vSymId.get(vSymCursor))
+        vSymCursor = vSymCursor + 1
+        word = word + 2
+      } else {
+        let mut value = tables.records.get(word)
+        if usize.toU32(word) >= start + state.RECORD_HEAD && usize.toU32(word) < chunked {
+          if u32.bitAnd(value, TAIL) != 0 { value = (recordWords + usize.toU32(tables.chunks.length()) + u32.bitAnd(value, TAIL - 1) - start) * 4 }
+          else { value = (recordWords + value * usize.toU32(CHUNK_WORDS) - start) * 4 }
+        }
+        run e.a.data32(value)
+        word = word + 1
+      }
+    }
+    x = x + 1
+  }
+  word = 0
+  while word < tables.chunks.length() { run e.a.data32(tables.chunks.get(word)) word = word + 1 }
+  word = 0
+  while word < tables.tails.length() { run e.a.data32(tables.tails.get(word)) word = word + 1 }
+}

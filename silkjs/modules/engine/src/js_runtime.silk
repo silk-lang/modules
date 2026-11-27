@@ -2,6 +2,7 @@ import temporal_zones { ZoneCache }
 import js_debugger_types { State as DebuggerState }
 import js_coverage { State as CoverageState }
 import js_cpu_profile { State as CpuProfileState }
+import js_feedback { State as FeedbackState }
 //! Native low-level runtime ownership and configuration. Allocate through the owning
 //! RuntimeAllocator provider; JS roots use js_gc, never native container destruction.
 //! allocateContextStorage is INTERNAL storage, not JS_NewContextRaw: callers must
@@ -27,6 +28,9 @@ import js_heap { HeapCell, HeapHeader, HeapKind, CellRef }
 import js_value { ValueBits }
 import js_owned_value { Value, lendBits }
 import js_realm { lendRealm }
+import js_core_types { HOT_ENTRY_BUDGET, CompiledTable, CompiledEntry, FunctionBytecode }
+import js_compiler_finish { STUB_FRAME_CELLS }
+import js_bytecode { LEAF_CREDITS, LEAF_CREDIT_MASK }
 import js_core_types { LastMatch, USER_VALUE_COUNT, DeferredSource, ForeignFrameSource }
 import js_core_types { blankConstructEntry, EMPTY_REGEXP_STANDARD, emptyStringCharCode, TransitionEntry, BLANK_TRANSITION_CHAIN, CHAIN_UNVERIFIED, blankReceiverEntry, InstanceCacheEntry, INSTANCE_CACHE_EMPTY,
   RuntimeState, ContextState, ContextList, ModuleList, HeapList, GcPhase,
@@ -96,6 +100,7 @@ pub effect fn allocateRuntimeStorage(stackTop: usize) -> *mut HeapHeader
   state.observeFresh = false
   state.allocationRealmsUsed = false
   unsafe Pointer.put(Pointer.fromMutRef(&mut state.cpuProfile), CpuProfileState.make())
+  unsafe Pointer.put(Pointer.fromMutRef(&mut state.feedback), FeedbackState.make())
   unsafe Pointer.put(Pointer.fromMutRef(&mut state.runtimeInfo), Option<ByteStorage>.none())
   unsafe Pointer.put(Pointer.fromMutRef(&mut state.atoms), move atoms)
   unsafe Pointer.put(Pointer.fromMutRef(&mut state.classes), move registry)
@@ -160,6 +165,10 @@ pub effect fn allocateRuntimeStorage(stackTop: usize) -> *mut HeapHeader
   state.asyncPromiseParent = ValueBits.Undefined
   state.currentStackFrame = Pointer.null<StackFrame>()
   state.interrupt = noHook()
+  state.hotFunctions = noHook()
+  state.hotPending = ValueBits.Undefined
+  state.hotEntryBudget = HOT_ENTRY_BUDGET
+  unsafe Pointer.put(Pointer.fromMutRef(&mut state.compiled), CompiledTable.none())
   state.promiseRejectionTracker = noHook()
   state.jobs = HeapList.make()
   state.nextScriptId = 1
@@ -190,6 +199,8 @@ pub effect fn allocateRuntimeStorage(stackTop: usize) -> *mut HeapHeader
   state.stringCharCode = emptyStringCharCode()
   state.retiredShapeNext = 0
   state.receiverCache = [blankReceiverEntry(); 64]
+  state.receiverFunctions = [0; 64]
+  state.receiverHints = [0; 16]
   state.instanceCache = [InstanceCacheEntry { version: INSTANCE_CACHE_EMPTY, index: 0 }; 64]
   state.joinCache = [ValueBits.Undefined; 4]
   state.splitCache = [ValueBits.Undefined; 2]
@@ -851,6 +862,93 @@ pub unsafe fn setInterruptHandler(runtime: *mut HeapHeader, hook: HostHook) -> (
   let mut anchor = ()
   let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
   state.interrupt = move hook
+}
+/// The hot function handler (js_hotness): a FunctionBytecode whose entries run
+/// out of budget is reported once to hook.callback through
+/// InterruptHooks.hotFunction at the next interrupt poll. None stops reporting.
+pub unsafe fn setHotFunctionHandler(runtime: *mut HeapHeader, hook: HostHook) -> () {
+  let mut anchor = ()
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  state.hotFunctions = move hook
+}
+/// Entries before js_hotness reports a function created from now on (at least 1).
+pub unsafe fn setHotEntryBudget(runtime: *mut HeapHeader, budget: u32) -> () {
+  let mut anchor = ()
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  if budget == 0 { state.hotEntryBudget = 1 } else { state.hotEntryBudget = budget }
+}
+/// The embedder's compiled code (js_compiled): count entries at entries, which
+/// must stay valid, unmoved, until the runtime is destroyed or the table is
+/// replaced. Functions linked to an index past a new count must be unlinked first.
+pub unsafe fn setCompiledTable(runtime: *mut HeapHeader, entries: ?*mut CompiledEntry, count: u32) -> () {
+  let mut anchor = ()
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  state.compiled.entries = entries state.compiled.count = count
+}
+/// The loop header whose back-edge poll reported the function the hot function handler is
+/// called with, or u32.MAX when its entries did (CompiledTable.loopPc).
+pub unsafe fn hotLoopPc(runtime: *mut HeapHeader) -> u32 {
+  let anchor = ()
+  return (unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)).compiled.loopPc
+}
+/// Lends the runtime words of storage (u64) for the
+/// activations of compiled code that makes calls; null and 0 take it back while none run.
+pub unsafe fn setActivationStack(runtime: *mut HeapHeader, storage: ?*mut u64, words: usize) -> () {
+  let mut anchor = ()
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  state.compiled.activations = storage state.compiled.activationWords = words state.compiled.activationTop = 0
+}
+/// Links bytecode, a FunctionBytecode cell, to compiled table entry index
+/// (from 0), or unlinks it with index u32.MAX. Its next native-stack entry runs
+/// the code; inline calls of it then take the native-stack path.
+pub unsafe fn linkCompiled(runtime: *mut HeapHeader, bytecode: *mut HeapHeader, index: u32) -> () {
+  let mut anchor = ()
+  let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
+  let tableEntries = state.compiled.entries
+  let tableCount = state.compiled.count
+  drop state
+  let entries = unsafe Pointer.assumeManyMut<CompiledEntry>(unsafe Intrinsic.pointerRequalify<?*mut CompiledEntry, *mut CompiledEntry>(tableEntries))
+  let mut codeAnchor = () let code = unsafe HeapCell.payloadMut<FunctionBytecode, ()>(&mut codeAnchor, bytecode)
+  if code.compiled != 0 {
+    let mut oldAnchor = () let old = unsafe Pointer.borrowMut<(), CompiledEntry>(&mut oldAnchor, unsafe Pointer.atMut<CompiledEntry>(entries, u32.toUsize(code.compiled - 1)))
+    if code.frameCells == STUB_FRAME_CELLS {
+      code.frameCells = old.frameCells
+      code.leaf = old.leaf
+    }
+    drop old
+    code.compiled = 0
+  }
+  if index == u32.MAX { return () }
+  if index >= tableCount { Intrinsic.trap("compiled code table invariant violated") }
+  let mut entryAnchor = () let entry = unsafe Pointer.borrowMut<(), CompiledEntry>(&mut entryAnchor, unsafe Pointer.atMut<CompiledEntry>(entries, u32.toUsize(index)))
+  entry.frameCells = code.frameCells
+  entry.leaf = code.leaf
+  drop entry
+  // A function the interpreter runs as a leaf (frameless, js_vm_leaf) keeps that path for
+  // interpreted callers while no run of it was declined: it costs less than any entry into
+  // machine code, and compiled callers reach the code through the index. Every other function
+  // is entered through its compiled code from now on (declined runs are what made it hot).
+  if (code.leaf & LEAF_CREDIT_MASK) != LEAF_CREDITS { code.leaf = 0 code.frameCells = STUB_FRAME_CELLS }
+  code.compiled = index + 1
+}
+/// Links bytecode to compiled table entry index for on-stack replacement only (the entry's
+/// code is null): native-stack and inline calls keep interpreting, and back-edge polls
+/// enter the entry's osr code (js_compiled_osr). Unlink with linkCompiled(.., u32.MAX).
+pub unsafe fn linkOsr(runtime: *mut HeapHeader, bytecode: *mut HeapHeader, index: u32) -> () {
+  unsafe linkCompiled(runtime, bytecode, u32.MAX)
+  let mut anchor = ()
+  let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
+  let tableEntries = state.compiled.entries
+  let tableCount = state.compiled.count
+  drop state
+  if index >= tableCount { Intrinsic.trap("compiled code table invariant violated") }
+  let entries = unsafe Pointer.assumeManyMut<CompiledEntry>(unsafe Intrinsic.pointerRequalify<?*mut CompiledEntry, *mut CompiledEntry>(tableEntries))
+  let mut codeAnchor = () let code = unsafe HeapCell.payloadMut<FunctionBytecode, ()>(&mut codeAnchor, bytecode)
+  let mut entryAnchor = () let entry = unsafe Pointer.borrowMut<(), CompiledEntry>(&mut entryAnchor, unsafe Pointer.atMut<CompiledEntry>(entries, u32.toUsize(index)))
+  entry.frameCells = code.frameCells
+  entry.leaf = code.leaf
+  drop entry
+  code.compiled = index + 1
 }
 pub unsafe fn setPromiseRejectionTracker(runtime: *mut HeapHeader, hook: HostHook) -> () {
   let mut anchor = ()

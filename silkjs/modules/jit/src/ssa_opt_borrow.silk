@@ -1,0 +1,164 @@
+//! Reads that borrow (docs/jit/code-quality.md, "Reads without counts").
+//!
+//! `get.elem`, `get.length`, `get.var` and `get.scope` answer an owned value: the read takes
+//! a count and a `release` drops it, two tag tests around every `a[i]`, `a.length` and global
+//! even when the value is a number. When the value is released in the block that read it,
+//! with nothing between that could let go of what holds it, the read borrows instead: the
+//! read takes no count and the release goes. An element or a length borrows from the object
+//! (or from the object's own root); a variable borrows from its binding (`RootKind.Binding`).
+//!
+//! What may let go of an element: a call (it can run anything), a `put.elem` (the store's
+//! slow path releases the element it replaces, and a string is freed at once), the release
+//! of the object. A `put.elem` that stores the element read, as its last reader with only
+//! releases up to the value's own, is no danger either (`a[i] = b[j]`): the store takes the
+//! Array's count of the value before it lets go of the one it replaces. A length is a number or comes from a string that the object value keeps.
+//! What may let go of a variable's value: a call, and any store to a binding (`put.var`,
+//! `put.scope`: a captured variable and a global can be the same cell) or to a field (a
+//! global is also a property of the global object). A store to a field that is the last
+//! reader of the variable's value, with only releases up to the value's own, is no danger:
+//! the store takes its own count first and nothing names the value after it.
+import silk.collections.list { List }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.i32
+import silk.num.u32
+import silk.num.usize
+import ssa { Function, Own, RootKind, Op, NONE, readsK, steppedRead }
+import ssa_verify { readsA, readsB }
+import ssa_ownership { fixSlots }
+import ssa_calls as calls
+
+fn noteRead(first: &mut List<u32>, last: &mut List<u32>, v: u32, at: u32) -> () {
+  if u32.toUsize(v) >= last.length() { return () }
+  if first.get(u32.toUsize(v)) == NONE { first.set(u32.toUsize(v), at) }
+  last.set(u32.toUsize(v), at)
+}
+
+/// Whether `op` is one this pass and ssa_opt_hoist know cannot run the program's code or
+/// free what a value is held by, other than the ways they test for (stores, releases). An
+/// instruction added later is taken to do both until it is listed here.
+pub fn quiet(op: Op) -> bool {
+  return op == Op.Arg || op == Op.ConstI32 || op == Op.Imm || op == Op.Unbox || op == Op.UnboxBool || op == Op.BoxI32 || op == Op.BoxBool
+    || op == Op.Add || op == Op.Sub || op == Op.Mul || op == Op.Cmp || op == Op.Retain || op == Op.Release || op == Op.Poll
+    || op == Op.Jump || op == Op.Branch || op == Op.Return || op == Op.This || op == Op.CheckTag || op == Op.CheckArray || op == Op.CheckBound || op == Op.Elements || op == Op.TagIn
+    || op == Op.GetField || op == Op.PutField || op == Op.AtomValue || op == Op.ConstVal || op == Op.GetVar || op == Op.PutVar || op == Op.GetScope || op == Op.PutScope
+    || op == Op.GetKey || op == Op.GetElem || op == Op.PutElem || op == Op.GetLength || op == Op.Truthy || op == Op.TagIs || op == Op.TypeofAtom || op == Op.Typeof || op == Op.InstanceOf
+    || op == Op.Equals || op == Op.CallArg || op == Op.ConstF64 || op == Op.UnboxF64 || op == Op.BoxF64 || op == Op.ToF64 || op == Op.AddF64
+    || op == Op.SubF64 || op == Op.MulF64 || op == Op.DivF64 || op == Op.ModF64 || op == Op.CmpF64 || op == Op.NegF64 || op == Op.SqrtF64 || op == Op.AbsF64
+    || op == Op.FloorF64 || op == Op.ToInt32 || op == Op.ExactI32 || op == Op.BitAnd || op == Op.BitOr || op == Op.BitXor || op == Op.Shl
+    || op == Op.Sar || op == Op.Shr || op == Op.Mod || op == Op.Neg || op == Op.BitNot || op == Op.NotBool || op == Op.Imul
+    || op == Op.CheckCallee || op == Op.CheckShape || op == Op.CheckWatched || op == Op.IsCallee || op == Op.InlineFrame || op == Op.NewObject || op == Op.InitSlot || op == Op.CheckConstruct || op == Op.KnownMethod || op == Op.Removed
+}
+
+fn borrowable(op: Op) -> bool { return op == Op.GetElem || op == Op.GetLength || op == Op.GetVar || op == Op.GetScope || op == Op.ConstVal }
+
+/// Turns the reads described above into borrows. Requires compacted blocks; the caller
+/// compacts again when this answers true. Linear in the function but for the window each
+/// read looks through, which ends at the read's own release in the same block.
+pub effect fn borrowReads(f: &mut Function) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let count = f.values.length()
+  let mut firstRelease = List<u32>.make() let mut lastRead = List<u32>.make() let mut firstRead = List<u32>.make() let mut escapes = List<bool>.make()
+  run firstRelease.appendRepeated(NONE, count) run lastRead.appendRepeated(0, count) run firstRead.appendRepeated(NONE, count) run escapes.appendRepeated(false, count)
+  let mut any = false
+  let mut i: usize = 0
+  while i < f.insts.length() {
+    let inst = f.insts.get(i)
+    let at = usize.toU32(i)
+    if borrowable(inst.op) { any = true }
+    if readsA(inst.op) { noteRead(&mut firstRead, &mut lastRead, inst.a, at) }
+    if readsB(inst.op) { noteRead(&mut firstRead, &mut lastRead, inst.b, at) }
+    if readsK(inst.op) { noteRead(&mut firstRead, &mut lastRead, i32.wrappingToU32(inst.k), at) }
+    if inst.op == Op.Release && inst.a != NONE && firstRelease.get(u32.toUsize(inst.a)) == NONE { firstRelease.set(u32.toUsize(inst.a), at) }
+    i = i + 1
+  }
+  f.work = f.work + usize.toU64(f.insts.length())
+  if !any { return false }
+  i = 0
+  while i < f.edgeArgs.length() { let e = f.edgeArgs.get(i) if u32.toUsize(e) < count { escapes.set(u32.toUsize(e), true) } i = i + 1 }
+  i = 0
+  while i < count {
+    let info = f.values.get(i)
+    if info.own == Own.Borrowed && info.rootKind == RootKind.Value && u32.toUsize(info.root) < count { escapes.set(u32.toUsize(info.root), true) }
+    i = i + 1
+  }
+  let mut changed = false
+  let mut b: u32 = 0
+  while b < f.blockCount() {
+    let block = f.blocks.get(u32.toUsize(b))
+    let end = block.firstInst + block.instCount
+    let mut at = block.firstInst
+    while at < end {
+      let read = f.inst(at)
+      // A get.elem with k set is not a plain read (a for-of step keeps its owned result and
+      // its exit, whose miss is the loop's end).
+      // A field read that may be stepped keeps its owned result too (FIELD_STEPS).
+      let stepped = steppedRead(read)
+      if borrowable(read.op) && !stepped && (read.op != Op.GetElem || read.k == 0) && read.result != NONE && f.value(read.result).own == Own.Owned {
+        let binding = read.op == Op.GetVar || read.op == Op.GetScope || read.op == Op.ConstVal
+        let mut kind = RootKind.Binding
+        let mut root = NONE
+        let r = read.result
+        let release = firstRelease.get(u32.toUsize(r))
+        let mut ok = release != NONE && release > at && release < end && !escapes.get(u32.toUsize(r)) && lastRead.get(u32.toUsize(r)) <= release
+          && (firstRead.get(u32.toUsize(r)) == NONE || firstRead.get(u32.toUsize(r)) > at)
+        if !binding {
+          let object = f.value(read.a)
+          kind = RootKind.Value root = read.a
+          if object.own == Own.Borrowed && (object.rootKind == RootKind.Argument || object.rootKind == RootKind.Value) { kind = object.rootKind root = object.root }
+          else if object.own == Own.Borrowed && object.rootKind == RootKind.Binding { kind = RootKind.Binding root = NONE }
+          else if object.own != Own.Owned { ok = false }
+        }
+        let mut j = at + 1
+        while ok && j < release {
+          let inst = f.inst(j)
+          // A pop that runs no JavaScript (calls.quietCall) changes no binding.
+          if !(quiet(inst.op) || (binding && calls.quietCall(inst))) || inst.op == Op.Return || inst.op == Op.Jump || inst.op == Op.Branch { ok = false }
+          // What borrows from a binding, directly or through the object read from it, ends
+          // at a store to a binding; an element also at a store to an element.
+          if kind == RootKind.Binding && (inst.op == Op.PutVar || inst.op == Op.PutScope) { ok = false }
+          // A store to a field may be a store to the binding (a global is a property of the
+          // global object). It takes its own count of what it stores before the binding
+          // lets go, so the borrow may end at such a store when only releases stand between
+          // the store and the value's own release (an exit record there could name the value).
+          if kind == RootKind.Binding && inst.op == Op.PutField {
+            let mut m = j + 1
+            while ok && m < release {
+              let after = f.inst(m).op
+              if after != Op.Release && after != Op.Removed { ok = false }
+              m = m + 1
+            }
+          }
+          // An element receiver may itself be borrowed from the field being replaced.
+          if !binding && inst.op == Op.PutField { ok = false }
+          // A store to an element lets go of the element it replaces, which may be the one
+          // read. The store of the value read itself (`a[i] = b[j]`) takes the Array's count
+          // of it first (writeElement), so the borrow may end there on the same terms as at
+          // a field store above.
+          if !binding && inst.op == Op.PutElem {
+            if inst.b != r { ok = false }
+            let mut m = j + 1
+            while ok && m < release {
+              let after = f.inst(m).op
+              if after != Op.Release && after != Op.Removed { ok = false }
+              m = m + 1
+            }
+          }
+          if inst.op == Op.Release && kind == RootKind.Value && inst.a == root { ok = false }
+          j = j + 1
+        }
+        f.work = f.work + u32.toU64(j - at)
+        if ok {
+          f.setOwnership(r, Own.Borrowed, kind, root)
+          let mut gone = f.inst(release)
+          gone.op = Op.Removed
+          f.setInst(release, gone)
+          if kind == RootKind.Value && u32.toUsize(root) < count { escapes.set(u32.toUsize(root), true) }
+          changed = true
+        }
+      }
+      at = at + 1
+    }
+    b = b + 1
+  }
+  if changed { run fixSlots(&mut f) }
+  return changed
+}

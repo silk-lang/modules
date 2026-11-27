@@ -1,0 +1,165 @@
+//! Exercises hot code inside a Node-compatible event-loop callback after bootstrap. The host
+//! owns the Jit across embed.start, including while the runtime releases its heap on shutdown.
+import silk.core.effect { Effect }
+import silk.core.result { Result }
+import silk.core.option { Option }
+import silk.collections.slice { Slice }
+import silk.num.u8
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silkjs.js_atomics_native { SynchronizationError }
+import silkjs.js_exceptions { JsException }
+import silkjs.js_realm { Realm }
+import silk.system.host_input { HostInput, HostInputError }
+import silkjs.cli_io as io
+import silkjs.js_engine as engine
+import silkjs.js_baseline as engineBaseline
+import silkjs.js_baseline { BaselineFrame }
+import silkjs.js_value { ValueBits }
+import silk.mem.pointer { Pointer }
+import node.libs.core.host { Services }
+import node.ext.diagnostics_fatal { RuntimeHeap }
+import node.runtime.embed { Host, Options as RuntimeOptions }
+import node.runtime.embed as embed
+import node.runtime.session { Runtime, Turn }
+import node.libs.core.capabilities { Capabilities, Composition, EmptyWasm, EmptyHostApi, EmptyCompression, EmptyHttp2, EmptyCrypto, EmptyTls, EmptyDatabase, EmptyAddons, OsProcesses, OsNetwork, OsSystemInfo, EmptyTypeStripping, ThreadWorkers, EmptyInspector }
+import node.libs.core.module_sources { NodeResolution }
+import node.libs.core.platforms { OsPlatform }
+import node.libs.core.files { OsFiles }
+import http.llhttp { Llhttp }
+import silkjs.js_heap { HeapHeader }
+import jit.jit_helpers as jitHelpers
+import jit.jit_runtime { Jit, Options }
+import jit.jit_runtime as compiler
+
+const MODULE: &[u8] = b"""import { setImmediate } from 'node:timers';
+process.exitCode = 1;
+function block(base) {
+  let part = 0;
+  for (let j = 0; j < 16; ++j) part += (base + j) & 1023;
+  return part;
+}
+setImmediate(() => {
+  let sum = 0;
+  for (let i = 0; i < 4096; ++i) sum += block(i);
+  if (sum === 33521664) { console.log('timer checksum', sum); process.exitCode = 0; }
+});
+"""
+
+/// What this host's runtime is made of (embed.start below).
+type Parts = Capabilities<OsPlatform, NodeResolution, OsFiles, EmptyCompression, EmptyHttp2, EmptyCrypto, EmptyTls, EmptyDatabase, EmptyAddons, OsProcesses, OsNetwork, Llhttp, OsSystemInfo, EmptyTypeStripping, ThreadWorkers, EmptyInspector, EmptyWasm, EmptyHostApi>
+
+/// js_baseline.ServiceEntry for this host's engine: what baseline code asks the engine for runs
+/// on the hooks that entered it and on the runtime's heap (the runtime lends that allocator).
+export "C" fn silkjsEmbedBaselineService(hooks: *mut u8, allocator: *mut u8, record: *mut BaselineFrame, request: u64, base: *mut ValueBits, count: usize) -> u64 {
+  return unsafe engine.baselineService<Services<Parts>, RuntimeHeap>(hooks, allocator, record, request, base, count)
+}
+fn serviceAddress() -> *const u8 {
+  let entry: extern "C" fn(*mut u8, *mut u8, *mut BaselineFrame, u64, *mut ValueBits, usize) -> u64 = silkjsEmbedBaselineService
+  return unsafe Pointer.read<*const u8>(unsafe Intrinsic.pointerReinterpret<*const extern "C" fn(*mut u8, *mut u8, *mut BaselineFrame, u64, *mut ValueBits, usize) -> u64, *const *const u8>(Pointer.fromRef(&entry)))
+}
+export "C" fn jitEmbedAllocCell(hooks: *mut u8, allocator: *mut u8, rt: *mut HeapHeader, tailBytes: usize) -> ?*mut HeapHeader {
+  return unsafe jitHelpers.allocPooledCell<Services<Parts>, RuntimeHeap>(hooks, allocator, rt, tailBytes)
+}
+fn allocCellAddress() -> ?*const u8 {
+  let f: jitHelpers.AllocCellFn = jitEmbedAllocCell
+  return unsafe Pointer.read<?*const u8>(unsafe Intrinsic.pointerReinterpret<*const jitHelpers.AllocCellFn, *const ?*const u8>(Pointer.fromRef(&f)))
+}
+
+fn startsWith(bytes: &[u8], prefix: &[u8]) -> bool {
+  if bytes.length < prefix.length { return false }
+  return Slice.view(bytes, 0, prefix.length) == prefix
+}
+/// The decimal after prefix in bytes, or None.
+fn number(bytes: &[u8], prefix: &[u8]) -> Option<u32> {
+  if bytes.length == prefix.length { return Option<u32>.none() }
+  let mut value: u32 = 0
+  let mut index = prefix.length
+  while index < bytes.length {
+    let digit = bytes[index]
+    if digit < 48 || digit > 57 || value > 400000000 { return Option<u32>.none() }
+    value = value * 10 + u8.toU32(digit - 48) index = index + 1
+  }
+  return Option<u32>.some(value)
+}
+
+struct App { jit: Jit, smoke: bool }
+impl Host for App {
+  fn afterBootstrap<'r>(self: &mut Self, realm: Realm<'r>) -> () {
+    unsafe engineBaseline.setServiceEntry(realm.runtime(), unsafe Intrinsic.pointerRequalify<*const u8, ?*const u8>(serviceAddress()))
+    self.jit.setAllocCell(allocCellAddress())
+    unsafe compiler.enable(&mut self.jit, realm.runtime())
+  }
+  effect fn drive<'e, 'm, C: Composition>(self: &mut Self, runtime: &mut Runtime<'e, 'm, C>) -> i32 ! OutOfMemoryError | JsException ? &mut Allocator {
+    if self.smoke { run runtime.evaluateModule(b"/jit-embed-smoke/main.mjs", MODULE) }
+    while true {
+      match run runtime.spin() {
+        Turn.Running => ()
+        Turn.Finished { status } => { return status }
+      }
+    }
+    return 1
+  }
+}
+
+effect fn program() -> i32 ! HostInputError | OutOfMemoryError | SynchronizationError ? &mut Allocator | &mut HostInput {
+  let mut arguments = run HostInput.arguments()
+  let mut options = Options.make()
+  options.enabled = true
+  let mut interpret = false
+  let mut baseline = false
+  let mut valid = true
+  // The host's own flags come first, as the JIT shell's do (modules/jit/shell).
+  while arguments.length() >= 2 {
+    let flag = arguments.asSlice()[1].asSlice()
+    if flag == b"--jit-calls" { options.calls = true }
+    else if flag == b"--no-jit" { interpret = true options.enabled = false }
+    // Baseline code for hot functions instead of the SSA compiler's (docs/jit/baseline.md).
+    else if flag == b"--jit-baseline" { baseline = true options.baseline = true }
+    // Optimized code on the baseline frame for a function that ran N more times
+    // (docs/jit/optimizer.md), as the JIT shell's flag.
+    else if flag == b"--jit-opt" { baseline = true options.baseline = true options.optimize = true }
+    else if startsWith(flag, b"--jit-opt=") {
+      baseline = true options.baseline = true options.optimize = true
+      match number(flag, b"--jit-opt=") { Option<u32>.Some { value } => { options.optimizeEntries = value } Option<u32>.None => { valid = false } }
+    }
+    // Per-opcode counts of steps and departures in the counters line.
+    else if flag == b"--jit-stats" { options.stats = true }
+    else if flag == b"--jit-dump" { options.dump = true }
+    else if startsWith(flag, b"--jit-threshold=") {
+      match number(flag, b"--jit-threshold=") { Option<u32>.Some { value } => { options.threshold = value } Option<u32>.None => { valid = false } }
+    }
+    else { break }
+    drop arguments.remove(1)
+  }
+  let smoke = arguments.length() == 1
+  if arguments.length() == 2 {
+    let path = arguments.asSlice()[1].asSlice()
+    valid = valid && path.length > 0 && path[0] != 45
+  } else if !smoke { valid = false }
+  if !valid || (interpret && (baseline || options.calls)) {
+    io.stderr(b"usage: silkjs-jit-embed-smoke [--no-jit | --jit-calls | --jit-baseline | --jit-opt[=N]] [--jit-stats] [--jit-dump] [--jit-threshold=N] [module.mjs]\n") return 2
+  }
+  let mut app = App { jit: run Jit.make(move options), smoke: smoke }
+  // The host reads the Jit's counters after the runtime ended, so the process is not the runtime's.
+  let runtime = RuntimeOptions { arguments: move arguments, keepAlive: false, ownsProcess: false }
+  // What a script of the operating system needs, and node:http: the HTTP order service
+  // (modules/runtime/bench/jit_http.py) runs on this host.
+  let capabilities = Capabilities { platform: OsPlatform {}, modules: NodeResolution {}, files: OsFiles {}, compression: EmptyCompression {}, http2: EmptyHttp2 {}, crypto: EmptyCrypto {}, tls: EmptyTls {}, database: EmptyDatabase {}, addons: EmptyAddons {}, processes: OsProcesses {}, network: OsNetwork {}, http: Llhttp.make(), systemInfo: OsSystemInfo {}, typeStripping: EmptyTypeStripping {}, workers: ThreadWorkers {}, inspector: EmptyInspector {}, wasm: EmptyWasm {}, hostApi: EmptyHostApi {} }
+  let status = run embed.start(move runtime, &mut app, move capabilities)
+  app.jit.collect()
+  let counters = run app.jit.statsLine()
+  io.stderr(counters.asSlice())
+  if !smoke || status != 0 || interpret { return status }
+  if baseline { return if app.jit.failed != 0 || app.jit.baselineCompiled == 0 { 1 } else { 0 } }
+  if app.jit.failed != 0 || app.jit.compiledFunctions == 0 || app.jit.runs + app.jit.osrRuns == 0 { return 1 }
+  return 0
+}
+
+pub effect fn main() -> i32 ? &mut HostInput {
+  let mut system = Allocator.systemAllocatorProvider()
+  let outcome = run Effect.result(program()) |> Effect.provideMut<Allocator>(&mut system)
+  return match move outcome {
+    Result<i32, HostInputError | OutOfMemoryError | SynchronizationError>.Success { value } => value
+    Result<i32, HostInputError | OutOfMemoryError | SynchronizationError>.Failure { .. } => 1
+  }
+}

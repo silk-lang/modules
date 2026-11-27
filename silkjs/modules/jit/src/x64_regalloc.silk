@@ -1,0 +1,894 @@
+//! Register allocation for x64_backend (docs/jit/ssa.md, "Register allocation"): linear scan
+//! over one live interval per value, on the compacted, verified function.
+//!
+//! Order. Blocks are in reverse postorder; instruction i sits at position 2i + 2, its operands
+//! and exit slots are read there and its result is written at 2i + 3. A block's parameters are
+//! written at its start, 2 * firstInst + 1. Because lowering reads every operand into scratch
+//! registers and writes the result last, after any exit, an operand whose interval ends where a
+//! result's begins may share its register.
+//!
+//! Liveness is the usual backward pass over blocks in reverse order (Wimmer and Franz, "Linear
+//! Scan Register Allocation on SSA Form"): a block's live-out is its successors' live-in plus
+//! its edge arguments, and a value live into a loop header is live through the whole loop. Each
+//! value then gets the hull of its live ranges, from its definition to its last live position:
+//! coarse but safe, since a definition comes first in reverse postorder.
+//!
+//! Pools. Integers and bools take rbx, r12, r13, r14, r15: callee-saved, so they survive the
+//! helper calls compiled code makes, and the prologue saves those it uses. Doubles take xmm2 to
+//! xmm15. rax, rcx, rdx, rsi, rdi, r8 to r11 and xmm0, xmm1 stay with the lowering (scratch, and
+//! the ABI's state, counter and stress words). A `value` (16 bytes) always lives in its slot.
+//! A raw word (an Array's elements) takes an integer register, all 64 bits of it.
+//! When a pool runs out, the interval that costs least in its slot is spilled there (weigh):
+//! each write and read counts 8 to the power of its block's loop depth, less for an operand
+//! arithmetic reads from memory as it is (exit slots, read only on the way out, count
+//! nothing), and between weights within a quarter of each other the one that ends furthest
+//! away goes. A loop header's parameter counts three times over: in its slot, each turn's
+//! load waits for the store of the turn before. A value live across a call (an exit and a
+//! re-entry) is never given a register.
+//!
+//! Shortcuts. The lowering needs no register for some values, and says which before the
+//! intervals are made (shortcuts). A plain store writes through the address the read
+//! before it left in R11, reads no index and never leaves (plainStore): its index and its
+//! exit's values are not read there, so an index that is counted up before the store ends
+//! at the sum, which takes its register. A folded unbox leaves its number in the element
+//! for the add after it (foldedUnbox): the number gets no register. The lowering makes the
+//! same tests and refuses the code when a plain store's disagree.
+import silk.collections.list { List }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.ownership { Copy }
+import silk.num.u8
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+import asm_x64 { Alu, Assembler, Mem, PackedOp, Reg, ScalarOp, Width, Xmm }
+import ssa { Function, Inst, Op, Own, SlotMode, Type, NONE, ELEM_STEPS, FIELD_STEPS, edgeCount, readsK }
+import silk.num.i32
+import ssa_verify { readsA, readsB }
+import ssa_ranges { mulRangeSafe, mulNoNegZero }
+
+pub const SPILL: u8 = 0
+pub const GPR: u8 = 1
+pub const XMM: u8 = 2
+
+/// Where a value lives for its whole life: its slot (`mem`) when `kind` is SPILL, else `gpr`
+/// or `xmm`.
+pub struct Place { pub kind: u8, pub gpr: Reg, pub xmm: Xmm, pub mem: Mem }
+impl Copy for Place {}
+
+/// A spilled place at mem.
+pub fn spilled(mem: Mem) -> Place { return Place { kind: SPILL, gpr: Reg.Rax, xmm: Xmm.Xmm0, mem: mem } }
+
+/// The outcome of `allocate`: one kind and register per value, and which callee-saved
+/// integer registers the code uses.
+pub struct Allocation {
+  pub kinds: List<u8>,
+  pub registers: List<u8>,
+  /// Bit n: the pool's register n is used.
+  pub savedMask: u32,
+  /// Interval bounds, for the tests' checker.
+  pub starts: List<u32>,
+  pub ends: List<u32>,
+  /// The integer registers the scan handed out.
+  pub pool: Pool
+}
+
+const GPR_COUNT: usize = 8
+const XMM_COUNT: usize = 14
+
+/// The integer registers a scan hands out, in order: `count` of `registers`. Bit n of
+/// overCalls: register n keeps its value over a call (Op.Call), so a value live across one
+/// may take it. pollCalls: a poll may call out (callsOut), so no double lives across one.
+/// fragile: register n is caller-saved and kept by none but the instructions keepsFragile
+/// names: a value whose interval holds anything else does not take it.
+pub struct Pool { pub registers: [Reg; 8], pub count: usize, pub overCalls: u32, pub pollCalls: bool, pub fragile: u32 }
+impl Copy for Pool {}
+/// x64_backend's: rbx, r12 to r15, none of them over a call (an exit and a re-entry).
+pub fn entryPool() -> Pool { return Pool { registers: [Reg.Rbx, Reg.R12, Reg.R13, Reg.R14, Reg.R15, Reg.R15, Reg.R15, Reg.R15], count: 5, overCalls: 0, pollCalls: false, fragile: 0 } }
+/// x64_frame's, on a baseline frame (r12 and r13 are pinned there): rbx, which every callee
+/// restores, then r14 and r15, which baseline code and its stubs use freely, then rsi, rdi,
+/// rdx, r10 and rcx, which only helper calls, frame services and instructions outside
+/// keepsFragile touch (fragile; a shift by a register keeps rcx in r11). rax, r8 (an exit's
+/// reason), r9 and r11 stay the lowering's own.
+pub fn framePool() -> Pool { return Pool { registers: [Reg.Rbx, Reg.R14, Reg.R15, Reg.Rsi, Reg.Rdi, Reg.Rdx, Reg.R10, Reg.Rcx], count: 8, overCalls: 1, pollCalls: false, fragile: 248 } }
+
+/// The integer pool, in the order the scan hands it out.
+/// Entry mode's (entryPool), which holds five.
+pub fn gprAt(index: usize) -> Reg {
+  if index == 0 { return Reg.Rbx }
+  if index == 1 { return Reg.R12 }
+  if index == 2 { return Reg.R13 }
+  if index == 3 { return Reg.R14 }
+  return Reg.R15
+}
+pub fn gprCount() -> usize { return GPR_COUNT }
+pub fn xmmAt(index: usize) -> Xmm {
+  if index == 0 { return Xmm.Xmm2 }
+  if index == 1 { return Xmm.Xmm3 }
+  if index == 2 { return Xmm.Xmm4 }
+  if index == 3 { return Xmm.Xmm5 }
+  if index == 4 { return Xmm.Xmm6 }
+  if index == 5 { return Xmm.Xmm7 }
+  if index == 6 { return Xmm.Xmm8 }
+  if index == 7 { return Xmm.Xmm9 }
+  if index == 8 { return Xmm.Xmm10 }
+  if index == 9 { return Xmm.Xmm11 }
+  if index == 10 { return Xmm.Xmm12 }
+  if index == 11 { return Xmm.Xmm13 }
+  if index == 12 { return Xmm.Xmm14 }
+  return Xmm.Xmm15
+}
+
+impl Allocation {
+  /// The place of value v, whose slot is mem.
+  pub fn place(self: &Self, v: u32, mem: Mem) -> Place {
+    let kind = self.kinds.get(u32.toUsize(v))
+    let index = u8.toUsize(self.registers.get(u32.toUsize(v)))
+    if kind == GPR { return Place { kind: GPR, gpr: self.pool.registers[index], xmm: Xmm.Xmm0, mem: mem } }
+    if kind == XMM { return Place { kind: XMM, gpr: Reg.Rax, xmm: xmmAt(index), mem: mem } }
+    return spilled(mem)
+  }
+  /// The register index of v within its pool (meaningful when kind is not SPILL).
+  pub fn register(self: &Self, v: u32) -> u8 { return self.registers.get(u32.toUsize(v)) }
+  pub fn kind(self: &Self, v: u32) -> u8 { return self.kinds.get(u32.toUsize(v)) }
+}
+
+fn position(inst: u32) -> u32 { return inst * 2 + 2 }
+fn blockStart(f: &Function, b: u32) -> u32 { return f.blocks.get(u32.toUsize(b)).firstInst * 2 + 1 }
+fn blockEnd(f: &Function, b: u32) -> u32 {
+  let block = f.blocks.get(u32.toUsize(b))
+  return position(block.firstInst + block.instCount - 1)
+}
+
+struct Live { words: usize, bits: List<u64> }
+impl Live {
+  fn has(self: &Self, set: usize, v: u32) -> bool {
+    let word = self.bits.get(set * self.words + u32.toUsize(v / 64))
+    return u64.bitAnd(u64.shiftRight(word, u32.toU64(v % 64)), 1) != 0
+  }
+  fn put(self: &mut Self, set: usize, v: u32, on: bool) -> () {
+    let index = set * self.words + u32.toUsize(v / 64)
+    let bit = u64.shiftLeft(1, u32.toU64(v % 64))
+    let word = self.bits.get(index)
+    if on { self.bits.set(index, u64.bitOr(word, bit)) } else { self.bits.set(index, u64.bitAnd(word, u64.bitXor(bit, 18446744073709551615))) }
+  }
+  /// Extends the interval of every value in set to end at least.
+  fn extendAll(self: &Self, set: usize, ends: &mut List<u32>, end: u32) -> () {
+    let mut w: usize = 0
+    while w < self.words {
+      let mut word = self.bits.get(set * self.words + w)
+      while word != 0 {
+        extend(&mut ends, usize.toU32(w * 64) + u64.trailingZeros(word), end)
+        word = u64.bitAnd(word, word - 1)
+      }
+      w = w + 1
+    }
+  }
+  /// set |= other
+  fn join(self: &mut Self, set: usize, other: usize) -> () {
+    let mut w: usize = 0
+    while w < self.words {
+      let a = self.bits.get(set * self.words + w)
+      let b = self.bits.get(other * self.words + w)
+      self.bits.set(set * self.words + w, u64.bitOr(a, b))
+      w = w + 1
+    }
+  }
+}
+
+/// Whether a position of at (in order) lies after start and no later than end.
+fn crossesAny(at: &List<u32>, start: u32, end: u32) -> bool {
+  // The first position after start.
+  let mut low: usize = 0
+  let mut high = at.length()
+  while low < high { let middle = (low + high) / 2 if at.get(middle) <= start { low = middle + 1 } else { high = middle } }
+  return low < at.length() && at.get(low) <= end
+}
+fn extend(ends: &mut List<u32>, v: u32, end: u32) -> () {
+  let index = u32.toUsize(v)
+  if ends.get(index) == NONE || ends.get(index) < end { ends.set(index, end) }
+}
+
+/// Allocates registers for f, which must be compacted and verified.
+pub effect fn allocate(f: &Function) -> Allocation ! OutOfMemoryError ? &mut Allocator {
+  let cuts = noShortcuts()
+  return run allocateIn(&f, entryPool(), &cuts)
+}
+/// allocate with the integer registers of pool, for a lowering that takes the shortcuts
+/// `cuts` (shortcuts, or noShortcuts).
+pub effect fn allocateIn(f: &Function, pool: Pool, cuts: &Shortcuts) -> Allocation ! OutOfMemoryError ? &mut Allocator {
+  let plain = &cuts.plain
+  let values = f.valueCount()
+  let count = f.blockCount()
+  let mut starts = List<u32>.make()
+  run starts.appendRepeated(NONE, u32.toUsize(values))
+  let mut ends = List<u32>.make()
+  run ends.appendRepeated(NONE, u32.toUsize(values))
+  // Definitions.
+  let mut b: u32 = 0
+  while b < count {
+    let block = f.blocks.get(u32.toUsize(b))
+    let mut p: u32 = 0
+    while p < block.paramCount { starts.set(u32.toUsize(f.paramAt(block, p)), blockStart(&f, b)) p = p + 1 }
+    let mut i = block.firstInst
+    while i < block.firstInst + block.instCount {
+      let inst = f.inst(i)
+      if inst.result != NONE { starts.set(u32.toUsize(inst.result), position(i) + 1) }
+      i = i + 1
+    }
+    b = b + 1
+  }
+  // Live sets: one per block (live-in) plus a working set at index count.
+  let words = u32.toUsize(values / 64 + 1)
+  let mut live = Live { words: words, bits: List<u64>.make() }
+  run live.bits.appendRepeated(0, words * (u32.toUsize(count) + 1))
+  let work = u32.toUsize(count)
+  // A loop header's last back edge: the end of the last block with an edge to it.
+  let mut loopEnds = List<u32>.make()
+  run loopEnds.appendRepeated(0, u32.toUsize(count))
+  b = 0
+  while b < count {
+    let st = f.terminator(f.blocks.get(u32.toUsize(b)))
+    if st.edge != NONE {
+      let mut e: u32 = 0
+      while e < edgeCount(st.op) {
+        let target = f.edge(st.edge + e).target
+        if target <= b { loopEnds.set(u32.toUsize(target), blockEnd(&f, b)) }
+        e = e + 1
+      }
+    }
+    b = b + 1
+  }
+  b = count
+  while b > 0 {
+    b = b - 1
+    let block = f.blocks.get(u32.toUsize(b))
+    let start = blockStart(&f, b)
+    let end = blockEnd(&f, b)
+    let mut w: usize = 0
+    while w < words { live.bits.set(work * words + w, 0) w = w + 1 }
+    let term = f.terminator(block)
+    if term.edge != NONE {
+      let mut e: u32 = 0
+      while e < edgeCount(term.op) {
+        let edge = f.edge(term.edge + e)
+        if edge.target > b { live.join(work, u32.toUsize(edge.target)) }
+        let mut g: u32 = 0
+        while g < edge.argCount { live.put(work, f.edgeArg(edge, g), true) g = g + 1 }
+        e = e + 1
+      }
+    }
+    // Everything live out is live through the block, as far as its definition.
+    live.extendAll(work, &mut ends, end)
+    let mut i = block.firstInst + block.instCount
+    while i > block.firstInst {
+      i = i - 1
+      let inst = f.inst(i)
+      if inst.result != NONE { live.put(work, inst.result, false) }
+      let at = position(i)
+      if readsA(inst.op) && inst.a != NONE { live.put(work, inst.a, true) extend(&mut ends, inst.a, at) }
+      if readsB(inst.op) && inst.b != NONE { live.put(work, inst.b, true) extend(&mut ends, inst.b, at) }
+      // A plain store takes its element from the read before it and never leaves: its index
+      // and its exit's values are read by nothing.
+      let plainStore = plainAt(plain, i)
+      if readsK(inst.op) && !plainStore { let third = i32.wrappingToU32(inst.k) live.put(work, third, true) extend(&mut ends, third, at) }
+      let kept = cuts.kept(i)
+      if kept != NONE { live.put(work, kept, true) extend(&mut ends, kept, at) }
+      if inst.exit != NONE && !plainStore {
+        let exit = f.exit(inst.exit)
+        let mut s: u32 = 0
+        while s < f.slotCount(exit) {
+          let slot = f.slot(exit, s)
+          if slot.mode == SlotMode.Virtual {
+            let vo = f.virtualObjs.get(u32.toUsize(slot.value))
+            let mut fk: u32 = 0
+            while fk < vo.slotCount && fk < 8 {
+              let fv = vo.fields[u32.toUsize(fk)]
+              live.put(work, fv, true) extend(&mut ends, fv, at)
+              fk = fk + 1
+            }
+          } else {
+            let slotValue = slot.value
+            live.put(work, slotValue, true) extend(&mut ends, slotValue, at)
+          }
+          s = s + 1
+        }
+      }
+    }
+    let mut p: u32 = 0
+    while p < block.paramCount { live.put(work, f.paramAt(block, p), false) p = p + 1 }
+    // A loop header: what is live into it is live to the end of its last back edge.
+    let loopEnd = loopEnds.get(u32.toUsize(b))
+    live.extendAll(work, &mut ends, if loopEnd > start { loopEnd } else { start })
+    w = 0
+    while w < words { let word = live.bits.get(work * words + w) live.bits.set(u32.toUsize(b) * words + w, word) w = w + 1 }
+  }
+  // A value nothing reads still needs somewhere to be written.
+  let mut v: u32 = 0
+  while v < values {
+    let index = u32.toUsize(v)
+    if ends.get(index) == NONE || ends.get(index) < starts.get(index) { ends.set(index, starts.get(index)) }
+    v = v + 1
+  }
+  // A call is an exit and a re-entry (docs/jit/compiled-entry.md 7.3): no register survives
+  // it, so a value live across one, or read by its exit, stays in its slot. A helper call
+  // (callsOut) keeps the callee-saved integer pool but not xmm2 to xmm15.
+  // In a pool with registers that last over a call (Pool.overCalls), an integer live across
+  // one may take one of those (OVER_CALL).
+  // The positions of the calls of each kind, in order: a value crosses one when it lies
+  // after the value's start and no later than its end.
+  let mut exitsAt = List<u32>.make()
+  let mut callsAt = List<u32>.make()
+  let mut c: usize = 0
+  while c < f.insts.length() {
+    let inst = f.insts.get(c)
+    let op = inst.op
+    // On a baseline frame a field read that left before may call its getter
+    // (x64_backend.getterCall), which baseline code's r14 and r15 do not survive.
+    let exits = op == Op.Call || (pool.overCalls != 0 && op == Op.GetField && (inst.k & FIELD_STEPS) != 0)
+    if exits || callsOutInst(inst, pool.overCalls != 0) || (pool.pollCalls && op == Op.Poll) {
+      let at = position(usize.toU32(c))
+      run callsAt.append(at)
+      if exits { run exitsAt.append(at) }
+    }
+    c = c + 1
+  }
+  let mut across = List<u8>.make()
+  run across.appendRepeated(ANYWHERE, u32.toUsize(values))
+  v = 0
+  while v < values {
+    let index = u32.toUsize(v)
+    let start = starts.get(index)
+    if start != NONE {
+      let end = ends.get(index)
+      if f.value(v).ty == Type.F64 {
+        if crossesAny(&callsAt, start, end) { across.set(index, NOWHERE) }
+      } else if crossesAny(&exitsAt, start, end) {
+        if pool.overCalls == 0 { across.set(index, NOWHERE) } else { across.set(index, OVER_CALL) }
+      }
+    }
+    v = v + 1
+  }
+  // Whether each value's interval holds gentle instructions alone (Pool.fragile): a prefix
+  // count of the others over the instructions, which an interval's positions index.
+  let mut harsh = List<u32>.make()
+  run harsh.append(0)
+  c = 0
+  while c < f.insts.length() {
+    let before = harsh.get(c)
+    if keepsFragile(f.insts.get(c)) { run harsh.append(before) } else { run harsh.append(before + 1) }
+    c = c + 1
+  }
+  let mut calm = List<bool>.make()
+  run calm.appendRepeated(false, u32.toUsize(values))
+  if pool.fragile != 0 {
+    v = 0
+    while v < values {
+      let index = u32.toUsize(v)
+      let start = starts.get(index)
+      if start != NONE {
+        // From the instruction that defines v (a parameter: the one before its block, the
+        // jump that writes it) to the last that reads it.
+        let mut low: u32 = 0
+        if start >= 3 { low = (start - 3) / 2 }
+        let mut high = (ends.get(index) - 2) / 2
+        if ends.get(index) < 2 { high = 0 }
+        if u32.toUsize(high) >= f.insts.length() { high = usize.toU32(f.insts.length() - 1) }
+        if low <= high { calm.set(index, harsh.get(u32.toUsize(high) + 1) == harsh.get(u32.toUsize(low))) }
+      }
+      v = v + 1
+    }
+  }
+  // A number an operation takes from its element is never in a register.
+  c = 0
+  while c < cuts.folds.length() {
+    if cuts.folds.get(c) { across.set(u32.toUsize(f.insts.get(c).result), NOWHERE) }
+    c = c + 1
+  }
+  let weights = run weigh(&f, &ends, plain)
+  return run scan(&f, move starts, move ends, &across, &calm, &weights, pool)
+}
+fn plainAt(plain: &List<bool>, i: u32) -> bool { return u32.toUsize(i) < plain.length() && plain.get(u32.toUsize(i)) }
+/// How many times each value is read: as an operand, as an edge's argument, and in an exit's
+/// slots (an object an exit rebuilds: each of its fields).
+pub effect fn useCounts(f: &Function) -> List<u32> ! OutOfMemoryError ? &mut Allocator {
+  let values = f.valueCount()
+  let mut uses = List<u32>.make()
+  run uses.appendRepeated(0, u32.toUsize(values))
+  let mut i: usize = 0
+  while i < f.insts.length() {
+    let inst = f.insts.get(i)
+    if inst.a != NONE && inst.a < values { addUse(&mut uses, inst.a) }
+    if readsK(inst.op) { addUse(&mut uses, i32.wrappingToU32(inst.k)) }
+    if inst.b != NONE && inst.b < values { addUse(&mut uses, inst.b) }
+    i = i + 1
+  }
+  i = 0
+  while i < f.edgeArgs.length() { addUse(&mut uses, f.edgeArgs.get(i)) i = i + 1 }
+  i = 0
+  while i < f.slots.length() {
+    let slot = f.slots.get(i)
+    if slot.mode == SlotMode.Virtual {
+      let vo = f.virtualObjs.get(u32.toUsize(slot.value))
+      let mut fk: u32 = 0
+      while fk < vo.slotCount { addUse(&mut uses, vo.fields[u32.toUsize(fk)]) fk = fk + 1 }
+    } else { addUse(&mut uses, slot.value) }
+    i = i + 1
+  }
+  return move uses
+}
+fn addUse(uses: &mut List<u32>, v: u32) -> () {
+  if v == NONE || u32.toUsize(v) >= uses.length() { return () }
+  let before = uses.get(u32.toUsize(v))
+  uses.set(u32.toUsize(v), before + 1)
+}
+/// Whether lowering inst leaves R11 as it is, and stores to no Array: arithmetic,
+/// compares, constants, boxes and unboxes of numbers, and shifts by a constant (a shift by
+/// a register keeps rcx in R11).
+pub fn r11Kept(function: &Function, inst: Inst) -> bool {
+  let op = inst.op
+  if op == Op.ConstI32 || op == Op.Imm || op == Op.Unbox || op == Op.UnboxBool || op == Op.BoxI32 || op == Op.BoxBool
+    || op == Op.Add || op == Op.Sub || op == Op.Mul || op == Op.Imul || op == Op.Cmp || op == Op.BitAnd || op == Op.BitOr || op == Op.BitXor
+    || op == Op.BitNot || op == Op.Neg || op == Op.NotBool
+    || op == Op.ConstF64 || op == Op.ConstVal || op == Op.UnboxF64 || op == Op.BoxF64 || op == Op.ToF64
+    || op == Op.AddF64 || op == Op.SubF64 || op == Op.MulF64 || op == Op.DivF64 || op == Op.CmpF64
+    || op == Op.NegF64 || op == Op.SqrtF64 || op == Op.AbsF64 || op == Op.FloorF64 || op == Op.ExactI32
+    || op == Op.Removed { return true }
+  if op == Op.Shl || op == Op.Sar || op == Op.Shr {
+    let def = function.value(inst.b).def
+    return def != NONE && function.inst(def).op == Op.ConstI32
+  }
+  return false
+}
+/// What the lowering does with no register for a value, per instruction (empty lists: none
+/// of it). `plain`: a store that reads neither its index nor its exit (plainStore).
+/// `folds`: an unbox whose number the next instruction takes from the element (foldedUnbox).
+/// `keeps`: a number the instruction reads besides its operands, or NONE (x64_backend.knownInts:
+/// the number of an `equals` operand that an unbox before it proved an Int).
+pub struct Shortcuts { pub plain: List<bool>, pub folds: List<bool>, pub keeps: List<u32> }
+pub fn noShortcuts() -> Shortcuts { return Shortcuts { plain: List<bool>.make(), folds: List<bool>.make(), keeps: List<u32>.make() } }
+impl Shortcuts {
+  /// The number instruction `i` reads besides its operands, or NONE.
+  pub fn kept(self: &Self, i: u32) -> u32 { if u32.toUsize(i) < self.keeps.length() { return self.keeps.get(u32.toUsize(i)) } return NONE }
+}
+/// The shortcuts of f, whose values are read `uses` times (useCounts).
+pub effect fn shortcuts(f: &Function, uses: &List<u32>) -> Shortcuts ! OutOfMemoryError ? &mut Allocator {
+  let plain = run plainStores(&f, uses)
+  let mut folds = List<bool>.make()
+  run folds.appendRepeated(false, f.insts.length())
+  let mut i: usize = 0
+  while i < f.insts.length() {
+    if f.insts.get(i).op == Op.Unbox && foldedUnbox(f, uses, usize.toU32(i)) { folds.set(i, true) }
+    i = i + 1
+  }
+  return Shortcuts { plain: move plain, folds: move folds, keeps: List<u32>.make() }
+}
+/// How many of an exit's slots name v itself (not as a field of an object it rebuilds).
+fn named(f: &Function, exit: u32, v: u32) -> u32 {
+  let state = f.exit(exit)
+  let mut count: u32 = 0
+  let mut s: u32 = 0
+  while s < f.slotCount(state) {
+    let slot = f.slot(state, s)
+    if slot.mode != SlotMode.Virtual && slot.value == v { count = count + 1 }
+    s = s + 1
+  }
+  return count
+}
+/// Whether the unbox at `at` is of an element a trusted read just before it found, read by
+/// that unbox alone, and its number is read only by the instruction after it: an add of it
+/// to a value that is no constant, or a subtraction of it. The lowering then tests the
+/// element's tag and leaves the number where it is: the operation takes it from the
+/// element (`add r14d, [rdi + r11 * 8 + 8]`), and where the operation overflows, a piece
+/// after the blocks writes the number to its slot for the exit (x64_backend: `memFor`).
+/// Such a number takes no register.
+fn foldedUnbox(f: &Function, uses: &List<u32>, at: u32) -> bool {
+  let unbox = f.inst(at)
+  if unbox.k != 0 || unbox.result == NONE || unbox.exit == NONE { return false }
+  let block = f.blocks.get(u32.toUsize(unbox.block))
+  if at == block.firstInst || at + 1 >= block.firstInst + block.instCount { return false }
+  let read = f.inst(at - 1)
+  if read.op != Op.GetElem || !read.trusted || read.k != 0 || read.result == NONE || read.result != unbox.a { return false }
+  if f.value(read.result).own != Own.Borrowed || uses.get(u32.toUsize(read.result)) != 1 + named(f, unbox.exit, read.result) { return false }
+  let v = unbox.result
+  let by = f.inst(at + 1)
+  let mut other = by.a
+  if by.op == Op.Add && by.a == v { other = by.b }
+  else if (by.op != Op.Add && by.op != Op.Sub) || by.b != v { return false }
+  if other == NONE || other == v { return false }
+  let made = f.value(other).def
+  if made != NONE && f.inst(made).op == Op.ConstI32 { return false }
+  let mut inExit: u32 = 0
+  if by.exit != NONE { inExit = named(f, by.exit, v) }
+  return uses.get(u32.toUsize(v)) == 1 + inExit
+}
+/// Which instructions are plain stores: a trusted store through an Array's elements of a
+/// number boxed right before it, into the element a trusted read in the same block found
+/// and went on with as an Int (the read's result has one reader, the unbox after it), with
+/// nothing between that touches R11 or an Array. The lowering writes the number where the
+/// read left the element's address (x64_backend.trustedStore): it reads no index, the
+/// element holds nothing counted, and its exit is never taken. `uses` is useCounts.
+effect fn plainStores(f: &Function, uses: &List<u32>) -> List<bool> ! OutOfMemoryError ? &mut Allocator {
+  let mut plain = List<bool>.make()
+  run plain.appendRepeated(false, f.insts.length())
+  let mut i: usize = 0
+  while i < f.insts.length() {
+    let inst = f.insts.get(i)
+    if inst.op == Op.PutElem && inst.trusted && f.isElements(inst.a) && plainStore(f, uses, usize.toU32(i)) { plain.set(i, true) }
+    i = i + 1
+  }
+  return move plain
+}
+fn plainStore(f: &Function, uses: &List<u32>, at: u32) -> bool {
+  let store = f.inst(at)
+  let first = f.blocks.get(u32.toUsize(store.block)).firstInst
+  if at < first + 3 { return false }
+  let box = f.inst(at - 1)
+  if (box.op != Op.BoxI32 && box.op != Op.BoxBool && box.op != Op.BoxF64) || box.result == NONE || box.result != store.b { return false }
+  if uses.get(u32.toUsize(box.result)) != 1 { return false }
+  let index = i32.wrappingToU32(store.k)
+  let mut c = at - 1
+  while c > first {
+    c = c - 1
+    let read = f.inst(c)
+    if read.op == Op.GetElem {
+      if !read.trusted || read.k != 0 || read.a != store.a || read.b != index || read.result == NONE { return false }
+      if f.value(read.result).own != Own.Borrowed { return false }
+      let unbox = f.inst(c + 1)
+      if unbox.op != Op.Unbox || unbox.k != 0 || unbox.a != read.result || unbox.result == NONE || unbox.exit == NONE { return false }
+      return uses.get(u32.toUsize(read.result)) == 1 + named(f, unbox.exit, read.result)
+    }
+    if !r11Kept(f, read) { return false }
+  }
+  return false
+}
+/// Instructions whose lowering touches neither rsi nor rdi and calls nothing (Pool.fragile):
+/// integer arithmetic and compares, constants, boxes and unboxes of numbers, and the moves
+/// of jumps and branches (rax, rcx, r8 to r11 and a scratch slot are theirs).
+/// Whether a value in a fragile register lives through inst: a gentle instruction or an
+/// `inline.frame`; a
+/// `check.array`, a `check.bound` or an `elements`, or an element read a `check.array` proved (Inst.trusted), which leave
+/// instead of calling out; a trusted element store, a poll or a `grow.bound`, which keep the
+/// fragile registers over the call their slow path makes (x64_backend.keepFragile).
+fn keepsFragile(inst: Inst) -> bool {
+  // An inlined body's `inline.frame` (at each of its blocks) emits nothing.
+  if gentle(inst.op) || inst.op == Op.CheckArray || inst.op == Op.CheckBound || inst.op == Op.GrowBound || inst.op == Op.Elements || inst.op == Op.Poll || inst.op == Op.CheckConstruct || inst.op == Op.InlineFrame { return true }
+  return (inst.op == Op.GetElem && inst.trusted && inst.k == 0) || (inst.op == Op.PutElem && inst.trusted)
+}
+fn gentle(op: Op) -> bool {
+  return op == Op.ConstI32 || op == Op.Imm || op == Op.Unbox || op == Op.UnboxBool || op == Op.BoxI32 || op == Op.BoxBool
+    || op == Op.Add || op == Op.Sub || op == Op.Mul || op == Op.Imul || op == Op.Cmp || op == Op.BitAnd || op == Op.BitOr || op == Op.BitXor
+    || op == Op.Shl || op == Op.Sar || op == Op.Shr || op == Op.BitNot || op == Op.Neg || op == Op.NotBool
+    || op == Op.ConstF64 || op == Op.UnboxF64 || op == Op.BoxF64 || op == Op.ToF64
+    || op == Op.AddF64 || op == Op.SubF64 || op == Op.MulF64 || op == Op.DivF64 || op == Op.CmpF64
+    || op == Op.NegF64 || op == Op.SqrtF64 || op == Op.AbsF64 || op == Op.FloorF64
+    || op == Op.ToInt32 || op == Op.ExactI32
+    || op == Op.Jump || op == Op.Branch || op == Op.Removed
+}
+/// What a value's interval allows: any register of its pool, only one that lasts over a
+/// call, or none.
+const ANYWHERE: u8 = 0
+const OVER_CALL: u8 = 1
+const NOWHERE: u8 = 2
+
+/// What each value costs in its slot, in quarter instructions: every write and read in block b
+/// counts 8^depth(b), at most 8^6, times what a slot adds there. A write (the definition, or
+/// a parameter's moves) adds a store and a read a load (4 each; 12 for a loop header's
+/// parameter, whose load waits for the store of the turn before), but an operand that
+/// arithmetic takes from memory as it is adds none, only a little time (1): the second
+/// operand, or the first when it lives on and the result gets another place anyway. So a
+/// value a loop only reads that way goes to its slot before one the loop carries around.
+/// An Array's elements are loaded to R9 for an access and mostly still there for the next
+/// one in the block, which counts 1.
+/// Loops are back edges s -> h with h <= s, their bodies the blocks h..s in reverse postorder.
+effect fn weigh(f: &Function, ends: &List<u32>, plain: &List<bool>) -> List<u64> ! OutOfMemoryError ? &mut Allocator {
+  let count = f.blockCount()
+  let mut depth = List<u32>.make()
+  run depth.appendRepeated(0, u32.toUsize(count))
+  let mut header = List<bool>.make()
+  run header.appendRepeated(false, u32.toUsize(count))
+  let mut s: u32 = 0
+  while s < count {
+    let term = f.terminator(f.blocks.get(u32.toUsize(s)))
+    if term.edge != NONE {
+      let mut e: u32 = 0
+      while e < edgeCount(term.op) {
+        let h = f.edge(term.edge + e).target
+        if h <= s {
+          header.set(u32.toUsize(h), true)
+          let mut b = h
+          while b <= s { let d = depth.get(u32.toUsize(b)) depth.set(u32.toUsize(b), d + 1) b = b + 1 }
+        }
+        e = e + 1
+      }
+    }
+    s = s + 1
+  }
+  let mut weights = List<u64>.make()
+  run weights.appendRepeated(0, u32.toUsize(f.valueCount()))
+  // The block that read each Array's elements last: its next access there finds them in R9
+  // still, more often than not (x64_backend.preservesArrCache).
+  let mut loaded = List<u32>.make()
+  run loaded.appendRepeated(NONE, u32.toUsize(f.valueCount()))
+  let mut b: u32 = 0
+  while b < count {
+    let block = f.blocks.get(u32.toUsize(b))
+    let mut d = depth.get(u32.toUsize(b))
+    if d > 6 { d = 6 }
+    let heat = u64.shiftLeft(1, u32.toU64(3 * d))
+    let mut p: u32 = 0
+    // A loop's parameter in its slot is stored on every turn and read on the next, which
+    // waits for the store, where a value the loop only reads costs a load nothing waits for.
+    let mut carried: u64 = 4
+    if header.get(u32.toUsize(b)) { carried = 12 }
+    while p < block.paramCount { addWeight(&mut weights, f.paramAt(block, p), heat * carried) p = p + 1 }
+    let mut i = block.firstInst
+    while i < block.firstInst + block.instCount {
+      let inst = f.inst(i)
+      let folds = fromMemory(inst.op)
+      if readsA(inst.op) && inst.a != NONE {
+        let mut cost: u64 = 4
+        if folds && !compares(inst.op) && ends.get(u32.toUsize(inst.a)) > position(i) { cost = 1 }
+        if (inst.op == Op.GetElem || inst.op == Op.PutElem) && inst.trusted && f.isElements(inst.a) {
+          if loaded.get(u32.toUsize(inst.a)) == b { cost = 1 }
+          loaded.set(u32.toUsize(inst.a), b)
+        }
+        addWeight(&mut weights, inst.a, heat * cost)
+      }
+      if readsB(inst.op) && inst.b != NONE {
+        let mut cost: u64 = 4
+        if folds { cost = 1 }
+        addWeight(&mut weights, inst.b, heat * cost)
+      }
+      if readsK(inst.op) && !plainAt(plain, i) { addWeight(&mut weights, i32.wrappingToU32(inst.k), heat * 4) }
+      if inst.result != NONE { addWeight(&mut weights, inst.result, heat * 4) }
+      if inst.edge != NONE {
+        let mut e: u32 = 0
+        while e < edgeCount(inst.op) {
+          let edge = f.edge(inst.edge + e)
+          let mut g: u32 = 0
+          while g < edge.argCount { addWeight(&mut weights, f.edgeArg(edge, g), heat * 4) g = g + 1 }
+          e = e + 1
+        }
+      }
+      i = i + 1
+    }
+    b = b + 1
+  }
+  return move weights
+}
+/// Arithmetic whose lowering takes an operand from its slot as it is (aluWith, scalarWith).
+fn fromMemory(op: Op) -> bool {
+  return op == Op.Add || op == Op.Sub || op == Op.Mul || op == Op.BitAnd || op == Op.BitOr || op == Op.BitXor || compares(op)
+    || op == Op.AddF64 || op == Op.SubF64 || op == Op.MulF64 || op == Op.DivF64
+}
+fn compares(op: Op) -> bool { return op == Op.Cmp || op == Op.CmpF64 }
+fn addWeight(weights: &mut List<u64>, v: u32, heat: u64) -> () {
+  let before = weights.get(u32.toUsize(v))
+  weights.set(u32.toUsize(v), before + heat)
+}
+
+fn poolKind(double: bool) -> u8 { if double { return XMM } return GPR }
+
+effect fn scan(f: &Function, starts: List<u32>, ends: List<u32>, across: &List<u8>, calm: &List<bool>, weights: &List<u64>, pool: Pool) -> Allocation ! OutOfMemoryError ? &mut Allocator {
+  let values = f.valueCount()
+  let mut kinds = List<u8>.make()
+  run kinds.appendRepeated(SPILL, u32.toUsize(values))
+  let mut registers = List<u8>.make()
+  run registers.appendRepeated(0, u32.toUsize(values))
+  // Hints: an edge argument and the parameter it becomes would rather share a register, so
+  // the edge moves nothing (a loop's back edge most of all).
+  let mut hints = List<u32>.make()
+  run hints.appendRepeated(NONE, u32.toUsize(values))
+  let mut e: usize = 0
+  while e < f.edges.length() {
+    let edge = f.edges.get(e)
+    let target = f.blocks.get(u32.toUsize(edge.target))
+    let mut g: u32 = 0
+    while g < edge.argCount {
+      let arg = f.edgeArg(edge, g)
+      let into = f.paramAt(target, g)
+      if hints.get(u32.toUsize(arg)) == NONE { hints.set(u32.toUsize(arg), into) }
+      if hints.get(u32.toUsize(into)) == NONE { hints.set(u32.toUsize(into), arg) }
+      g = g + 1
+    }
+    e = e + 1
+  }
+  // The result of arithmetic would rather take the register of an operand that ends there,
+  // where the operation then runs in place (`operand`): the first operand's, or the second's
+  // when the operands may change sides. Where they may not (a difference, a quotient), the
+  // second operand's register is the one the result would rather not take (`shunned`): the
+  // operation there goes through a scratch register and back.
+  let mut operand = List<u32>.make()
+  run operand.appendRepeated(NONE, u32.toUsize(values))
+  let mut shunned = List<u32>.make()
+  run shunned.appendRepeated(NONE, u32.toUsize(values))
+  // A product that may overflow or be -0 leaves with both factors where they were, so it
+  // would rather take neither's register (`shunned` and `aside`): in one of them it is
+  // computed in a scratch register and moved. A product that can do neither runs in place.
+  let mut aside = List<u32>.make()
+  run aside.appendRepeated(NONE, u32.toUsize(values))
+  let mut c: usize = 0
+  while c < f.insts.length() {
+    let inst = f.insts.get(c)
+    let op = inst.op
+    let sided = op == Op.SubF64 || op == Op.DivF64 || op == Op.Sub
+    if (sided || op == Op.AddF64 || op == Op.MulF64 || op == Op.Add) && inst.result != NONE && inst.a != NONE && inst.b != NONE {
+      let at = position(usize.toU32(c))
+      if ends.get(u32.toUsize(inst.a)) == at { operand.set(u32.toUsize(inst.result), inst.a) }
+      else if !sided && ends.get(u32.toUsize(inst.b)) == at { operand.set(u32.toUsize(inst.result), inst.b) }
+      if sided { shunned.set(u32.toUsize(inst.result), inst.b) }
+    }
+    if op == Op.Mul && inst.result != NONE && inst.a != NONE && inst.b != NONE {
+      let at = position(usize.toU32(c))
+      if mulRangeSafe(f, inst.a, inst.b) && (inst.proven || mulNoNegZero(f, inst.a, inst.b)) {
+        if ends.get(u32.toUsize(inst.a)) == at { operand.set(u32.toUsize(inst.result), inst.a) }
+        else if ends.get(u32.toUsize(inst.b)) == at { operand.set(u32.toUsize(inst.result), inst.b) }
+      } else { shunned.set(u32.toUsize(inst.result), inst.a) aside.set(u32.toUsize(inst.result), inst.b) }
+    }
+    // A bit operation or a shift by a constant runs in its result's register
+    // (x64_backend.withImmediate): in place where its operand ends.
+    if (op == Op.BitAnd || op == Op.BitOr || op == Op.BitXor || op == Op.Shl || op == Op.Sar || op == Op.Shr) && inst.result != NONE && inst.a != NONE && inst.b != NONE {
+      let count = f.value(inst.b).def
+      if count != NONE && f.inst(count).op == Op.ConstI32 && ends.get(u32.toUsize(inst.a)) == position(usize.toU32(c)) { operand.set(u32.toUsize(inst.result), inst.a) }
+    }
+    c = c + 1
+  }
+  // Candidates by start, then value.
+  let mut order = List<u64>.make()
+  let mut v: u32 = 0
+  while v < values {
+    let ty = f.value(v).ty
+    // A constant takes no register: its readers take it as an immediate, or from its slot.
+    let def = f.value(v).def
+    let constant = def != NONE && f.inst(def).op == Op.ConstI32
+    if !constant && (ty == Type.I32 || ty == Type.Bool || ty == Type.F64 || ty == Type.Raw) && starts.get(u32.toUsize(v)) != NONE && across.get(u32.toUsize(v)) != NOWHERE {
+      run order.append(u64.bitOr(u64.shiftLeft(u32.toU64(starts.get(u32.toUsize(v))), 32), u32.toU64(v)))
+    }
+    v = v + 1
+  }
+  run order.sort()
+  // The value holding each register (integers first, then doubles), or NONE.
+  let mut owners = List<u32>.make()
+  run owners.appendRepeated(NONE, GPR_COUNT + XMM_COUNT)
+  let mut saved: u32 = 0
+  let mut k: usize = 0
+  while k < order.length() {
+    let v = u64.wrappingToU32(order.get(k))
+    let start = starts.get(u32.toUsize(v))
+    let double = f.value(v).ty == Type.F64
+    let mut first: usize = 0
+    let mut last = pool.count
+    if double { first = GPR_COUNT last = GPR_COUNT + XMM_COUNT }
+    // The registers this value may take: all of its pool, or those that last over a call.
+    let mut allowed: u32 = u32.MAX
+    if !double && across.get(u32.toUsize(v)) == OVER_CALL { allowed = pool.overCalls }
+    if !double && !calm.get(u32.toUsize(v)) { allowed = u32.bitAnd(allowed, u32.bitXor(pool.fragile, u32.MAX)) }
+    // Expire what ended before this start; take a free register, the first that is not the
+    // shunned one.
+    let mut shun = usize.MAX
+    let other = shunned.get(u32.toUsize(v))
+    if other != NONE && kinds.get(u32.toUsize(other)) == poolKind(double) { shun = first + u8.toUsize(registers.get(u32.toUsize(other))) }
+    let mut shunToo = usize.MAX
+    let second = aside.get(u32.toUsize(v))
+    if second != NONE && kinds.get(u32.toUsize(second)) == poolKind(double) { shunToo = first + u8.toUsize(registers.get(u32.toUsize(second))) }
+    let mut free = usize.MAX
+    let mut r = first
+    while r < last {
+      let owner = owners.get(r)
+      if owner != NONE && ends.get(u32.toUsize(owner)) < start { owners.set(r, NONE) }
+      if owners.get(r) == NONE && (free == usize.MAX || free == shun || free == shunToo) && u32.bitAnd(u32.shiftRight(allowed, usize.toU32(r - first)), 1) != 0 { free = r }
+      r = r + 1
+    }
+    // The register of the operand that ends here, then the hinted value's (which wins),
+    // when that value is already placed in this pool and its register is free now.
+    let mut pass: u32 = 0
+    while pass < 2 {
+      let mut hint = operand.get(u32.toUsize(v))
+      if pass == 1 { hint = hints.get(u32.toUsize(v)) }
+      if free != usize.MAX && hint != NONE && kinds.get(u32.toUsize(hint)) == poolKind(double) {
+        let wanted = first + u8.toUsize(registers.get(u32.toUsize(hint)))
+        if owners.get(wanted) == NONE && u32.bitAnd(u32.shiftRight(allowed, usize.toU32(wanted - first)), 1) != 0 { free = wanted }
+      }
+      pass = pass + 1
+    }
+    if free == usize.MAX {
+      // Spill whichever of v and the holders costs least in its slot; of those within a
+      // quarter of each other, the one that ends last, which leaves its register free for
+      // the longest (a temporary that costs a little less would go now, and the long value
+      // at the next temporary all the same).
+      let mut furthest = usize.MAX
+      let mut furthestEnd = ends.get(u32.toUsize(v))
+      let mut lightest = weights.get(u32.toUsize(v))
+      r = first
+      while r < last {
+        let owner = owners.get(r)
+        if owner != NONE && u32.bitAnd(u32.shiftRight(allowed, usize.toU32(r - first)), 1) != 0 {
+          let end = ends.get(u32.toUsize(owner))
+          let weight = weights.get(u32.toUsize(owner))
+          if weight * 5 < lightest * 4 || (weight * 4 <= lightest * 5 && end > furthestEnd) { furthest = r furthestEnd = end lightest = weight }
+        }
+        r = r + 1
+      }
+      if furthest != usize.MAX {
+        kinds.set(u32.toUsize(owners.get(furthest)), SPILL)
+        free = furthest
+      }
+    }
+    if free != usize.MAX {
+      owners.set(free, v)
+      let index = free - first
+      if double { kinds.set(u32.toUsize(v), XMM) } else { kinds.set(u32.toUsize(v), GPR) saved = u32.bitOr(saved, u32.shiftLeft(1, usize.toU32(index))) }
+      registers.set(u32.toUsize(v), usize.wrappingToU8(index))
+    }
+    k = k + 1
+  }
+  return Allocation { kinds: move kinds, registers: move registers, savedMask: saved, starts: move starts, ends: move ends, pool: pool }
+}
+
+// ---- reading and writing places ----
+
+/// dst = the i32 or bool at p (zero-extended).
+pub effect fn getI32(a: &mut Assembler, dst: Reg, p: Place) -> () ! OutOfMemoryError ? &mut Allocator {
+  if p.kind == GPR { if p.gpr != dst { run a.mov(Width.W32, dst, p.gpr) } return () }
+  run a.load(Width.W32, dst, p.mem)
+}
+/// p = the i32 or bool in src, which holds it zero-extended.
+pub effect fn putI32(a: &mut Assembler, p: Place, src: Reg) -> () ! OutOfMemoryError ? &mut Allocator {
+  if p.kind == GPR { if p.gpr != src { run a.mov(Width.W32, p.gpr, src) } return () }
+  run a.store(Width.W64, p.mem, src)
+}
+/// dst op= the i32 at p.
+pub effect fn aluWith(a: &mut Assembler, op: Alu, dst: Reg, p: Place) -> () ! OutOfMemoryError ? &mut Allocator {
+  if p.kind == GPR { run a.alu(op, Width.W32, dst, p.gpr) return () }
+  run a.aluLoad(op, Width.W32, dst, p.mem)
+}
+/// dst = the double at p.
+pub effect fn getF64(a: &mut Assembler, dst: Xmm, p: Place) -> () ! OutOfMemoryError ? &mut Allocator {
+  if p.kind == XMM { if p.xmm != dst { run a.packed(PackedOp.Movapd, dst, p.xmm) } return () }
+  run a.loadDouble(dst, p.mem)
+}
+/// p = the double in src.
+pub effect fn putF64(a: &mut Assembler, p: Place, src: Xmm) -> () ! OutOfMemoryError ? &mut Allocator {
+  if p.kind == XMM { if p.xmm != src { run a.packed(PackedOp.Movapd, p.xmm, src) } return () }
+  run a.storeDouble(p.mem, src)
+}
+/// dst = the bits of the double at p.
+pub effect fn getBits(a: &mut Assembler, dst: Reg, p: Place) -> () ! OutOfMemoryError ? &mut Allocator {
+  if p.kind == XMM { run a.doubleToBits(dst, p.xmm) return () }
+  run a.load(Width.W64, dst, p.mem)
+}
+/// p = the double whose bits are in src.
+pub effect fn putBits(a: &mut Assembler, p: Place, src: Reg) -> () ! OutOfMemoryError ? &mut Allocator {
+  if p.kind == XMM { run a.bitsToDouble(p.xmm, src) return () }
+  run a.store(Width.W64, p.mem, src)
+}
+/// dst = dst op the double at p (or op of it, for sqrt).
+pub effect fn scalarWith(a: &mut Assembler, op: ScalarOp, dst: Xmm, p: Place) -> () ! OutOfMemoryError ? &mut Allocator {
+  if p.kind == XMM { run a.scalar(op, dst, p.xmm) return () }
+  run a.scalarLoad(op, dst, p.mem)
+}
+
+/// Whether lowering `op` calls a helper (x64_backend callHelper), which may change rax, rcx,
+/// rdx, rsi, rdi, r8 to r11 and every xmm register.
+pub fn callsOut(op: Op) -> bool {
+  return op == Op.Release || op == Op.GetField || op == Op.PutField || op == Op.AtomValue || op == Op.GetVar
+    || op == Op.PutVar || op == Op.GetScope || op == Op.PutScope || op == Op.GetKey || op == Op.GetElem || op == Op.PutElem || op == Op.PutKey
+    || op == Op.GetLength || op == Op.Truthy || op == Op.TypeofAtom || op == Op.Typeof || op == Op.InstanceOf || op == Op.Equals || op == Op.ModF64 || op == Op.NewObject
+}
+
+/// Whether lowering `inst` can clobber xmm2..xmm15. In frame mode, cold slow paths for
+/// Release, non-stepping GetElem, PutElem, non-stepping GetField, PutField, GetLength,
+/// GetVar, and GetScope preserve allocated XMM registers via x64_backend.keepXmm/restoreXmm.
+fn callsOutInst(inst: Inst, frameMode: bool) -> bool {
+  let op = inst.op
+  if frameMode {
+    if op == Op.Release { return false }
+    if op == Op.GetElem && inst.k != ELEM_STEPS { return false }
+    if op == Op.PutElem { return false }
+    if op == Op.GetField && (inst.k & FIELD_STEPS) == 0 { return false }
+    if op == Op.PutField { return false }
+    if op == Op.GetLength { return false }
+    if op == Op.GetVar || op == Op.GetScope { return false }
+  }
+  return callsOut(op)
+}

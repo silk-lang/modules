@@ -82,6 +82,8 @@ enum {
     FLAG_ATTRIBUTES = 1u << 21,
     FLAG_ROOT = 1u << 22,
     FLAG_HAS_PARENT = 1u << 23,
+    FLAG_HAS_EXPANDED = 1u << 24,
+    FLAG_EXPANDED = 1u << 25,
 };
 
 // Action kinds: keep in step with the ACTION_ functions of src/adapter.silk.
@@ -336,8 +338,11 @@ static BOOL box_contains(SilkAKBox box, NSPoint point) {
 }
 
 - (id)focusedElement {
-    if (!self.hasFocus) return nil;
-    return self.nodes[@(self.focusId)];
+    if (self.hasFocus) {
+        SilkAKNode *node = self.nodes[@(self.focusId)];
+        if (node) return node;
+    }
+    return self.rootIds.count ? self.nodes[self.rootIds[0]] : nil;
 }
 
 @end
@@ -538,11 +543,16 @@ static BOOL box_contains(SilkAKBox box, NSPoint point) {
         SilkAKNode *parent = adapter.nodes[@(self.parentId)];
         if (parent) return parent;
     }
-    return adapter.view.accessibilityParent;
+    if (adapter.view) {
+        id ancestor = NSAccessibilityUnignoredAncestor(adapter.view);
+        if (ancestor) return ancestor;
+        return adapter.view.accessibilityParent;
+    }
+    return nil;
 }
 
-- (id)accessibilityWindow { return self.adapter.view.accessibilityParent; }
-- (id)accessibilityTopLevelUIElement { return self.adapter.view.accessibilityParent; }
+- (id)accessibilityWindow { return self.adapter.view.window ?: self.adapter.view.accessibilityParent; }
+- (id)accessibilityTopLevelUIElement { return self.adapter.view.window ?: self.adapter.view.accessibilityParent; }
 
 - (NSArray *)accessibilityChildren { return [self.adapter elements:self.childIds]; }
 - (NSArray *)accessibilityChildrenInNavigationOrder { return [self accessibilityChildren]; }
@@ -571,8 +581,27 @@ static BOOL box_contains(SilkAKBox box, NSPoint point) {
     return [super accessibilityRoleDescription];
 }
 
+static BOOL role_uses_description(NSString *role) {
+    return [role isEqualToString:NSAccessibilityGroupRole]
+        || [role isEqualToString:NSAccessibilitySliderRole]
+        || [role isEqualToString:NSAccessibilityTextFieldRole]
+        || [role isEqualToString:NSAccessibilityTextAreaRole]
+        || [role isEqualToString:NSAccessibilityImageRole]
+        || [role isEqualToString:NSAccessibilityListRole]
+        || [role isEqualToString:NSAccessibilityTabGroupRole]
+        || [role isEqualToString:NSAccessibilityRadioGroupRole]
+        || [role isEqualToString:NSAccessibilityProgressIndicatorRole]
+        || [role isEqualToString:NSAccessibilityLevelIndicatorRole]
+        || [role isEqualToString:NSAccessibilityToolbarRole]
+        || [role isEqualToString:NSAccessibilityTableRole]
+        || [role isEqualToString:NSAccessibilityOutlineRole];
+}
+
 - (NSString *)accessibilityIdentifier { return self.identifierText; }
 - (NSString *)accessibilityTitle { return self.titleText; }
+- (NSString *)accessibilityLabel {
+    return self.titleText && role_uses_description(self.roleName) ? self.titleText : nil;
+}
 - (NSString *)accessibilityHelp { return self.helpText; }
 - (NSString *)accessibilityPlaceholderValue { return self.placeholderText; }
 - (id)accessibilityValue { return self.valueObject; }
@@ -781,6 +810,7 @@ static BOOL box_contains(SilkAKBox box, NSPoint point) {
 }
 
 - (BOOL)isAccessibilityRequired { return [self has:FLAG_REQUIRED]; }
+- (BOOL)isAccessibilityExpanded { return [self has:FLAG_EXPANDED]; }
 - (BOOL)isAccessibilitySelected { return [self has:FLAG_SELECTED]; }
 
 - (void)setAccessibilitySelected:(BOOL)selected {
@@ -793,6 +823,9 @@ static BOOL box_contains(SilkAKBox box, NSPoint point) {
     NSMutableArray *names = [[super accessibilityAttributeNames] mutableCopy] ?: [NSMutableArray array];
     if (self.positionInSet) [names addObject:@"AXARIAPosInSet"];
     if (self.sizeOfSet) [names addObject:@"AXARIASetSize"];
+    if (self.brailleLabel) [names addObject:@"AXBrailleLabel"];
+    if (self.brailleRoleDescription) [names addObject:@"AXBrailleRoleDescription"];
+    if (self.domIdentifier) [names addObject:@"AXDOMIdentifier"];
     return names;
 }
 
@@ -804,7 +837,7 @@ static BOOL box_contains(SilkAKBox box, NSPoint point) {
         return self.brailleRoleDescription;
     }
     if ([attribute isEqualToString:@"AXDOMIdentifier"] && self.domIdentifier) return self.domIdentifier;
-    return nil;
+    return [super accessibilityAttributeValue:attribute];
 }
 
 - (NSArray *)accessibilityRows {
@@ -840,7 +873,9 @@ static BOOL box_contains(SilkAKBox box, NSPoint point) {
 - (void)accessibilityPerformAction:(NSString *)action {
     if ([action isEqualToString:SCROLL_TO_VISIBLE_ACTION]) {
         [self.adapter enqueue:ACTION_SCROLL_INTO_VIEW node:self.nodeId];
+        return;
     }
+    [super accessibilityPerformAction:action];
 }
 
 - (BOOL)isAccessibilitySelectorAllowed:(SEL)selector {
@@ -862,6 +897,7 @@ static BOOL box_contains(SilkAKBox box, NSPoint point) {
     }
     if (selector == @selector(setAccessibilityValue:)) return [self has:FLAG_SET_VALUE];
     if (selector == @selector(isAccessibilitySelected)) return [self has:FLAG_ITEM_LIKE];
+    if (selector == @selector(isAccessibilityExpanded)) return [self has:FLAG_HAS_EXPANDED];
     if (selector == @selector(accessibilityRows) || selector == @selector(accessibilitySelectedRows)) {
         return [self has:FLAG_SELECTABLE_CONTAINER];
     }
@@ -873,6 +909,7 @@ static BOOL box_contains(SilkAKBox box, NSPoint point) {
     if (selector == @selector(accessibilityAttributeValue:)) return [self has:FLAG_ATTRIBUTES];
     if (selector == @selector(accessibilityAttributeNames)) return YES;
     if (selector == @selector(accessibilityURL)) return [self has:FLAG_URL];
+    if (selector == @selector(accessibilityLabel)) return self.titleText && role_uses_description(self.roleName);
     return selector == @selector(accessibilityParent) || selector == @selector(accessibilityChildren)
         || selector == @selector(accessibilityChildrenInNavigationOrder)
         || selector == @selector(accessibilitySelectedChildren) || selector == @selector(accessibilityFrame)
@@ -936,6 +973,7 @@ static Class subclass_of(Class base) {
     Class subclass = objc_allocateClassPair(base, name.UTF8String, 0);
     if (!subclass) return Nil;
     class_addMethod(subclass, @selector(accessibilityChildren), (IMP)view_children, "@@:");
+    class_addMethod(subclass, @selector(accessibilityChildrenInNavigationOrder), (IMP)view_children, "@@:");
     class_addMethod(subclass, @selector(accessibilityFocusedUIElement), (IMP)view_focused, "@@:");
     NSString *types = [NSString stringWithFormat:@"@@:%s", @encode(NSPoint)];
     class_addMethod(subclass, @selector(accessibilityHitTest:), (IMP)view_hit_test, types.UTF8String);
@@ -1004,6 +1042,8 @@ void silk_ak_macos_set_node(uint64_t handle, uint64_t nodeId, const uint8_t *rec
     SilkAKAdapter *adapter = adapter_for(handle);
     if (!adapter) return;
     SilkAKNode *node = adapter.nodes[@(nodeId)];
+    BOOL existed = node != nil;
+    NSArray<NSNumber *> *oldChildren = existed ? node.childIds : nil;
     if (!node) {
         node = [SilkAKNode new];
         node.adapter = adapter;
@@ -1011,6 +1051,9 @@ void silk_ak_macos_set_node(uint64_t handle, uint64_t nodeId, const uint8_t *rec
         adapter.nodes[@(nodeId)] = node;
     }
     [node load:record length:length];
+    if (existed && ![oldChildren isEqualToArray:node.childIds]) {
+        NSAccessibilityPostNotification(node, NSAccessibilityLayoutChangedNotification);
+    }
 }
 
 void silk_ak_macos_remove_node(uint64_t handle, uint64_t nodeId) {
@@ -1026,7 +1069,12 @@ void silk_ak_macos_set_roots(uint64_t handle, const uint64_t *ids, size_t count)
     if (!adapter) return;
     NSMutableArray<NSNumber *> *roots = [NSMutableArray arrayWithCapacity:count];
     for (size_t i = 0; i < count; i++) [roots addObject:@(ids[i])];
+    BOOL changed = ![adapter.rootIds isEqualToArray:roots];
     adapter.rootIds = roots;
+    if (changed) {
+        id target = adapter.view.window ?: (id)adapter.view;
+        if (target) NSAccessibilityPostNotification(target, NSAccessibilityLayoutChangedNotification);
+    }
 }
 
 void silk_ak_macos_set_focus(uint64_t handle, uint32_t has, uint64_t nodeId) {
@@ -1115,7 +1163,11 @@ static NSString *describe(SilkAKAdapter *adapter, uint64_t nodeId) {
     if (node.feedSize) [out appendFormat:@"queried set size: %@\n", [node accessibilityAttributeValue:@"AXARIASetSize"]];
     if (node.accessibilitySubrole) [out appendFormat:@"subrole: %@\n", node.accessibilitySubrole];
     if (node.accessibilityTitle) [out appendFormat:@"title: %@\n", node.accessibilityTitle];
+    if (node.accessibilityLabel) [out appendFormat:@"label: %@\n", node.accessibilityLabel];
     if (node.accessibilityHelp) [out appendFormat:@"help: %@\n", node.accessibilityHelp];
+    if ([node isAccessibilitySelectorAllowed:@selector(isAccessibilityExpanded)]) {
+        [out appendFormat:@"expanded: %d\n", node.isAccessibilityExpanded ? 1 : 0];
+    }
     id value = node.accessibilityValue;
     if (value) [out appendFormat:@"value: %@\n", value];
     [out appendFormat:@"focused: %d\n", node.isAccessibilityFocused ? 1 : 0];

@@ -12,6 +12,13 @@ const post = (method, params) => new Promise((resolve, reject) => {
 });
 function profileLeaf() { let result = 0; for (let i = 0; i < 200000; i++) result += i; return result; }
 function profileOuter() { return profileLeaf(); }
+function profileNativeCaller() {
+  const big = [];
+  for (let i = 0; i < 20000; i++) big.push('item ' + i);
+  let length = 0;
+  for (let round = 0; round < 40; round++) length += JSON.stringify(big).length;
+  return length;
+}
 function allocationLeaf() { return { bytes: new Uint8Array(256), value: 7 }; }
 (async () => {
   await post('Profiler.enable');
@@ -23,13 +30,35 @@ function allocationLeaf() { return { bytes: new Uint8Array(256), value: 7 }; }
   assert.equal(profile.samples.length, profile.timeDeltas.length);
   assert.ok(profile.nodes.some(node => node.callFrame.functionName === 'profileLeaf'));
   assert.ok(profile.nodes.some(node => node.callFrame.functionName === 'profileOuter'));
-  assert.ok(profile.timeDeltas.every(delta => delta > 0));
+  // A stretch without safepoints is a sample stamped at its start, which may be the sample before it.
+  assert.ok(profile.timeDeltas.every(delta => delta >= 0));
   assert.ok(profile.timeDeltas.reduce((sum, delta) => sum + delta, 0) <= profile.endTime - profile.startTime);
   assert.equal(profile.silk.safepointBias, true);
   const ids = new Set(profile.nodes.map(node => node.id));
   assert.ok(profile.samples.every(id => ids.has(id)));
   assert.ok(profile.nodes.every(node => node.children.every(id => ids.has(id))));
   await assert.rejects(post('Profiler.stop'));
+
+  // Time in a native call gets a sample of its own at its start, as (native) under
+  // the caller: a reader gives each sample the time up to the next one, so the
+  // call's time must not land on the JavaScript sample before it.
+  await post('Profiler.setSamplingInterval', { interval: 100 });
+  await post('Profiler.start');
+  assert.ok(profileNativeCaller() > 0);
+  const stretched = (await post('Profiler.stop')).profile;
+  const parents = new Map();
+  for (const node of stretched.nodes) for (const child of node.children) parents.set(child, node);
+  const byId = new Map(stretched.nodes.map(node => [node.id, node]));
+  let nativeTime = 0, callerTime = 0;
+  for (let i = 0; i + 1 < stretched.samples.length; i++) {
+    const node = byId.get(stretched.samples[i]);
+    const held = stretched.timeDeltas[i + 1];
+    if (node.callFrame.functionName === '(native)' && parents.get(node.id).callFrame.functionName === 'profileNativeCaller') nativeTime += held;
+    else if (node.callFrame.functionName === 'profileNativeCaller') callerTime += held;
+  }
+  assert.ok(nativeTime > 0, 'a long native call is sampled as (native) under its caller');
+  assert.ok(nativeTime > callerTime, `JSON.stringify's time is charged to (native): ${nativeTime} against ${callerTime}`);
+  assert.equal(stretched.silk.droppedObservations, 0);
 
   await post('HeapProfiler.startSampling', { samplingInterval: 1 });
   globalThis.profileRetained = Array.from({ length: 12 }, allocationLeaf);

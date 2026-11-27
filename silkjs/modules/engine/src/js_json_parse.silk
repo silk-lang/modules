@@ -6,6 +6,7 @@ import silk.mem.pointer { Pointer }
 import silk.core.effect { Effect }
 import silk.num.f64
 import silk.num.i32
+import silk.num.i64
 import silk.collections.list { List }
 import silk.core.option { Option }
 import silk.core.ownership { Copy }
@@ -30,6 +31,8 @@ import js_array_storage as arrays
 import js_array_storage { StorageOutcome }
 import js_shapes as shapes
 import js_lexer { Lexer, LexicalContext }
+import js_atoms { AtomTable }
+import dtoa { Dtoa }
 import js_lexer_chars { decode }
 import js_tokens { Token, TokenPayload, LexError }
 import js_tokens as tok
@@ -437,34 +440,34 @@ struct FailedAdd { error: OutOfMemoryError }
 effect fn failedAdd(error: OutOfMemoryError) -> FailedAdd { return FailedAdd { error: move error } }
 // Only fresh ordinary objects: no accessor/proxy/prototype-setter dispatch.
 // Consumes incoming on every path. Duplicate definitions preserve slot order.
-effect fn defineProperty<'v, H: HeapHooks>(s: &JsonParser<'_, '_>, hooks: &mut H,
+effect fn defineProperty<'v, H: HeapHooks>(runtime: *mut HeapHeader, hooks: &mut H,
   object: ValueRef<'v>, key: u32, incoming: ValueBits) -> () ! OutOfMemoryError ? &mut Allocator {
   let mut anchor = ()
   let data = ObjectRef.of(object).dataMut(&mut anchor)
   // A memoized transition adds a key the shape lacks: objects of one layout
   // after the first skip the key search and the general add.
-  let target = unsafe shapes.memoTarget(s.runtime, data.shape, key, u32.toU8(JS_PROP_C_W_E))
+  let target = unsafe shapes.memoTarget(runtime, data.shape, key, u32.toU8(JS_PROP_C_W_E))
   if let Option<*mut HeapHeader>.Some { value } = Pointer.nonNullMut<HeapHeader>(target) {
-    if unsafe shapes.memoAdd(s.runtime, &mut data, value, incoming) { return () }
+    if unsafe shapes.memoAdd(runtime, &mut data, value, incoming) { return () }
   }
   match unsafe shapes.lookup(data.shape, key) {
     Option<usize>.Some { value: index } => {
       let old = unsafe data.slot(index).retire(unsafe shapes.slotFlags(data.shape, index))
       data.setSlot(index, SlotBits.value(incoming))
       drop data
-      unsafe gc.releaseProperty(&mut hooks, s.runtime, old)
+      unsafe gc.releaseProperty(&mut hooks, runtime, old)
     }
     Option<usize>.None => {
       let result = run Intrinsic.catchFailure<OutOfMemoryError>(
-        unsafe shapes.addProperty(s.runtime, &mut data, key, u32.toU8(JS_PROP_C_W_E)), failedAdd)
+        unsafe shapes.addProperty(runtime, &mut data, key, u32.toU8(JS_PROP_C_W_E)), failedAdd)
       match move result {
         shapes.AddResult value => {
           data.setSlot(value.index, SlotBits.value(incoming))
           drop data
-          unsafe gc.releaseOptional(&mut hooks, s.runtime, value.retiredShape)
+          unsafe gc.releaseOptional(&mut hooks, runtime, value.retiredShape)
         }
         FailedAdd { error } => {
-          drop data unsafe gc.release(&mut hooks, s.runtime, incoming) fail move error
+          drop data unsafe gc.release(&mut hooks, runtime, incoming) fail move error
         }
       }
     }
@@ -590,11 +593,11 @@ effect fn parseValueInto<H: HeapHooks>(s: &mut JsonParser<'_, '_>, hooks: &mut H
         let quick = unsafe quickPrimitive(&s.*)
         if let ValueBits.Uninitialized = quick {
           let property = run parseValue(&mut s, &mut hooks, memory, child)
-          run defineProperty(&s.*, &mut hooks, unsafe lendBits(&value, value.*), name.get(), property)
+          run defineProperty(s.runtime, &mut hooks, unsafe lendBits(&value, value.*), name.get(), property)
         } else {
           // Owned by the object before the next token can fail.
           s.records.initialize(child, unsafe lendBits(&quick, quick), JsonRecordKind.Primitive, s.token.start, s.lexer.offset - s.token.start)
-          run defineProperty(&s.*, &mut hooks, unsafe lendBits(&value, value.*), name.get(), quick)
+          run defineProperty(s.runtime, &mut hooks, unsafe lendBits(&value, value.*), name.get(), quick)
           run s.advance()
         }
         if s.token.kind != 44 { break }
@@ -669,6 +672,199 @@ effect fn parseValueInto<H: HeapHooks>(s: &mut JsonParser<'_, '_>, hooks: &mut H
     s.records.initialize(record, unsafe lendBits(&value, value.*), JsonRecordKind.Primitive, s.token.start, s.lexer.offset - s.token.start)
   }
   run s.advance()
+}
+
+/// JSON.parse of ASCII text with no reviver, read straight from the bytes: plain
+/// objects, arrays, strings without escapes, numbers, true, false and null,
+/// nested at most QUICK_DEPTH deep. It builds what the parser would (the same
+/// key atoms, defineProperty for each key in source order, fast arrays) and
+/// declines with Uninitialized, having released everything it made, on anything
+/// else, malformed text included: parse then reads the text again and reports.
+pub effect fn quickParse<'a, H: HeapHooks>(hooks: &mut H, memory: &AllocationObserver, realm: Realm<'a>,
+  source: &[u8]) -> ValueBits ? &mut Allocator {
+  let mut q = Quick { at: 0, depth: 0 }
+  q.space(source)
+  let value = run q.value(&mut hooks, memory, realm, source)
+  if let ValueBits.Uninitialized = value { return value }
+  q.space(source)
+  if q.at != source.length {
+    unsafe gc.release(&mut hooks, realm.runtime(), value)
+    return ValueBits.Uninitialized
+  }
+  return value
+}
+const QUICK_DEPTH: u32 = 64
+fn quickWord(source: &[u8], at: usize, word: &[u8]) -> bool {
+  if source.length - at < word.length { return false }
+  return sameBytes(Slice.view<u8>(source, at, word.length), word)
+}
+struct Quick { at: usize, depth: u32 }
+impl Quick {
+  @inlineAlways
+  fn space(self: &mut Self, source: &[u8]) -> () {
+    while self.at < source.length && isJsonSpace(source[self.at]) { self.at = self.at + 1 }
+  }
+  @inlineAlways
+  fn byte(self: &Self, source: &[u8]) -> u8 {
+    if self.at < source.length { return source[self.at] }
+    return 0
+  }
+  /// The end of the string whose opening quote is at self.at: the offset of its
+  /// closing quote, or 0 when it has an escape, a control character or no end.
+  /// hash takes the atom hash of its bytes.
+  fn stringEnd(self: &Self, source: &[u8], hash: &mut u32) -> usize {
+    let mut p = self.at + 1
+    let mut h: u32 = 1
+    while p < source.length {
+      let c = source[p]
+      if c == 34 { hash.* = AtomTable.asciiHashFinish(h) return p }
+      if c < 32 || c == 92 { return 0 }
+      h = AtomTable.asciiHashStep(h, c)
+      p = p + 1
+    }
+    return 0
+  }
+  effect fn value<'a, H: HeapHooks>(self: &mut Self, hooks: &mut H, memory: &AllocationObserver, realm: Realm<'a>,
+    source: &[u8]) -> ValueBits ? &mut Allocator {
+    let c = self.byte(source)
+    if c == 34 {
+      let mut hash: u32 = 0
+      let end = self.stringEnd(source, &mut hash)
+      if end == 0 { return ValueBits.Uninitialized }
+      let made = run Effect.result(unitStrings.latin1Substring(realm, Slice.view<u8>(source, self.at + 1, end - self.at - 1)))
+      self.at = end + 1
+      return match move made {
+        Result<ValueBits, OutOfMemoryError | StringLengthError>.Success { value } => value
+        Result<ValueBits, OutOfMemoryError | StringLengthError>.Failure { .. } => ValueBits.Uninitialized
+      }
+    }
+    if c == 123 { return run self.object(&mut hooks, memory, realm, source) }
+    if c == 91 { return run self.array(&mut hooks, memory, realm, source) }
+    if c == 45 || (c >= 48 && c <= 57) { return self.number(source) }
+    if c == 116 && quickWord(source, self.at, b"true") { self.at = self.at + 4 return ValueBits.Bool { value: true } }
+    if c == 102 && quickWord(source, self.at, b"false") { self.at = self.at + 5 return ValueBits.Bool { value: false } }
+    if c == 110 && quickWord(source, self.at, b"null") { self.at = self.at + 4 return ValueBits.Null }
+    return ValueBits.Uninitialized
+  }
+  fn number(self: &mut Self, source: &[u8]) -> ValueBits {
+    let start = self.at
+    let mut p = start
+    let negative = source[p] == 45
+    if negative { p = p + 1 }
+    if p >= source.length || source[p] < 48 || source[p] > 57 { return ValueBits.Uninitialized }
+    let mut integer: i64 = 0
+    if source[p] == 48 {
+      p = p + 1
+      if p < source.length && source[p] >= 48 && source[p] <= 57 { return ValueBits.Uninitialized }
+    } else {
+      while p < source.length && source[p] >= 48 && source[p] <= 57 {
+        if p - start < 16 { integer = integer * 10 + u8.toI64(source[p] - 48) }
+        p = p + 1
+      }
+    }
+    let digitsEnd = p
+    if p < source.length && source[p] == 46 {
+      p = p + 1
+      if p >= source.length || source[p] < 48 || source[p] > 57 { return ValueBits.Uninitialized }
+      while p < source.length && source[p] >= 48 && source[p] <= 57 { p = p + 1 }
+    }
+    if p < source.length && (source[p] == 101 || source[p] == 69) {
+      p = p + 1
+      if p < source.length && (source[p] == 43 || source[p] == 45) { p = p + 1 }
+      if p >= source.length || source[p] < 48 || source[p] > 57 { return ValueBits.Uninitialized }
+      while p < source.length && source[p] >= 48 && source[p] <= 57 { p = p + 1 }
+    }
+    self.at = p
+    // Up to nine digits with no fraction or exponent: the value is the integer.
+    if p == digitsEnd && digitsEnd - start <= 10 && !(negative && integer == 0) {
+      if negative { integer = -integer }
+      if integer >= -2147483648 && integer <= 2147483647 { return ValueBits.Int { value: i64.toI32(integer) } }
+    }
+    let parsed = Dtoa.parse(Slice.view(source, start, p - start), 10, 0)
+    return ValueBits.number(parsed.value)
+  }
+  effect fn object<'a, H: HeapHooks>(self: &mut Self, hooks: &mut H, memory: &AllocationObserver, realm: Realm<'a>,
+    source: &[u8]) -> ValueBits ? &mut Allocator {
+    if self.depth >= QUICK_DEPTH { return ValueBits.Uninitialized }
+    let made = run Effect.result(objects.object(&mut hooks, memory, realm))
+    let object = match move made {
+      Result<ValueBits, OutOfMemoryError>.Success { value } => value
+      Result<ValueBits, OutOfMemoryError>.Failure { .. } => { return ValueBits.Uninitialized }
+    }
+    let runtime = realm.runtime()
+    self.at = self.at + 1
+    self.space(source)
+    if self.byte(source) == 125 { self.at = self.at + 1 return object }
+    self.depth = self.depth + 1
+    while true {
+      if self.byte(source) != 34 { break }
+      let mut hash: u32 = 0
+      let end = self.stringEnd(source, &mut hash)
+      // Keys starting with a digit may be integer atoms: the parser takes them.
+      if end == 0 || end == self.at + 1 || (source[self.at + 1] >= 48 && source[self.at + 1] <= 57) { break }
+      let mut anchor = ()
+      let state = realm.runtimeStateMut(&mut anchor)
+      let interned = run Effect.result(state.atoms.internAsciiNameHashed(Slice.view<u8>(source, self.at + 1, end - self.at - 1), hash))
+      drop state
+      let atom = match move interned {
+        Result<u32, OutOfMemoryError | StringLengthError>.Success { value } => value
+        Result<u32, OutOfMemoryError | StringLengthError>.Failure { .. } => { break }
+      }
+      let key = unsafe OwnedAtom.adopt(runtime, atom)
+      self.at = end + 1
+      self.space(source)
+      if self.byte(source) != 58 { break }
+      self.at = self.at + 1
+      self.space(source)
+      let property = run self.value(&mut hooks, memory, realm, source)
+      if let ValueBits.Uninitialized = property { break }
+      let defined = run Effect.result(defineProperty(runtime, &mut hooks, unsafe lendBits(&object, object), key.get(), property))
+      drop key
+      let failed = match move defined { Result<(), OutOfMemoryError>.Success { .. } => false Result<(), OutOfMemoryError>.Failure { .. } => true }
+      if failed { break }
+      self.space(source)
+      let next = self.byte(source)
+      if next == 125 { self.at = self.at + 1 self.depth = self.depth - 1 return object }
+      if next != 44 { break }
+      self.at = self.at + 1
+      self.space(source)
+    }
+    unsafe gc.release(&mut hooks, runtime, object)
+    return ValueBits.Uninitialized
+  }
+  effect fn array<'a, H: HeapHooks>(self: &mut Self, hooks: &mut H, memory: &AllocationObserver, realm: Realm<'a>,
+    source: &[u8]) -> ValueBits ? &mut Allocator {
+    if self.depth >= QUICK_DEPTH { return ValueBits.Uninitialized }
+    let made = run Effect.result(objects.array(&mut hooks, memory, realm))
+    let array = match move made {
+      Result<ValueBits, OutOfMemoryError>.Success { value } => value
+      Result<ValueBits, OutOfMemoryError>.Failure { .. } => { return ValueBits.Uninitialized }
+    }
+    let runtime = realm.runtime()
+    self.at = self.at + 1
+    self.space(source)
+    if self.byte(source) == 93 { self.at = self.at + 1 return array }
+    self.depth = self.depth + 1
+    while true {
+      let element = run self.value(&mut hooks, memory, realm, source)
+      if let ValueBits.Uninitialized = element { break }
+      if !unsafe arrays.appendReserved(objectReference(array), element) {
+        let appended = run Effect.result(unsafe arrays.appendFastElement(&mut hooks, realm, objectReference(array), element))
+        match move appended {
+          Result<StorageOutcome, OutOfMemoryError>.Success { value } => { if value != StorageOutcome.Accepted { return invalidObject() } }
+          Result<StorageOutcome, OutOfMemoryError>.Failure { .. } => { break }
+        }
+      }
+      self.space(source)
+      let next = self.byte(source)
+      if next == 93 { self.at = self.at + 1 self.depth = self.depth - 1 return array }
+      if next != 44 { break }
+      self.at = self.at + 1
+      self.space(source)
+    }
+    unsafe gc.release(&mut hooks, runtime, array)
+    return ValueBits.Uninitialized
+  }
 }
 
 effect fn parseDocument<H: HeapHooks>(s: &mut JsonParser<'_, '_>, hooks: &mut H,

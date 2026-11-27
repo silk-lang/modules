@@ -554,7 +554,10 @@ entry cannot go stale: a shape's version changes with its records, and a shape t
 property holds the symbol, so while an object has that version the cell address still names
 the same symbol. A store also asks the object for the exotic flag, since an entry is per
 shape and an exotic object keeps its own `[[Set]]`. The table lives in `BaselineEnv`, not in
-the code, so the code still holds no address.
+the code, so the code still holds no address. The helper also enters an index a shape keeps
+as a property (an Array that is not fast, an ordinary object) under the site, the version
+and the index together, for the optimizer's `get.key` to read (optimizer.md, "Conditions and
+keyed elements"); the baseline templates test Symbol keys only.
 
 ### Counts
 

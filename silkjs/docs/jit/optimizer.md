@@ -610,6 +610,33 @@ function every six orders.
   for a test against the prototype's shape fails on every string and left: `s.toLowerCase()`
   and `s.charCodeAt(0)` in one function compiled it three times, as in the HTTP parser's
   `_addHeaderLine`.
+  On a baseline frame the cached read of a flat string reads the method inline: the code
+  links the realm's String.prototype (`x64_backend.stringSymbol`,
+  `js_compiled_inline.stringPrototype`) and tests the site's cache entry against that
+  object, the entry a read through the helper fills. `length` and an index are a string's
+  own and keep their paths. On Crypto that was 283,000 helper calls of 110 instructions
+  (`intAt`'s `s.charCodeAt`).
+- **`charCodeAt` and `charAt` are answered by one helper.** A method call with one argument
+  whose callee is a native of the String family (`helpers.MathLayout.stringFamily`, tested
+  next to the Math family in `mathCallOnFrame`) calls `helpers.STRING_UNIT`
+  (`js_compiled_objects.stringUnit`): a string receiver and an index inside it give the
+  unit, or the one-unit string, with no frame and no call into the engine's native. What it
+  declines (an index outside or not an integer, a String object, another native) is the
+  ordinary call. The interpreter's `unitInline` is the model.
+- **A widened element read in an inlined body is `get.key`.** A read that missed in baseline
+  code (`jit_runtime.calleeDoubleSites` now carries element reads too) used to end
+  inlining at that call for good after one exit: Crypto's `intAt` reads `BI_RC[c]` from an
+  Array that is not fast, left once and was a call from then on. The translator now emits
+  `get.key` with the boxed index there, which leaves only where the engine's read declines.
+- **`get.key` with an Int key** reads an element of a fast Array inline, and a property a
+  shape keeps under an index (an Array that is not fast, an ordinary object used as a
+  table) from the element site cache: `js_baseline.noteSite` enters such a property under
+  the site, the shape version and the index together (`indexEntry`), with `index * 2 + 1`
+  where a Symbol entry has the symbol's cell, so one site keeps an entry per index it
+  reads. The code tests the same three words as for a Symbol. A typed array and a fast
+  Array are never entered (`js_vm_property_ops.indexSite`). Crypto reads its digit table
+  260,000 times a run, 160 instructions each through the helper: the run is 43M instructions
+  shorter (4.448G to 4.405G at scale 20).
 - **A string literal is a linked constant.** `atom.value` named the atom only by its pc,
   so each `push_atom_value` built a frame record and called a helper that looked the atom
   up, about 2% of the optimizer's samples on the HTTP service. The translator now puts a

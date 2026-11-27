@@ -17,6 +17,20 @@ for (var round = 0; round < 3; round++) {
     s += o.a + o.k + Object.keys(o).length;
   }
   check(s, 299 * 300 / 2 + 600, "create, assign and keys");
+  // Object.create on null, on many prototypes (cached empty shapes evicted and
+  // refilled) and on prototypes that are arrays, functions and frozen objects.
+  check(Object.getPrototypeOf(Object.create(null)), null, "create with a null prototype");
+  var protos = [];
+  for (var j = 0; j < 40; j++) protos.push({ j: j });
+  var seen = 0;
+  for (var j = 0; j < 400; j++) { var made = Object.create(protos[j % 40]); seen += made.j + (Object.getPrototypeOf(made) === protos[j % 40] ? 1 : 0); }
+  check(seen, 10 * (39 * 40 / 2) + 400, "create on many prototypes");
+  check(Object.create([7]).length, 1, "create with an array prototype");
+  check(Object.create(function f(a, b) {}).length, 2, "create with a function prototype");
+  var frozen = Object.freeze({ z: 3 });
+  var child = Object.create(frozen);
+  check(child.z + Object.keys(child).length, 3, "create with a frozen prototype");
+  check(Object.isExtensible(child), true, "create's object is extensible");
   // Declined calls throw the usual errors.
   var thrown = false;
   try { Object.create(5); } catch (e) { thrown = e instanceof TypeError; }

@@ -462,10 +462,14 @@ the two guards are what is left.
   value on every turn, and a release in the latch would be all that makes the loop carry
   it. NavierStokes' `advect` carried `x`, `y`, `i0` and `i1` boxed through frame slots:
   279M instructions at scale 20 where it ran 430M.
-  Two other uses of the same liveness measured no gain on DeltaBlue: releasing a local where
-  it dies (the release only moves), and taking the local's count at its last `get_loc` (on
-  a path that reads it last, while another path keeps it, the merge gets a new parameter
-  that costs more than the retain saved).
+  A local that is dead where an edge goes is not passed along it: a count it holds is
+  released on the edge. One that is dead at an inlined call and holds no count is not held
+  through the body (code-quality.md, "Locals a block does not read" and "Exits leave dead
+  locals out").
+  Two other uses of the same liveness measured no gain on DeltaBlue: releasing a local at
+  its last read inside a block (the release only moves), and taking the local's count at
+  its last `get_loc` (on a path that reads it last, while another path keeps it, the merge
+  gets a new parameter that costs more than the retain saved).
 
 ## Leaving too often
 

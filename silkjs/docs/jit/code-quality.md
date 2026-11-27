@@ -131,11 +131,26 @@ The latch's state names a box's number where the latch passes the box (an exit w
 `int x` for `box.i32 x`), and the entry state maps such a slot through the box.
 
 **Locals a block does not read.** An edge passes a local as `undefined` when no path from
-its target's offset reads the local before writing it (the translator's liveness), and its
-value holds no count (a number, an immediate, a borrow: an owned value would need a release
-on the edge alone). A temporary written at the top of each iteration (`var l = a[i]`) was a
-header parameter for its exits only, boxed at every latch; a loop counter dead after the
-loop was passed to the exit block. Both go.
+its target's offset reads the local before writing it (the translator's liveness). A value
+that holds no count (a number, an immediate, a borrow) is simply not passed. A temporary
+written at the top of each iteration (`var l = a[i]`) was a header parameter for its exits
+only, boxed at every latch; a loop counter dead after the loop was passed to the exit
+block. Both go. A value that holds a count is released on the edge
+(`Translator.edgeTo`): in front of the jump when the edge is its block's only way out, and
+otherwise in a block of the edge's own, since the branch's other arm may still read the
+local. Every edge into the target then passes undefined and the target has no parameter
+for the local. Such a parameter is typed as a value that may hold a count, so a number
+that reached it was boxed on its edge and the parameter released where the local was
+written next: in `montReduce` the index `j` of the carry loop went boxed from the loop's
+pre-test to the end of the outer turn, about 10 instructions a turn. The edges to a latch
+and from it carry the count as before: the latch decides (optimizer.md, "Dead stores").
+Most of those releases are of values that turn out to hold no count (an argument's
+borrow, a number), and the edge's block is left with its jump alone: an edge into such a
+block goes where the jump goes, with the jump's arguments (`ssa_ownership.passEmpty`), so
+that what reads edges (`sinkBoxes`, the loop passes) finds them as it did. A loop's
+latch is not passed by. `tests/baseline/t101.js` lets objects, strings and numbers go on
+one arm of a branch, in front of a loop and behind one, and leaves compiled code after
+each.
 
 **Boxes for one exit edge.** A loop's exit edge often passes its numbers boxed, to a block
 whose parameters stay boxed because it is also reached from in front of the loop. Those
@@ -264,6 +279,28 @@ it calls, and its accesses stay inside the Arrays it reads. Its `poll` (three in
 turn: the realm, the countdown, a branch) is therefore taken once in the front block, with
 an exit of its own at the header, and the latch is left a bare jump. A loop inside a
 counted loop keeps its own poll unless it is counted too.
+
+**What the front leaves out.** Inlined code hands the pass constants: `am3(i, x[i], r,
+2 * i, 0, 1)` is a loop from 1 down with a start of `2 * i`. Arithmetic on two constants
+is done when the block is made, where its result fits an int32 (`ssa_opt_bounds.guarded`;
+one that would leave stays, and leaves), a sum with 0 is its other operand, and the
+counter's own guards make nothing when both ends are constants (`fitting`). The ownership
+folds do the same for `add.i32`, `sub.i32` and `mul.i32` of two constants anywhere
+(`ssa_ownership.fold`; a product that is -0 stays). A bound the block has tested already
+is not tested again: with a constant trip bound of 0 the first and the last index are one
+value, and two steps that start at one value share their checks. `check.bound` itself is
+one unsigned compare with the count: an Array's elements are a `ThinList`, whose capacity
+stays below 2^30 (`fields.capacityMask`), so an index below the count is below 2^31
+without a test of its sign.
+
+A front block's poll is for its own loop, but in front of a loop that runs inside another
+it is taken on every turn of the outer one. When the loop around polls on each turn (its
+latch still has its `poll`: it is not counted), the inner fronts' polls go: between two of
+the outer loop's polls there are then only counted loops, which end. A counted outer loop
+has no latch poll, so the fronts inside it keep theirs (`ssa_opt_bounds.settle`).
+`tests/baseline/t100.js` runs inlined loops with constant counts of one, none and more,
+constant arithmetic that overflows or makes -0, and counted loops inside loops that poll
+for them. In `bnpSquareTo` an outer turn went from 264 instructions to 214.
 
 ## A fill grows its Array in front
 
@@ -409,6 +446,37 @@ stays). The interpreter resumes at that pc and writes the local before any read.
 liveness is per instruction start; an offset inside an instruction keeps every local live.
 In `am3` the values of `l`, `h` and `m` from the turn before, and `xl`'s and `xh`'s
 sources, no longer hold registers across the loop: 70 instructions a turn became 60.
+
+The frames around an inlined body are written by every exit of the body as they were at
+the call, so a local of the caller that is dead at the call lived through the body, and
+through its loop, for those exits alone. At an inlined call the caller's dead locals that
+hold no count (a number, a borrow) are undefined from there on, for the body's exits and
+for the caller after the call (`Translator.inlineOne`). A value that holds a count stays.
+Releasing it at the call was tried: a copy of the local among the call's operands (`f(v)`,
+`v.m()`) borrows from the local while the local lives, and is a count of its own once the
+local is gone, a retain and a release where there were none. Richards' compiled code ran
+8% more instructions that way. What the translator sees as a value that may hold a count
+is often a number once parameters unbox (a result of an inlined call, as the first
+carry `c` of `bnpSquareTo`, which still holds a register through the second call's loop:
+two instructions a turn); telling those apart is left to do.
+
+**A copy that takes the count.** `v = retain x` with `release x` behind it and only
+copies between them is one value: the count neither rises nor falls
+(`ssa_ownership.handOver`). A local that is returned is that (`return r` copies r, then
+the function's end releases it), and so is a local an edge lets go right behind its last
+read. It runs after `borrowArguments`: a local that only ever holds an argument is a borrow
+with no count at all, unless the value it is returned as were the local itself. In the
+compiled functions of Richards, DeltaBlue, Crypto, RayTrace and Splay 7 to 35 owned
+copies go this way.
+
+**A store to the field that was read.** `var v = this.v1; this.v1 = null` followed by a
+release of `v` close by made the read a borrow (`borrowFields`) and marked the store to
+leave when the field holds the value's last count, which it then does on every call: with
+the local released where it died, Richards' `DeviceTask.run` left at each store, 42% more
+instructions for the suite. `borrowFields` gives up at a store to the field the value was
+read from, of the same object. The translator records the atom of each named read and
+store for that (`Function.nameField`, `fieldAtom`); a store to another field of the object
+is crossed as before.
 
 ## Products that need no sign of zero
 

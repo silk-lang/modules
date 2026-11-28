@@ -25,14 +25,14 @@ def host_target() -> str:
 
 
 def silk_output() -> Path:
-    """Where `silk build` writes: the output-dir of the workspace that lists this package
+    """Where `silk build` writes: the build/ directory of the workspace that lists this package
     (the repository root's silk.toml), or this package's own build/ directory."""
     workspace = ROOT.parents[1] / "silk.toml"
     if workspace.is_file():
         table = tomllib.loads(workspace.read_text()).get("workspace", {})
         members = {(workspace.parent / member).resolve() for member in table.get("members", [])}
         if ROOT.resolve() in members:
-            return workspace.parent / table.get("output-dir", "build")
+            return workspace.parent / "build"
     return ROOT / "build"
 
 

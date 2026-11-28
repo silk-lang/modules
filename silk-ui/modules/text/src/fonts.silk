@@ -46,6 +46,7 @@ import silk.core.option { Option }
 import silk.core.result { Result }
 import silk.core.ownership { Copy }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.mem.pointer { Pointer }
 import silk.text.unicode_script { Script }
 import silk.text.string { String }
 import silk.num.f32
@@ -290,8 +291,48 @@ struct Shaped {
 
 impl Copy for Shaped {}
 
+/// A prepared unit of HarfRust shaping work that can run read-only across `EnginePool`.
+pub struct PreparedShapeJob {
+  pub hash: u64,
+  pub instance: usize,
+  pub face: usize,
+  pub plan: usize,
+  pub features: FontFeatures,
+  pub textOffset: usize,
+  pub textLen: usize,
+  pub start: usize,
+  pub end: usize,
+  pub rtl: bool,
+  pub vertical: bool,
+  pub script: u32,
+}
+
+impl Copy for PreparedShapeJob {}
+
+struct WorkerVarCache {
+  instance: usize,
+  scalars: List<Fixed>,
+  advances: List<F48Dot16>,
+  gdefScalars: List<Fixed>,
+}
+
+/// Reusable per-worker scratch for read-only parallel shaping (`shapePreparedReadOnly`).
+pub struct ShapeWorkerScratch {
+  buffer: Buffer,
+  varCache: List<WorkerVarCache>,
+}
+
+impl ShapeWorkerScratch {
+  pub fn make() -> ShapeWorkerScratch {
+    return ShapeWorkerScratch {
+      buffer: Buffer.new(),
+      varCache: List<WorkerVarCache>.make(),
+    }
+  }
+}
+
 /// The cache holds at most this many glyphs; past it, it starts again empty.
-const SHAPED_GLYPHS: usize = 262144
+const SHAPED_GLYPHS: usize = 4194304
 
 pub struct FontState<'a> {
   /// The faces: installed ones and those added at run time.
@@ -336,6 +377,10 @@ pub struct FontState<'a> {
   /// OpenType features by [`FontState.defineFeatures`] handle, less one, as tag and value
   /// pairs.
   defined: List<List<u32>>,
+  /// Optional read-only pointer to parent `FontState` while worker tasks execute in parallel.
+  sharedParent: Option<*const u8>,
+  /// Count of face instances cloned directly from `sharedParent` (identical indices).
+  baseInstances: usize,
 }
 
 fn sameSelection(left: &Selection, right: &Selection) -> bool {
@@ -430,6 +475,83 @@ effect fn makePlan<'a>(data: &ShaperData<'a>, coords: &[F2Dot14], buffer: &Buffe
   let mut shaper = ConfiguredShaper.new(data)
   run shaper.coords.appendSlice(coords)
   return run ShapePlan.new(&shaper, buffer, features)
+}
+
+effect fn populateShapeBuffer(
+  buffer: &mut Buffer,
+  text: string,
+  start: usize,
+  end: usize,
+  rtl: bool,
+  script: Script,
+  vertical: bool,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  buffer.clear()
+  run buffer.setPreContext(String.slice(text, 0, start))
+  run buffer.setPostContext(String.slice(text, end, String.byteLength(text) - end))
+  run buffer.pushStr(String.slice(text, start, end - start))
+  if vertical {
+    buffer.setDirection(Direction.TopToBottom)
+  } else if rtl {
+    buffer.setDirection(Direction.RightToLeft)
+  } else {
+    buffer.setDirection(Direction.LeftToRight)
+  }
+  let tag = script.value
+  if tag == Script.common().value || tag == Script.inherited().value
+    || tag == Script.unknown().value {
+    buffer.setScript(Option<Script>.None)
+  } else {
+    buffer.setScript(Option<Script>.Some { value: script })
+  }
+  buffer.guessSegmentProperties()
+}
+
+effect fn computeVarAdvances<'a>(
+  data: &ShaperData<'a>,
+  coords: &[F2Dot14],
+  scalars: &mut List<Fixed>,
+  advances: &mut List<F48Dot16>,
+  gdefScalars: &mut List<Fixed>,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut shaper = ConfiguredShaper.new(data)
+  run shaper.coords.appendSlice(coords)
+  run shaper.setNormalizedCoords(coords)
+  run shaper.prepareAdvances()
+  scalars.* = Intrinsic.replace(shaper.hvarScalars, List<Fixed>.make())
+  advances.* = Intrinsic.replace(shaper.hvarAdvances, List<F48Dot16>.make())
+  gdefScalars.* = Intrinsic.replace(shaper.gdefScalars, List<Fixed>.make())
+}
+
+effect fn appendRawGlyphs(buffer: &Buffer, start: usize, out: &mut List<RawGlyph>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let infos = buffer.glyphInfos()
+  let positions = buffer.glyphPositions()
+  run out.reserve(infos.len())
+  let mut index: usize = 0
+  while index < infos.len() {
+    if let Option<GlyphInfo>.Some { value: info } = infos.get(index) {
+      if let Option<GlyphPosition>.Some { value: position } = positions.get(index) {
+        run out.append(
+          RawGlyph {
+            glyph: info.glyphId,
+            cluster: info.cluster + usize.toU32(start),
+            xAdvance: position.xAdvance,
+            yAdvance: position.yAdvance,
+            xOffset: position.xOffset,
+            yOffset: position.yOffset,
+            safe: (info.flags & 1) == 0,
+          },
+        )
+      }
+    }
+    index = index + 1
+  }
 }
 
 fn fourCc(name: &[u8]) -> u32 {
@@ -534,6 +656,8 @@ impl<'a> FontState<'a> {
       shapeTextCalls: 0, shapeTextBytes: 0, shapeCacheHits: 0, shapeSliceHits: 0, shaperBytes: 0, cacheFlushes: 0,
       roundMetrics: true,
       defined: List<List<u32>>.make(),
+      sharedParent: Option<*const u8>.None,
+      baseInstances: 0,
     }
   }
 
@@ -667,6 +791,228 @@ impl<'a> FontState<'a> {
       return size
     }
     return size * adjust.value / aspect
+  }
+
+  /// The selection that created face instance `instance`.
+  pub fn instanceSelection(self: &Self, instance: usize) -> Selection {
+    return self.instances.asSlice()[instance].selection
+  }
+
+  /// Creates an independent worker `FontState` cloning styles, keys, metrics, instances,
+  /// and defined feature lists over the shared immutable `FontCollection` and parent caches.
+  pub effect fn forkForWorker(self: &Self) -> FontState<'a>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut styles = List<StyleEntry>.make()
+    run styles.reserve(self.styles.length())
+    let srcStyles = self.styles.asSlice()
+    let mut i: usize = 0
+    while i < srcStyles.length {
+      let s = &srcStyles[i]
+      let mut families = List<Family>.make()
+      run families.reserve(s.families.length())
+      let famSlice = s.families.asSlice()
+      let mut f: usize = 0
+      while f < famSlice.length {
+        run families.append(run famSlice[f].copy())
+        f = f + 1
+      }
+      let mut chain = List<Link>.make()
+      run chain.appendSlice(s.chain.asSlice())
+      run styles.append(
+        StyleEntry {
+          size: s.size,
+          variations: s.variations,
+          sizeAdjust: s.sizeAdjust,
+          treatment: s.treatment,
+          request: s.request,
+          families: move families,
+          chain: move chain,
+          primary: s.primary,
+        },
+      )
+      i = i + 1
+    }
+
+    let mut keys = List<KeyInfo>.make()
+    run keys.appendSlice(self.keys.asSlice())
+    let mut metrics = List<FontMetrics>.make()
+    run metrics.appendSlice(self.metrics.asSlice())
+
+    let mut instances = List<Instance>.make()
+    run instances.reserve(self.instances.length())
+    let srcInsts = self.instances.asSlice()
+    i = 0
+    while i < srcInsts.length {
+      let inst = &srcInsts[i]
+      let mut coords = List<F2Dot14>.make()
+      run coords.appendSlice(inst.coords.asSlice())
+      let mut scalars = List<Fixed>.make()
+      run scalars.appendSlice(inst.scalars.asSlice())
+      let mut advances = List<F48Dot16>.make()
+      run advances.appendSlice(inst.advances.asSlice())
+      let mut gdefScalars = List<Fixed>.make()
+      run gdefScalars.appendSlice(inst.gdefScalars.asSlice())
+      run instances.append(
+        Instance {
+          face: inst.face,
+          selection: inst.selection,
+          opticalSize: inst.opticalSize,
+          settings: inst.settings,
+          coords: move coords,
+          unitsPerEm: inst.unitsPerEm,
+          scalars: move scalars,
+          advances: move advances,
+          gdefScalars: move gdefScalars,
+        },
+      )
+      i = i + 1
+    }
+
+    let mut defined = List<List<u32>>.make()
+    run defined.reserve(self.defined.length())
+    let srcDef = self.defined.asSlice()
+    i = 0
+    while i < srcDef.length {
+      let mut inner = List<u32>.make()
+      run inner.appendSlice(srcDef[i].asSlice())
+      run defined.append(move inner)
+      i = i + 1
+    }
+
+    let sharedParent = if self.shaped.length() != 0 {
+      Option<*const u8>.some(
+        unsafe Intrinsic.pointerReinterpret<*const FontState<'a>, *const u8>(Pointer.fromRef(self)),
+      )
+    } else {
+      Option<*const u8>.None
+    }
+
+    return FontState {
+      set: run self.set.forkForWorker(),
+      styles: move styles,
+      keys: move keys,
+      metrics: move metrics,
+      instances: move instances,
+      data: List<ShaperData<'a>>.make(),
+      dataSlots: List<u32>.make(),
+      plans: List<PlanEntry<'a>>.make(),
+      buffer: Buffer.new(),
+      shapedIndex: HashMap<Word, u32>.make(Hash.seed(0x7368617065)),
+      shaped: List<Shaped>.make(),
+      shapedText: List<u8>.make(),
+      shapedGlyphs: List<RawGlyph>.make(),
+      leans: false,
+      shaperCalls: 0,
+      shapeTextCalls: 0,
+      shapeTextBytes: 0,
+      shapeCacheHits: 0,
+      shapeSliceHits: 0,
+      shaperBytes: 0,
+      cacheFlushes: 0,
+      roundMetrics: self.roundMetrics,
+      defined: move defined,
+      sharedParent: sharedParent,
+      baseInstances: self.instances.length(),
+    }
+  }
+
+  /// Merges any newly created fallback font keys and shaped runs from `worker` into `self`,
+  /// building `fontKeyRemap` mapping each worker font key to its canonical key in `self`.
+  pub effect fn mergeWorkerKeys(
+    self: &mut Self,
+    worker: &FontState<'a>,
+    baseKeys: usize,
+    fontKeyRemap: &mut List<usize>,
+  ) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    fontKeyRemap.clear()
+    let workerKeys = worker.keyCount()
+    run fontKeyRemap.reserve(workerKeys)
+    let mut k: usize = 0
+    while k < workerKeys {
+      if k < baseKeys {
+        run fontKeyRemap.append(k)
+      } else {
+        let info = worker.key(k)
+        if info.instance == usize.MAX || info.style >= self.styles.length() {
+          run fontKeyRemap.append(k)
+        } else {
+          let sel = worker.instanceSelection(info.instance)
+          let canonical = run self.keyFor(info.style, sel)
+          run fontKeyRemap.append(canonical)
+        }
+      }
+      k = k + 1
+    }
+    run self.set.mergeWorker(&worker.set)
+
+    let workerInsts = worker.instances.asSlice()
+    let mut instRemap = List<usize>.make()
+    run instRemap.reserveExact(workerInsts.length)
+    let mut ii: usize = 0
+    while ii < workerInsts.length {
+      if ii < worker.baseInstances && ii < self.instances.length() {
+        run instRemap.append(ii)
+      } else {
+        let inst = &workerInsts[ii]
+        let canonical = run self.instanceFor(inst.selection, inst.opticalSize, &inst.settings)
+        run instRemap.append(canonical)
+      }
+      ii = ii + 1
+    }
+    let workerShaped = worker.shaped.asSlice()
+    let workerText = worker.shapedText.asSlice()
+    let workerGlyphs = worker.shapedGlyphs.asSlice()
+    let mut e: usize = 0
+    while e < workerShaped.length {
+      let entry = workerShaped[e]
+      if entry.instance < instRemap.length() {
+        let mappedInst = instRemap.get(entry.instance)
+        let textBytes = Slice.view(workerText, entry.textStart, entry.textLength)
+        let text = unsafe String.fromUtf8Unchecked(textBytes)
+        let hash = if mappedInst == entry.instance {
+          entry.hash
+        } else {
+          shapeHash(mappedInst, text, entry.start, entry.end, entry.rtl, entry.script, entry.vertical, &entry.features)
+        }
+        if !self.hasShapedEntry(hash, mappedInst, text, entry.start, entry.end, entry.rtl, entry.script, entry.vertical, &entry.features) {
+          if self.shapedGlyphs.length() + entry.glyphCount > SHAPED_GLYPHS {
+            break
+          }
+          let merged = Shaped {
+            hash: hash,
+            instance: mappedInst,
+            features: entry.features,
+            start: entry.start,
+            end: entry.end,
+            rtl: entry.rtl,
+            vertical: entry.vertical,
+            script: entry.script,
+            textStart: self.shapedText.length(),
+            textLength: entry.textLength,
+            glyphStart: self.shapedGlyphs.length(),
+            glyphCount: entry.glyphCount,
+            leans: entry.leans,
+          }
+          run self.shapedText.appendSlice(textBytes)
+          run self.shapedGlyphs.appendSlice(Slice.view(workerGlyphs, entry.glyphStart, entry.glyphCount))
+          let index = usize.toU32(self.shaped.length())
+          run self.shaped.append(merged)
+          drop run self.shapedIndex.insert(Hash.word(hash), index)
+        }
+      }
+      e = e + 1
+    }
+
+    self.shaperCalls = self.shaperCalls + worker.shaperCalls
+    self.shapeTextCalls = self.shapeTextCalls + worker.shapeTextCalls
+    self.shapeTextBytes = self.shapeTextBytes + worker.shapeTextBytes
+    self.shapeCacheHits = self.shapeCacheHits + worker.shapeCacheHits
+    self.shapeSliceHits = self.shapeSliceHits + worker.shapeSliceHits
+    self.shaperBytes = self.shaperBytes + worker.shaperBytes
+    self.cacheFlushes = self.cacheFlushes + worker.cacheFlushes
   }
 
   /// The key of style `style` drawn with `selection`, made on first use.
@@ -947,6 +1293,326 @@ impl<'a> FontState<'a> {
     run self.shapeTextOriented(instance, text, start, end, rtl, script, false, &features, &mut out)
   }
 
+  fn hasShapedEntry(
+    self: &Self,
+    hash: u64,
+    instance: usize,
+    text: string,
+    start: usize,
+    end: usize,
+    rtl: bool,
+    script: u32,
+    vertical: bool,
+    features: &FontFeatures,
+  ) -> bool {
+    if let Option<u32>.Some { value: at } = self.shapedIndex.get(Hash.word(hash)) {
+      let entry = self.shaped.get(u32.toUsize(at))
+      return entry.hash == hash && entry.instance == instance && entry.start == start
+        && entry.end == end && entry.rtl == rtl && entry.vertical == vertical
+        && entry.script == script && entry.features.same(features)
+        && sameBytes(
+          Slice.view(self.shapedText.asSlice(), entry.textStart, entry.textLength),
+          String.utf8Bytes(text),
+        )
+    }
+    return false
+  }
+
+  fn findPlan(
+    self: &Self,
+    instance: usize,
+    script: u32,
+    rtl: bool,
+    vertical: bool,
+    features: &FontFeatures,
+  ) -> usize {
+    let mut index: usize = 0
+    while index < self.plans.length() {
+      let entry = &self.plans.asSlice()[index]
+      if entry.instance == instance && entry.script == script && entry.rtl == rtl
+        && entry.vertical == vertical && entry.features.same(features) {
+        return index
+      }
+      index = index + 1
+    }
+    return usize.MAX
+  }
+
+  /// Prepares a shaping job serially: deduplicates against existing cache and `seen`,
+  /// loads the face, precomputes variable advances if needed, ensures a `ShapePlan`,
+  /// and appends text + job to `textBuf` and `out`. Returns true when a new job was queued.
+  pub effect fn prepareShapeJob(
+    self: &mut Self,
+    instance: usize,
+    text: string,
+    start: usize,
+    end: usize,
+    rtl: bool,
+    script: Script,
+    vertical: bool,
+    features: &FontFeatures,
+    textBuf: &mut List<u8>,
+    seen: &mut HashMap<Word, u32>,
+    out: &mut List<PreparedShapeJob>,
+  ) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if instance >= self.instances.length() {
+      return false
+    }
+    let tag = script.value
+    let hash = shapeHash(instance, text, start, end, rtl, tag, vertical, features)
+    if self.hasShapedEntry(hash, instance, text, start, end, rtl, tag, vertical, features) {
+      return false
+    }
+    let word = Hash.word(hash)
+    if let Option<u32>.Some { value: queuedAt } = seen.get(word) {
+      let prev = out.get(u32.toUsize(queuedAt))
+      if prev.hash == hash && prev.instance == instance && prev.start == start
+        && prev.end == end && prev.rtl == rtl && prev.vertical == vertical
+        && prev.script == tag && prev.features.same(features)
+        && sameBytes(
+          Slice.view(textBuf.asSlice(), prev.textOffset, prev.textLen),
+          String.utf8Bytes(text),
+        ) {
+        return false
+      }
+    }
+    let face = self.instances.asSlice()[instance].face
+    if !run self.loadFace(face) {
+      return false
+    }
+    let needsVar = self.instances.asSlice()[instance].coords.length() != 0
+      && self.instances.asSlice()[instance].advances.length() == 0
+    if needsVar {
+      let mut coordsCopy = List<F2Dot14>.make()
+      run coordsCopy.appendSlice(self.instances.asSlice()[instance].coords.asSlice())
+      let mut scalars = List<Fixed>.make()
+      let mut advances = List<F48Dot16>.make()
+      let mut gdefScalars = List<Fixed>.make()
+      if let Option<&ShaperData<'a>>.Some { value: data } = self.shaper(face) {
+        run computeVarAdvances(&data, coordsCopy.asSlice(), &mut scalars, &mut advances, &mut gdefScalars)
+      }
+      let held = &mut self.instances.asMutSlice()[instance]
+      held.scalars = move scalars
+      held.advances = move advances
+      held.gdefScalars = move gdefScalars
+    }
+    let mut plan = self.findPlan(instance, tag, rtl, vertical, features)
+    if plan == usize.MAX {
+      run populateShapeBuffer(&mut self.buffer, text, start, end, rtl, script, vertical)
+      let wanted = run shaperFeatures(features, self.defined.asSlice())
+      let mut coordsCopy = List<F2Dot14>.make()
+      run coordsCopy.appendSlice(self.instances.asSlice()[instance].coords.asSlice())
+      let madeOpt = match self.shaper(face) {
+        Option<&ShaperData<'a>>.Some { value: data } => {
+          let made = run makePlan(&data, coordsCopy.asSlice(), &self.buffer, wanted.asSlice())
+          Option<ShapePlan<'a>>.Some { value: move made }
+        }
+        Option<&ShaperData<'a>>.None => Option<ShapePlan<'a>>.None
+      }
+      match move madeOpt {
+        Option<ShapePlan<'a>>.Some { value: made } => {
+          run self.plans.append(
+            PlanEntry {
+              vertical: vertical,
+              instance: instance,
+              features: features.*,
+              script: tag,
+              rtl: rtl,
+              plan: move made,
+            },
+          )
+          plan = self.plans.length() - 1
+        }
+        Option<ShapePlan<'a>>.None => {
+          return false
+        }
+      }
+    }
+    let bytes = String.utf8Bytes(text)
+    let textOffset = textBuf.length()
+    let textLen = bytes.length
+    run textBuf.appendSlice(bytes)
+    let jobIndex = usize.toU32(out.length())
+    run out.append(
+      PreparedShapeJob {
+        hash: hash,
+        instance: instance,
+        face: face,
+        plan: plan,
+        features: features.*,
+        textOffset: textOffset,
+        textLen: textLen,
+        start: start,
+        end: end,
+        rtl: rtl,
+        vertical: vertical,
+        script: tag,
+      },
+    )
+    if seen.get(word).isNone() {
+      drop run seen.insert(word, jobIndex)
+    }
+    return true
+  }
+
+  /// Shapes one prepared job on a worker thread with strictly read-only `&Self` access.
+  /// Returns `leans` (`buffer.leansOnBefore`).
+  pub effect fn shapePreparedReadOnly(
+    self: &Self,
+    job: PreparedShapeJob,
+    textBuf: &[u8],
+    scratch: &mut ShapeWorkerScratch,
+    out: &mut List<RawGlyph>,
+  ) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let text = unsafe String.fromUtf8Unchecked(Slice.view(textBuf, job.textOffset, job.textLen))
+    let script = Script { value: job.script }
+    run populateShapeBuffer(&mut scratch.buffer, text, job.start, job.end, job.rtl, script, job.vertical)
+    let slot = if job.face < self.dataSlots.length() { self.dataSlots.get(job.face) } else { 0 }
+    if slot == 0 {
+      return false
+    }
+    let data = &self.data.asSlice()[u32.toUsize(slot) - 1]
+    let wanted = run shaperFeatures(&job.features, self.defined.asSlice())
+    let inst = &self.instances.asSlice()[job.instance]
+    let mut shaper = ConfiguredShaper.new(data)
+    run shaper.coords.appendSlice(inst.coords.asSlice())
+    let mut varIdx = usize.MAX
+    if inst.coords.length() != 0 {
+      let mut i: usize = 0
+      while i < scratch.varCache.length() {
+        if scratch.varCache.asSlice()[i].instance == job.instance {
+          varIdx = i
+          break
+        }
+        i = i + 1
+      }
+      if varIdx == usize.MAX {
+        let mut scalars = List<Fixed>.make()
+        let mut advances = List<F48Dot16>.make()
+        let mut gdefScalars = List<Fixed>.make()
+        run scalars.appendSlice(inst.scalars.asSlice())
+        run advances.appendSlice(inst.advances.asSlice())
+        run gdefScalars.appendSlice(inst.gdefScalars.asSlice())
+        varIdx = scratch.varCache.length()
+        run scratch.varCache.append(
+          WorkerVarCache {
+            instance: job.instance,
+            scalars: move scalars,
+            advances: move advances,
+            gdefScalars: move gdefScalars,
+          },
+        )
+      }
+      let cache = &mut scratch.varCache.asMutSlice()[varIdx]
+      shaper.hvarScalars = Intrinsic.replace(cache.scalars, List<Fixed>.make())
+      shaper.hvarAdvances = Intrinsic.replace(cache.advances, List<F48Dot16>.make())
+      shaper.gdefScalars = Intrinsic.replace(cache.gdefScalars, List<Fixed>.make())
+      if shaper.hvarAdvances.length() == 0 {
+        run shaper.setNormalizedCoords(inst.coords.asSlice())
+        run shaper.prepareAdvances()
+      }
+    }
+    let shaped = run shape(
+      &shaper,
+      &mut scratch.buffer,
+      ShapeOptions.forPlan(&self.plans.asSlice()[job.plan].plan, wanted.asSlice()),
+    )
+    if varIdx != usize.MAX {
+      let cache = &mut scratch.varCache.asMutSlice()[varIdx]
+      cache.scalars = Intrinsic.replace(shaper.hvarScalars, List<Fixed>.make())
+      cache.advances = Intrinsic.replace(shaper.hvarAdvances, List<F48Dot16>.make())
+      cache.gdefScalars = Intrinsic.replace(shaper.gdefScalars, List<Fixed>.make())
+    }
+    if let Result<(), ShapeError>.Failure { error: _ } = move shaped {
+      return false
+    }
+    let leans = scratch.buffer.leansOnBefore
+    run appendRawGlyphs(&scratch.buffer, job.start, &mut out)
+    return leans
+  }
+
+  /// Inserts a pre-shaped result serially into the shaping cache without touching `shaperCalls`.
+  pub effect fn insertPreparedShape(
+    self: &mut Self,
+    job: PreparedShapeJob,
+    textBytes: &[u8],
+    glyphs: &[RawGlyph],
+    leans: bool,
+  ) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let text = unsafe String.fromUtf8Unchecked(textBytes)
+    if self.hasShapedEntry(job.hash, job.instance, text, job.start, job.end, job.rtl, job.script, job.vertical, &job.features) {
+      return
+    }
+    if self.shapedGlyphs.length() + glyphs.length > SHAPED_GLYPHS {
+      self.cacheFlushes = self.cacheFlushes + 1
+      self.shapedIndex.clear()
+      self.shaped.clear()
+      self.shapedText.clear()
+      self.shapedGlyphs.clear()
+    }
+    let entry = Shaped {
+      hash: job.hash,
+      instance: job.instance,
+      features: job.features,
+      start: job.start,
+      end: job.end,
+      rtl: job.rtl,
+      vertical: job.vertical,
+      script: job.script,
+      textStart: self.shapedText.length(),
+      textLength: textBytes.length,
+      glyphStart: self.shapedGlyphs.length(),
+      glyphCount: glyphs.length,
+      leans: leans,
+    }
+    run self.shapedText.appendSlice(textBytes)
+    run self.shapedGlyphs.appendSlice(glyphs)
+    let index = usize.toU32(self.shaped.length())
+    run self.shaped.append(entry)
+    drop run self.shapedIndex.insert(Hash.word(job.hash), index)
+  }
+
+  effect fn lookupShaped(
+    self: &Self,
+    hash: u64,
+    instance: usize,
+    text: string,
+    start: usize,
+    end: usize,
+    rtl: bool,
+    script: u32,
+    vertical: bool,
+    features: &FontFeatures,
+    out: &mut List<RawGlyph>,
+    leansOut: &mut bool,
+  ) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if let Option<u32>.Some { value: at } = self.shapedIndex.get(Hash.word(hash)) {
+      let entry = self.shaped.get(u32.toUsize(at))
+      if entry.hash == hash && entry.instance == instance && entry.start == start
+        && entry.end == end && entry.rtl == rtl && entry.vertical == vertical
+        && entry.script == script && entry.features.same(features)
+        && sameBytes(
+          Slice.view(self.shapedText.asSlice(), entry.textStart, entry.textLength),
+          String.utf8Bytes(text),
+        ) {
+        run out.appendSlice(
+          Slice.view(self.shapedGlyphs.asSlice(), entry.glyphStart, entry.glyphCount),
+        )
+        leansOut.* = entry.leans
+        return true
+      }
+    }
+    return false
+  }
+
   pub effect fn shapeTextOriented(
     self: &mut Self,
     instance: usize,
@@ -964,22 +1630,27 @@ impl<'a> FontState<'a> {
     self.shapeTextCalls = self.shapeTextCalls + 1
     self.shapeTextBytes = self.shapeTextBytes + String.byteLength(text)
     let hash = shapeHash(instance, text, start, end, rtl, script.value, vertical, features)
-    if let Option<u32>.Some { value: at } = self.shapedIndex.get(Hash.word(hash)) {
-      let entry = self.shaped.get(u32.toUsize(at))
-      if entry.hash == hash && entry.instance == instance && entry.start == start
-        && entry.end == end && entry.rtl == rtl && entry.vertical == vertical
-        && entry.script == script.value && entry.features.same(features)
-        && sameBytes(
-          Slice.view(self.shapedText.asSlice(), entry.textStart, entry.textLength),
-          String.utf8Bytes(text),
-        ) {
-        run out.appendSlice(
-          Slice.view(self.shapedGlyphs.asSlice(), entry.glyphStart, entry.glyphCount),
+    let mut hitLeans = false
+    let mut cacheHit = run self.lookupShaped(hash, instance, text, start, end, rtl, script.value, vertical, features, &mut out, &mut hitLeans)
+    if !cacheHit && instance < self.baseInstances {
+      if let Option<*const u8>.Some { value: parentPtr } = self.sharedParent {
+        let anchor = ()
+        let parent = unsafe Pointer.borrow<(), FontState<'a>>(
+          &anchor,
+          unsafe Intrinsic.pointerReinterpret<*const u8, *const FontState<'a>>(parentPtr),
         )
-        self.shapeCacheHits = self.shapeCacheHits + 1
-        self.leans = entry.leans
-        return
+        cacheHit = run parent.lookupShaped(hash, instance, text, start, end, rtl, script.value, vertical, features, &mut out, &mut hitLeans)
       }
+    }
+    if cacheHit {
+      // Ensure `sliceable(key)` sees `dataSlots[face]` even when cache hits skip `shapeUncached`.
+      let face = self.instances.asSlice()[instance].face
+      if face >= self.dataSlots.length() || self.dataSlots.get(face) == 0 {
+        drop run self.loadFace(face)
+      }
+      self.shapeCacheHits = self.shapeCacheHits + 1
+      self.leans = hitLeans
+      return
     }
     let first = out.length()
     run self.shapeUncached(instance, text, start, end, rtl, script, vertical, features, &mut out)
@@ -1035,36 +1706,9 @@ impl<'a> FontState<'a> {
     if !run self.loadFace(face) {
       return
     }
-    self.buffer.clear()
-    run self.buffer.setPreContext(String.slice(text, 0, start))
-    run self.buffer.setPostContext(String.slice(text, end, String.byteLength(text) - end))
-    run self.buffer.pushStr(String.slice(text, start, end - start))
-    if vertical {
-      self.buffer.setDirection(Direction.TopToBottom)
-    } else if rtl {
-      self.buffer.setDirection(Direction.RightToLeft)
-    } else {
-      self.buffer.setDirection(Direction.LeftToRight)
-    }
+    run populateShapeBuffer(&mut self.buffer, text, start, end, rtl, script, vertical)
     let tag = script.value
-    if tag == Script.common().value || tag == Script.inherited().value
-      || tag == Script.unknown().value {
-      self.buffer.setScript(Option<Script>.None)
-    } else {
-      self.buffer.setScript(Option<Script>.Some { value: script })
-    }
-    self.buffer.guessSegmentProperties()
-    let mut plan = usize.MAX
-    let mut index: usize = 0
-    while index < self.plans.length() {
-      let entry = &self.plans.asSlice()[index]
-      if entry.instance == instance && entry.script == tag && entry.rtl == rtl
-        && entry.vertical == vertical && entry.features.same(features) {
-        plan = index
-        break
-      }
-      index = index + 1
-    }
+    let mut plan = self.findPlan(instance, tag, rtl, vertical, features)
     if plan == usize.MAX {
       if let Option<&ShaperData<'a>>.Some { value: data } = self.shaper(face) {
         let made = run makePlan(
@@ -1115,28 +1759,7 @@ impl<'a> FontState<'a> {
       }
       self.leans = self.buffer.leansOnBefore
     }
-    let infos = self.buffer.glyphInfos()
-    let positions = self.buffer.glyphPositions()
-    run out.reserve(infos.len())
-    index = 0
-    while index < infos.len() {
-      if let Option<GlyphInfo>.Some { value: info } = infos.get(index) {
-        if let Option<GlyphPosition>.Some { value: position } = positions.get(index) {
-          run out.append(
-            RawGlyph {
-              glyph: info.glyphId,
-              cluster: info.cluster + usize.toU32(start),
-              xAdvance: position.xAdvance,
-              yAdvance: position.yAdvance,
-              xOffset: position.xOffset,
-              yOffset: position.yOffset,
-              safe: (info.flags & 1) == 0,
-            },
-          )
-        }
-      }
-      index = index + 1
-    }
+    run appendRawGlyphs(&self.buffer, start, &mut out)
   }
 
   /// What the style behind key `key` does to its text.

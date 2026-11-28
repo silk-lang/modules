@@ -8,6 +8,7 @@
 import ui_tree.legacy { UiTree, TreeError, Batch, NodeKind, Attribute, FrameInput, Input, Mutation, StyleState }
 import ui_tree.cssom_view { firstFragment }
 import ui_tree.digest { DigestBox, DigestText, digestLayout }
+import ui_transport.pool { Pools, WorkPoolHandle }
 import silk.num.u64
 import silk.num.f32
 import ui_tree.style_media { Preferences }
@@ -16,10 +17,12 @@ import css_style.compile { Options, CompileError }
 import css_style.compile
 import css_style.tokens { CssError }
 import silk.build.source { Source }
+import silk.collections.bytes { Bytes }
 import silk.collections.list { List }
 import silk.collections.slice { Slice }
 import silk.core.effect { Effect }
 import silk.core.option { Option }
+import silk.core.result { Result }
 import silk.io.writer_native { StderrWriter }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.num.i64
@@ -27,6 +30,9 @@ import silk.num.u32
 import silk.num.u8
 import silk.core.ownership { Copy }
 import silk.num.usize
+import silk.system.filesystem { Path, FileSystem }
+import silk.system.filesystem_native { OsFileSystem }
+import silk.system.host_input { HostInput }
 import silk.system.monotonic_clock { MonotonicClock }
 import silk.system.monotonic_clock_native { OsMonotonicClock }
 import silk.time.mark { Mark }
@@ -35,6 +41,31 @@ import silk.text.string { String }
 const RUNS: usize = 41
 
 fn frameInput(time: f64) -> FrameInput { return FrameInput { width: 1280.0, height: 800.0, scale: 1.0, time: time } }
+
+fn feedFrameInput(time: f64) -> FrameInput { return FrameInput { width: 1040.0, height: 720.0, scale: 1.0, time: time } }
+
+fn printSplit(label: string, tree: &UiTree<'_>) -> () {
+  let textTotalNs = tree.stats.preShapeNs + tree.stats.textAnalyzeNs + tree.stats.textShapeNs
+  let nonTextLayoutNs = if tree.stats.layoutNs > textTotalNs { tree.stats.layoutNs - textTotalNs } else { 0 }
+  StderrWriter.print(
+    "split ({}): style={}ms preShape={}ms analyze={}ms shape={}ms nonTextLayout={}ms layout={}ms paint={}ms styled={} shaped={} laidOut={} shaperCalls={} cacheHits={}\n",
+    &(
+      label,
+      u64.toF64(tree.stats.styleNs) / 1000000.0,
+      u64.toF64(tree.stats.preShapeNs) / 1000000.0,
+      u64.toF64(tree.stats.textAnalyzeNs) / 1000000.0,
+      u64.toF64(tree.stats.textShapeNs) / 1000000.0,
+      u64.toF64(nonTextLayoutNs) / 1000000.0,
+      u64.toF64(tree.stats.layoutNs) / 1000000.0,
+      u64.toF64(tree.stats.paintNs) / 1000000.0,
+      tree.stats.parallelStyled,
+      tree.stats.parallelShaped,
+      tree.stats.parallelLaidOut,
+      tree.provider.text.fonts.shaperCalls,
+      tree.provider.text.fonts.shapeCacheHits,
+    ),
+  )
+}
 
 fn nanos(at: &Mark) -> i64 { return at.*.seconds() * 1000000000 + u32.toI64(at.*.subsecondNanoseconds()) }
 
@@ -352,9 +383,304 @@ effect fn verify(tree: &mut UiTree<'_>, time: &mut f64) -> usize ! TreeError | O
   return wrong
 }
 
-effect fn application() -> i32 ! TreeError | CompileError | CssError | OutOfMemoryError ? &mut Allocator | &mut MonotonicClock {
+effect fn feedBox(batch: &mut Batch, parent: u32, next: &mut u32, classes: string) -> u32 ! OutOfMemoryError ? &mut Allocator {
+  let id = next.*
+  next.* = id + 1
+  run batch.create(id, NodeKind.Box)
+  run batch.append(parent, id)
+  run batch.attribute(id, Attribute.ClassName { value: run String.copy(classes) })
+  return id
+}
+
+effect fn feedTextBox(batch: &mut Batch, parent: u32, next: &mut u32, classes: string, text: string) -> u32 ! OutOfMemoryError ? &mut Allocator {
+  let id = run feedBox(&mut batch, parent, &mut next, classes)
+  let tid = next.*
+  next.* = tid + 1
+  run batch.text(id, tid, text)
+  return id
+}
+
+fn markClass(open: u8) -> string<'static> {
+  if open == 42 { return "b" }
+  if open == 95 { return "i" }
+  if open == 96 { return "k" }
+  return "a"
+}
+
+fn markClose(open: u8) -> u8 { return if open == 91 { 93 } else { open } }
+
+effect fn emitInline(batch: &mut Batch, parent: u32, next: &mut u32, bytes: &[u8]) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut plainStart: usize = 0
+  let mut i: usize = 0
+  while i < bytes.length {
+    let ch = bytes[i]
+    if ch == 42 || ch == 95 || ch == 96 || ch == 91 {
+      let endMark = markClose(ch)
+      let mut j = i + 1
+      while j < bytes.length && bytes[j] != endMark { j = j + 1 }
+      if j < bytes.length && j > i + 1 {
+        if i > plainStart {
+          let tid = next.*
+          next.* = tid + 1
+          run batch.text(parent, tid, view(Slice.view<u8>(bytes, plainStart, i - (plainStart))))
+        }
+        drop run feedTextBox(&mut batch, parent, &mut next, markClass(ch), view(Slice.view<u8>(bytes, i + 1, j - (i + 1))))
+        i = j + 1
+        plainStart = i
+        continue
+      }
+    }
+    i = i + 1
+  }
+  if plainStart < bytes.length {
+    let tid = next.*
+    next.* = tid + 1
+    run batch.text(parent, tid, view(Slice.view<u8>(bytes, plainStart, bytes.length - (plainStart))))
+  }
+}
+
+fn splitPipe<'a>(bytes: &'a [u8], index: usize) -> &'a [u8] {
+  let mut at: usize = 0
+  let mut start: usize = 0
+  let mut i: usize = 0
+  while i <= bytes.length {
+    if i == bytes.length || bytes[i] == 124 {
+      if at == index { return Slice.view<u8>(bytes, start, i - (start)) }
+      at = at + 1
+      start = i + 1
+    }
+    i = i + 1
+  }
+  return Slice.view<u8>(bytes, 0, 0 - (0))
+}
+
+fn pipeCount(bytes: &[u8]) -> usize {
+  if bytes.length == 0 { return 0 }
+  let mut count: usize = 1
+  let mut i: usize = 0
+  while i < bytes.length {
+    if bytes[i] == 124 { count = count + 1 }
+    i = i + 1
+  }
+  return count
+}
+
+/// Builds the xbench `feed` scene (~3,000 cards, ~61k nodes) into `batch`.
+effect fn buildFeed(batch: &mut Batch, corpus: &[u8]) -> u32 ! OutOfMemoryError ? &mut Allocator {
+  run batch.create(1, NodeKind.Box)
+  run batch.root(1)
+  run batch.attribute(1, Attribute.ClassName { value: run String.copy("app") })
+  let mut next: u32 = 2
+  drop run feedTextBox(&mut batch, 1, &mut next, "bar", "Feed benchmark (corpus)")
+  let scroll = run feedBox(&mut batch, 1, &mut next, "scroll")
+  let feed = run feedBox(&mut batch, scroll, &mut next, "feed")
+  let mut card: u32 = 0
+  let mut listBox: u32 = 0
+  let mut codeBox: u32 = 0
+  let mut tableBox: u32 = 0
+  let mut tableCols: usize = 0
+  let mut footReplies = String.make()
+  let mut footLikes = String.make()
+  let mut start: usize = 0
+  let mut i: usize = 0
+  let avatars = ["avatar c0", "avatar c1", "avatar c2", "avatar c3", "avatar c4", "avatar c5", "avatar c6", "avatar c7"]
+  while i <= corpus.length {
+    if i == corpus.length || corpus[i] == 10 {
+      let line = Slice.view<u8>(corpus, start, i - (start))
+      start = i + 1
+      i = i + 1
+      if line.length == 0 { continue }
+      if line[0] == 35 {
+        if card != 0 {
+          let foot = run feedBox(&mut batch, card, &mut next, "foot")
+          drop run feedTextBox(&mut batch, foot, &mut next, "act", String.view(&footReplies))
+          drop run feedTextBox(&mut batch, foot, &mut next, "act", String.view(&footLikes))
+        }
+        listBox = 0
+        codeBox = 0
+        tableBox = 0
+        let header = Slice.view<u8>(line, 1, line.length - (1))
+        let itemNo = number(splitPipe(header, 0))
+        let author = splitPipe(header, 1)
+        let when = splitPipe(header, 2)
+        let tagList = splitPipe(header, 3)
+        let countsText = splitPipe(header, 4)
+        let mut comma: usize = 0
+        while comma < countsText.length && countsText[comma] != 44 { comma = comma + 1 }
+        footReplies = run String.copy(view(Slice.view<u8>(countsText, 0, comma - (0))))
+        footLikes = if comma < countsText.length { run String.copy(view(Slice.view<u8>(countsText, comma + 1, countsText.length - (comma + 1)))) } else { String.make() }
+        card = run feedBox(&mut batch, feed, &mut next, "item")
+        let head = run feedBox(&mut batch, card, &mut next, "head")
+        let initial = if author.length > 0 { Slice.view<u8>(author, 0, 1 - (0)) } else { Slice.view<u8>(b"A", 0, 1 - (0)) }
+        drop run feedTextBox(&mut batch, head, &mut next, avatars[itemNo % 8], view(initial))
+        let who = run feedBox(&mut batch, head, &mut next, "who")
+        drop run feedTextBox(&mut batch, who, &mut next, "name", view(author))
+        drop run feedTextBox(&mut batch, who, &mut next, "time", view(when))
+        let tags = run feedBox(&mut batch, head, &mut next, "tags")
+        let mut ts: usize = 0
+        let mut t: usize = 0
+        while t <= tagList.length {
+          if t == tagList.length || tagList[t] == 44 {
+            if t > ts { drop run feedTextBox(&mut batch, tags, &mut next, "tag", view(Slice.view<u8>(tagList, ts, t - (ts)))) }
+            ts = t + 1
+          }
+          t = t + 1
+        }
+        continue
+      }
+      if card == 0 { continue }
+      let kind = line[0]
+      let body = if line.length > 2 { Slice.view<u8>(line, 2, line.length - (2)) } else { Slice.view<u8>(b"", 0, 0 - (0)) }
+      if kind != 76 { listBox = 0 }
+      if kind != 67 { codeBox = 0 }
+      if kind != 84 { tableBox = 0 }
+      if kind == 80 {
+        let p = run feedBox(&mut batch, card, &mut next, "p")
+        run emitInline(&mut batch, p, &mut next, body)
+      } else if kind == 72 {
+        drop run feedTextBox(&mut batch, card, &mut next, "h", view(body))
+      } else if kind == 81 {
+        let q = run feedBox(&mut batch, card, &mut next, "q")
+        run emitInline(&mut batch, q, &mut next, body)
+      } else if kind == 76 {
+        if listBox == 0 { listBox = run feedBox(&mut batch, card, &mut next, "ul") }
+        let li = run feedBox(&mut batch, listBox, &mut next, "li")
+        drop run feedBox(&mut batch, li, &mut next, "dot")
+        let lt = run feedBox(&mut batch, li, &mut next, "lt")
+        run emitInline(&mut batch, lt, &mut next, body)
+      } else if kind == 67 {
+        if codeBox == 0 { codeBox = run feedBox(&mut batch, card, &mut next, "pre") }
+        drop run feedTextBox(&mut batch, codeBox, &mut next, "cl", view(body))
+      } else if kind == 84 {
+        let cols = pipeCount(body)
+        let isHead = tableBox == 0
+        if tableBox == 0 {
+          tableCols = if cols >= 4 { 4 } else { 3 }
+          tableBox = run feedBox(&mut batch, card, &mut next, if tableCols == 4 { "t4" } else { "t3" })
+        }
+        let cls = if isHead { "th" } else { "td" }
+        let mut c: usize = 0
+        while c < tableCols {
+          drop run feedTextBox(&mut batch, tableBox, &mut next, cls, view(splitPipe(body, c)))
+          c = c + 1
+        }
+      } else if kind == 73 {
+        let fig = run feedBox(&mut batch, card, &mut next, "fig")
+        drop run feedBox(&mut batch, fig, &mut next, "img")
+        drop run feedTextBox(&mut batch, fig, &mut next, "cap", view(body))
+      }
+      continue
+    }
+    i = i + 1
+  }
+  if card != 0 {
+    let foot = run feedBox(&mut batch, card, &mut next, "foot")
+    drop run feedTextBox(&mut batch, foot, &mut next, "act", String.view(&footReplies))
+    drop run feedTextBox(&mut batch, foot, &mut next, "act", String.view(&footLikes))
+  }
+  return next - 1
+}
+
+effect fn tryReadUnder(dirBytes: &[u8], relative: string) -> Option<Bytes>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let root = run Path.root()
+  let path = match move run Effect.result(Path.resolve(&root, relative)) {
+    Result.Success { value } => move value
+    _ => { return Option<Bytes>.None }
+  }
+  let mut files = run OsFileSystem.makeBytes(dirBytes)
+  return match move run Effect.result(FileSystem.readFile(&path) |> Effect.provideMut<FileSystem>(&mut files)) {
+    Result.Success { value } => Option<Bytes>.some(move value)
+    _ => Option<Bytes>.None
+  }
+}
+
+effect fn readXbenchFile(relativeFromXbench: string) -> Bytes
+  ! TreeError | OutOfMemoryError
+  ? &mut Allocator | &mut HostInput {
+  let cwd = match move run Effect.result(HostInput.workingDirectory()) {
+    Result.Success { value } => move value
+    _ => { fail TreeError.Layout }
+  }
+  let raw = cwd.asSlice()
+  let mut rel1 = run String.copy("xbench/")
+  run String.append(&mut rel1, relativeFromXbench)
+  let mut rel2 = run String.copy("silk-ui/xbench/")
+  run String.append(&mut rel2, relativeFromXbench)
+  let mut end = raw.length
+  let mut step: usize = 0
+  while step < 8 && end > 0 {
+    let dir = Slice.view<u8>(raw, 0, end - (0))
+    if let Option<Bytes>.Some { value } = move run tryReadUnder(dir, String.view(&rel1)) { return move value }
+    if let Option<Bytes>.Some { value } = move run tryReadUnder(dir, String.view(&rel2)) { return move value }
+    while end > 0 && raw[end - 1] != 47 && raw[end - 1] != 92 { end = end - 1 }
+    if end > 1 { end = end - 1 }
+    step = step + 1
+  }
+  fail TreeError.Layout
+}
+
+effect fn runFeed(pool: &Option<WorkPoolHandle>, verifyParallel: bool) -> i32
+  ! TreeError | CompileError | CssError | OutOfMemoryError
+  ? &mut Allocator | &mut MonotonicClock | &mut HostInput {
   let fonts = run fixtures.fonts()
   let mut tree = run UiTree.make(&fonts)
+  if let Option<WorkPoolHandle>.Some { value: handle } = &pool.* {
+    tree.setEnginePool(handle.clone(), 1)
+  }
+  drop tree.setStylePreferences(Preferences.desktop(false))
+  let cssBytes = run readXbenchFile("style/bench.css")
+  let corpusBytes = run readXbenchFile("content/corpus.txt")
+  let compiled = run compile.compile(cssBytes.asSlice(), &Options.make())
+  let bytes = run compiled.encode()
+  let mut batch = Batch.make()
+  let nodes = run buildFeed(&mut batch, corpusBytes.asSlice())
+  run batch.adoptStyleSheet(0, 1, bytes.asSlice())
+  let started = run MonotonicClock.now()
+  run tree.apply(run batch.take())
+  run tree.frame(feedFrameInput(0.0))
+  let finished = run MonotonicClock.now()
+  StderrWriter.print(
+    "feed: {} nodes, {} fragments, first frame {} ms\n",
+    &(u32.toUsize(nodes), tree.stats.fragments, i64.toUsize((nanos(&finished) - nanos(&started)) / 1000000)),
+  )
+  printSplit("feed", &tree)
+  if verifyParallel || pool.isSome() {
+    let parSig = run signature(&tree)
+    let mut serial = run UiTree.make(&fonts)
+    drop serial.setStylePreferences(Preferences.desktop(false))
+    let mut sb = Batch.make()
+    drop run buildFeed(&mut sb, corpusBytes.asSlice())
+    run sb.adoptStyleSheet(0, 1, bytes.asSlice())
+    run serial.apply(run sb.take())
+    run serial.frame(feedFrameInput(0.0))
+    let serSig = run signature(&serial)
+    if parSig.length() != serSig.length() {
+      StderrWriter.print("feed parity mismatch: len {} != {}\n", &(parSig.length(), serSig.length()))
+      return 4
+    }
+    let mut diff: usize = 0
+    let mut idx: usize = 0
+    while idx < parSig.length() {
+      if parSig.get(idx) != serSig.get(idx) { diff = diff + 1 }
+      idx = idx + 1
+    }
+    StderrWriter.print("feed parallel vs serial: {} differences\n", &.(diff))
+    if diff != 0 { return 4 }
+  }
+  return 0
+}
+
+effect fn application(feedMode: bool, verifyParallel: bool, pool: &Option<WorkPoolHandle>) -> i32 ! TreeError | CompileError | CssError | OutOfMemoryError ? &mut Allocator | &mut MonotonicClock | &mut HostInput {
+  if feedMode {
+    return run runFeed(pool, verifyParallel)
+  }
+  let fonts = run fixtures.fonts()
+  let mut tree = run UiTree.make(&fonts)
+  if let Option<WorkPoolHandle>.Some { value: handle } = &pool.* {
+    tree.setEnginePool(handle.clone(), 1)
+  }
   drop tree.setStylePreferences(Preferences.desktop(false))
   let compiled = run compile.compile(Source.read("fixtures/t3.css"), &Options.make())
   let bytes = run compiled.encode()
@@ -372,6 +698,7 @@ effect fn application() -> i32 ! TreeError | CompileError | CssError | OutOfMemo
   let finished = run MonotonicClock.now()
   StderrWriter.print("page: {} nodes, first frame {} ms; editor {} text {} sidebar {} rows {} menus {}\n", &(
     u32.toUsize(nodes), i64.toUsize((nanos(&finished) - nanos(&started)) / 1000000), targets.editor, targets.editorText, targets.sidebarWrapper, targets.rows.length(), targets.menus.length()))
+  printSplit("t3-page", &tree)
   StderrWriter.print("watch overflows: {} (last at node {})\n", &(tree.work.watchOverflows, tree.work.lastOverflow))
   if targets.editorText == 0 || targets.sidebarWrapper == 0 || targets.rows.length() < 2 || targets.menus.length() == 0 { return 2 }
   let kinds = [Kind.Type, Kind.Sidebar, Kind.Panel, Kind.Menu, Kind.Scroll, Kind.Hover, Kind.Mount]
@@ -392,10 +719,44 @@ effect fn failed(error: TreeError | CompileError | CssError | OutOfMemoryError) 
   return 1
 }
 
-pub fn main() -> i32 {
+pub effect fn main() -> i32 ? &mut HostInput {
   let mut allocator = Allocator.systemAllocatorProvider()
   let mut clock = OsMonotonicClock.make()
-  return run Effect.catchAll(application(), failed)
+  let mut feedMode = false
+  let mut verifyParallel = false
+  let mut serialEnv = false
+  let argsResult = run Effect.result(HostInput.arguments()) |> Effect.provideMut<Allocator>(&mut allocator)
+  if let Result.Success { value: arguments } = move argsResult {
+    let mut i: usize = 1
+    while i < arguments.length() {
+      let text = unsafe String.fromUtf8Unchecked(arguments.asSlice()[i].asSlice())
+      if text == "--feed" { feedMode = true }
+      else if text == "--verify-parallel" { verifyParallel = true }
+      i = i + 1
+    }
+  }
+  let envResult = run Effect.result(HostInput.variableNamed("SILK_UI_SERIAL_ENGINE")) |> Effect.provideMut<Allocator>(&mut allocator)
+  if let Result.Success { value: found } = move envResult {
+    serialEnv = found.isSome()
+  }
+  let mut pools = if !serialEnv {
+    match move run Effect.result(Pools.make()) {
+      Result.Success { value } => Option<Pools>.some(move value)
+      Result.Failure { error: _ } => Option<Pools>.None
+    }
+  } else {
+    Option<Pools>.None
+  }
+  let poolHandle = match &pools {
+    Option<Pools>.Some { value: p } => Option<WorkPoolHandle>.some(p.engine.handle())
+    Option<Pools>.None => Option<WorkPoolHandle>.None
+  }
+  let code = run Effect.catchAll(application(feedMode, verifyParallel, &poolHandle), failed)
     |> Effect.provideMut<Allocator>(&mut allocator)
     |> Effect.provideMut<MonotonicClock>(&mut clock)
+  drop poolHandle
+  if let Option<Pools>.Some { value: p } = &mut pools {
+    p.stop()
+  }
+  return code
 }

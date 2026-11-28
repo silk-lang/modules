@@ -1,0 +1,527 @@
+//! Parallel stylesheet selector matching on `EnginePool` (`preMatchBatch`), with
+//! high-sharing deduplication so repetitive trees skip redundant twin matches and serial
+//! commit remains strictly top-down deterministic.
+import engine { UiTree, TreeError }
+import node { NONE, NO_INDEX }
+import mutation { Declaration, NodeKind }
+import selector_tree { SelectorTree, ParallelSelectorTree }
+import style_sheets { PreMatch, collectInlinePriorities }
+import style_change
+import style_identity { NodeIdentity }
+import properties.catalog
+import svg_css.adopted { StyleSheetsScratch, Candidate, MatchedRule }
+import svg_css.ancestor_filter { AncestorFilter }
+import svg_css.element { ElementTree, MatchContext, PseudoTarget, StateBits, ContainerDependency, Watch, NO_ELEMENT }
+import svg_css.cascade { Priority }
+import svg_css.selectors
+import svg_css.tokens { Limits }
+import ui_transport.pool { WorkPoolHandle }
+import silk.collections.hash { Hash }
+import silk.collections.hash_map { HashMap }
+import silk.collections.list { List }
+import silk.concurrency.sync { Arc, Mutex }
+import silk.concurrency.thread { Concurrent, Transferable }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.core.result { Result }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.mem.pointer { Pointer }
+import silk.num.u8
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+import silk.text.string { String }
+
+const PARALLEL_STYLE_MIN: usize = 64
+
+struct StyleChunk {
+  start: usize,
+  len: usize,
+}
+
+impl Copy for StyleChunk {}
+
+struct PreMatchSlot {
+  slot: u32,
+  value: PreMatch,
+}
+
+struct StyleTarget {
+  slot: u32,
+  enters: bool,
+}
+
+impl Copy for StyleTarget {}
+
+struct StyleBatch {
+  treePtr: *const u8,
+  rootIndex: usize,
+  targets: List<StyleTarget>,
+  chunks: List<StyleChunk>,
+  outputs: Mutex<List<List<PreMatchSlot>>>,
+}
+
+impl Transferable for StyleBatch {}
+impl Concurrent for StyleBatch {}
+
+/// Rebuilds `filter` to hold the ancestor chain above `slot` (excluding `slot` itself).
+effect fn rebuildFilter(tree: &UiTree<'_>, slot: u32, filter: &mut AncestorFilter) -> u32
+  ! OutOfMemoryError ? &mut Allocator {
+  run filter.clear()
+  let mut chain = List<u32>.make()
+  let parent = tree.node(slot).parent
+  let mut up = parent
+  while up != NONE {
+    run chain.append(up)
+    up = tree.node(up).parent
+  }
+  let mut i = chain.length()
+  while i > 0 {
+    i = i - 1
+    let keys = run tree.filterKeys(chain.get(i))
+    let mut k: usize = 0
+    while k < keys.length() {
+      filter.push(keys.get(k))
+      k = k + 1
+    }
+  }
+  return parent
+}
+
+effect fn runOneSlot(
+  tree: &UiTree<'_>,
+  rootIndex: usize,
+  target: StyleTarget,
+  filter: &AncestorFilter,
+  filterParent: u32,
+  filterReady: bool,
+  priorities: &mut List<Priority>,
+  context: &mut MatchContext,
+  scratch: &mut StyleSheetsScratch,
+) -> PreMatch ! OutOfMemoryError ? &mut Allocator {
+  let slot = target.slot
+  run collectInlinePriorities(tree, slot, false, PseudoTarget.None, &mut priorities)
+  context.pseudo = PseudoTarget.None
+  context.pseudoStates = StateBits.empty()
+  context.reads = 0
+  context.watchOverflow = false
+  context.containers.truncate(0)
+  context.clearWatches()
+  let adapter = ParallelSelectorTree {
+    inner: SelectorTree { tree: tree },
+    filter: filter,
+    filterParent: filterParent,
+    filterReady: filterReady,
+  }
+  let sheets = &tree.styleSheets.asSlice()[rootIndex].sheets
+  let outcome = run Effect.result(sheets.resolveWithInto(&adapter, u32.toUsize(slot), priorities.asSlice(), &mut context.*, false, &mut scratch))
+  match move outcome {
+    Result.Success { value: _ } => {
+      let mut candidates = List<Candidate>.make()
+      run candidates.appendSlice(scratch.candidates())
+      let mut matched = List<MatchedRule>.make()
+      run matched.appendSlice(scratch.matches())
+      let states = scratch.stateDependencies()
+      let reads = context.reads
+      let mut watched = List<Watch>.make()
+      run watched.appendSlice(context.watched())
+      let watchAll = context.watchOverflow
+      let mut containers = List<ContainerDependency>.make()
+      run containers.appendSlice(context.containers.asSlice())
+      let mut hasStart = false
+      let mut startCandidates = List<Candidate>.make()
+      let mut startMatched = List<MatchedRule>.make()
+      let mut startStates: u32 = 0
+      let mut startWatched = List<Watch>.make()
+      let mut startWatchAll = false
+      let mut startContainers = List<ContainerDependency>.make()
+      if target.enters {
+        run collectInlinePriorities(tree, slot, true, PseudoTarget.None, &mut priorities)
+        context.pseudo = PseudoTarget.None
+        context.pseudoStates = StateBits.empty()
+        context.reads = 0
+        context.watchOverflow = false
+        context.containers.truncate(0)
+        context.clearWatches()
+        let startOut = run Effect.result(sheets.resolveWithInto(&adapter, u32.toUsize(slot), priorities.asSlice(), &mut context.*, true, &mut scratch))
+        if let Result.Success { value: _ } = move startOut {
+          hasStart = true
+          run startCandidates.appendSlice(scratch.candidates())
+          run startMatched.appendSlice(scratch.matches())
+          startStates = scratch.stateDependencies()
+          run startWatched.appendSlice(context.watched())
+          startWatchAll = context.watchOverflow
+          run startContainers.appendSlice(context.containers.asSlice())
+        }
+      }
+      return PreMatch {
+        candidates: move candidates,
+        matched: move matched,
+        states: states,
+        reads: reads,
+        watched: move watched,
+        watchAll: watchAll,
+        containers: move containers,
+        hasStart: hasStart,
+        startCandidates: move startCandidates,
+        startMatched: move startMatched,
+        startStates: startStates,
+        startWatched: move startWatched,
+        startWatchAll: startWatchAll,
+        startContainers: move startContainers,
+        valid: true,
+      }
+    }
+    Result.Failure { error: _ } => {
+      return PreMatch.empty()
+    }
+  }
+}
+
+fn runStyleChunk(batch: &StyleBatch, chunkIdx: usize) -> () {
+  let mut heap = Allocator.systemAllocatorProvider()
+  let anchor = ()
+  let tree = unsafe Pointer.borrow<(), UiTree<'static>>(&anchor, unsafe Intrinsic.pointerReinterpret<*const u8, *const UiTree<'static>>(batch.treePtr))
+  let chunk = batch.chunks.asSlice()[chunkIdx]
+  let targets = batch.targets.asSlice()
+  let mut scratch = StyleSheetsScratch.make()
+  let mut filter = AncestorFilter.make()
+  let mut filterParent: u32 = NONE
+  let mut filterReady = false
+  let mut priorities = List<Priority>.make()
+  let mut context = MatchContext.make(u32.toUsize(tree.root), NO_ELEMENT)
+  let mut out = List<PreMatchSlot>.make()
+  let end = chunk.start + chunk.len
+  let mut i = chunk.start
+  let mut ok = true
+  while i < end {
+    let target = targets[i]
+    let slot = target.slot
+    let parent = tree.node(slot).parent
+    if !filterReady || parent != filterParent {
+      let rebuilt = run Effect.result(rebuildFilter(tree, slot, &mut filter)) |> Effect.provideMut<Allocator>(&mut heap)
+      match move rebuilt {
+        Result.Success { value } => {
+          filterParent = value
+          filterReady = true
+        }
+        Result.Failure { error: _ } => {
+          ok = false
+          break
+        }
+      }
+    }
+    let matched = run Effect.result(runOneSlot(tree, batch.rootIndex, target, &filter, filterParent, filterReady, &mut priorities, &mut context, &mut scratch))
+      |> Effect.provideMut<Allocator>(&mut heap)
+    match move matched {
+      Result.Success { value } => {
+        if value.valid {
+          let appended = run Effect.result(out.append(PreMatchSlot { slot: slot, value: move value }))
+            |> Effect.provideMut<Allocator>(&mut heap)
+          if let Result.Failure { error: _ } = move appended {
+            ok = false
+            break
+          }
+        }
+      }
+      Result.Failure { error: _ } => {
+        ok = false
+        break
+      }
+    }
+    i = i + 1
+  }
+  if ok && out.length() != 0 {
+    let mut guard = batch.outputs.lock()
+    let slice = guard.getMut().asMutSlice()
+    slice[chunkIdx] = move out
+    drop guard
+  }
+}
+
+fn mixBytes(seed: u64, bytes: &[u8]) -> u64 {
+  let mut h = Hash.combine(seed, usize.toU64(bytes.length))
+  let mut i: usize = 0
+  while i < bytes.length {
+    h = Hash.combine(h, u8.toU64(bytes[i]))
+    i = i + 1
+  }
+  return h
+}
+
+fn mixDecls(seed: u64, decls: &[Declaration]) -> u64 {
+  let mut h = Hash.combine(seed, usize.toU64(decls.length))
+  let mut i: usize = 0
+  while i < decls.length {
+    h = Hash.combine(h, usize.toU64(catalog.index(decls[i].property)))
+    h = Hash.combine(h, if decls[i].important { 1 } else { 0 })
+    i = i + 1
+  }
+  return h
+}
+
+fn nodeSelfHash(tree: &UiTree<'_>, slot: u32, isRootNode: bool) -> u64 {
+  let node = tree.node(slot)
+  let mut h = Hash.mix(&tree.seed, u32.toU64(if isRootNode { 1 } else { 2 }))
+  h = Hash.combine(h, if node.kind == NodeKind.Input { 1 } else if node.kind == NodeKind.Image { 2 } else if node.kind == NodeKind.Icon { 3 } else if node.kind == NodeKind.Canvas { 4 } else { 0 })
+  if let Option<&NodeIdentity>.Some { value } = node.identity() {
+    if let Option.Some { value: key } = &value.key {
+      h = Hash.combine(h, key.get().hash)
+    }
+    if value.hasId { h = mixBytes(Hash.combine(h, 991), String.utf8Bytes(value.id())) }
+    let attrs = value.attributes()
+    if attrs.length != 0 {
+      h = Hash.combine(h, usize.toU64(attrs.length))
+      let mut i: usize = 0
+      while i < attrs.length {
+        h = mixBytes(h, String.utf8Bytes(String.view(&attrs[i].name)))
+        h = mixBytes(h, String.utf8Bytes(String.view(&attrs[i].value)))
+        i = i + 1
+      }
+    }
+    h = Hash.combine(h, usize.toU64(value.custom().length))
+  }
+  if node.base.length() != 0 { h = mixDecls(h, node.base.asSlice()) }
+  if node.hover().length != 0 { h = mixDecls(h, node.hover()) }
+  if node.active().length != 0 { h = mixDecls(h, node.active()) }
+  if node.focus().length != 0 { h = mixDecls(h, node.focus()) }
+  if node.focusVisible().length != 0 { h = mixDecls(h, node.focusVisible()) }
+  let hasExtras = match node.identity() {
+    Option<&NodeIdentity>.Some { value } => value.extras.get().isSome()
+    _ => false
+  }
+  if tree.focused != NONE || node.kind != NodeKind.Box || node.hovered || node.pressed || node.disabled || node.checked || node.selected || hasExtras {
+    let adapter = SelectorTree { tree: tree }
+    h = Hash.combine(h, u32.toU64(ElementTree.state(&adapter, u32.toUsize(slot)).bits))
+  }
+  return h
+}
+
+/// Checks if a box can be skipped during pre-matching because an identical structural twin was
+/// already queued earlier in DFS order (only safe when selectors never read sibling indices/descendants).
+fn dedupKeyFor(
+  tree: &UiTree<'_>,
+  slot: u32,
+  parentAncHash: u64,
+  elemIndex: u32,
+  elemTotal: u32,
+  reads: u32,
+) -> u64 {
+  let node = tree.node(slot)
+  if node.parent == NONE || node.kind != NodeKind.Box || node.starting().length != 0 { return 0 }
+  if let Option<&NodeIdentity>.Some { value } = node.identity() {
+    if value.hasId || value.custom().length != 0 { return 0 }
+  }
+  let mut key = Hash.combine(parentAncHash, nodeSelfHash(tree, slot, false))
+  if u32.bitAnd(reads, selectors.READS_EDGE) != 0 {
+    let firstEdge: u64 = if elemIndex == 1 { 1 } else { 0 }
+    let lastEdge: u64 = if elemIndex == elemTotal { 2 } else { 0 }
+    key = Hash.combine(key, firstEdge | lastEdge)
+  }
+  if u32.bitAnd(reads, selectors.READS_EMPTY) != 0 {
+    let adapter = SelectorTree { tree: tree }
+    key = Hash.combine(key, if ElementTree.isEmpty(&adapter, u32.toUsize(slot)) { 7 } else { 3 })
+  }
+  return if key == 0 { 1 } else { key }
+}
+
+struct WalkEntry {
+  slot: u32,
+  ancHash: u64,
+  elemIndex: u32,
+  elemTotal: u32,
+}
+
+impl Copy for WalkEntry {}
+
+effect fn ensureSheetVariables(tree: &mut UiTree<'_>, rootIndex: usize) -> ()
+  ! TreeError | OutOfMemoryError ? &mut Allocator {
+  let roots = tree.styleSheets.asMutSlice()
+  let varsOk = run Effect.result(roots[rootIndex].sheets.ensureVariables(&Limits.make()))
+  match move varsOk {
+    Result.Success { value: _ } => {}
+    Result.Failure { error: why } => {
+      match move why {
+        OutOfMemoryError {} => { fail OutOfMemoryError {} }
+        _ => { fail TreeError.StyleSheet { index: 0, root: tree.current, sheet: 0 } }
+      }
+    }
+  }
+}
+
+/// Collects eligible dirty selector-match targets in deterministic DFS order, populates
+/// `siblingIndex`/`siblingCount`/`siblingStamp`, deduplicates high-sharing twins, and
+/// pre-matches them across `EnginePool`.
+pub effect fn preMatchBatch<'a>(tree: &mut UiTree<'a>, rootIndex: usize, full: bool) -> ()
+  ! TreeError | OutOfMemoryError ? &mut Allocator {
+  tree.preMatches.truncate(0)
+  tree.preMatchedSlots.truncate(0)
+  tree.preMatchFull = full
+  let pool = match &tree.enginePool {
+    Option<WorkPoolHandle>.Some { value } => value.clone()
+    Option<WorkPoolHandle>.None => { return () }
+  }
+  if rootIndex >= tree.styleSheets.length() || tree.styleOverrides().length != 0 { return () }
+  if tree.styleSheets.asSlice()[rootIndex].sheets.hasStyleContainers() { return () }
+  run ensureSheetVariables(&mut tree, rootIndex)
+  let sheetsEmpty = tree.styleSheets.asSlice()[rootIndex].sheets.length() == 0 && !tree.styleSheets.asSlice()[rootIndex].inlineVariables
+  if sheetsEmpty { return () }
+  let reads = tree.styleSheets.asSlice()[rootIndex].reads
+  let hasStarting = tree.styleSheets.asSlice()[rootIndex].hasStarting
+  let dedupEnabled = u32.bitAnd(reads, selectors.READS_INDEX | selectors.READS_SIBLINGS | selectors.READS_DESCENDANTS) == 0
+  let mut seenDedup = HashMap<u64, u32>.make(tree.seed)
+  let mut targets = List<StyleTarget>.make()
+  let mut stack = List<WalkEntry>.make()
+  run stack.append(WalkEntry { slot: tree.root, ancHash: 0, elemIndex: 1, elemTotal: 1 })
+  let pass = tree.siblingPass
+  while stack.length() != 0 {
+    let last = stack.length() - 1
+    let item = stack.get(last)
+    stack.truncate(last)
+    let slot = item.slot
+    let nodeLive = tree.node(slot).live
+    if !nodeLive { continue }
+    let nodeCss = tree.node(slot).css
+    let nodeStyleDirty = tree.node(slot).styleDirty
+    let nodeTick = tree.node(slot).styleTick
+    let nodeSubtreeDirty = tree.node(slot).subtreeDirty
+    let nodeStyleSubtree = tree.node(slot).styleSubtree
+    let nodeBoxPlain = tree.node(slot).kind == NodeKind.Box && !tree.node(slot).isGenerated()
+    let mayStart = hasStarting && tree.styleSheets.asSlice()[rootIndex].startingSubjects.mayMatch(tree.node(slot))
+    let hasInlineStart = tree.node(slot).starting().length != 0
+    let ancBelow = Hash.combine(item.ancHash, nodeSelfHash(&tree.*, slot, slot == tree.root))
+    if nodeBoxPlain && (full || (nodeStyleDirty && !nodeTick)) {
+      let enters = !style_change.rendered(&tree.*, slot) && (mayStart || hasInlineStart)
+      let mut keep = true
+      // When `mayStart` is true, `resolveSheet` skips `style_share.twin()`, so keep every target.
+      if dedupEnabled && !mayStart && !hasInlineStart {
+        let dk = dedupKeyFor(&tree.*, slot, item.ancHash, item.elemIndex, item.elemTotal, reads)
+        if dk != 0 {
+          if seenDedup.get(dk).isSome() {
+            keep = false
+          } else {
+            drop run seenDedup.insert(dk, slot)
+          }
+        }
+      }
+      if keep {
+        run targets.append(StyleTarget { slot: slot, enters: enters })
+      }
+    }
+    if !full && !nodeStyleDirty && !nodeSubtreeDirty && !nodeStyleSubtree {
+      continue
+    }
+    let first = stack.length()
+    let mut elemCount: u32 = 0
+    let mut child = tree.layout.firstChild(nodeCss)
+    while child != NO_INDEX {
+      let found = tree.slotOfCssNode(child)
+      let nextChild = tree.layout.nextSibling(child)
+      if found != NONE {
+        let childLive = tree.node(found).live
+        let childKind = tree.node(found).kind
+        let childGen = tree.node(found).isGenerated()
+        let childRecur = childKind != NodeKind.Text && (full || tree.node(found).styleDirty || tree.node(found).subtreeDirty || tree.node(found).styleSubtree || nodeStyleDirty)
+        let isElem = childLive && childKind != NodeKind.Text && !childGen
+        if isElem {
+          elemCount = elemCount + 1
+          let idx = u32.toUsize(found)
+          if idx < tree.siblingIndex.length() {
+            let indices = tree.siblingIndex.asMutSlice()
+            indices[idx] = elemCount
+          }
+        }
+        if childRecur {
+          run stack.append(WalkEntry {
+            slot: found,
+            ancHash: ancBelow,
+            elemIndex: if isElem { elemCount } else { 0 },
+            elemTotal: 0,
+          })
+        }
+      }
+      child = nextChild
+    }
+    let parentIdx = u32.toUsize(slot)
+    if parentIdx < tree.siblingCount.length() {
+      let counts = tree.siblingCount.asMutSlice()
+      counts[parentIdx] = elemCount
+      let stamps = tree.siblingStamp.asMutSlice()
+      stamps[parentIdx] = pass
+    }
+    let items = stack.asMutSlice()
+    let mut a = first
+    while a < items.length {
+      items[a].elemTotal = elemCount
+      a = a + 1
+    }
+    a = first
+    let mut b = items.length
+    while b > a + 1 {
+      b = b - 1
+      let swap = items[a]
+      items[a] = items[b]
+      items[b] = swap
+      a = a + 1
+    }
+  }
+  if targets.length() < PARALLEL_STYLE_MIN {
+    return ()
+  }
+  let nodeCount = tree.nodes.length()
+  if tree.preMatchSlot.length() < nodeCount {
+    let missing = nodeCount - tree.preMatchSlot.length()
+    run tree.preMatchSlot.reserve(missing)
+    while tree.preMatchSlot.length() < nodeCount { run tree.preMatchSlot.append(NONE) }
+  }
+  let workers = if pool.workerCount() == 0 { 1 } else { pool.workerCount() }
+  let desired = workers * 4
+  let mut chunkSize = (targets.length() + desired - 1) / desired
+  if chunkSize < 16 { chunkSize = 16 }
+  let mut chunks = List<StyleChunk>.make()
+  let mut outputs = List<List<PreMatchSlot>>.make()
+  let mut offset: usize = 0
+  while offset < targets.length() {
+    let remain = targets.length() - offset
+    let len = if remain < chunkSize { remain } else { chunkSize }
+    run chunks.append(StyleChunk { start: offset, len: len })
+    run outputs.append(List<PreMatchSlot>.make())
+    offset = offset + len
+  }
+  let chunkCount = chunks.length()
+  let batch = run Arc<StyleBatch>.make(
+    StyleBatch {
+      treePtr: unsafe Intrinsic.pointerReinterpret<*const UiTree<'a>, *const u8>(Pointer.fromRef(&tree.*)),
+      rootIndex: rootIndex,
+      targets: move targets,
+      chunks: move chunks,
+      outputs: run Mutex<List<List<PreMatchSlot>>>.make(move outputs),
+    },
+  )
+  run pool.runParallel(tree.engineGroupId, chunkCount, batch.clone(), runStyleChunk)
+  let mut guard = batch.get().outputs.lock()
+  let results = guard.getMut().asMutSlice()
+  let mut c: usize = 0
+  while c < results.length {
+    let mut chunkOut = Intrinsic.replace(results[c], List<PreMatchSlot>.make())
+    let chunkSlice = chunkOut.asMutSlice()
+    let mut k: usize = 0
+    while k < chunkSlice.length {
+      let slot = chunkSlice[k].slot
+      let pre = Intrinsic.replace(chunkSlice[k].value, PreMatch.empty())
+      if pre.valid {
+        let preIdx = tree.preMatches.length()
+        run tree.preMatches.append(move pre)
+        let slotMap = tree.preMatchSlot.asMutSlice()
+        slotMap[u32.toUsize(slot)] = usize.toU32(preIdx)
+        run tree.preMatchedSlots.append(slot)
+        tree.stats.parallelStyled = tree.stats.parallelStyled + 1
+      }
+      k = k + 1
+    }
+    drop chunkOut
+    c = c + 1
+  }
+  drop guard
+}

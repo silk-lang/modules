@@ -1,0 +1,343 @@
+//! Window-group hosts and secondary group thread spawner.
+//!
+//! Splits the window-hosting surface along the v3 architectural boundary:
+//! - [`runDocumentWindow`] / [`runDocumentWindowWith`]: hosts a JavaScript Realm + `UiTree` (`GroupKind.Document`).
+//! - [`runEngineWindow`] / [`runEngineWindowWith`]: hosts a retained Loom engine `UiTree` (`GroupKind.Engine`).
+//! - [`spawnGroupThread`]: launches an isolated OS thread for an independent group (such as DevTools)
+//!   with its own `Waiter`, `CompositorHandle`, `GpuHandle`, `PlatformClient`, and `PoolHandles`.
+pub import compositor_thread { DEVTOOLS_GROUP, GroupKind, GroupServices, PRIMARY_GROUP }
+import companion { Companion, NoCompanion }
+import compositor_thread {
+  CompositorHandle,
+  CompositorToGroup,
+  GroupSubscription
+}
+import host { RunOptions, WindowClient, runWindowForGroup }
+import platform_thread { PlatformClient }
+import render_thread { GpuHandle }
+import ui_inspect_server.lib { Inspector }
+import ui_transport.channel { UnboundedReceiver }
+import ui_transport.pool { PoolHandles }
+import ui_transport.wake { Waiter, WakeHandle }
+import ui_tree.legacy { Mutation, TreeError }
+import atlas.atlas { AtlasError }
+import font_collection.lib { FontCollection }
+import vector.geometry_error { GeometryError }
+import webgpu.runtime { GpuError }
+import window.types { WindowError }
+import silk.collections.list { List }
+import silk.concurrency.atomic { Atomic, MemoryOrder }
+import silk.concurrency.sync { Arc }
+import silk.concurrency.thread { Concurrent, Transferable }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.ownership { Drop }
+import silk.core.result { Result }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.mem.box { Box }
+import silk.mem.pointer { Pointer }
+
+static if Intrinsic.targetArchitecture() != "wasm32" {
+  import silk.concurrency.thread_native { JoinHandle, NativeThread, SpawnError }
+}
+
+struct StopCell {
+  storage: Box<u32>,
+  word: *mut u32,
+  wake: WakeHandle,
+}
+
+impl Transferable for StopCell {}
+impl Concurrent for StopCell {}
+
+/// Atomic stop signal paired with the secondary group's `Waiter` wakeup handle.
+pub struct GroupStopFlag {
+  cell: Arc<StopCell>,
+}
+
+impl Transferable for GroupStopFlag {}
+impl Concurrent for GroupStopFlag {}
+
+impl GroupStopFlag {
+  pub fn clone(self: &Self) -> GroupStopFlag {
+    return GroupStopFlag { cell: self.cell.clone() }
+  }
+
+  /// Returns `true` once the owning host requested teardown.
+  pub fn isStopped(self: &Self) -> bool {
+    return unsafe Atomic.load<u32>(self.cell.get().word, MemoryOrder.Acquire) != 0
+  }
+
+  /// Marks this group stopped and wakes its `Waiter` immediately.
+  pub fn stop(self: &Self) -> () {
+    unsafe Atomic.store<u32>(self.cell.get().word, 1, MemoryOrder.Release)
+    self.cell.get().wake.wake()
+  }
+}
+
+effect fn makeStopFlag(wake: WakeHandle) -> GroupStopFlag
+  ! OutOfMemoryError {
+  let mut heap = Allocator.systemAllocatorProvider()
+  let mut storage = run Box<u32>.make(0) |> Effect.provideMut<Allocator>(&mut heap)
+  let slot = storage.getMut()
+  let word = Pointer.fromMutRef(&mut slot[0])
+  drop slot
+  let cell = run Arc<StopCell>.make(
+    StopCell { storage: move storage, word: word, wake: move wake },
+  )
+    |> Effect.provideMut<Allocator>(&mut heap)
+  return GroupStopFlag { cell: move cell }
+}
+
+/// Capabilities passed into an isolated secondary window-group thread.
+pub struct SecondaryGroupContext {
+  pub groupId: u32,
+  pub kind: GroupKind,
+  pub pools: PoolHandles,
+  pub compositor: CompositorHandle,
+  pub gpu: GpuHandle,
+  pub platform: PlatformClient,
+  pub rx: UnboundedReceiver<CompositorToGroup>,
+  pub waiter: Waiter,
+  pub stop: GroupStopFlag,
+}
+
+impl Transferable for SecondaryGroupContext {}
+
+static if Intrinsic.targetArchitecture() != "wasm32" {
+  /// Owns a spawned secondary group thread and joins it cleanly on `stop` / `Drop`.
+  pub struct SecondaryGroupHandle {
+    groupId: u32,
+    stopFlag: GroupStopFlag,
+    compositor: CompositorHandle,
+    thread: Option<JoinHandle<i32>>,
+  }
+
+  impl SecondaryGroupHandle {
+    /// Signals stop, wakes and joins the group thread, then unregisters its compositor endpoint.
+    pub fn stop(self: &mut Self) -> () {
+      self.stopFlag.stop()
+      match move Intrinsic.replace(self.thread, Option<JoinHandle<i32>>.None) {
+        Option<JoinHandle<i32>>.Some { value } => {
+          drop value.join()
+          self.compositor.unregisterGroup(self.groupId)
+        }
+        Option<JoinHandle<i32>>.None => ()
+      }
+    }
+  }
+
+  impl Drop for SecondaryGroupHandle {
+    fn drop(self: &mut Self) -> () {
+      self.stop()
+    }
+  }
+
+  /// Registers `groupId` with the compositor and spawns an isolated thread running `body`.
+  /// Returns `None` when running without compositor/GPU/platform handles or if thread spawn fails.
+  pub effect fn spawnGroupThread<
+    F: 'static + once fn(SecondaryGroupContext) -> i32 + Intrinsic.Detached + Transferable
+  >(
+    groupId: u32,
+    kind: GroupKind,
+    services: GroupServices,
+    body: F,
+  ) -> Option<SecondaryGroupHandle>
+    ! OutOfMemoryError {
+    let GroupServices {
+      groupId: _,
+      kind: _,
+      pools,
+      wake: _,
+      compositor: maybeComp,
+      gpu: maybeGpu,
+      platform: maybePlatform,
+    } = move services
+    let comp = match move maybeComp {
+      Option<CompositorHandle>.Some { value } => move value
+      Option<CompositorHandle>.None => {
+        drop body
+        return Option<SecondaryGroupHandle>.None
+      }
+    }
+    let gpu = match move maybeGpu {
+      Option<GpuHandle>.Some { value } => move value
+      Option<GpuHandle>.None => {
+        drop body
+        return Option<SecondaryGroupHandle>.None
+      }
+    }
+    let platform = match move maybePlatform {
+      Option<PlatformClient>.Some { value } => move value
+      Option<PlatformClient>.None => {
+        drop body
+        return Option<SecondaryGroupHandle>.None
+      }
+    }
+    let sub = run comp.openGroupChannel(groupId)
+    let GroupSubscription { groupId: _, rx, waiter } = move sub
+    let stopFlag = run makeStopFlag(waiter.handle())
+    let stopHandle = stopFlag.clone()
+    let handleCompositor = comp.clone()
+    let ctx = SecondaryGroupContext {
+      groupId: groupId,
+      kind: kind,
+      pools: move pools,
+      compositor: move comp,
+      gpu: move gpu,
+      platform: move platform,
+      rx: move rx,
+      waiter: move waiter,
+      stop: move stopFlag,
+    }
+    let mut heap = Allocator.systemAllocatorProvider()
+    let spawned = run Effect.result(
+      NativeThread.spawn(
+        || -> i32 {
+          return body(move ctx)
+        },
+      ),
+    )
+      |> Effect.provideMut<Allocator>(&mut heap)
+    return match move spawned {
+      Result<JoinHandle<i32>, SpawnError | OutOfMemoryError>.Success { value: thread } => Option<
+        SecondaryGroupHandle
+      >.some(
+        SecondaryGroupHandle {
+          groupId: groupId,
+          stopFlag: move stopHandle,
+          compositor: move handleCompositor,
+          thread: Option<JoinHandle<i32>>.some(move thread),
+        },
+      )
+      Result<JoinHandle<i32>, SpawnError | OutOfMemoryError>.Failure { error } => match move error {
+        SpawnError _ => {
+          handleCompositor.unregisterGroup(groupId)
+          Option<SecondaryGroupHandle>.None
+        }
+        OutOfMemoryError allocation => {
+          handleCompositor.unregisterGroup(groupId)
+          fail move allocation
+        }
+      }
+    }
+  }
+} else {
+  /// Browser (`wasm32`) stub for [`SecondaryGroupHandle`].
+  pub struct SecondaryGroupHandle {}
+
+  impl SecondaryGroupHandle {
+    pub fn stop(self: &mut Self) -> () {}
+  }
+
+  /// Browser (`wasm32`) stub: secondary group threads are unavailable without OS threads.
+  pub effect fn spawnGroupThread<
+    F: 'static + once fn(SecondaryGroupContext) -> i32 + Intrinsic.Detached + Transferable
+  >(
+    groupId: u32,
+    kind: GroupKind,
+    services: GroupServices,
+    body: F,
+  ) -> Option<SecondaryGroupHandle>
+    ! OutOfMemoryError {
+    drop groupId
+    drop kind
+    drop services
+    drop body
+    return Option<SecondaryGroupHandle>.None
+  }
+}
+
+/// Runs a Document-group (JS realm + `UiTree`) client until close or check completion.
+pub effect fn runDocumentWindow<H: WindowClient<S, E, R>, S, E, ? R>(
+  state: &mut S,
+  collection: &FontCollection,
+  resources: List<Mutation>,
+  options: RunOptions,
+  inspector: Inspector,
+  content: &mut H,
+) -> i32
+  ! E | WindowError | GpuError | TreeError | AtlasError | GeometryError | OutOfMemoryError
+  ? R | &mut Allocator {
+  let mut none = NoCompanion {}
+  return run runDocumentWindowWith<H, NoCompanion, S, E, R>(
+    &mut state,
+    collection,
+    move resources,
+    move options,
+    move inspector,
+    &mut content,
+    &mut none,
+  )
+}
+
+/// [`runDocumentWindow`] with a `companion` beside the client.
+pub effect fn runDocumentWindowWith<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
+  state: &mut S,
+  collection: &FontCollection,
+  resources: List<Mutation>,
+  options: RunOptions,
+  inspector: Inspector,
+  content: &mut H,
+  companion: &mut K,
+) -> i32
+  ! E | WindowError | GpuError | TreeError | AtlasError | GeometryError | OutOfMemoryError
+  ? R | &mut Allocator {
+  return run runWindowForGroup<H, K, S, E, R>(
+    &mut state,
+    collection,
+    move resources,
+    move options,
+    move inspector,
+    &mut content,
+    &mut companion,
+    GroupKind.Document,
+  )
+}
+
+/// Runs an Engine-group (retained Loom `UiTree`) client until close or check completion.
+pub effect fn runEngineWindow<H: WindowClient<S, E, R>, S, E, ? R>(
+  state: &mut S,
+  collection: &FontCollection,
+  resources: List<Mutation>,
+  options: RunOptions,
+  inspector: Inspector,
+  content: &mut H,
+) -> i32
+  ! E | WindowError | GpuError | TreeError | AtlasError | GeometryError | OutOfMemoryError
+  ? R | &mut Allocator {
+  let mut none = NoCompanion {}
+  return run runEngineWindowWith<H, NoCompanion, S, E, R>(
+    &mut state,
+    collection,
+    move resources,
+    move options,
+    move inspector,
+    &mut content,
+    &mut none,
+  )
+}
+
+/// [`runEngineWindow`] with a `companion` beside the client.
+pub effect fn runEngineWindowWith<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
+  state: &mut S,
+  collection: &FontCollection,
+  resources: List<Mutation>,
+  options: RunOptions,
+  inspector: Inspector,
+  content: &mut H,
+  companion: &mut K,
+) -> i32
+  ! E | WindowError | GpuError | TreeError | AtlasError | GeometryError | OutOfMemoryError
+  ? R | &mut Allocator {
+  return run runWindowForGroup<H, K, S, E, R>(
+    &mut state,
+    collection,
+    move resources,
+    move options,
+    move inspector,
+    &mut content,
+    &mut companion,
+    GroupKind.Engine,
+  )
+}

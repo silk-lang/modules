@@ -211,6 +211,73 @@
     });
   }
 
+  // Asynchronous image decode and PNG encode on `AppPool`, with synchronous fallback when the
+  // host runs without a shared worker pool.
+  const codecCalls = new Map();
+  let nextCodecCall = 0;
+  const byteView = (value) => (value instanceof ArrayBuffer ? new Uint8Array(value) : value);
+  native.codecDone = function (call, ok, width, height, byteLength, errorText) {
+    const pending = codecCalls.get(call);
+    if (!pending) return;
+    codecCalls.delete(call);
+    if (!ok) {
+      pending.reject(new Error(errorText || "Codec operation failed"));
+      return;
+    }
+    const bytes = new Uint8Array(byteLength);
+    if (byteLength > 0 && native.codecTake) native.codecTake(bytes);
+    if (pending.kind === "decode") {
+      pending.resolve({ width, height, data: new Uint8ClampedArray(bytes.buffer, bytes.byteOffset, bytes.byteLength) });
+    } else {
+      pending.resolve(bytes);
+    }
+  };
+  native.imageDecodeAsync = function (bytes) {
+    const view = byteView(bytes);
+    if (!view || typeof view.byteLength !== "number") {
+      return Promise.reject(new TypeError("imageDecodeAsync requires typed array bytes"));
+    }
+    if (native.imageDecodeStart) {
+      const call = ++nextCodecCall;
+      const entry = { kind: "decode", resolve: null, reject: null };
+      const promise = new Promise((resolve, reject) => {
+        entry.resolve = resolve;
+        entry.reject = reject;
+      });
+      codecCalls.set(call, entry);
+      if (native.imageDecodeStart(call, view) === 1) return promise;
+      codecCalls.delete(call);
+    }
+    if (!native.imageDecode || native.imageDecode(view) !== 2) {
+      return Promise.reject(new Error("The source image could not be decoded."));
+    }
+    const width = native.geometry(0);
+    const height = native.geometry(1);
+    const data = new Uint8ClampedArray(width * height * 4);
+    native.imageTake(data);
+    return Promise.resolve({ width, height, data });
+  };
+  native.pngEncodeAsync = function (width, height, rgba) {
+    const view = byteView(rgba);
+    if (native.pngEncodeStart) {
+      const call = ++nextCodecCall;
+      const entry = { kind: "encode", resolve: null, reject: null };
+      const promise = new Promise((resolve, reject) => {
+        entry.resolve = resolve;
+        entry.reject = reject;
+      });
+      codecCalls.set(call, entry);
+      if (native.pngEncodeStart(call, width, height, view) === 1) return promise;
+      codecCalls.delete(call);
+    }
+    if (!native.pngEncode || !native.pngTake) return Promise.resolve(null);
+    const len = native.pngEncode(width, height, view);
+    if (!len || len <= 0) return Promise.resolve(null);
+    const bytes = new Uint8Array(len);
+    native.pngTake(bytes);
+    return Promise.resolve(bytes);
+  };
+
   // As `window.open` in a browser, for an address outside the application: the host opens
   // it with the system's browser or mail program. Only http, https and mailto addresses go.
   globalThis.open = (url) => {

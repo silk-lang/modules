@@ -1,0 +1,797 @@
+//! Parallel HarfRust shaping pre-pass (`preShapeTree`) on `EnginePool`: gathers
+//! unique inline text segments in deterministic DFS order, itemizes and prepares
+//! HarfRust plans serially, shapes unique segments read-only across workers, and
+//! inserts results serially into `FontState`'s shaping cache before `Engine.compute`.
+import engine { UiTree }
+import layout_table { NO_NODE }
+import provider { nowNs }
+import ui_text.fonts { FontState, PreparedShapeJob, ShapeWorkerScratch, RawGlyph }
+import ui_text.shaping
+import ui_transport.pool { WorkPoolHandle }
+import layout.lib {
+  Style as CssStyle,
+  DisplayOutside,
+  DisplayInside,
+  Dimension,
+  DimensionKind,
+  VerticalAlignKind,
+  WhiteSpaceCollapse,
+  WritingMode,
+  TextOrientation,
+  Direction,
+  Float,
+  Position,
+}
+import silk.collections.hash { Hash, Word }
+import silk.collections.hash_map { HashMap }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.concurrency.sync { Arc, Mutex }
+import silk.concurrency.thread { Concurrent, Transferable }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.core.result { Result }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.mem.pointer { Pointer }
+import silk.num.u8
+import silk.num.u32
+import silk.num.usize
+import silk.text.string { String }
+import silk.text.unicode_properties { BidiClass }
+import silk.text.utf8_scan
+
+const PARALLEL_SHAPE_MIN: usize = 16
+
+struct ShapeChunk {
+  start: usize,
+  len: usize,
+}
+
+impl Copy for ShapeChunk {}
+
+struct ShapedJobOut {
+  jobIndex: usize,
+  glyphStart: usize,
+  glyphLen: usize,
+  leans: bool,
+}
+
+impl Copy for ShapedJobOut {}
+
+struct ShapeChunkOut {
+  glyphs: List<RawGlyph>,
+  entries: List<ShapedJobOut>,
+}
+
+struct ShapeBatch {
+  fontsPtr: *const u8,
+  textBuf: List<u8>,
+  jobs: List<PreparedShapeJob>,
+  chunks: List<ShapeChunk>,
+  outputs: Mutex<List<ShapeChunkOut>>,
+}
+
+impl Transferable for ShapeBatch {}
+impl Concurrent for ShapeBatch {}
+
+fn runShapeChunk(batch: &ShapeBatch, chunkIdx: usize) -> () {
+  let mut heap = Allocator.systemAllocatorProvider()
+  let anchor = ()
+  let fonts = unsafe Pointer.borrow<(), FontState<'static>>(
+    &anchor,
+    unsafe Intrinsic.pointerReinterpret<*const u8, *const FontState<'static>>(batch.fontsPtr),
+  )
+  let chunk = batch.chunks.asSlice()[chunkIdx]
+  let jobSlice = batch.jobs.asSlice()
+  let textBytes = batch.textBuf.asSlice()
+  let mut scratch = ShapeWorkerScratch.make()
+  let mut glyphs = List<RawGlyph>.make()
+  let mut entries = List<ShapedJobOut>.make()
+  let end = chunk.start + chunk.len
+  let mut i = chunk.start
+  let mut ok = true
+  while i < end {
+    let glyphStart = glyphs.length()
+    let shaped = run Effect.result(
+      fonts.shapePreparedReadOnly(jobSlice[i], textBytes, &mut scratch, &mut glyphs),
+    )
+      |> Effect.provideMut<Allocator>(&mut heap)
+    match move shaped {
+      Result.Success { value: leans } => {
+        let appended = run Effect.result(
+          entries.append(
+            ShapedJobOut {
+              jobIndex: i,
+              glyphStart: glyphStart,
+              glyphLen: glyphs.length() - glyphStart,
+              leans: leans,
+            },
+          ),
+        )
+          |> Effect.provideMut<Allocator>(&mut heap)
+        if let Result.Failure { error: _ } = move appended {
+          ok = false
+          break
+        }
+      }
+      Result.Failure { error: _ } => {
+        ok = false
+        break
+      }
+    }
+    i = i + 1
+  }
+  if ok && entries.length() != 0 {
+    let mut guard = batch.outputs.lock()
+    let slice = guard.getMut().asMutSlice()
+    slice[chunkIdx] = ShapeChunkOut { glyphs: move glyphs, entries: move entries }
+    drop guard
+  }
+}
+
+fn dimNonZero(d: Dimension) -> bool {
+  if d.kind == DimensionKind.Length {
+    return d.value != 0.0
+  }
+  if d.kind == DimensionKind.Percent {
+    return d.percent != 0.0
+  }
+  return d.kind == DimensionKind.Calc
+}
+
+fn isInlineFlow(style: &CssStyle) -> bool {
+  return style.display.outsideIs(DisplayOutside.Inline)
+    && style.display.insideIs(DisplayInside.Flow)
+    && !style.replaced
+    && style.float == Float.None
+    && style.position != Position.Absolute
+    && style.position != Position.Fixed
+}
+
+fn isShapingBarrier(style: &CssStyle) -> bool {
+  return style.verticalAlign.kind != VerticalAlignKind.Baseline
+    || dimNonZero(style.padding.left)
+    || dimNonZero(style.padding.right)
+    || dimNonZero(style.border.left)
+    || dimNonZero(style.border.right)
+    || dimNonZero(style.margin.left)
+    || dimNonZero(style.margin.right)
+}
+
+fn isFlexOrGrid(style: &CssStyle) -> bool {
+  return style.display.insideIs(DisplayInside.Flex) || style.display.isGrid()
+}
+
+fn isWhitespaceByte(byte: u8) -> bool {
+  return byte == 9 || byte == 10 || byte == 13 || byte == 32
+}
+
+fn hasNonAsciiByte(bytes: &[u8]) -> bool {
+  let mut i: usize = 0
+  while i < bytes.length {
+    if bytes[i] >= 128 {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+fn segmentHasOnlyStrongRtl(text: string) -> bool {
+  let bytes = String.utf8Bytes(text)
+  let mut hasRtl = false
+  let mut at: usize = 0
+  while at < bytes.length {
+    let decoded = utf8_scan.decode(bytes, at)
+    let cls = BidiClass.of(decoded.scalar)
+    if cls == BidiClass.L {
+      return false
+    }
+    if cls == BidiClass.R || cls == BidiClass.AL {
+      hasRtl = true
+    }
+    at = decoded.next
+  }
+  return hasRtl
+}
+
+struct InlineFrame {
+  node: usize,
+  exitBarrier: bool,
+}
+
+impl Copy for InlineFrame {}
+
+struct TextAttrs {
+  fontKey: usize,
+  rtl: bool,
+  mode: WritingMode,
+  orientation: TextOrientation,
+  collapse: WhiteSpaceCollapse,
+}
+
+impl Copy for TextAttrs {}
+
+fn sameSegAttrs(a: TextAttrs, b: TextAttrs) -> bool {
+  return a.fontKey == b.fontKey
+    && a.rtl == b.rtl
+    && a.mode == b.mode
+    && a.orientation == b.orientation
+}
+
+struct InlineSegState {
+  segBuf: String,
+  segActive: bool,
+  segAttrs: TextAttrs,
+  segNonAscii: bool,
+  hasBlockContent: bool,
+  hasPendingSpace: bool,
+  spaceAttrs: TextAttrs,
+}
+
+impl InlineSegState {
+  fn make() -> InlineSegState {
+    let empty = TextAttrs {
+      fontKey: usize.MAX,
+      rtl: false,
+      mode: WritingMode.HorizontalTb,
+      orientation: TextOrientation.Mixed,
+      collapse: WhiteSpaceCollapse.Collapse,
+    }
+    return InlineSegState {
+      segBuf: String.make(),
+      segActive: false,
+      segAttrs: empty,
+      segNonAscii: false,
+      hasBlockContent: false,
+      hasPendingSpace: false,
+      spaceAttrs: empty,
+    }
+  }
+
+  fn resetForContainer(self: &mut Self) -> () {
+    self.segBuf.clear()
+    self.segActive = false
+    self.segNonAscii = false
+    self.hasBlockContent = false
+    self.hasPendingSpace = false
+  }
+}
+
+effect fn flushSegment<'a>(
+  st: &mut InlineSegState,
+  tree: &mut UiTree<'a>,
+  textBuf: &mut List<u8>,
+  seen: &mut HashMap<Word, u32>,
+  jobs: &mut List<PreparedShapeJob>,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if !st.segActive || String.byteLength(st.segBuf.view()) == 0 {
+    st.segBuf.clear()
+    st.segActive = false
+    st.segNonAscii = false
+    return
+  }
+  let mut rtl = st.segAttrs.rtl
+  if !rtl && st.segNonAscii && segmentHasOnlyStrongRtl(st.segBuf.view()) {
+    rtl = true
+  }
+  run shaping.collectShapeJobs(
+    &mut tree.provider.text.shaping,
+    &mut tree.provider.text.fonts,
+    st.segAttrs.fontKey,
+    st.segBuf.view(),
+    rtl,
+    st.segAttrs.mode,
+    st.segAttrs.orientation,
+    &mut textBuf,
+    &mut seen,
+    &mut jobs,
+  )
+  st.segBuf.clear()
+  st.segActive = false
+  st.segNonAscii = false
+}
+
+effect fn emitPendingSpace<'a>(
+  st: &mut InlineSegState,
+  tree: &mut UiTree<'a>,
+  textBuf: &mut List<u8>,
+  seen: &mut HashMap<Word, u32>,
+  jobs: &mut List<PreparedShapeJob>,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if !st.hasPendingSpace {
+    return
+  }
+  if st.segActive && !sameSegAttrs(st.segAttrs, st.spaceAttrs) {
+    run flushSegment(&mut st, &mut tree, &mut textBuf, &mut seen, &mut jobs)
+  }
+  if !st.segActive {
+    st.segActive = true
+    st.segAttrs = st.spaceAttrs
+    st.segNonAscii = false
+  }
+  run st.segBuf.append(" ")
+  st.hasPendingSpace = false
+}
+
+effect fn appendRawRun<'a>(
+  st: &mut InlineSegState,
+  attrs: TextAttrs,
+  part: string,
+  tree: &mut UiTree<'a>,
+  textBuf: &mut List<u8>,
+  seen: &mut HashMap<Word, u32>,
+  jobs: &mut List<PreparedShapeJob>,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run emitPendingSpace(&mut st, &mut tree, &mut textBuf, &mut seen, &mut jobs)
+  if st.segActive && !sameSegAttrs(st.segAttrs, attrs) {
+    run flushSegment(&mut st, &mut tree, &mut textBuf, &mut seen, &mut jobs)
+  }
+  if !st.segActive {
+    st.segActive = true
+    st.segAttrs = attrs
+    st.segNonAscii = false
+  }
+  if !st.segNonAscii && hasNonAsciiByte(String.utf8Bytes(part)) {
+    st.segNonAscii = true
+  }
+  run st.segBuf.append(part)
+  st.hasBlockContent = true
+}
+
+effect fn feedNormalizedText<'a>(
+  st: &mut InlineSegState,
+  attrs: TextAttrs,
+  raw: &String,
+  tree: &mut UiTree<'a>,
+  textBuf: &mut List<u8>,
+  seen: &mut HashMap<Word, u32>,
+  jobs: &mut List<PreparedShapeJob>,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let textView = raw.view()
+  let bytes = String.utf8Bytes(textView)
+  let collapse = attrs.collapse
+  let collapses = collapse == WhiteSpaceCollapse.Collapse || collapse == WhiteSpaceCollapse.PreserveBreaks
+  let mut at: usize = 0
+  while at < bytes.length {
+    if isWhitespaceByte(bytes[at]) {
+      let newline = bytes[at] == 10
+      let isTab = bytes[at] == 9
+      if collapse == WhiteSpaceCollapse.Discard {
+        at = at + 1
+        continue
+      }
+      if newline && collapse == WhiteSpaceCollapse.PreserveBreaks {
+        st.hasPendingSpace = false
+        st.hasBlockContent = false
+        run flushSegment(&mut st, &mut tree, &mut textBuf, &mut seen, &mut jobs)
+        at = at + 1
+        continue
+      }
+      if collapses {
+        if st.hasBlockContent {
+          st.hasPendingSpace = true
+          st.spaceAttrs = attrs
+        }
+        at = at + 1
+        continue
+      }
+      let preservedBreak = newline && collapse != WhiteSpaceCollapse.PreserveSpaces
+      let preservedTab = isTab && collapse != WhiteSpaceCollapse.PreserveSpaces
+      if preservedBreak || preservedTab {
+        st.hasPendingSpace = false
+        st.hasBlockContent = true
+        run flushSegment(&mut st, &mut tree, &mut textBuf, &mut seen, &mut jobs)
+        at = at + 1
+        continue
+      }
+      let start = at
+      at = at + 1
+      while at < bytes.length && isWhitespaceByte(bytes[at])
+        && !((bytes[at] == 10 || bytes[at] == 9) && collapse != WhiteSpaceCollapse.PreserveSpaces) {
+        at = at + 1
+      }
+      let part = String.slice(textView, start, at - start)
+      run appendRawRun(&mut st, attrs, part, &mut tree, &mut textBuf, &mut seen, &mut jobs)
+    } else {
+      let start = at
+      at = at + 1
+      while at < bytes.length && !isWhitespaceByte(bytes[at]) {
+        at = at + 1
+      }
+      let part = String.slice(textView, start, at - start)
+      run appendRawRun(&mut st, attrs, part, &mut tree, &mut textBuf, &mut seen, &mut jobs)
+    }
+  }
+}
+
+effect fn pushChildrenReversed(
+  tree: &UiTree<'_>,
+  parent: usize,
+  stack: &mut List<InlineFrame>,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let first = stack.length()
+  let mut child = tree.layout.firstChild(parent)
+  while child != NO_NODE {
+    run stack.append(InlineFrame { node: child, exitBarrier: false })
+    child = tree.layout.nextSibling(child)
+  }
+  let items = stack.asMutSlice()
+  let mut a = first
+  let mut b = items.length
+  while b > a + 1 {
+    b = b - 1
+    let swap = items[a]
+    items[a] = items[b]
+    items[b] = swap
+    a = a + 1
+  }
+}
+
+effect fn collectContainerJobs<'a>(
+  tree: &mut UiTree<'a>,
+  container: usize,
+  fullWalk: bool,
+  blockStack: &mut List<usize>,
+  inlineStack: &mut List<InlineFrame>,
+  st: &mut InlineSegState,
+  rawScratch: &mut String,
+  textBuf: &mut List<u8>,
+  seen: &mut HashMap<Word, u32>,
+  jobs: &mut List<PreparedShapeJob>,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let containerInFlexOrGrid = isFlexOrGrid(tree.layout.seenStyle(container))
+  st.resetForContainer()
+  inlineStack.clear()
+  run pushChildrenReversed(&tree.*, container, &mut inlineStack)
+  while inlineStack.length() != 0 {
+    let top = inlineStack.length() - 1
+    let frame = inlineStack.get(top)
+    inlineStack.truncate(top)
+    if frame.exitBarrier {
+      run flushSegment(&mut st, &mut tree, &mut textBuf, &mut seen, &mut jobs)
+      continue
+    }
+    let node = frame.node
+    if tree.layout.isText(node) {
+      let tStyle = tree.layout.seenStyle(node)
+      let attrs = TextAttrs {
+        fontKey: tStyle.fontKey,
+        rtl: tStyle.usedDirection() == Direction.Rtl,
+        mode: tStyle.writingMode,
+        orientation: tStyle.textOrientation,
+        collapse: tStyle.whiteSpaceCollapse,
+      }
+      rawScratch.clear()
+      if let Option<string<'_>>.Some { value } = tree.layout.textIn(
+        node,
+        tree.nodes.asSlice(),
+        tree.slotOfCss.asSlice(),
+      ) {
+        let len = String.byteLength(value)
+        let start = tree.layout.textStart(node)
+        if start < len {
+          run rawScratch.append(String.slice(value, start, len - start))
+        }
+      }
+      if String.byteLength(rawScratch.view()) != 0 {
+        run feedNormalizedText(&mut st, attrs, &rawScratch.*, &mut tree, &mut textBuf, &mut seen, &mut jobs)
+      }
+      continue
+    }
+    let cStyle = tree.layout.seenStyle(node)
+    if cStyle.display.isNone() || tree.layout.skipped(node) {
+      continue
+    }
+    if cStyle.display.isContents() {
+      run pushChildrenReversed(&tree.*, node, &mut inlineStack)
+      continue
+    }
+    if !containerInFlexOrGrid && isInlineFlow(cStyle) {
+      let barrier = isShapingBarrier(cStyle)
+      if barrier {
+        run flushSegment(&mut st, &mut tree, &mut textBuf, &mut seen, &mut jobs)
+        run inlineStack.append(InlineFrame { node: NO_NODE, exitBarrier: true })
+      }
+      run pushChildrenReversed(&tree.*, node, &mut inlineStack)
+      continue
+    }
+    let isAtomicInline = !containerInFlexOrGrid
+      && cStyle.display.outsideIs(DisplayOutside.Inline)
+      && cStyle.float == Float.None
+      && cStyle.position != Position.Absolute
+      && cStyle.position != Position.Fixed
+    if isAtomicInline {
+      run emitPendingSpace(&mut st, &mut tree, &mut textBuf, &mut seen, &mut jobs)
+      st.hasBlockContent = true
+    } else {
+      st.hasPendingSpace = false
+      st.hasBlockContent = false
+    }
+    run flushSegment(&mut st, &mut tree, &mut textBuf, &mut seen, &mut jobs)
+    if fullWalk && tree.layout.firstChild(node) != NO_NODE {
+      run blockStack.append(node)
+    }
+  }
+  st.hasPendingSpace = false
+  run flushSegment(&mut st, &mut tree, &mut textBuf, &mut seen, &mut jobs)
+}
+
+fn ancestorChainVisible(tree: &UiTree<'_>, start: usize) -> bool {
+  let mut cur = start
+  while cur != NO_NODE {
+    if !tree.layout.exists(cur) {
+      return false
+    }
+    let s = tree.layout.seenStyle(cur)
+    if s.display.isNone() {
+      return false
+    }
+    let parent = tree.layout.parent(cur)
+    if cur != start && tree.layout.skipped(cur) {
+      return false
+    }
+    if parent != NO_NODE && tree.layout.skipped(parent) {
+      return false
+    }
+    cur = parent
+  }
+  return true
+}
+
+fn enclosingContainer(tree: &UiTree<'_>, node: usize) -> usize {
+  let mut cur = node
+  if tree.layout.isText(cur) {
+    cur = tree.layout.parent(cur)
+  }
+  while cur != NO_NODE {
+    let style = tree.layout.seenStyle(cur)
+    let parent = tree.layout.parent(cur)
+    let parentFlexGrid = parent != NO_NODE && isFlexOrGrid(tree.layout.seenStyle(parent))
+    if !style.display.isContents() && (!isInlineFlow(style) || parentFlexGrid) {
+      return cur
+    }
+    if parent == NO_NODE {
+      return cur
+    }
+    cur = parent
+  }
+  return NO_NODE
+}
+
+effect fn buildBalancedChunks(
+  jobs: &[PreparedShapeJob],
+  workers: usize,
+  chunks: &mut List<ShapeChunk>,
+  outputs: &mut List<ShapeChunkOut>,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut totalWeight: usize = 0
+  let mut i: usize = 0
+  while i < jobs.length {
+    totalWeight = totalWeight + (jobs[i].end - jobs[i].start) + 16
+    i = i + 1
+  }
+  let desired = workers * 4
+  let mut target = (totalWeight + desired - 1) / desired
+  if target < 1 {
+    target = 1
+  }
+  let mut start: usize = 0
+  while start < jobs.length {
+    let mut weight: usize = 0
+    let mut count: usize = 0
+    while start + count < jobs.length {
+      weight = weight + (jobs[start + count].end - jobs[start + count].start) + 16
+      count = count + 1
+      if count >= 4 && weight >= target {
+        break
+      }
+    }
+    run chunks.append(ShapeChunk { start: start, len: count })
+    run outputs.append(ShapeChunkOut { glyphs: List<RawGlyph>.make(), entries: List<ShapedJobOut>.make() })
+    start = start + count
+  }
+}
+
+/// Pre-shapes uncached inline text segments in parallel across `EnginePool` before
+/// `Engine.compute` runs, so subsequent shaping calls hit `FontState`'s cache with
+/// deterministic single-threaded segment ordering.
+pub effect fn preShapeTree<'a>(tree: &mut UiTree<'a>, sinceRevision: usize) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let pool = match &tree.enginePool {
+    Option<WorkPoolHandle>.Some { value } => value.clone()
+    Option<WorkPoolHandle>.None => { return () }
+  }
+  let t0 = nowNs()
+  let mut textBuf = List<u8>.make()
+  let mut seen = HashMap<Word, u32>.make(tree.seed)
+  let mut jobs = List<PreparedShapeJob>.make()
+  let mut blockStack = List<usize>.make()
+  let mut inlineStack = List<InlineFrame>.make()
+  let mut st = InlineSegState.make()
+  let mut rawScratch = String.make()
+
+  let mut usedIncremental = false
+  if sinceRevision != usize.MAX && sinceRevision > 0 {
+    let mut dirty = List<usize>.make()
+    if run tree.layout.changes.changedNodes(sinceRevision, &mut dirty) {
+      usedIncremental = true
+      if dirty.length() != 0 {
+        let mut seenContainers = HashMap<Word, u8>.make(tree.seed)
+        let mut i: usize = 0
+        while i < dirty.length() {
+          let node = dirty.get(i)
+          if tree.layout.exists(node) && ancestorChainVisible(&tree.*, node) {
+            let container = enclosingContainer(&tree.*, node)
+            if container != NO_NODE {
+              let word = Hash.word(usize.toU64(container))
+              if seenContainers.get(word).isNone() {
+                drop run seenContainers.insert(word, 1)
+                run blockStack.append(container)
+              }
+            }
+          }
+          i = i + 1
+        }
+        i = 0
+        while i < blockStack.length() {
+          let c = blockStack.get(i)
+          let mut dummy = List<usize>.make()
+          run collectContainerJobs(
+            &mut tree,
+            c,
+            false,
+            &mut dummy,
+            &mut inlineStack,
+            &mut st,
+            &mut rawScratch,
+            &mut textBuf,
+            &mut seen,
+            &mut jobs,
+          )
+          i = i + 1
+        }
+      }
+    }
+  }
+  if !usedIncremental {
+    let rootCss = tree.layout.root().index
+    if tree.layout.exists(rootCss) && !tree.layout.seenStyle(rootCss).display.isNone()
+      && !tree.layout.skipped(rootCss) {
+      run blockStack.append(rootCss)
+      while blockStack.length() != 0 {
+        let last = blockStack.length() - 1
+        let container = blockStack.get(last)
+        blockStack.truncate(last)
+        run collectContainerJobs(
+          &mut tree,
+          container,
+          true,
+          &mut blockStack,
+          &mut inlineStack,
+          &mut st,
+          &mut rawScratch,
+          &mut textBuf,
+          &mut seen,
+          &mut jobs,
+        )
+      }
+    }
+  }
+
+  if jobs.length() < PARALLEL_SHAPE_MIN {
+    let t1 = nowNs()
+    if t1 > t0 {
+      tree.stats.preShapeNs = tree.stats.preShapeNs + (t1 - t0)
+    }
+    return ()
+  }
+
+  let workers = if pool.workerCount() == 0 { 1 } else { pool.workerCount() }
+  let mut chunks = List<ShapeChunk>.make()
+  let mut outputs = List<ShapeChunkOut>.make()
+  run buildBalancedChunks(jobs.asSlice(), workers, &mut chunks, &mut outputs)
+  let chunkCount = chunks.length()
+  let batch = run Arc<ShapeBatch>.make(
+    ShapeBatch {
+      fontsPtr: unsafe Intrinsic.pointerReinterpret<*const FontState<'a>, *const u8>(
+        Pointer.fromRef(&tree.provider.text.fonts),
+      ),
+      textBuf: move textBuf,
+      jobs: move jobs,
+      chunks: move chunks,
+      outputs: run Mutex<List<ShapeChunkOut>>.make(move outputs),
+    },
+  )
+  run pool.runParallel(tree.engineGroupId, chunkCount, batch.clone(), runShapeChunk)
+
+  let mut guard = batch.get().outputs.lock()
+  let taken = Intrinsic.replace(guard.getMut().*, List<ShapeChunkOut>.make())
+  drop guard
+
+  let textBytes = batch.get().textBuf.asSlice()
+  let jobSlice = batch.get().jobs.asSlice()
+  let results = taken.asSlice()
+  let mut c: usize = 0
+  while c < results.length {
+    let chunkOut = &results[c]
+    let glyphSlice = chunkOut.glyphs.asSlice()
+    let entries = chunkOut.entries.asSlice()
+    let mut k: usize = 0
+    while k < entries.length {
+      let item = entries[k]
+      let job = jobSlice[item.jobIndex]
+      run tree.provider.text.fonts.insertPreparedShape(
+        job,
+        Slice.view(textBytes, job.textOffset, job.textLen),
+        Slice.view(glyphSlice, item.glyphStart, item.glyphLen),
+        item.leans,
+      )
+      tree.stats.parallelShaped = tree.stats.parallelShaped + 1
+      k = k + 1
+    }
+    c = c + 1
+  }
+  drop taken
+
+  let t1 = nowNs()
+  if t1 > t0 {
+    tree.stats.preShapeNs = tree.stats.preShapeNs + (t1 - t0)
+  }
+}
+
+/// Returns `true` when any live container holds at least 16 non-text parallel-eligible items
+/// so parallel subtree layout runs directly without a serial `preShapeTree` walk first.
+pub effect fn hasWideParallelContainer(tree: &UiTree<'_>) -> bool
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let root = tree.layout.root().index
+  if !tree.layout.exists(root) { return false }
+  let rootStyle = tree.layout.seenStyle(root)
+  if rootStyle.display.isNone() || tree.layout.skipped(root) { return false }
+  let mut stack = List<usize>.make()
+  run stack.append(root)
+  while stack.length() != 0 {
+    let top = stack.length() - 1
+    let parent = stack.get(top)
+    stack.truncate(top)
+    let pStyle = tree.layout.seenStyle(parent)
+    let flexGrid = isFlexOrGrid(pStyle)
+    let mut eligible: usize = 0
+    let mut child = tree.layout.firstChild(parent)
+    while child != NO_NODE {
+      if tree.layout.exists(child) && !tree.layout.isText(child) {
+        let cStyle = tree.layout.seenStyle(child)
+        if !cStyle.display.isNone() && !tree.layout.skipped(child) {
+          let absPos = cStyle.position == Position.Absolute
+          let blockLevel = !cStyle.display.outsideIs(DisplayOutside.Inline) && cStyle.float == Float.None
+          if flexGrid || absPos || blockLevel {
+            eligible = eligible + 1
+            if eligible >= 16 { return true }
+          }
+          if tree.layout.firstChild(child) != NO_NODE {
+            run stack.append(child)
+          }
+        }
+      }
+      child = tree.layout.nextSibling(child)
+    }
+  }
+  return false
+}

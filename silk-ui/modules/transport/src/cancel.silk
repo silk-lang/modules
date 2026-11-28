@@ -1,0 +1,242 @@
+//! Lock-free three-state cancellation token for cross-thread and pooled tasks.
+//!
+//! States: `Active` -> `Requested` -> `Observed` -> `Finished` (or `Active` -> `Finished` when the
+//! task completes without cancellation). Pool workers check [`CancellationToken.check`] at
+//! checkpoints; non-checking compute runs to completion and marks [`CancellationToken.finish`] when
+//! returning.
+import silk.concurrency.atomic { Atomic, CompareExchange, MemoryOrder }
+import silk.concurrency.sync { Arc }
+import silk.concurrency.thread { Concurrent, Transferable }
+import silk.core.effect { Effect }
+import silk.core.ownership { Drop }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.mem.box { Box }
+import silk.mem.pointer { Pointer }
+import silk.num.u32
+
+const BIT_REQUESTED: u32 = 1
+const BIT_OBSERVED: u32 = 2
+const BIT_FINISHED: u32 = 4
+
+/// The lifecycle state of a [`CancellationToken`].
+pub enum CancellationState {
+  /// Running normally with no cancellation requested.
+  Active,
+  /// Owner requested cancellation; the task has not reached a checkpoint yet.
+  Requested,
+  /// The task observed cancellation at a checkpoint and is unwinding or skipping work.
+  Observed,
+  /// The task has exited (either normally or after observing cancellation).
+  Finished,
+}
+
+struct CancelCell {
+  storage: Box<u32>,
+  word: *mut u32,
+}
+
+impl Transferable for CancelCell {}
+impl Concurrent for CancelCell {}
+
+fn atomicSetBit(word: *mut u32, bit: u32) -> u32 {
+  let mut cur = unsafe Atomic.load<u32>(word, MemoryOrder.Acquire)
+  while true {
+    let next = u32.bitOr(cur, bit)
+    if next == cur {
+      return cur
+    }
+    match unsafe Atomic.compareExchange<u32>(
+      word,
+      cur,
+      next,
+      MemoryOrder.AcquireRelease,
+      MemoryOrder.Acquire,
+    ) {
+      CompareExchange<u32>.Exchanged => {
+        return cur
+      }
+      CompareExchange<u32>.Observed { value } => {
+        cur = value
+      }
+    }
+  }
+  return cur
+}
+
+/// Lock-free cooperative cancellation token shared across threads, backed by the system allocator.
+pub struct CancellationToken {
+  cell: Arc<CancelCell>,
+}
+
+impl Transferable for CancellationToken {}
+impl Concurrent for CancellationToken {}
+
+impl CancellationToken {
+  /// Creates a new active cancellation token.
+  pub effect fn make() -> CancellationToken
+    ! OutOfMemoryError {
+    let mut heap = Allocator.systemAllocatorProvider()
+    let mut storage = run Box<u32>.make(0) |> Effect.provideMut<Allocator>(&mut heap)
+    let slot = storage.getMut()
+    let word = Pointer.fromMutRef(&mut slot[0])
+    drop slot
+    let cell = run Arc<CancelCell>.make(CancelCell { storage: move storage, word: word })
+      |> Effect.provideMut<Allocator>(&mut heap)
+    return CancellationToken { cell: move cell }
+  }
+
+  /// Returns another handle to the same cancellation token.
+  pub fn clone(self: &Self) -> CancellationToken {
+    return CancellationToken { cell: self.cell.clone() }
+  }
+
+  /// Marks cancellation as requested. Non-blocking and idempotent.
+  pub fn request(self: &Self) -> () {
+    drop atomicSetBit(self.cell.get().word, BIT_REQUESTED)
+  }
+
+  /// Returns whether cancellation has been requested.
+  pub fn isRequested(self: &Self) -> bool {
+    let bits = unsafe Atomic.load<u32>(self.cell.get().word, MemoryOrder.Acquire)
+    return u32.bitAnd(bits, BIT_REQUESTED) != 0
+  }
+
+  /// Returns whether a task has observed cancellation at a checkpoint.
+  pub fn isObserved(self: &Self) -> bool {
+    let bits = unsafe Atomic.load<u32>(self.cell.get().word, MemoryOrder.Acquire)
+    return u32.bitAnd(bits, BIT_OBSERVED) != 0
+  }
+
+  /// Returns whether the task has finished execution.
+  pub fn isFinished(self: &Self) -> bool {
+    let bits = unsafe Atomic.load<u32>(self.cell.get().word, MemoryOrder.Acquire)
+    return u32.bitAnd(bits, BIT_FINISHED) != 0
+  }
+
+  /// Checkpoint polled by tasks. Returns `true` if cancellation was requested (transitioning the
+  /// token to `Observed`), or `false` if still active.
+  pub fn check(self: &Self) -> bool {
+    let word = self.cell.get().word
+    let bits = unsafe Atomic.load<u32>(word, MemoryOrder.Acquire)
+    if u32.bitAnd(bits, BIT_REQUESTED) == 0 {
+      return false
+    }
+    if u32.bitAnd(bits, BIT_OBSERVED) == 0 {
+      drop atomicSetBit(word, BIT_OBSERVED)
+    }
+    return true
+  }
+
+  /// Marks the task as finished. Idempotent; safe to call from `Drop` guards.
+  pub fn finish(self: &Self) -> () {
+    drop atomicSetBit(self.cell.get().word, BIT_FINISHED)
+  }
+
+  /// Returns the current aggregate [`CancellationState`].
+  pub fn state(self: &Self) -> CancellationState {
+    let bits = unsafe Atomic.load<u32>(self.cell.get().word, MemoryOrder.Acquire)
+    if u32.bitAnd(bits, BIT_FINISHED) != 0 {
+      return CancellationState.Finished
+    }
+    if u32.bitAnd(bits, BIT_OBSERVED) != 0 {
+      return CancellationState.Observed
+    }
+    if u32.bitAnd(bits, BIT_REQUESTED) != 0 {
+      return CancellationState.Requested
+    }
+    return CancellationState.Active
+  }
+}
+
+/// Scope guard that marks a [`CancellationToken`] finished when dropped.
+pub struct CancelFinishGuard {
+  token: CancellationToken,
+}
+
+impl CancelFinishGuard {
+  /// Creates a guard that calls `token.finish()` on drop.
+  pub fn make(token: CancellationToken) -> CancelFinishGuard {
+    return CancelFinishGuard { token: move token }
+  }
+}
+
+impl Drop for CancelFinishGuard {
+  fn drop(self: &mut CancelFinishGuard) -> () {
+    self.token.finish()
+  }
+}
+
+/// Lock-free atomic binary flag shared across threads (e.g. out-of-band DevTools break requests).
+struct SignalCell {
+  storage: Box<u32>,
+  word: *mut u32,
+}
+
+impl Transferable for SignalCell {}
+impl Concurrent for SignalCell {}
+
+/// Cross-thread binary signal backed by the system allocator.
+pub struct AtomicSignal {
+  cell: Arc<SignalCell>,
+}
+
+impl Transferable for AtomicSignal {}
+impl Concurrent for AtomicSignal {}
+
+impl AtomicSignal {
+  /// Creates a cleared signal.
+  pub effect fn make() -> AtomicSignal
+    ! OutOfMemoryError {
+    let mut heap = Allocator.systemAllocatorProvider()
+    let mut storage = run Box<u32>.make(0) |> Effect.provideMut<Allocator>(&mut heap)
+    let slot = storage.getMut()
+    let word = Pointer.fromMutRef(&mut slot[0])
+    drop slot
+    let cell = run Arc<SignalCell>.make(SignalCell { storage: move storage, word: word })
+      |> Effect.provideMut<Allocator>(&mut heap)
+    return AtomicSignal { cell: move cell }
+  }
+
+  /// Returns another handle pointing to the same signal word.
+  pub fn clone(self: &Self) -> AtomicSignal {
+    return AtomicSignal { cell: self.cell.clone() }
+  }
+
+  /// Sets the signal bit without blocking.
+  pub fn raise(self: &Self) -> () {
+    unsafe Atomic.store<u32>(self.cell.get().word, 1, MemoryOrder.Release)
+  }
+
+  /// Clears the signal bit without blocking.
+  pub fn clear(self: &Self) -> () {
+    unsafe Atomic.store<u32>(self.cell.get().word, 0, MemoryOrder.Release)
+  }
+
+  /// Returns whether the signal bit is currently set.
+  pub fn isRaised(self: &Self) -> bool {
+    return unsafe Atomic.load<u32>(self.cell.get().word, MemoryOrder.Acquire) != 0
+  }
+
+  /// Atomically reads and clears the signal bit, returning true if it was raised.
+  pub fn take(self: &Self) -> bool {
+    let word = self.cell.get().word
+    let mut cur = unsafe Atomic.load<u32>(word, MemoryOrder.Acquire)
+    while cur != 0 {
+      match unsafe Atomic.compareExchange<u32>(
+        word,
+        cur,
+        0,
+        MemoryOrder.AcquireRelease,
+        MemoryOrder.Acquire,
+      ) {
+        CompareExchange<u32>.Exchanged => {
+          return true
+        }
+        CompareExchange<u32>.Observed { value } => {
+          cur = value
+        }
+      }
+    }
+    return false
+  }
+}

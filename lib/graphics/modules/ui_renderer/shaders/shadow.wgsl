@@ -12,9 +12,11 @@ struct Shadow {
   boxRadii: Radii,
   // Everything the shadow can touch.
   reach: vec4f,
-  // sigma, inset (1 or 0), the transform
+  // sigma, inset (1 or 0), the transform, cutout
   params: vec4f,
   maskRadii: Radii,
+  // x is the scroll group (a `Placement`).
+  extra: vec4f,
 }
 @group(0) @binding(1) var<storage, read> shadows: array<Shadow>;
 
@@ -22,7 +24,10 @@ struct Varying { @builtin(position) position: vec4f, @location(0) @interpolate(f
 
 @vertex fn vs(@builtin(vertex_index) v: u32, @builtin(instance_index) index: u32) -> Varying {
   let s = shadows[index];
-  let placed = place(s.reach, s.mask, u32(s.params.z), v);
+  let g = placements[u32(s.extra.x)];
+  let own = s.mask + g.offset.xyxy;
+  let clipRect = vec4f(max(own.xy, g.clip.xy), min(own.zw, g.clip.zw));
+  let placed = place(s.reach + g.offset.xyxy, clipRect, u32(s.params.z), v);
   return Varying(placed.position, index, placed.local);
 }
 
@@ -57,18 +62,22 @@ fn inverseOf(e: vec2f) -> f32 {
 
 @fragment fn fs(v: Varying) -> @location(0) vec4f {
   let s = shadows[v.index];
+  let g = placements[u32(s.extra.x)];
   let at = spot(v.position, v.local, u32(s.params.z));
   let p = at.p;
-  let clip = areaInAt(s.mask, p, at.scale) * cornerCoverageAt(s.mask, s.maskRadii, p, at.scale) * at.keep;
+  let own = s.mask + g.offset.xyxy;
+  let clipRect = vec4f(max(own.xy, g.clip.xy), min(own.zw, g.clip.zw));
+  let clip = areaInAt(clipRect, p, at.scale) * cornerCoverageAt(own, s.maskRadii, p, at.scale) * cornerCoverageAt(g.clip, g.clipRadii, p, at.scale) * at.keep;
   if clip <= 0.0 { discard; }
+  let lp = p - g.offset.xy;
   let sigma = s.params.x;
   var alpha = 0.0;
   if s.shape.x < s.shape.z && s.shape.y < s.shape.w {
     if sigma < 0.05 {
-      alpha = roundedCoverage(p, s.shape, s.shapeRadii, at.scale);
+      alpha = roundedCoverage(lp, s.shape, s.shapeRadii, at.scale);
     } else {
       let half = (s.shape.zw - s.shape.xy) * 0.5;
-      let q = p - (s.shape.xy + half);
+      let q = lp - (s.shape.xy + half);
       // The kernel is only non-zero over the shape's rows within 3 sigma.
       let start = clamp(-3.0 * sigma, q.y - half.y, q.y + half.y);
       let end = clamp(3.0 * sigma, q.y - half.y, q.y + half.y);
@@ -99,9 +108,9 @@ fn inverseOf(e: vec2f) -> f32 {
     }
   }
   if s.params.y != 0.0 {
-    alpha = (1.0 - alpha) * roundedCoverage(p, s.box, s.boxRadii, at.scale);
+    alpha = (1.0 - alpha) * roundedCoverage(lp, s.box, s.boxRadii, at.scale);
   } else if s.params.w != 0.0 {
-    alpha = alpha * (1.0 - roundedCoverage(p, s.box, s.boxRadii, at.scale));
+    alpha = alpha * (1.0 - roundedCoverage(lp, s.box, s.boxRadii, at.scale));
   }
   return premultiply(s.color) * (clamp(alpha, 0.0, 1.0) * clip);
 }

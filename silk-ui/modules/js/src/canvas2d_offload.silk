@@ -1,0 +1,227 @@
+//! Asynchronous single-canvas Canvas 2D rasterization on `AppPool`.
+//!
+//! Pure non-text, single-canvas command batches are offloaded onto `AppPool` so Canvas 2D drawing
+//! does not stall the Document Thread. `measureText` stays synchronous in-thread, and readbacks
+//! (`getImageData`, `toDataURL`, `toBlob`, `createPattern`) flush ONLY that canvas via
+//! `ClaimHandle.runOrWait()` so an `AppPool` saturation never deadlocks or blocks readback.
+import ui_tree.canvas2d { BitmapTransfer, drawStaticNoText, inspectOffload }
+import ui_tree.legacy { UiTree }
+import ui_transport.cancel { CancellationToken }
+import ui_transport.pool { ClaimHandle, WorkPoolHandle }
+import ui_transport.wake { WakeHandle }
+import silk.collections.list { List }
+import silk.concurrency.sync { Arc, Mutex }
+import silk.concurrency.thread { Transferable }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.ownership { Drop }
+import silk.core.result { Result }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.usize
+
+struct Canvas2dResult {
+  bitmap: Option<BitmapTransfer>,
+}
+
+impl Transferable for Canvas2dResult {}
+
+struct Canvas2dJobPayload {
+  bitmap: Option<BitmapTransfer>,
+  commands: List<u8>,
+  slot: Arc<Mutex<Canvas2dResult>>,
+}
+
+impl Transferable for Canvas2dJobPayload {}
+
+fn runCanvas2dJob(payload: Canvas2dJobPayload, cancel: &CancellationToken) -> () {
+  let _unused = cancel.check()
+  let Canvas2dJobPayload { bitmap, commands, slot } = move payload
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut out = Option<BitmapTransfer>.None
+  let ran = run Effect.result(drawStaticNoText(move bitmap, commands.asSlice()))
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  if let Result.Success { value } = move ran {
+    out = move value
+  }
+  let mut guard = slot.get().lock()
+  let state = guard.getMut()
+  state.bitmap = move out
+}
+
+struct PendingCanvas2d {
+  node: u32,
+  handle: ClaimHandle,
+  slot: Arc<Mutex<Canvas2dResult>>,
+}
+
+impl Drop for PendingCanvas2d {
+  fn drop(self: &mut PendingCanvas2d) -> () {
+    self.handle.runOrWait()
+  }
+}
+
+effect fn installResult(entry: &PendingCanvas2d, tree: &mut UiTree<'_>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut guard = entry.slot.get().lock()
+  let state = guard.getMut()
+  let taken = Intrinsic.replace(state.bitmap, Option<BitmapTransfer>.None)
+  drop guard
+  if let Option<BitmapTransfer>.Some { value } = move taken {
+    run tree.canvas2d.installBitmapTransfer(move value)
+  }
+}
+
+/// Manages per-canvas asynchronous raster jobs on `AppPool`.
+pub struct Canvas2dOffload {
+  pool: Option<WorkPoolHandle>,
+  groupId: u32,
+  wake: WakeHandle,
+  hasWake: bool,
+  inFlight: List<PendingCanvas2d>,
+}
+
+impl Canvas2dOffload {
+  /// Offload coordinator with no pool attached (every draw falls back inline).
+  pub fn make() -> Canvas2dOffload {
+    return Canvas2dOffload {
+      pool: Option<WorkPoolHandle>.None,
+      groupId: 1,
+      wake: WakeHandle.noop(),
+      hasWake: false,
+      inFlight: List<PendingCanvas2d>.make(),
+    }
+  }
+
+  /// Attaches `AppPool`, fair-queue `groupId`, and optional Document Thread wakeup handle.
+  pub fn attachPool(self: &mut Self, pool: WorkPoolHandle, groupId: u32, wake: Option<WakeHandle>) -> () {
+    self.pool = Option<WorkPoolHandle>.some(move pool)
+    self.groupId = groupId
+    match move wake {
+      Option<WakeHandle>.Some { value } => {
+        self.wake = move value
+        self.hasWake = true
+      }
+      Option<WakeHandle>.None => {
+        self.wake = WakeHandle.noop()
+        self.hasWake = false
+      }
+    }
+  }
+
+  /// Whether at least one Canvas 2D batch is currently in flight on `AppPool`.
+  pub fn pending(self: &Self) -> bool {
+    return self.inFlight.length() != 0
+  }
+
+  /// Whether job completion wakes the owning Document Thread directly via `WakeHandle`.
+  pub fn wakesOnCompletion(self: &Self) -> bool {
+    return self.hasWake
+  }
+
+  /// Submits single-canvas non-text command batches onto `AppPool`, returning `true` if queued.
+  /// Multi-canvas or text batches flush only the referenced canvases and return `false` for inline
+  /// execution on the Document Thread.
+  pub effect fn submit(self: &mut Self, tree: &mut UiTree<'_>, commands: &[u8]) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut nodes = List<u32>.make()
+    let offloadable = run inspectOffload(commands, &mut nodes)
+    if offloadable && nodes.length() == 1 && self.pool.isSome() {
+      let node = nodes.get(0)
+      drop run self.flushNode(&mut tree, node)
+      if let Option<WorkPoolHandle>.Some { value: pool } = &self.pool {
+        let bitmap = run tree.canvas2d.takeBitmapTransfer(node)
+        let mut copy = List<u8>.make()
+        run copy.appendSlice(commands)
+        let mut heap = Allocator.systemAllocatorProvider()
+        let slot = run Arc<Mutex<Canvas2dResult>>.make(
+          run Mutex<Canvas2dResult>.make(Canvas2dResult { bitmap: Option<BitmapTransfer>.None })
+            |> Effect.provideMut<Allocator>(&mut heap),
+        )
+          |> Effect.provideMut<Allocator>(&mut heap)
+        let cancelToken = run CancellationToken.make()
+        let payload = Canvas2dJobPayload {
+          bitmap: move bitmap,
+          commands: move copy,
+          slot: slot.clone(),
+        }
+        let handle = run pool.submitWith(
+          self.groupId,
+          move payload,
+          runCanvas2dJob,
+          move cancelToken,
+          self.wake.clone(),
+        )
+        run self.inFlight.append(PendingCanvas2d {
+          node: node,
+          handle: move handle,
+          slot: move slot,
+        })
+        return true
+      }
+    }
+    if nodes.length() == 0 {
+      drop run self.flushAll(&mut tree)
+    } else {
+      let mut i: usize = 0
+      while i < nodes.length() {
+        drop run self.flushNode(&mut tree, nodes.get(i))
+        i = i + 1
+      }
+    }
+    return false
+  }
+
+  /// Synchronously finishes any pending offloaded draw for `node` alone (`ClaimHandle.runOrWait`),
+  /// so readback executes inline if `AppPool` workers are saturated.
+  pub effect fn flushNode(self: &mut Self, tree: &mut UiTree<'_>, node: u32) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut flushed = false
+    let mut i: usize = 0
+    while i < self.inFlight.length() {
+      if self.inFlight.asSlice()[i].node == node {
+        let entry = self.inFlight.remove(i)
+        entry.handle.runOrWait()
+        run installResult(&entry, &mut tree)
+        flushed = true
+      } else {
+        i = i + 1
+      }
+    }
+    return flushed
+  }
+
+  /// Installs any finished offloaded canvas bitmaps without blocking.
+  pub effect fn pollReady(self: &mut Self, tree: &mut UiTree<'_>) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut installed = false
+    let mut i: usize = 0
+    while i < self.inFlight.length() {
+      if self.inFlight.asSlice()[i].handle.isDone() {
+        let entry = self.inFlight.remove(i)
+        run installResult(&entry, &mut tree)
+        installed = true
+      } else {
+        i = i + 1
+      }
+    }
+    return installed
+  }
+
+  /// Synchronously finishes every in-flight Canvas 2D job via `ClaimHandle.runOrWait`.
+  pub effect fn flushAll(self: &mut Self, tree: &mut UiTree<'_>) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut flushed = false
+    while self.inFlight.length() != 0 {
+      let entry = self.inFlight.remove(0)
+      entry.handle.runOrWait()
+      run installResult(&entry, &mut tree)
+      flushed = true
+    }
+    return flushed
+  }
+}

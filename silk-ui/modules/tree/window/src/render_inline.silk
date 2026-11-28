@@ -8,16 +8,23 @@
 //! `silk_browser#yield` import, which `browser/app-host.js` makes a JSPI suspending import; so
 //! the app's entry point must be called through `WebAssembly.promising`, as `app-host.js` does.
 import ui_scene.scene { Scene }
+import ui_scene.property_tree { LayerOverride }
 import ui_scene.scroll { ScrollPosition }
 import ui_scene.color as color
 import ui_tree.legacy { Pending }
+import browser_commit { encodeBrowserCommit }
+import layer_commit { CommitAck, LayerCommit, RetainedLayerStore }
 import atlas.atlas { Atlas, TextureInfo }
 import ui_renderer.atlas_textures { GpuAtlas }
 import ui_renderer.compare { Tolerance, compare }
 import ui_renderer.readback { copyOut, isBgra, pickFormat, readbackSize, unpack }
 import ui_renderer.renderer { UiRenderer }
 import ui_renderer.text { TextSettings }
-import render_thread { FastScroll, Grab, RenderReport, RenderSettings }
+import ui_tree.node { Move }
+import platform_thread { PlatformClient }
+import render_thread { Grab, GpuEvent, GpuHandle, RenderReport, RenderSettings, OpenedSurface }
+import ui_transport.channel { UnboundedSender }
+import ui_transport.wake { WakeHandle }
 import console { StderrWriter }
 import clock { Clock }
 import window.types { RawSurface, WindowId }
@@ -32,14 +39,23 @@ import silk.collections.list { List }
 import silk.core.effect { Effect }
 import silk.core.option { Option }
 import silk.core.result { Result }
+import silk.geometry.rect { Rect }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.mem.pointer { Pointer }
 import silk.text.string { String }
+import silk.num.f32
 import silk.num.u64
 import silk.num.usize
 
 static if Intrinsic.targetArchitecture() == "wasm32" {
   unsafe extern "C" fn hostYield() -> () as "silk_browser#yield"
+
+  @foreign(noCapture: .("bytes"))
+  unsafe extern "C" fn hostCommitMeta(bytes: ?[*]const u8, length: usize) -> () as "silk_browser#commit_meta"
+
+  fn sendCommitMeta(bytes: &[u8]) -> () {
+    unsafe hostCommitMeta(Pointer.fromSlice(bytes), bytes.length)
+  }
 
   /// Lets the page's event loop run, so pending WebGPU promises settle.
   fn pause() -> () {
@@ -75,6 +91,10 @@ static if Intrinsic.targetArchitecture() == "wasm32" {
   }
 } else {
   fn pause() -> () {}
+
+  fn sendCommitMeta(bytes: &[u8]) -> () {
+    drop bytes
+  }
 
   effect fn pageCanvases(device: &Device, renderer: &mut UiRenderer) -> ()
     ! OutOfMemoryError
@@ -128,6 +148,14 @@ pub struct InlineRenderer {
   last: RenderReport,
   /// Milliseconds between presents since `takePresented` last took them.
   presented: List<f64>,
+  /// Async surface-open completions queued during `openSurfaceAsync`.
+  opened: List<OpenedSurface>,
+  overrides: List<LayerOverride>,
+  store: RetainedLayerStore,
+  windowId: WindowId,
+  deviceScale: f32,
+  blockedRegions: List<Rect<f32>>,
+  preventFlags: u32,
 }
 
 impl InlineRenderer {
@@ -209,7 +237,67 @@ impl InlineRenderer {
         textures: [0; 5],
       },
       presented: List<f64>.make(),
+      opened: List<OpenedSurface>.make(),
+      overrides: List<LayerOverride>.make(),
+      store: RetainedLayerStore.make(),
+      windowId: window,
+      deviceScale: 1.0,
+      blockedRegions: List<Rect<f32>>.make(),
+      preventFlags: 0,
     }
+  }
+
+  /// Updates browser compositor hit regions, declarative prevent bits, and scale for the next frame.
+  pub effect fn setBrowserHitMeta(
+    self: &mut Self,
+    blocked: &[Rect<f32>],
+    preventFlags: u32,
+    deviceScale: f32,
+  ) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    self.blockedRegions.clear()
+    run self.blockedRegions.appendSlice(blocked)
+    self.preventFlags = preventFlags
+    self.deviceScale = if deviceScale > 0.0 { deviceScale } else { 1.0 }
+  }
+
+  /// Applies compositor layer overrides to subsequent inline draws.
+  pub effect fn applyProperties(self: &mut Self, scrolls: &[ScrollPosition], overrides: &[LayerOverride]) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.renderer.setScrolls(scrolls)
+    self.overrides.clear()
+    run self.overrides.appendSlice(overrides)
+    run self.renderer.setLayerOverrides(self.overrides.asSlice())
+  }
+
+  /// Applies a layer commit to the inline retained layer store.
+  pub effect fn commitLayers(self: &mut Self, commit: &LayerCommit) -> CommitAck
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let ack = run self.store.applyCommit(commit)
+    if ack.applied {
+      self.overrides.clear()
+      run self.overrides.appendSlice(self.store.overrides.asSlice())
+      run self.renderer.setLayerOverrides(self.overrides.asSlice())
+    }
+    return ack
+  }
+
+  /// No-op on single-thread inline renderer.
+  pub fn setEventSink(self: &mut Self, tx: UnboundedSender<GpuEvent>) -> () {
+    drop tx
+  }
+
+  /// No-op on single-thread inline renderer.
+  pub fn setUiWake(self: &mut Self, wake: WakeHandle) -> () {
+    drop wake
+  }
+
+  /// Returns no GPU handle on single-thread `wasm32`.
+  pub fn gpuHandle(self: &Self) -> GpuHandle {
+    Intrinsic.trap("ui-tree-window: InlineRenderer has no GpuHandle")
   }
 
   /// The canvas texture format.
@@ -217,10 +305,7 @@ impl InlineRenderer {
     return self.textureFormat
   }
 
-  /// Uploads `uploads`, draws `scene` and presents it before returning. With `compare` set
-  /// (check mode) the drawn canvas is read back and compared with the RGBA pixels `expected`;
-  /// the result shows in [`InlineRenderer.report`]. `fast` and `fastSeq` are unused: the
-  /// browser host scrolls on the UI thread.
+  /// Uploads `uploads`, draws `scene` and presents it before returning.
   pub effect fn submit(
     self: &mut Self,
     scene: &Scene,
@@ -230,11 +315,12 @@ impl InlineRenderer {
     height: u32,
     compare: bool,
     expected: &[u8],
-    fast: FastScroll,
-    fastSeq: u64,
+    moves: &[Move],
+    commitEpoch: u64,
+    consumedInputSeq: u64,
   ) -> ()
     ! GpuError | OutOfMemoryError {
-    drop fast
+    drop moves
     let mut heap = Allocator.systemAllocatorProvider()
     if width == 0 || height == 0 {
       self.last.frames = self.last.frames + 1
@@ -263,6 +349,8 @@ impl InlineRenderer {
     let view = run texture.texture.createView(&TextureViewDescriptor.default())
     let acquired = run self.clock.seconds()
     run self.renderer.setScrolls(&[]) |> Effect.provideMut<Allocator>(&mut heap)
+    run self.renderer.setLayerOverrides(self.overrides.asSlice())
+      |> Effect.provideMut<Allocator>(&mut heap)
     run self.renderer.draw(
       &self.device,
       &self.queue,
@@ -280,6 +368,19 @@ impl InlineRenderer {
       status = run self.checkFrame(&texture.texture, expected, width, height)
         |> Effect.provideMut<Allocator>(&mut heap)
     }
+    let browserMeta = run encodeBrowserCommit(
+      self.windowId,
+      commitEpoch,
+      consumedInputSeq,
+      width,
+      height,
+      self.deviceScale,
+      self.preventFlags,
+      scene,
+      self.blockedRegions.asSlice(),
+    )
+      |> Effect.provideMut<Allocator>(&mut heap)
+    sendCommitMeta(browserMeta.asSlice())
     run self.surface.present()
     run self.device.checkErrors()
     let presented = run self.clock.seconds()
@@ -380,41 +481,34 @@ impl InlineRenderer {
     }
   }
 
-  /// Makes the surface of another window's canvas `raw`, and returns the number to draw on it
-  /// with. `None` when the canvas cannot be a surface: its window then shows nothing.
-  pub effect fn openSurface(self: &mut Self, raw: RawSurface, window: WindowId) -> Option<u32>
+  /// Queues a secondary canvas surface synchronously and records completion for `takeSurfaceOpened`.
+  pub effect fn openSurfaceAsync(self: &mut Self, raw: RawSurface, window: WindowId) -> u32
     ! GpuError | OutOfMemoryError {
-    drop window
-    let handle = match raw {
-      RawSurface.Canvas { handle } => handle
-      _ => {
-        return Option<u32>.None
-      }
-    }
-    let id = match canvasId(handle) {
-      Option<&'static [u8]>.Some { value } => value
-      Option<&'static [u8]>.None => {
-        StderrWriter.print("ui-tree: window {} has no known canvas id\n", &.(handle))
-        return Option<u32>.None
-      }
-    }
-    let target = SurfaceTarget.canvasId(id)
-    let created = run Effect.result(
-      Surface.create(&self.instance, &target, String.utf8Bytes("ui tree window")),
-    )
-    let surface = match move created {
-      Result.Success { value } => move value
-      Result.Failure { error } => {
-        drop error
-        return Option<u32>.None
-      }
-    }
     let number = self.nextSurface
     self.nextSurface = self.nextSurface + 1
+    let mut made = false
+    if let RawSurface.Canvas { handle } = raw {
+      if let Option<&'static [u8]>.Some { value: id } = canvasId(handle) {
+        let target = SurfaceTarget.canvasId(id)
+        let created = run Effect.result(
+          Surface.create(&self.instance, &target, String.utf8Bytes("ui tree window")),
+        )
+        if let Result.Success { value: surface } = move created {
+          let mut heap = Allocator.systemAllocatorProvider()
+          run self.others.append(
+            ExtraSurface { id: number, surface: move surface, width: 0, height: 0 },
+          )
+            |> Effect.provideMut<Allocator>(&mut heap)
+          made = true
+        }
+      } else {
+        StderrWriter.print("ui-tree: window {} has no known canvas id\n", &.(handle))
+      }
+    }
     let mut heap = Allocator.systemAllocatorProvider()
-    run self.others.append(ExtraSurface { id: number, surface: move surface, width: 0, height: 0 })
+    run self.opened.append(OpenedSurface { surface: number, window: window, made: made })
       |> Effect.provideMut<Allocator>(&mut heap)
-    return Option<u32>.some(number)
+    return number
   }
 
   /// Draws `scene` on the canvas of another window and presents it before returning.
@@ -460,6 +554,8 @@ impl InlineRenderer {
     let texture = run target.surface.getCurrentTexture()
     let view = run texture.texture.createView(&TextureViewDescriptor.default())
     run self.renderer.setScrolls(&[]) |> Effect.provideMut<Allocator>(&mut heap)
+    run self.renderer.setLayerOverrides(self.overrides.asSlice())
+      |> Effect.provideMut<Allocator>(&mut heap)
     run self.renderer.draw(
       &self.device,
       &self.queue,
@@ -475,8 +571,13 @@ impl InlineRenderer {
     run self.device.checkErrors()
   }
 
-  /// Lets go of another window's canvas.
-  pub fn closeSurface(self: &mut Self, surface: u32) -> () {
+  /// Releases another window's canvas immediately (browser host calls `closeWindow` if `platform` absent).
+  pub fn closeSurfaceAsync(
+    self: &mut Self,
+    surface: u32,
+    window: WindowId,
+    platform: Option<PlatformClient>,
+  ) -> () {
     let mut i: usize = 0
     while i < self.others.length() {
       if self.others.asSlice()[i].id == surface {
@@ -487,6 +588,17 @@ impl InlineRenderer {
         i = i + 1
       }
     }
+    if let Option<PlatformClient>.Some { value: client } = move platform {
+      client.closeWindow(window)
+    }
+  }
+
+  /// Drains recorded secondary surface open answers.
+  pub effect fn takeSurfaceOpened(self: &mut Self, out: &mut List<OpenedSurface>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run out.appendSlice(self.opened.asSlice())
+    self.opened.clear()
   }
 
   /// What the last frame took.
@@ -518,12 +630,17 @@ impl InlineRenderer {
   pub effect fn rescroll(
     self: &mut Self,
     positions: &[ScrollPosition],
-    fastSeq: u64,
-    fast: FastScroll,
-    refast: bool,
-  ) -> u64
+    commitEpoch: u64,
+    moves: &[Move],
+    updateMoves: bool,
+    consumedInputSeq: u64,
+  ) -> ()
     ! GpuError | OutOfMemoryError {
-    return fastSeq
+    drop positions
+    drop commitEpoch
+    drop moves
+    drop updateMoves
+    drop consumedInputSeq
   }
 
   /// Every frame is drawn inside `submit`: there is no redraw to wait for.

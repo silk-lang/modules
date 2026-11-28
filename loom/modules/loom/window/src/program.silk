@@ -34,7 +34,23 @@ pub import ui_tree.style_compiler { Compiler as StylesheetCompiler }
 //! A worker thread reaches the program through a [`Poster`]: `poster.post(name, text)` is
 //! heard by `subs.port(key, name, …)` on the UI thread.
 import lib { WindowContent, runWindowHostedWithSheetUpdates, Loader }
-import keeper { Keeper }
+import app_thread { AppBridge, runSplitAppLoop }
+import engine_group { CarriedFile }
+import extension { EngineExtension }
+
+static if Intrinsic.targetArchitecture() != "wasm32" {
+  import engine_group { spawnEngineThread }
+}
+import keeper { Keeper, TreeKeeper }
+import protocol {
+  AppToEngine,
+  AppToEngineTx,
+  EngineReadyInfo,
+  EngineToApp,
+  EngineWakeSlot,
+  ShellCommand,
+  ShellEvent
+}
 import background { Background }
 import loom.app { App, Perform }
 import loom.program { Program, CommandSet, Hosted, Run, make }
@@ -57,9 +73,14 @@ import loom.shell {
   PORT_MENU
 }
 import loom.keys { MOD_SHIFT, MOD_CONTROL, MOD_ALT, MOD_META }
+import loom.snapshot_backend { SnapshotBackend }
 import ui_tree.legacy { UiTree, TreeError, Batch }
+import ui_transport.cancel { CancellationToken }
+import ui_transport.channel { UnboundedChannel, UnboundedPair, UnboundedSender }
+import ui_transport.pool { ClaimHandle, PoolHandles, WorkPoolHandle }
+import ui_transport.wake { Waiter, WakeHandle }
 import ui_tree_window.host { RunOptions, startInspector, StartedGpu }
-import ui_tree_window.platform_thread { HostPlatform, Nudge, launch as launchThread }
+import ui_tree_window.platform_thread { HostPlatform, Nudge, PlatformClient, launch as launchThread }
 import ui_inspect_server.lib { Inspector, InspectorOptions }
 import atlas.atlas { AtlasError }
 import vector.geometry_error { GeometryError }
@@ -72,7 +93,7 @@ import window.platform { Platform }
 import window.types { WindowError, WindowId, WindowOptions, Appearance }
 import webgpu.runtime { GpuError }
 import silk.collections.list { List }
-import silk.concurrency.sync { Arc, Mutex, Condition }
+import silk.concurrency.sync { Arc, Mutex }
 import silk.concurrency.thread { Transferable }
 import silk.concurrency.thread_native { SpawnError }
 import silk.core.effect { Effect }
@@ -80,7 +101,6 @@ import silk.core.option { Option }
 import silk.geometry.size { Size2 }
 import ui_tree_window.console { StderrWriter }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
-import silk.mem.pointer { Pointer }
 import silk.num.f64
 import silk.num.u32
 import silk.text.string { String }
@@ -101,23 +121,6 @@ static if Intrinsic.targetOperatingSystem() == "windows" {
   import silk.system.host_input { HostInput, HostInputError }
 }
 
-/// What the shell was asked and the window has not done yet.
-union Ask {
-  Title { text: String },
-  Size { width: f64, height: f64 },
-  Minimize,
-  FullScreen,
-  Copy { text: String },
-  SetMenu { menu: Menu },
-  Open { request: u32, title: String, extensions: String, multiple: bool, directories: bool },
-  Save { request: u32, title: String, name: String, extensions: String },
-  SetTray { tray: Tray },
-  RemoveTray,
-  Shortcut { id: u32, code: String, modifiers: u32 },
-  Unshortcut { id: u32 },
-  Notify { id: u32, title: String, body: String },
-}
-
 struct Post {
   name: String,
   text: String,
@@ -125,18 +128,15 @@ struct Post {
 
 /// What the shell, the posters and the window's loop share.
 struct Desk {
-  asks: List<Ask>,
+  asks: List<ShellCommand>,
   posts: List<Post>,
+  appWake: Option<WakeHandle>,
+  engineTx: Option<AppToEngineTx>,
   nudge: Option<Nudge>,
+  platform: Option<PlatformClient>,
   quit: bool,
   dark: bool,
-  // The open window's platform, for what the shell answers at once. Only the UI thread
-  // follows it, between `opened` and the end of `run`.
-  platform: ?*mut HostPlatform,
   window: Option<WindowId>,
-  // Workers that wait for the clipboard's text, and the answers the UI thread left them.
-  pastes: u32,
-  clips: List<String>,
   // The window's loop ended: nothing answers a worker any more.
   closed: bool,
 }
@@ -144,9 +144,21 @@ struct Desk {
 impl Transferable for Desk {}
 
 fn wake(desk: &Arc<Mutex<Desk>>) -> () {
-  let mut guard = desk.get().lock()
-  let state = guard.getMut()
-  if let Option<Nudge>.Some { value } = &state.nudge {
+  let guard = desk.get().lock()
+  let state = guard.get()
+  let maybeWake = match &state.appWake {
+    Option<WakeHandle>.Some { value } => Option<WakeHandle>.some(value.clone())
+    Option<WakeHandle>.None => Option<WakeHandle>.None
+  }
+  let maybeNudge = match &state.nudge {
+    Option<Nudge>.Some { value } => Option<Nudge>.some(value.clone())
+    Option<Nudge>.None => Option<Nudge>.None
+  }
+  drop guard
+  if let Option<WakeHandle>.Some { value } = move maybeWake {
+    value.wake()
+  }
+  if let Option<Nudge>.Some { value } = move maybeNudge {
     value.nudge()
   }
 }
@@ -175,7 +187,6 @@ pub struct Window {
   checkExpect: string<'static>,
   lowestLatency: bool,
   desk: Arc<Mutex<Desk>>,
-  answered: Arc<Condition>,
 }
 
 impl Window {
@@ -184,15 +195,15 @@ impl Window {
     ! OutOfMemoryError
     ? &mut Allocator {
     let desk = Desk {
-      asks: List<Ask>.make(),
+      asks: List<ShellCommand>.make(),
       posts: List<Post>.make(),
+      appWake: Option<WakeHandle>.None,
+      engineTx: Option<AppToEngineTx>.None,
       nudge: Option<Nudge>.None,
+      platform: Option<PlatformClient>.None,
       quit: false,
       dark: false,
-      platform: Pointer.null<HostPlatform>(),
       window: Option<WindowId>.None,
-      pastes: 0,
-      clips: List<String>.make(),
       closed: false,
     }
     return Window {
@@ -214,7 +225,6 @@ impl Window {
       checkExpect: "",
       lowestLatency: false,
       desk: run Arc<Mutex<Desk>>.make(run Mutex<Desk>.make(move desk)),
-      answered: run Arc<Condition>.make(run Condition.make()),
     }
   }
 
@@ -291,7 +301,7 @@ impl Window {
 
   /// The [`Shell`] of this window: provide it to `run` with `Effect.provideMut<Shell>`.
   pub fn shell(self: &Self) -> WindowShell {
-    return WindowShell { desk: self.desk.clone(), answered: self.answered.clone(), worker: false }
+    return WindowShell { desk: self.desk.clone() }
   }
 
   /// A handle that posts to the program's ports from any thread.
@@ -338,53 +348,33 @@ impl Poster {
 /// The [`Shell`] of a [`Window`].
 pub struct WindowShell {
   desk: Arc<Mutex<Desk>>,
-  answered: Arc<Condition>,
-  // A command on a worker thread holds this one: the UI thread answers what it asks.
-  worker: bool,
 }
 
 impl Transferable for WindowShell {}
 
 impl WindowShell {
-  effect fn ask(self: &mut Self, ask: Ask) -> ()
+  effect fn ask(self: &mut Self, ask: ShellCommand) -> ()
     ! OutOfMemoryError
     ? &mut Allocator {
     let mut guard = self.desk.get().lock()
     let state = guard.getMut()
+    if state.closed {
+      return ()
+    }
+    if let Option<AppToEngineTx>.Some { value: tx } = &state.engineTx {
+      let sender = tx.clone()
+      drop guard
+      drop sender.send(AppToEngine.Shell { command: move ask })
+      return ()
+    }
     run state.asks.append(move ask)
     drop guard
-    if self.worker {
-      wake(&self.desk)
-    }
+    wake(&self.desk)
   }
 
-  /// The shell a command on a worker thread asks.
+  /// A cloneable handle usable from worker threads.
   fn onWorker(self: &Self) -> WindowShell {
-    return WindowShell { desk: self.desk.clone(), answered: self.answered.clone(), worker: true }
-  }
-
-  /// The clipboard's text, read by the UI thread for this worker. Empty once the window is gone.
-  fn pasteFromWorker(self: &mut Self) -> String {
-    let mut guard = self.desk.get().lock()
-    let state = guard.getMut()
-    if state.closed {
-      return String.make()
-    }
-    state.pastes = state.pastes + 1
-    if let Option<Nudge>.Some { value } = &state.nudge {
-      value.nudge()
-    }
-    while true {
-      let state = guard.getMut()
-      if state.clips.length() != 0 {
-        return state.clips.remove(0)
-      }
-      if state.closed {
-        break
-      }
-      self.answered.get().wait(&mut guard)
-    }
-    return String.make()
+    return WindowShell { desk: self.desk.clone() }
   }
 }
 
@@ -392,25 +382,25 @@ impl Shell for WindowShell {
   effect fn setTitle(self: &mut Self, title: string) -> ()
     ! OutOfMemoryError
     ? &mut Allocator {
-    run self.ask(Ask.Title { text: run String.copy(title) })
+    run self.ask(ShellCommand.Title { text: run String.copy(title) })
   }
 
   effect fn setSize(self: &mut Self, width: f64, height: f64) -> ()
     ! OutOfMemoryError
     ? &mut Allocator {
-    run self.ask(Ask.Size { width: width, height: height })
+    run self.ask(ShellCommand.Size { width: width, height: height })
   }
 
   effect fn minimize(self: &mut Self) -> ()
     ! OutOfMemoryError
     ? &mut Allocator {
-    run self.ask(Ask.Minimize)
+    run self.ask(ShellCommand.Minimize)
   }
 
   effect fn toggleFullScreen(self: &mut Self) -> ()
     ! OutOfMemoryError
     ? &mut Allocator {
-    run self.ask(Ask.FullScreen)
+    run self.ask(ShellCommand.FullScreen)
   }
 
   effect fn quit(self: &mut Self) -> ()
@@ -419,30 +409,38 @@ impl Shell for WindowShell {
     let mut guard = self.desk.get().lock()
     let state = guard.getMut()
     state.quit = true
+    let maybeTx = match &state.engineTx {
+      Option<AppToEngineTx>.Some { value } => Option<AppToEngineTx>.some(value.clone())
+      Option<AppToEngineTx>.None => Option<AppToEngineTx>.None
+    }
     drop guard
+    if let Option<AppToEngineTx>.Some { value: tx } = move maybeTx {
+      drop tx.send(AppToEngine.Shell { command: ShellCommand.Quit })
+    }
     wake(&self.desk)
   }
 
   effect fn copy(self: &mut Self, text: string) -> ()
     ! OutOfMemoryError
     ? &mut Allocator {
-    run self.ask(Ask.Copy { text: run String.copy(text) })
+    run self.ask(ShellCommand.Copy { text: run String.copy(text) })
   }
 
   effect fn paste(self: &mut Self) -> String
     ! OutOfMemoryError
     ? &mut Allocator {
-    if self.worker {
-      return self.pasteFromWorker()
+    let guard = self.desk.get().lock()
+    let state = guard.get()
+    if state.closed {
+      return String.make()
     }
-    let mut guard = self.desk.get().lock()
-    let state = guard.getMut()
-    let place = state.platform
+    let client = match &state.platform {
+      Option<PlatformClient>.Some { value } => Option<PlatformClient>.some(value.clone())
+      Option<PlatformClient>.None => Option<PlatformClient>.None
+    }
     drop guard
-    if let Option<*mut HostPlatform>.Some { value } = Pointer.nonNullMut<HostPlatform>(place) {
-      let mut anchor = ()
-      let platform = unsafe Pointer.borrowMut(&mut anchor, value)
-      if let Option<String>.Some { value: text } = run platform.readClipboard() {
+    if let Option<PlatformClient>.Some { value: platform } = move client {
+      if let Option<String>.Some { value: text } = move run platform.readClipboard() {
         return move text
       }
     }
@@ -457,14 +455,14 @@ impl Shell for WindowShell {
   effect fn setMenu(self: &mut Self, menu: Menu) -> ()
     ! OutOfMemoryError
     ? &mut Allocator {
-    run self.ask(Ask.SetMenu { menu: move menu })
+    run self.ask(ShellCommand.SetMenu { menu: move menu })
   }
 
   effect fn openFile(self: &mut Self, request: u32, dialog: FileDialog<'_>) -> ()
     ! OutOfMemoryError
     ? &mut Allocator {
     run self.ask(
-      Ask.Open {
+      ShellCommand.OpenFile {
         request: request,
         title: run String.copy(dialog.title),
         extensions: run String.copy(dialog.extensions),
@@ -478,7 +476,7 @@ impl Shell for WindowShell {
     ! OutOfMemoryError
     ? &mut Allocator {
     run self.ask(
-      Ask.Save {
+      ShellCommand.SaveFile {
         request: request,
         title: run String.copy(dialog.title),
         name: run String.copy(dialog.name),
@@ -490,31 +488,33 @@ impl Shell for WindowShell {
   effect fn setTray(self: &mut Self, tray: Tray) -> ()
     ! OutOfMemoryError
     ? &mut Allocator {
-    run self.ask(Ask.SetTray { tray: move tray })
+    run self.ask(ShellCommand.SetTray { tray: move tray })
   }
 
   effect fn removeTray(self: &mut Self) -> ()
     ! OutOfMemoryError
     ? &mut Allocator {
-    run self.ask(Ask.RemoveTray)
+    run self.ask(ShellCommand.RemoveTray)
   }
 
   effect fn registerShortcut(self: &mut Self, id: u32, code: string, modifiers: u32) -> ()
     ! OutOfMemoryError
     ? &mut Allocator {
-    run self.ask(Ask.Shortcut { id: id, code: run String.copy(code), modifiers: modifiers })
+    run self.ask(ShellCommand.Shortcut { id: id, code: run String.copy(code), modifiers: modifiers })
   }
 
   effect fn unregisterShortcut(self: &mut Self, id: u32) -> ()
     ! OutOfMemoryError
     ? &mut Allocator {
-    run self.ask(Ask.Unshortcut { id: id })
+    run self.ask(ShellCommand.Unshortcut { id: id })
   }
 
   effect fn notify(self: &mut Self, id: u32, title: string, body: string) -> ()
     ! OutOfMemoryError
     ? &mut Allocator {
-    run self.ask(Ask.Notify { id: id, title: run String.copy(title), body: run String.copy(body) })
+    run self.ask(
+      ShellCommand.Notify { id: id, title: run String.copy(title), body: run String.copy(body) },
+    )
   }
 }
 
@@ -634,16 +634,636 @@ struct Notice {
 const NOTICES_KEPT: usize = 64
 
 /// The window's side of the shell: does what was asked, and posts what the window says.
-/// A file a program carries, for a relative URL.
-struct CarriedFile {
-  path: string<'static>,
-  data: &'static [u8],
+/// Shared OS shell command execution used by both split `ShellExtension` and single-thread `ShellContent`.
+effect fn executeShellCommand(
+  ask: ShellCommand,
+  platform: &mut HostPlatform,
+  window: WindowId,
+  dialogs: &mut List<Asked>,
+  notices: &mut List<Notice>,
+) -> ()
+  ! WindowError | OutOfMemoryError
+  ? &mut Allocator {
+  match move ask {
+    ShellCommand.Title { text } => run platform.setTitle(window, String.view(&text))
+    ShellCommand.Size { width, height } => platform.setContentSize(window, Size2<f64>.new(width, height))
+    ShellCommand.Minimize => platform.minimize(window)
+    ShellCommand.FullScreen => platform.toggleFullScreen(window)
+    ShellCommand.Copy { text } => run platform.writeClipboard(String.view(&text))
+    ShellCommand.SetMenu { menu } => {
+      let bar = run menuBar(&menu)
+      run platform.setMenuBar(&bar)
+    }
+    ShellCommand.OpenFile { request, title, extensions, multiple, directories } => {
+      let mut options = OpenDialog.file(String.view(&title), String.view(&extensions))
+      options.multiple = multiple
+      options.directories = directories
+      options.files = !directories
+      options.parent = Option<WindowId>.some(window)
+      let dialog = run platform.openFileDialog(&options)
+      run dialogs.append(Asked { dialog: dialog.value, request: request })
+    }
+    ShellCommand.SaveFile { request, title, name, extensions } => {
+      let mut options = SaveDialog.named(
+        String.view(&title),
+        String.view(&name),
+        String.view(&extensions),
+      )
+      options.parent = Option<WindowId>.some(window)
+      let dialog = run platform.saveFileDialog(&options)
+      run dialogs.append(Asked { dialog: dialog.value, request: request })
+    }
+    ShellCommand.SetTray { tray } => {
+      let bar = run menuBar(&tray.menu)
+      let options = TrayOptions {
+        icon: TrayIcon {
+          width: tray.width,
+          height: tray.height,
+          pixels: tray.pixels.asSlice(),
+          template: tray.template,
+        },
+        tooltip: String.view(&tray.tooltip),
+        menu: &bar,
+      }
+      drop run platform.setTray(&options)
+    }
+    ShellCommand.RemoveTray => platform.removeTray()
+    ShellCommand.Shortcut { id, code, modifiers } => {
+      let key = keyCodeOf(String.view(&code))
+      if key != KeyCode.Unidentified {
+        let mut held = Modifiers.none()
+        held.shift = (modifiers & MOD_SHIFT) != 0
+        held.control = (modifiers & MOD_CONTROL) != 0
+        held.alt = (modifiers & MOD_ALT) != 0
+        held.meta = (modifiers & MOD_META) != 0
+        drop run platform.registerShortcut(id, key, held)
+      }
+    }
+    ShellCommand.Unshortcut { id } => platform.unregisterShortcut(id)
+    ShellCommand.Notify { id, title, body } => {
+      let notification = Notification { title: String.view(&title), body: String.view(&body) }
+      let shown = run platform.notify(&notification)
+      if shown != 0 {
+        if notices.length() >= NOTICES_KEPT {
+          drop notices.remove(0)
+        }
+        run notices.append(Notice { shown: shown, id: id })
+      }
+    }
+    ShellCommand.Quit => {}
+  }
 }
 
+fn takeAskedRequest(dialogs: &mut List<Asked>, dialog: u32) -> u32 {
+  let mut i: usize = 0
+  while i < dialogs.length() {
+    if dialogs.asSlice()[i].dialog == dialog {
+      return dialogs.remove(i).request
+    }
+    i = i + 1
+  }
+  return 0
+}
+
+fn takeNoticeProgram(notices: &mut List<Notice>, shown: u32) -> u32 {
+  let mut i: usize = 0
+  while i < notices.length() {
+    if notices.asSlice()[i].shown == shown {
+      return notices.remove(i).id
+    }
+    i = i + 1
+  }
+  return 0
+}
+
+/// Engine-thread shell integration for [`Window`] when running the 2-thread split host.
+struct ShellExtension {
+  stylesheetCompiler: StylesheetCompiler,
+  dialogs: List<Asked>,
+  notices: List<Notice>,
+  files: List<CarriedFile>,
+  treeKeeper: TreeKeeper,
+  titleBar: TitleBar,
+  titleBarHeight: f64,
+  controlsLeft: f64,
+  controlsTop: f64,
+  windowDrag: bool,
+}
+
+impl Transferable for ShellExtension {}
+
+impl EngineExtension for ShellExtension {
+  effect fn files(self: &mut Self, loader: &mut Loader) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    loader.setStylesheetCompiler(self.stylesheetCompiler)
+    let files = self.files.asSlice()
+    let mut i: usize = 0
+    while i < files.length {
+      run loader.file(files[i].path, files[i].data)
+      i = i + 1
+    }
+  }
+
+  fn configure(self: &Self, options: &mut WindowOptions<'_>) -> () {
+    options.titleBar = self.titleBar
+    options.titleBarHeight = self.titleBarHeight
+    options.controlsLeft = self.controlsLeft
+    options.controlsTop = self.controlsTop
+  }
+
+  effect fn event(
+    self: &mut Self,
+    tree: &mut UiTree<'_>,
+    event: &Event,
+    appTx: &UnboundedSender<EngineToApp>,
+  ) -> bool
+    ! WindowError | TreeError | AtlasError | GeometryError | OutOfMemoryError
+    ? &mut Allocator {
+    drop tree
+    static if Intrinsic.targetOperatingSystem() == "darwin" {
+      if let Event.MouseDown { button, position, .. } = &event.* {
+        if self.titleBar == TitleBar.Transparent && button == MouseButton.Left && position.y < self.titleBarHeight {
+          self.windowDrag = true
+          return true
+        }
+      }
+    }
+    match &event.* {
+      Event.MenuAction { action } => {
+        drop run Effect.result(appTx.send(EngineToApp.Shell { event: ShellEvent.MenuAction { action: action } }))
+        return true
+      }
+      Event.DialogClosed { dialog, paths } => {
+        let req = takeAskedRequest(&mut self.dialogs, dialog.value)
+        let mut copied = List<String>.make()
+        let chosen = paths.asSlice()
+        let mut i: usize = 0
+        while i < chosen.length {
+          run copied.append(run String.copy(String.view(&chosen[i])))
+          i = i + 1
+        }
+        drop run Effect.result(
+          appTx.send(EngineToApp.Shell { event: ShellEvent.DialogClosed { request: req, paths: move copied } }),
+        )
+        return true
+      }
+      Event.FileDragEntered { position, .. } => {
+        drop run Effect.result(
+          appTx.send(EngineToApp.Shell { event: ShellEvent.DragEntered { x: position.x, y: position.y } }),
+        )
+        return true
+      }
+      Event.FileDragMoved { position, .. } => {
+        drop run Effect.result(
+          appTx.send(EngineToApp.Shell { event: ShellEvent.DragMoved { x: position.x, y: position.y } }),
+        )
+        return true
+      }
+      Event.FileDragLeft { .. } => {
+        drop run Effect.result(appTx.send(EngineToApp.Shell { event: ShellEvent.DragLeft }))
+        return true
+      }
+      Event.FileDropped { position, paths, .. } => {
+        let mut copied = List<String>.make()
+        let dropped = paths.asSlice()
+        let mut i: usize = 0
+        while i < dropped.length {
+          run copied.append(run String.copy(String.view(&dropped[i])))
+          i = i + 1
+        }
+        drop run Effect.result(
+          appTx.send(
+            EngineToApp.Shell {
+              event: ShellEvent.Dropped { x: position.x, y: position.y, paths: move copied },
+            },
+          ),
+        )
+        return true
+      }
+      Event.GlobalShortcut { id } => {
+        drop run Effect.result(appTx.send(EngineToApp.Shell { event: ShellEvent.GlobalShortcut { id: id } }))
+        return true
+      }
+      Event.TrayClicked { button } => {
+        let btn: u32 = match button {
+          MouseButton.Middle => 1
+          MouseButton.Right => 2
+          _ => 0
+        }
+        drop run Effect.result(appTx.send(EngineToApp.Shell { event: ShellEvent.TrayClicked { button: btn } }))
+        return true
+      }
+      Event.NotificationClicked { id } => {
+        let program = takeNoticeProgram(&mut self.notices, id)
+        if program != 0 {
+          drop run Effect.result(
+            appTx.send(EngineToApp.Shell { event: ShellEvent.NotificationClicked { id: program } }),
+          )
+        }
+        return true
+      }
+      Event.AppearanceChanged { appearance } => {
+        let dark = match appearance {
+          Appearance.Dark => true
+          _ => false
+        }
+        drop run Effect.result(appTx.send(EngineToApp.Shell { event: ShellEvent.AppearanceChanged { dark: dark } }))
+      }
+      Event.Focused { focused, .. } => {
+        drop run Effect.result(appTx.send(EngineToApp.Shell { event: ShellEvent.Focused { focused: focused } }))
+      }
+      _ => {}
+    }
+    return false
+  }
+
+  effect fn onShellCommand(
+    self: &mut Self,
+    command: ShellCommand,
+    platform: &mut HostPlatform,
+    window: WindowId,
+    appTx: &UnboundedSender<EngineToApp>,
+  ) -> bool
+    ! WindowError | OutOfMemoryError
+    ? &mut Allocator {
+    drop appTx
+    run executeShellCommand(move command, &mut platform, window, &mut self.dialogs, &mut self.notices)
+    return false
+  }
+
+  effect fn update(
+    self: &mut Self,
+    tree: &mut UiTree<'_>,
+    platform: &mut HostPlatform,
+    window: WindowId,
+    appTx: &UnboundedSender<EngineToApp>,
+  ) -> bool
+    ! WindowError | TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    drop tree
+    drop appTx
+    if self.windowDrag {
+      self.windowDrag = false
+      Platform.startWindowDrag(&mut platform.*, window)
+    }
+    return false
+  }
+
+  effect fn afterLayout(
+    self: &mut Self,
+    tree: &mut UiTree<'_>,
+    appTx: &UnboundedSender<EngineToApp>,
+  ) -> bool
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    if let Option.Some { value: upd } = move run self.treeKeeper.track(&mut tree) {
+      if let Option<String>.Some { value: json } = move upd.treeJson {
+        drop run Effect.result(
+          appTx.send(
+            EngineToApp.Shell {
+              event: ShellEvent.TreeKeeperState { digest: upd.digest, treeJson: move json },
+            },
+          ),
+        )
+      }
+      return upd.restored
+    }
+    return false
+  }
+}
+
+/// App-thread bridge for [`Program`] connecting [`Desk`], [`Keeper`], [`PlatformClient`], and ports.
+struct ProgramAppBridge<A, M, C> {
+  desk: Arc<Mutex<Desk>>,
+  keeper: Keeper,
+  greeted: bool,
+}
+
+impl<A, M, C> ProgramAppBridge<A, M, C> {
+  fn setDark(self: &mut Self, dark: bool) -> () {
+    let mut guard = self.desk.get().lock()
+    let state = guard.getMut()
+    state.dark = dark
+  }
+}
+
+impl<A: App<M, C>, M, C> AppBridge<A, M, C> for ProgramAppBridge<A, M, C> {
+  effect fn onReady(
+    self: &mut Self,
+    app: &mut Runtime<A, M, C>,
+    info: EngineReadyInfo,
+    wake: WakeHandle,
+  ) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    drop wake
+    self.setDark(info.dark)
+    if !self.greeted {
+      self.greeted = true
+      if info.dark {
+        run app.posted(PORT_APPEARANCE, "dark")
+      }
+    }
+  }
+
+  effect fn onServices(
+    self: &mut Self,
+    groupId: u32,
+    pools: PoolHandles,
+    platform: Option<PlatformClient>,
+    wake: WakeHandle,
+  ) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    drop groupId
+    drop pools
+    drop wake
+    let mut guard = self.desk.get().lock()
+    let state = guard.getMut()
+    state.platform = move platform
+  }
+
+  effect fn onShellEvent(
+    self: &mut Self,
+    app: &mut Runtime<A, M, C>,
+    event: ShellEvent,
+  ) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    match move event {
+      ShellEvent.MenuAction { action } => {
+        let mut text = String.make()
+        run decimal(&mut text, action)
+        run app.posted(PORT_MENU, String.view(&text))
+      }
+      ShellEvent.DialogClosed { request, paths } => {
+        let mut text = String.make()
+        run decimal(&mut text, request)
+        let chosen = paths.asSlice()
+        let mut i: usize = 0
+        while i < chosen.length {
+          run text.append("\n")
+          run text.append(String.view(&chosen[i]))
+          i = i + 1
+        }
+        run app.posted(PORT_FILES, String.view(&text))
+      }
+      ShellEvent.DragEntered { x, y } => {
+        let text = run dragText("enter", x, y)
+        run app.posted(PORT_DRAG, String.view(&text))
+      }
+      ShellEvent.DragMoved { x, y } => {
+        let text = run dragText("over", x, y)
+        run app.posted(PORT_DRAG, String.view(&text))
+      }
+      ShellEvent.DragLeft => {
+        run app.posted(PORT_DRAG, "leave")
+      }
+      ShellEvent.Dropped { x, y, paths } => {
+        let mut text = run dragText("drop", x, y)
+        let dropped = paths.asSlice()
+        let mut i: usize = 0
+        while i < dropped.length {
+          run text.append("\n")
+          run text.append(String.view(&dropped[i]))
+          i = i + 1
+        }
+        run app.posted(PORT_DRAG, String.view(&text))
+      }
+      ShellEvent.GlobalShortcut { id } => {
+        let mut text = String.make()
+        run decimal(&mut text, id)
+        run app.posted(PORT_SHORTCUT, String.view(&text))
+      }
+      ShellEvent.TrayClicked { button } => {
+        run app.posted(
+          PORT_TRAY,
+          match button {
+            1 => "1"
+            2 => "2"
+            _ => "0"
+          },
+        )
+      }
+      ShellEvent.NotificationClicked { id } => {
+        let mut text = String.make()
+        run decimal(&mut text, id)
+        run app.posted(PORT_NOTIFICATION, String.view(&text))
+      }
+      ShellEvent.AppearanceChanged { dark } => {
+        self.setDark(dark)
+        if self.greeted {
+          run app.posted(
+            PORT_APPEARANCE,
+            if dark {
+              "dark"
+            } else {
+              "light"
+            },
+          )
+        } else {
+          self.greeted = true
+          if dark {
+            run app.posted(PORT_APPEARANCE, "dark")
+          }
+        }
+      }
+      ShellEvent.Focused { focused } => {
+        run app.posted(
+          PORT_FOCUS,
+          if focused {
+            "1"
+          } else {
+            "0"
+          },
+        )
+      }
+      ShellEvent.CloseRequested => {
+        let guard = self.desk.get().lock()
+        let quit = guard.get().quit
+        drop guard
+        if !quit && app.listens(PORT_CLOSE) {
+          run app.posted(PORT_CLOSE, "")
+        }
+      }
+      ShellEvent.Resized { width, height } => {
+        self.keeper.resized(width, height)
+      }
+      ShellEvent.TreeKeeperState { digest, treeJson } => {
+        self.keeper.setTreeState(digest, move treeJson)
+      }
+    }
+  }
+
+  effect fn pollExternal(
+    self: &mut Self,
+    app: &mut Runtime<A, M, C>,
+    backend: &mut SnapshotBackend,
+    now: f64,
+  ) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    drop backend
+    drop now
+    let mut guard = self.desk.get().lock()
+    let state = guard.getMut()
+    let mut posts = Intrinsic.replace(state.posts, List<Post>.make())
+    drop guard
+    let had = posts.length() > 0
+    while posts.length() > 0 {
+      let post = posts.remove(0)
+      run app.posted(String.view(&post.name), String.view(&post.text))
+    }
+    return had
+  }
+
+  effect fn afterTurn(self: &mut Self, app: &Runtime<A, M, C>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.keeper.save(&app.model, app.stats.messages)
+  }
+
+  fn interceptClose(self: &Self, app: &mut Runtime<A, M, C>) -> bool {
+    return app.listens(PORT_CLOSE)
+  }
+
+  fn quitting(self: &Self) -> bool {
+    let guard = self.desk.get().lock()
+    return guard.get().quit
+  }
+}
+
+/// App-thread worker-dispatched bridge used by [`openWithWorkers`].
+struct WorkerAppBridge<A, M, C, F: fn<'static>(C, WindowShell, Option<WorkPoolHandle>, u32, Option<WakeHandle>) -> Option<Worker<M>>> {
+  shell: ProgramAppBridge<A, M, C>,
+  hands: WindowShell,
+  jobs: List<Job<M>>,
+  appPool: Option<WorkPoolHandle>,
+  groupId: u32,
+  wake: Option<WakeHandle>,
+  start: F,
+}
+
+impl<
+  A: App<M, C>,
+  M,
+  C,
+  F: fn<'static>(C, WindowShell, Option<WorkPoolHandle>, u32, Option<WakeHandle>) -> Option<Worker<M>>
+> AppBridge<A, M, C> for WorkerAppBridge<A, M, C, F> {
+  effect fn onReady(
+    self: &mut Self,
+    app: &mut Runtime<A, M, C>,
+    info: EngineReadyInfo,
+    wake: WakeHandle,
+  ) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    self.wake = Option<WakeHandle>.some(wake.clone())
+    run AppBridge<A, M, C>.onReady(&mut self.shell, &mut app, move info, move wake)
+  }
+
+  effect fn onServices(
+    self: &mut Self,
+    groupId: u32,
+    pools: PoolHandles,
+    platform: Option<PlatformClient>,
+    wake: WakeHandle,
+  ) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    self.appPool = Option<WorkPoolHandle>.some(pools.app.clone())
+    self.groupId = groupId
+    self.wake = Option<WakeHandle>.some(wake.clone())
+    run AppBridge<A, M, C>.onServices(&mut self.shell, groupId, move pools, move platform, move wake)
+  }
+
+  effect fn onShellEvent(
+    self: &mut Self,
+    app: &mut Runtime<A, M, C>,
+    event: ShellEvent,
+  ) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run AppBridge<A, M, C>.onShellEvent(&mut self.shell, &mut app, move event)
+  }
+
+  fn runsCommands(self: &Self) -> bool {
+    return true
+  }
+
+  effect fn pollExternal(
+    self: &mut Self,
+    app: &mut Runtime<A, M, C>,
+    backend: &mut SnapshotBackend,
+    now: f64,
+  ) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut changed = run AppBridge<A, M, C>.pollExternal(&mut self.shell, &mut app, &mut backend, now)
+    let mut i: usize = 0
+    while i < self.jobs.length() {
+      if workerReady(&self.jobs.asSlice()[i].work) {
+        let mut job = self.jobs.remove(i)
+        if let Option<Background<bool>>.Some { value: thread } = move job.work.thread {
+          let mut t = move thread
+          drop t.poll()
+        }
+        drop job.work.claim
+        let mut guard = job.work.slot.get().lock()
+        let place = guard.getMut()
+        let message = Intrinsic.replace(place.*, Option<M>.None)
+        drop guard
+        if let Option<M>.Some { value } = move message {
+          if app.finish(job.ticket, move value) {
+            changed = true
+          }
+        }
+      } else {
+        i = i + 1
+      }
+    }
+    while self.jobs.length() < WORKERS && app.deferredOn(false) != 0 {
+      let held = run app.takeWorkOn(false)
+      let ticket = held.ticket
+      let pool = match &self.appPool {
+        Option<WorkPoolHandle>.Some { value } => Option<WorkPoolHandle>.some(value.clone())
+        Option<WorkPoolHandle>.None => Option<WorkPoolHandle>.None
+      }
+      let wake = match &self.wake {
+        Option<WakeHandle>.Some { value } => Option<WakeHandle>.some(value.clone())
+        Option<WakeHandle>.None => Option<WakeHandle>.None
+      }
+      match self.start(move held.command, self.hands.onWorker(), move pool, self.groupId, move wake) {
+        Option<Worker<M>>.Some { value } => run self.jobs.append(Job<M> { ticket: ticket, work: move value })
+        Option<Worker<M>>.None => {
+          drop app.abandon(ticket)
+          break
+        }
+      }
+    }
+    return changed
+  }
+
+  effect fn afterTurn(self: &mut Self, app: &Runtime<A, M, C>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run AppBridge<A, M, C>.afterTurn(&mut self.shell, app)
+  }
+
+  fn interceptClose(self: &Self, app: &mut Runtime<A, M, C>) -> bool {
+    return AppBridge<A, M, C>.interceptClose(&self.shell, &mut app)
+  }
+
+  fn quitting(self: &Self) -> bool {
+    return AppBridge<A, M, C>.quitting(&self.shell)
+  }
+}
+
+/// Fallback single-threaded `WindowContent` used on `wasm32` where OS threads are unavailable.
 struct ShellContent<A, M, C> {
   stylesheetCompiler: StylesheetCompiler,
   desk: Arc<Mutex<Desk>>,
-  answered: Arc<Condition>,
   dialogs: List<Asked>,
   notices: List<Notice>,
   greeted: bool,
@@ -653,105 +1273,14 @@ struct ShellContent<A, M, C> {
   titleBarHeight: f64,
   controlsLeft: f64,
   controlsTop: f64,
-  /// A press in the bar asked for a window drag; `update` starts it.
   windowDrag: bool,
 }
 
 impl<A, M, C> ShellContent<A, M, C> {
-  effect fn perform(self: &mut Self, ask: Ask, platform: &mut HostPlatform, window: WindowId) -> ()
+  effect fn perform(self: &mut Self, ask: ShellCommand, platform: &mut HostPlatform, window: WindowId) -> ()
     ! WindowError | OutOfMemoryError
     ? &mut Allocator {
-    match move ask {
-      Ask.Title { text } => run platform.setTitle(window, String.view(&text))
-      Ask.Size { width, height } => platform.setContentSize(window, Size2<f64>.new(width, height))
-      Ask.Minimize => platform.minimize(window)
-      Ask.FullScreen => platform.toggleFullScreen(window)
-      Ask.Copy { text } => run platform.writeClipboard(String.view(&text))
-      Ask.SetMenu { menu } => {
-        let bar = run menuBar(&menu)
-        run platform.setMenuBar(&bar)
-      }
-      Ask.Open { request, title, extensions, multiple, directories } => {
-        let mut options = OpenDialog.file(String.view(&title), String.view(&extensions))
-        options.multiple = multiple
-        options.directories = directories
-        options.files = !directories
-        options.parent = Option<WindowId>.some(window)
-        let dialog = run platform.openFileDialog(&options)
-        run self.dialogs.append(Asked { dialog: dialog.value, request: request })
-      }
-      Ask.Save { request, title, name, extensions } => {
-        let mut options = SaveDialog.named(
-          String.view(&title),
-          String.view(&name),
-          String.view(&extensions),
-        )
-        options.parent = Option<WindowId>.some(window)
-        let dialog = run platform.saveFileDialog(&options)
-        run self.dialogs.append(Asked { dialog: dialog.value, request: request })
-      }
-      Ask.SetTray { tray } => {
-        let bar = run menuBar(&tray.menu)
-        let options = TrayOptions {
-          icon: TrayIcon {
-            width: tray.width,
-            height: tray.height,
-            pixels: tray.pixels.asSlice(),
-            template: tray.template,
-          },
-          tooltip: String.view(&tray.tooltip),
-          menu: &bar,
-        }
-        drop run platform.setTray(&options)
-      }
-      Ask.RemoveTray => platform.removeTray()
-      Ask.Shortcut { id, code, modifiers } => {
-        let key = keyCodeOf(String.view(&code))
-        if key != KeyCode.Unidentified {
-          let mut held = Modifiers.none()
-          held.shift = (modifiers & MOD_SHIFT) != 0
-          held.control = (modifiers & MOD_CONTROL) != 0
-          held.alt = (modifiers & MOD_ALT) != 0
-          held.meta = (modifiers & MOD_META) != 0
-          drop run platform.registerShortcut(id, key, held)
-        }
-      }
-      Ask.Unshortcut { id } => platform.unregisterShortcut(id)
-      Ask.Notify { id, title, body } => {
-        let notification = Notification { title: String.view(&title), body: String.view(&body) }
-        let shown = run platform.notify(&notification)
-        if shown != 0 {
-          if self.notices.length() >= NOTICES_KEPT {
-            drop self.notices.remove(0)
-          }
-          run self.notices.append(Notice { shown: shown, id: id })
-        }
-      }
-    }
-  }
-
-  /// The program's id of notification `shown`; zero for one the shell did not show.
-  fn noticeOf(self: &mut Self, shown: u32) -> u32 {
-    let mut i: usize = 0
-    while i < self.notices.length() {
-      if self.notices.asSlice()[i].shown == shown {
-        return self.notices.remove(i).id
-      }
-      i = i + 1
-    }
-    return 0
-  }
-
-  /// The request a dialog answers; zero for a dialog the shell did not open.
-  fn requestOf(self: &mut Self, dialog: u32) -> u32 {
-    let mut i: usize = 0
-    while i < self.dialogs.length() {
-      if self.dialogs.asSlice()[i].dialog == dialog {
-        return self.dialogs.remove(i).request
-      }
-      i = i + 1
-    }
-    return 0
+    run executeShellCommand(move ask, &mut platform, window, &mut self.dialogs, &mut self.notices)
   }
 
   fn setDark(self: &mut Self, dark: bool) -> () {
@@ -793,7 +1322,6 @@ impl<A: App<M, C>, M, C> WindowContent<A, M, C> for ShellContent<A, M, C> {
     let state = guard.getMut()
     state.dark = dark
     state.nudge = Option<Nudge>.some(move nudge)
-    state.platform = Pointer.fromMutRef(&mut platform.*)
     state.window = Option<WindowId>.some(window)
   }
 
@@ -805,7 +1333,7 @@ impl<A: App<M, C>, M, C> WindowContent<A, M, C> for ShellContent<A, M, C> {
   ) -> bool
     ! WindowError | TreeError | AtlasError | GeometryError | OutOfMemoryError
     ? &mut Allocator {
-    // Only macOS draws the program under the bar; elsewhere the system's bar is there.
+    drop tree
     static if Intrinsic.targetOperatingSystem() == "darwin" {
       if let Event.MouseDown { button, position, .. } = &event.* {
         if self.titleBar == TitleBar.Transparent && button == MouseButton.Left && position.y < self.titleBarHeight {
@@ -826,7 +1354,7 @@ impl<A: App<M, C>, M, C> WindowContent<A, M, C> for ShellContent<A, M, C> {
       }
       Event.DialogClosed { dialog, paths } => {
         let mut text = String.make()
-        run decimal(&mut text, self.requestOf(dialog.value))
+        run decimal(&mut text, takeAskedRequest(&mut self.dialogs, dialog.value))
         let chosen = paths.asSlice()
         let mut i: usize = 0
         while i < chosen.length {
@@ -881,7 +1409,7 @@ impl<A: App<M, C>, M, C> WindowContent<A, M, C> for ShellContent<A, M, C> {
         return true
       }
       Event.NotificationClicked { id } => {
-        let program = self.noticeOf(id)
+        let program = takeNoticeProgram(&mut self.notices, id)
         if program != 0 {
           let mut text = String.make()
           run decimal(&mut text, program)
@@ -918,8 +1446,6 @@ impl<A: App<M, C>, M, C> WindowContent<A, M, C> for ShellContent<A, M, C> {
       }
       _ => {}
     }
-
-    // The window's loop still handles these itself.
     return false
   }
 
@@ -932,13 +1458,13 @@ impl<A: App<M, C>, M, C> WindowContent<A, M, C> for ShellContent<A, M, C> {
   ) -> bool
     ! WindowError | TreeError | OutOfMemoryError
     ? &mut Allocator {
+    drop tree
     let mut changed = false
     if self.windowDrag {
       self.windowDrag = false
       Platform.startWindowDrag(&mut platform.*, window)
     }
     if !self.greeted {
-      // A program that started before the window opened hears a dark appearance now.
       self.greeted = true
       let guard = self.desk.get().lock()
       let dark = guard.get().dark
@@ -958,27 +1484,6 @@ impl<A: App<M, C>, M, C> WindowContent<A, M, C> for ShellContent<A, M, C> {
       drop guard
       run self.perform(move ask, &mut platform, window)
     }
-
-    // The clipboard is this thread's to read: the workers that asked wait for it.
-    let mut guard = self.desk.get().lock()
-    let state = guard.getMut()
-    let mut pastes = state.pastes
-    state.pastes = 0
-    drop guard
-    if pastes != 0 {
-      while pastes != 0 {
-        let text = match run platform.readClipboard() {
-          Option<String>.Some { value } => move value
-          Option<String>.None => String.make()
-        }
-        let mut guard = self.desk.get().lock()
-        let state = guard.getMut()
-        run state.clips.append(move text)
-        drop guard
-        pastes = pastes - 1
-      }
-      self.answered.get().notifyAll()
-    }
     return changed
   }
 
@@ -991,13 +1496,12 @@ impl<A: App<M, C>, M, C> WindowContent<A, M, C> for ShellContent<A, M, C> {
     if quit || !app.listens(PORT_CLOSE) {
       return true
     }
-
-    // The program decides: `Shell.quit` lets the window go.
     run app.posted(PORT_CLOSE, "")
     return false
   }
 
   fn quitting(self: &Self, app: &Runtime<A, M, C>) -> bool {
+    drop app
     let guard = self.desk.get().lock()
     return guard.get().quit
   }
@@ -1010,12 +1514,11 @@ impl<A: App<M, C>, M, C> WindowContent<A, M, C> for ShellContent<A, M, C> {
   ) -> bool
     ! WindowError | TreeError | OutOfMemoryError
     ? &mut Allocator {
+    drop time
     let mut guard = self.desk.get().lock()
     let state = guard.getMut()
     let mut posts = Intrinsic.replace(state.posts, List<Post>.make())
     drop guard
-
-    // The loop comes here after the messages of each turn.
     let restored = run self.keeper.track(&mut tree)
     run self.keeper.save(&app.model, app.stats.messages)
     let changed = restored || posts.length() > 0
@@ -1027,10 +1530,10 @@ impl<A: App<M, C>, M, C> WindowContent<A, M, C> for ShellContent<A, M, C> {
   }
 }
 
-/// What `open` made of a [`Window`] before the loop runs.
+/// Initialized program state ready for split execution or wasm32 fallback.
 struct Opening<P, M, C> {
   app: Runtime<Hosted<P>, M, Run<C>>,
-  content: ShellContent<Hosted<P>, M, Run<C>>,
+  keeper: Keeper,
   options: RunOptions,
   inspector: Inspector,
 }
@@ -1043,8 +1546,6 @@ effect fn opening<P: Program<M, C>, M, C>(
   ? &mut Allocator {
   let mut app = run make<P, M, C>()
   if !window.check {
-    // The window shows what an update changed before the commands it asked for run. A
-    // check draws a fixed number of frames, so there they run at once.
     app.deferCommands()
   }
   let mut keeper = run Keeper.fromEnvironment()
@@ -1064,33 +1565,29 @@ effect fn opening<P: Program<M, C>, M, C>(
     platform: move platform,
     gpu: Option<StartedGpu>.None,
   }
-
-  // Debug builds with SILK_UI_INSPECT set serve the inspector (modules/inspect/server).
   let inspector = if window.inspect {
     run startInspector(InspectorOptions.make())
   } else {
     Inspector.off()
   }
-  let content = ShellContent<Hosted<P>, M, Run<C>> {
-    stylesheetCompiler: window.stylesheetCompiler,
-    desk: window.desk.clone(),
-    answered: window.answered.clone(),
-    dialogs: List<Asked>.make(),
-    notices: List<Notice>.make(),
-    greeted: false,
-    files: Intrinsic.replace(window.files, List<CarriedFile>.make()),
-    keeper: move keeper,
-    titleBar: window.titleBar,
-    titleBarHeight: window.titleBarHeight,
-    controlsLeft: window.controlsLeft,
-    controlsTop: window.controlsTop,
-    windowDrag: false,
-  }
   return Opening<P, M, C> {
     app: move app,
-    content: move content,
+    keeper: move keeper,
     options: move options,
     inspector: move inspector,
+  }
+}
+
+fn attachSplitDesk(window: &Window, wake: WakeHandle, tx: AppToEngineTx) -> () {
+  let mut guard = window.desk.get().lock()
+  let state = guard.getMut()
+  state.appWake = Option<WakeHandle>.some(move wake)
+  state.engineTx = Option<AppToEngineTx>.some(tx.clone())
+  let mut queued = Intrinsic.replace(state.asks, List<ShellCommand>.make())
+  drop guard
+  while queued.length() != 0 {
+    let ask = queued.remove(0)
+    drop tx.send(AppToEngine.Shell { command: move ask })
   }
 }
 
@@ -1098,49 +1595,14 @@ effect fn opening<P: Program<M, C>, M, C>(
 fn closed(window: &Window) -> () {
   let mut guard = window.desk.get().lock()
   let state = guard.getMut()
-  state.platform = Pointer.null<HostPlatform>()
+  state.platform = Option<PlatformClient>.None
+  state.appWake = Option<WakeHandle>.None
+  state.engineTx = Option<AppToEngineTx>.None
   state.nudge = Option<Nudge>.None
   state.closed = true
-  drop guard
-  window.answered.get().notifyAll()
 }
 
-/// The window's loop around `content`, for a program whose commands need `R`.
-effect fn hosted<
-  H: WindowContent<Hosted<P>, M, Run<C>>,
-  P: Program<M, C>,
-  M,
-  C: CommandSet<M, R>,
-  ? R
->(
-  app: &mut Runtime<Hosted<P>, M, Run<C>>,
-  fonts: &FontCollection,
-  window: &mut Window,
-  options: RunOptions,
-  inspector: Inspector,
-  content: &mut H,
-) -> i32
-  ! WindowError | GpuError | TreeError | AtlasError | GeometryError | OutOfMemoryError
-  ? R | &mut Allocator {
-  return run runWindowHostedWithSheetUpdates<H, Hosted<P>, M, Run<C>, OutOfMemoryError, R>(
-    &mut app,
-    fonts,
-    run window.resources.take(),
-    move options,
-    move inspector,
-    &mut content,
-    Intrinsic.replace(window.stylesheets, StyleAssets.make()),
-    Intrinsic.replace(window.stylesheetUpdates, SheetWatch.make()),
-  )
-}
-
-/// Runs program `P` in `window` until the window closes or the program asks the shell to
-/// quit. `R` is what the program's commands need; `platform` is what [`launch`] gave. Returns
-/// the exit code.
-///
-/// A command runs on the UI thread, after the frame that shows the update that asked for it:
-/// the window answers a click at once, and is busy only then. [`openWithWorkers`] runs the
-/// commands on other threads instead.
+/// Opens `window` in a native 2-thread Engine + App split (or single-threaded on `wasm32`).
 pub effect fn open<P: Program<M, C>, M, C: CommandSet<M, R>, ? R>(
   window: Window,
   fonts: &FontCollection,
@@ -1150,16 +1612,97 @@ pub effect fn open<P: Program<M, C>, M, C: CommandSet<M, R>, ? R>(
   ? R | &mut Allocator {
   let mut window = move window
   let mut opening = run opening<P, M, C>(&mut window, move platform)
-  let code = run hosted<ShellContent<Hosted<P>, M, Run<C>>, P, M, C, R>(
-    &mut opening.app,
-    fonts,
-    &mut window,
-    move opening.options,
-    move opening.inspector,
-    &mut opening.content,
-  )
-  closed(&window)
-  return code
+  static if Intrinsic.targetArchitecture() != "wasm32" {
+    let pendingJson = run opening.keeper.takePendingJson()
+    let ext = ShellExtension {
+      stylesheetCompiler: window.stylesheetCompiler,
+      dialogs: List<Asked>.make(),
+      notices: List<Notice>.make(),
+      files: Intrinsic.replace(window.files, List<CarriedFile>.make()),
+      treeKeeper: TreeKeeper.make(opening.keeper.on(), move pendingJson),
+      titleBar: window.titleBar,
+      titleBarHeight: window.titleBarHeight,
+      controlsLeft: window.controlsLeft,
+      controlsTop: window.controlsTop,
+      windowDrag: false,
+    }
+    let waiter = run Waiter.make()
+    let appWake = waiter.handle()
+    let toAppPair = run UnboundedChannel.make<EngineToApp>(appWake.clone())
+    let UnboundedPair<EngineToApp> { sender: appTx, receiver: appRx } = move toAppPair
+    let wakeSlot = run EngineWakeSlot.make()
+    let toEnginePair = run UnboundedChannel.make<AppToEngine>(WakeHandle.noop())
+    let UnboundedPair<AppToEngine> { sender: engineTx, receiver: engineRx } = move toEnginePair
+    let tx = AppToEngineTx.make(move engineTx, wakeSlot.clone())
+    attachSplitDesk(&window, move appWake, tx.clone())
+    let width = f64.toF32(window.width)
+    let height = f64.toF32(window.height)
+    let mut guard = run spawnEngineThread<ShellExtension>(
+      fonts,
+      run window.resources.take(),
+      move opening.options,
+      move opening.inspector,
+      Intrinsic.replace(window.stylesheets, StyleAssets.make()),
+      Intrinsic.replace(window.stylesheetUpdates, SheetWatch.make()),
+      move ext,
+      move engineRx,
+      move appTx,
+      move wakeSlot,
+      tx.clone(),
+    )
+    let mut bridge = ProgramAppBridge<Hosted<P>, M, Run<C>> {
+      desk: window.desk.clone(),
+      keeper: move opening.keeper,
+      greeted: false,
+    }
+    let appCode = run runSplitAppLoop<Hosted<P>, M, Run<C>, ProgramAppBridge<Hosted<P>, M, Run<C>>, OutOfMemoryError, R>(
+      &mut opening.app,
+      &mut bridge,
+      move tx,
+      move appRx,
+      move waiter,
+      width,
+      height,
+      true,
+    )
+    closed(&window)
+    let engineCode = guard.finish()
+    return if appCode != 0 { appCode } else { engineCode }
+  } else {
+    let mut content = ShellContent<Hosted<P>, M, Run<C>> {
+      stylesheetCompiler: window.stylesheetCompiler,
+      desk: window.desk.clone(),
+      dialogs: List<Asked>.make(),
+      notices: List<Notice>.make(),
+      greeted: false,
+      files: Intrinsic.replace(window.files, List<CarriedFile>.make()),
+      keeper: move opening.keeper,
+      titleBar: window.titleBar,
+      titleBarHeight: window.titleBarHeight,
+      controlsLeft: window.controlsLeft,
+      controlsTop: window.controlsTop,
+      windowDrag: false,
+    }
+    let code = run runWindowHostedWithSheetUpdates<
+      ShellContent<Hosted<P>, M, Run<C>>,
+      Hosted<P>,
+      M,
+      Run<C>,
+      OutOfMemoryError,
+      R
+    >(
+      &mut opening.app,
+      fonts,
+      run window.resources.take(),
+      move opening.options,
+      move opening.inspector,
+      &mut content,
+      Intrinsic.replace(window.stylesheets, StyleAssets.make()),
+      Intrinsic.replace(window.stylesheetUpdates, SheetWatch.make()),
+    )
+    closed(&window)
+    return code
+  }
 }
 
 /// A command that runs on a worker, and the ticket the runtime knows it by.
@@ -1168,21 +1711,65 @@ struct Job<M> {
   work: Worker<M>,
 }
 
-/// A worker thread and where it leaves its command's message. The message waits in a slot
+/// A worker job and where it leaves its command's message. The message waits in a slot
 /// of its own so that the loop reads it without knowing what the message type can do.
 struct Worker<M> {
-  thread: Background<bool>,
+  thread: Option<Background<bool>>,
+  claim: Option<ClaimHandle>,
   slot: Arc<Mutex<Option<M>>>,
+}
+
+fn workerReady<M>(work: &Worker<M>) -> bool {
+  if let Option<ClaimHandle>.Some { value: claim } = &work.claim {
+    return claim.isDone()
+  }
+  if let Option<Background<bool>>.Some { value: thread } = &work.thread {
+    return thread.ready()
+  }
+  return true
+}
+
+struct PooledWorkerWork<M, C> {
+  command: C,
+  hands: WindowShell,
+  slot: Arc<Mutex<Option<M>>>,
+}
+
+impl<M: Transferable, C: Transferable> Transferable for PooledWorkerWork<M, C> {}
+
+fn runPooledWorker<
+  M: 'static + Transferable,
+  C: 'static + Transferable + CommandSet<M, &mut Shell | &mut Allocator>
+>(
+  work: PooledWorkerWork<M, C>,
+  cancel: &CancellationToken,
+) -> () {
+  drop cancel
+  let PooledWorkerWork<M, C> { command, hands, slot } = move work
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut shell = move hands
+  let message = run Effect.catch<OutOfMemoryError>(
+    CommandSet<M, &mut Shell | &mut Allocator>.execute(move command),
+    exhausted<M>,
+  )
+    |> Effect.provideMut<Shell>(&mut shell)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut guard = slot.get().lock()
+  let place = guard.getMut()
+  place.* = Option<M>.some(move message)
 }
 
 /// How many commands run at once; the rest wait their turn.
 const WORKERS: usize = 8
 
-/// [`ShellContent`] that runs the program's commands on native worker threads.
-struct WorkerContent<A, M, C, F: fn<'static>(C, WindowShell) -> Option<Worker<M>>> {
+/// [`ShellContent`] that runs the program's commands on shared AppPool or fallback worker threads.
+struct WorkerContent<A, M, C, F: fn<'static>(C, WindowShell, Option<WorkPoolHandle>, u32, Option<WakeHandle>) -> Option<Worker<M>>> {
   shell: ShellContent<A, M, C>,
   hands: WindowShell,
   jobs: List<Job<M>>,
+  appPool: Option<WorkPoolHandle>,
+  groupId: u32,
+  wake: Option<WakeHandle>,
   /// Starts a command on a worker, or says None when no thread could start.
   start: F,
 }
@@ -1203,6 +1790,9 @@ effect fn starting<
 >(
   command: Run<C>,
   hands: WindowShell,
+  pool: Option<WorkPoolHandle>,
+  groupId: u32,
+  wake: Option<WakeHandle>,
 ) -> Option<Worker<M>>
   ! OutOfMemoryError | SpawnError {
   let command = move command.command
@@ -1211,8 +1801,33 @@ effect fn starting<
     |> Effect.provideMut<Allocator>(&mut allocator)
   let slot = run Arc<Mutex<Option<M>>>.make(move empty)
     |> Effect.provideMut<Allocator>(&mut allocator)
+  if let Option<WorkPoolHandle>.Some { value: appPool } = &pool {
+    let work = PooledWorkerWork<M, C> {
+      command: move command,
+      hands: move hands,
+      slot: slot.clone(),
+    }
+    let completionWake = match move wake {
+      Option<WakeHandle>.Some { value } => move value
+      Option<WakeHandle>.None => WakeHandle.noop()
+    }
+    let claim = run appPool.submitWith(
+      groupId,
+      move work,
+      runPooledWorker<M, C>,
+      run CancellationToken.make(),
+      move completionWake,
+    )
+    return Option<Worker<M>>.some(
+      Worker<M> {
+        thread: Option<Background<bool>>.None,
+        claim: Option<ClaimHandle>.some(move claim),
+        slot: move slot,
+      },
+    )
+  }
   let filled = slot.clone()
-  let thread = run Background<bool>.start(
+  let thread = run Background<bool>.startWithWake(
     || -> bool {
       let mut allocator = Allocator.systemAllocatorProvider()
       let mut shell = move hands
@@ -1228,20 +1843,30 @@ effect fn starting<
       place.* = Option<M>.some(move message)
       return true
     },
+    move wake,
   )
-  return Option<Worker<M>>.some(Worker<M> { thread: move thread, slot: move slot })
+  return Option<Worker<M>>.some(
+    Worker<M> {
+      thread: Option<Background<bool>>.some(move thread),
+      claim: Option<ClaimHandle>.None,
+      slot: move slot,
+    },
+  )
 }
 
-/// Runs `command` on a worker thread of its own, with the shell `hands` to ask.
+/// Runs `command` on the shared `pool` when available, or on a fallback worker thread, with the shell `hands` to ask.
 fn startWorker<
   M: 'static + Transferable,
   C: 'static + Transferable + CommandSet<M, &mut Shell | &mut Allocator>
 >(
   command: Run<C>,
   hands: WindowShell,
+  pool: Option<WorkPoolHandle>,
+  groupId: u32,
+  wake: Option<WakeHandle>,
 ) -> Option<Worker<M>> {
   return run Effect.catch<OutOfMemoryError>(
-    Effect.catch<SpawnError>(starting<M, C>(move command, move hands), unstarted<M>),
+    Effect.catch<SpawnError>(starting<M, C>(move command, move hands, move pool, groupId, move wake), unstarted<M>),
     noWorker<M>,
   )
 }
@@ -1255,7 +1880,7 @@ impl<
   A: App<M, C>,
   M,
   C,
-  F: fn<'static>(C, WindowShell) -> Option<Worker<M>>
+  F: fn<'static>(C, WindowShell, Option<WorkPoolHandle>, u32, Option<WakeHandle>) -> Option<Worker<M>>
 > WindowContent<A, M, C> for WorkerContent<A, M, C, F> {
   effect fn files(self: &mut Self, loader: &mut Loader) -> ()
     ! OutOfMemoryError
@@ -1271,6 +1896,19 @@ impl<
     ! WindowError | OutOfMemoryError
     ? &mut Allocator {
     return run WindowContent<A, M, C>.opened(&mut self.shell, &mut platform, window)
+  }
+
+  effect fn attachRuntime(
+    self: &mut Self,
+    appPool: WorkPoolHandle,
+    groupId: u32,
+    wake: Nudge,
+  ) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    drop wake
+    self.appPool = Option<WorkPoolHandle>.some(move appPool)
+    self.groupId = groupId
   }
 
   effect fn event(
@@ -1310,15 +1948,6 @@ impl<
     return true
   }
 
-  fn wakeAfter(self: &Self) -> Option<f64> {
-    // A worker's message is collected within a frame of its end.
-    return if self.jobs.length() != 0 {
-      Option<f64>.some(0.008)
-    } else {
-      Option<f64>.None
-    }
-  }
-
   effect fn poll(
     self: &mut Self,
     app: &mut Runtime<A, M, C>,
@@ -1330,15 +1959,18 @@ impl<
     let mut changed = run WindowContent<A, M, C>.poll(&mut self.shell, &mut app, &mut tree, time)
     let mut i: usize = 0
     while i < self.jobs.length() {
-      if self.jobs.asSlice()[i].work.thread.ready() {
+      if workerReady(&self.jobs.asSlice()[i].work) {
         let mut job = self.jobs.remove(i)
-        drop job.work.thread.poll()
+        if let Option<Background<bool>>.Some { value: thread } = move job.work.thread {
+          let mut t = move thread
+          drop t.poll()
+        }
+        drop job.work.claim
         let mut guard = job.work.slot.get().lock()
         let place = guard.getMut()
         let message = Intrinsic.replace(place.*, Option<M>.None)
         drop guard
         if let Option<M>.Some { value } = move message {
-          // A cancelled command's message is dropped here.
           if app.finish(job.ticket, move value) {
             changed = true
           }
@@ -1350,7 +1982,15 @@ impl<
     while self.jobs.length() < WORKERS && app.deferredOn(false) != 0 {
       let held = run app.takeWorkOn(false)
       let ticket = held.ticket
-      match self.start(move held.command, self.hands.onWorker()) {
+      let pool = match &self.appPool {
+        Option<WorkPoolHandle>.Some { value } => Option<WorkPoolHandle>.some(value.clone())
+        Option<WorkPoolHandle>.None => Option<WorkPoolHandle>.None
+      }
+      let wake = match &self.wake {
+        Option<WakeHandle>.Some { value } => Option<WakeHandle>.some(value.clone())
+        Option<WakeHandle>.None => Option<WakeHandle>.None
+      }
+      match self.start(move held.command, self.hands.onWorker(), move pool, self.groupId, move wake) {
         Option<Worker<M>>.Some { value } => run self.jobs.append(Job<M> { ticket: ticket, work: move value })
         Option<Worker<M>>.None => {
           drop app.abandon(ticket)
@@ -1362,11 +2002,11 @@ impl<
   }
 }
 
-effect fn working<
+effect fn runWorkerSplit<
   P: Program<M, C>,
   M: 'static + Transferable,
   C: 'static + Transferable + CommandSet<M, &mut Shell | &mut Allocator>,
-  F: fn<'static>(Run<C>, WindowShell) -> Option<Worker<M>>
+  F: fn<'static>(Run<C>, WindowShell, Option<WorkPoolHandle>, u32, Option<WakeHandle>) -> Option<Worker<M>>
 >(
   opening: Opening<P, M, C>,
   fonts: &FontCollection,
@@ -1375,27 +2015,124 @@ effect fn working<
 ) -> i32
   ! WindowError | GpuError | TreeError | AtlasError | GeometryError | OutOfMemoryError
   ? &mut Shell | &mut Allocator {
-  let mut app = move opening.app
-  let mut content = WorkerContent<Hosted<P>, M, Run<C>, F> {
-    shell: move opening.content,
-    hands: window.shell(),
-    jobs: List<Job<M>>.make(),
-    start: move start,
+  let mut opening = move opening
+  static if Intrinsic.targetArchitecture() != "wasm32" {
+    let pendingJson = run opening.keeper.takePendingJson()
+    let ext = ShellExtension {
+      stylesheetCompiler: window.stylesheetCompiler,
+      dialogs: List<Asked>.make(),
+      notices: List<Notice>.make(),
+      files: Intrinsic.replace(window.files, List<CarriedFile>.make()),
+      treeKeeper: TreeKeeper.make(opening.keeper.on(), move pendingJson),
+      titleBar: window.titleBar,
+      titleBarHeight: window.titleBarHeight,
+      controlsLeft: window.controlsLeft,
+      controlsTop: window.controlsTop,
+      windowDrag: false,
+    }
+    let waiter = run Waiter.make()
+    let appWake = waiter.handle()
+    let bridgeWake = waiter.handle()
+    let toAppPair = run UnboundedChannel.make<EngineToApp>(appWake.clone())
+    let UnboundedPair<EngineToApp> { sender: appTx, receiver: appRx } = move toAppPair
+    let wakeSlot = run EngineWakeSlot.make()
+    let toEnginePair = run UnboundedChannel.make<AppToEngine>(WakeHandle.noop())
+    let UnboundedPair<AppToEngine> { sender: engineTx, receiver: engineRx } = move toEnginePair
+    let tx = AppToEngineTx.make(move engineTx, wakeSlot.clone())
+    attachSplitDesk(&window.*, move appWake, tx.clone())
+    let width = f64.toF32(window.width)
+    let height = f64.toF32(window.height)
+    let mut guard = run spawnEngineThread<ShellExtension>(
+      fonts,
+      run window.resources.take(),
+      move opening.options,
+      move opening.inspector,
+      Intrinsic.replace(window.stylesheets, StyleAssets.make()),
+      Intrinsic.replace(window.stylesheetUpdates, SheetWatch.make()),
+      move ext,
+      move engineRx,
+      move appTx,
+      move wakeSlot,
+      tx.clone(),
+    )
+    let shellBridge = ProgramAppBridge<Hosted<P>, M, Run<C>> {
+      desk: window.desk.clone(),
+      keeper: move opening.keeper,
+      greeted: false,
+    }
+    let mut bridge = WorkerAppBridge<Hosted<P>, M, Run<C>, F> {
+      shell: move shellBridge,
+      hands: window.shell(),
+      jobs: List<Job<M>>.make(),
+      appPool: Option<WorkPoolHandle>.None,
+      groupId: 0,
+      wake: Option<WakeHandle>.some(move bridgeWake),
+      start: move start,
+    }
+    let appCode = run runSplitAppLoop<
+      Hosted<P>,
+      M,
+      Run<C>,
+      WorkerAppBridge<Hosted<P>, M, Run<C>, F>,
+      OutOfMemoryError,
+      &mut Shell | &mut Allocator
+    >(
+      &mut opening.app,
+      &mut bridge,
+      move tx,
+      move appRx,
+      move waiter,
+      width,
+      height,
+      true,
+    )
+    let engineCode = guard.finish()
+    return if appCode != 0 { appCode } else { engineCode }
+  } else {
+    let shell = ShellContent<Hosted<P>, M, Run<C>> {
+      stylesheetCompiler: window.stylesheetCompiler,
+      desk: window.desk.clone(),
+      dialogs: List<Asked>.make(),
+      notices: List<Notice>.make(),
+      greeted: false,
+      files: Intrinsic.replace(window.files, List<CarriedFile>.make()),
+      keeper: move opening.keeper,
+      titleBar: window.titleBar,
+      titleBarHeight: window.titleBarHeight,
+      controlsLeft: window.controlsLeft,
+      controlsTop: window.controlsTop,
+      windowDrag: false,
+    }
+    let mut content = WorkerContent<Hosted<P>, M, Run<C>, F> {
+      shell: move shell,
+      hands: window.shell(),
+      jobs: List<Job<M>>.make(),
+      appPool: Option<WorkPoolHandle>.None,
+      groupId: 0,
+      wake: Option<WakeHandle>.None,
+      start: move start,
+    }
+    return run runWindowHostedWithSheetUpdates<
+      WorkerContent<Hosted<P>, M, Run<C>, F>,
+      Hosted<P>,
+      M,
+      Run<C>,
+      OutOfMemoryError,
+      &mut Shell | &mut Allocator
+    >(
+      &mut opening.app,
+      fonts,
+      run window.resources.take(),
+      move opening.options,
+      move opening.inspector,
+      &mut content,
+      Intrinsic.replace(window.stylesheets, StyleAssets.make()),
+      Intrinsic.replace(window.stylesheetUpdates, SheetWatch.make()),
+    )
   }
-  return run hosted<WorkerContent<Hosted<P>, M, Run<C>, F>, P, M, C, &mut Shell | &mut Allocator>(
-    &mut app,
-    fonts,
-    &mut window,
-    move opening.options,
-    move opening.inspector,
-    &mut content,
-  )
 }
 
-/// [`open`] with the program's commands on worker threads: the window stays live while a
-/// command is slow. The messages and the commands move between threads, so they own what
-/// they hold (no borrowed view, nothing of a UI arena). A command that must stay on the UI
-/// thread says so with `onUiThread`; those need the `Shell` this is run with.
+/// [`open`] with the program's commands on worker threads (`AppPool` + `Waiter` wakeup).
 pub effect fn openWithWorkers<
   P: Program<M, C>,
   M: 'static + Transferable,
@@ -1409,9 +2146,7 @@ pub effect fn openWithWorkers<
   ? &mut Shell | &mut Allocator {
   let mut window = move window
   let opening = run opening<P, M, C>(&mut window, move platform)
-  let code = run working(move opening, fonts, &mut window, startWorker<M, C>)
-
-  // The workers that still wait for the UI thread are let go before they are joined.
+  let code = run runWorkerSplit(move opening, fonts, &mut window, startWorker<M, C>)
   closed(&window)
   return code
 }

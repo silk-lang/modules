@@ -1,19 +1,32 @@
 import properties.census { Census }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.mem.pointer { Pointer }
 import source { LayoutSource }
 import silk.collections.list { List }
+import silk.core.effect { Effect }
 import silk.core.option { Option }
 import silk.core.ownership { Copy }
+import silk.core.result { Result }
 import silk.num.usize
 import silk.num.f32
 import silk.num.f64
 import geometry { Measure, Layout, BaselineSet, FontRequest, Size, Point, OptionalSize, AvailableSpace, AvailableKind, ResolvedEdges, max, min, clamp, abs }
 import style { Style, SizeValue, DimensionKind, Direction, WritingMode, TextOrientation, FlexDirection, FlexWrap, Align, OverflowAlignment, BoxSizing, Visibility, MarginBreak, BoxDecorationBreak }
-import tree { NO_NODE, Measurement }
+import tree { NO_NODE, Measurement, LayoutStats }
 import box_tree { BoxTree }
 import context { Input, ResolvedBox, resolveBox, childrenInput, resolveGap, resolveSize, sizeResolves, outOfFlow, isFlex, scrollable, overflowForAxis, UNBOUNDED }
 import engine { plainWidth, widthIgnoresHeight, crossIgnoresMain, layoutNode, layoutNodeInPlace, layoutEmptyLeafInPlace, plainMeasuredBox, probeFresh, normalizeKey, constraintFreeProbe, sizeEmptyBox, emptyIntrinsicWidth, shapedBox, ITEM_OUT_OF_FLOW, ITEM_ORDERED }
-import layout_pass { LayoutPass, CacheKind }
+import fragments { FragmentArena }
+import layout_cache { BoxFacts }
+import layout_pass { LayoutPass, CacheKind, PassState }
+import parallel {
+  ParallelBatch,
+  PARALLEL_LAYOUT_MIN,
+  probeSubtreeEligible,
+  pickChunkCount,
+  prepProbeSubtree,
+  mergeChunkStats,
+}
 import stored_input { StoredInput, RARE_NONE, sameStored }
 import text { TextMeasure, TextError }
 import fragmentation { FlowCursor, FragmentationError, BoundaryProbe }
@@ -257,23 +270,55 @@ fn probeInput(childInput: &Input, horizontal: bool, constraint: AvailableSpace, 
 fn stretchesCross(item: &Item) -> bool {
   return item.crossAuto && item.align == Align.Stretch && !item.autoCrossStart && !item.autoCrossEnd
 }
-// The final layout of an unfragmented item as placeFlexLines requests it,
-// once its cross constraint is known or independent of the line size:
-// with the item's target main size when `mainKnown`, else with none, so the
-// layout finds the content size a probe would. Marks the item `early`.
-effect fn layoutAhead<'pass, 'source, M: Measure + TextMeasure, S: LayoutSource>(nodes: &BoxTree<'source, S>, output: &mut LayoutPass<'pass, 'source>, measurer: &mut M, item: &mut Item, childInput: &Input, horizontal: bool, mainKnown: bool) -> Probe ! OutOfMemoryError | TextError | FragmentationError ? &mut Allocator {
+fn placeItemInput<S: LayoutSource>(nodes: &BoxTree<'_, S>, childInput: &Input, item: &Item, axis: &Axes, lineCross: f32, baseInput: Input) -> Input {
+  let mut finalInput = baseInput
+  finalInput.known = childInput.known
+  finalInput.indefiniteWidth = childInput.indefiniteWidth
+  finalInput.indefiniteHeight = childInput.indefiniteHeight
+  finalInput.availableWidth = childInput.availableWidth
+  finalInput.availableHeight = childInput.availableHeight
+  setKnown(&mut finalInput, axis.horizontal, item.target)
+  setIndefinite(&mut finalInput, axis.horizontal, !item.mainDefinite)
+  if stretchesCross(item) {
+    let childCross = clamp(lineCross - item.crossStart - item.crossEnd, item.crossMin, item.crossMax)
+    setKnown(&mut finalInput, !axis.horizontal, childCross)
+  } else if axisDimension(nodes.style(item.id), !axis.horizontal).kind == DimensionKind.FitContent {
+    setAvailable(&mut finalInput, !axis.horizontal, AvailableSpace.definite(lineCross))
+  }
+  return finalInput
+}
+fn aheadFinalInput<S: LayoutSource>(nodes: &BoxTree<'_, S>, item: &Item, childInput: &Input, horizontal: bool, mainKnown: bool) -> Input {
   let id = item.id
   let mut finalInput = childInput.*
   if mainKnown { setKnown(&mut finalInput, horizontal, item.target) }
   setIndefinite(&mut finalInput, horizontal, !item.mainDefinite)
   let lineCross = optionalSize(childInput.parent, !horizontal)
-  if stretchesCross(&item.*) {
+  if stretchesCross(item) {
     setKnown(&mut finalInput, !horizontal, clamp(lineCross - item.crossStart - item.crossEnd, item.crossMin, item.crossMax))
   } else if axisDimension(nodes.style(id), !horizontal).kind == DimensionKind.FitContent {
     setAvailable(&mut finalInput, !horizontal, AvailableSpace.definite(lineCross))
   }
-  if !run layoutEmptyLeafInPlace(nodes, &mut output, id, &finalInput) {
-    run layoutNodeInPlace(nodes, &mut output, &mut measurer, id, &finalInput)
+  return finalInput
+}
+fn canRunAhead<S: LayoutSource>(nodes: &BoxTree<'_, S>, id: usize, style: &Style, preferredKind: DimensionKind, early: bool, horizontal: bool) -> bool {
+  return early && !horizontal && style.writingMode == WritingMode.HorizontalTb && style.aspectRatio == 0.0
+    && !style.replaced && nodes.node(id).measurement != Measurement.Natural
+    && preferredKind == DimensionKind.Auto && style.flexBasis.kind == DimensionKind.Auto
+    && blockAxisConstraint(style, horizontal, AvailableSpace.minContent()).kind == AvailableKind.MaxContent
+}
+// The final layout of an unfragmented item as placeFlexLines requests it,
+// once its cross constraint is known or independent of the line size:
+// with the item's target main size when `mainKnown`, else with none, so the
+// layout finds the content size a probe would. Marks the item `early`.
+effect fn layoutAheadBatched<'pass, 'source, M: Measure + TextMeasure, S: LayoutSource>(nodes: &BoxTree<'source, S>, output: &mut LayoutPass<'pass, 'source>, measurer: &mut M, item: &mut Item, childInput: &Input, horizontal: bool, mainKnown: bool, batch: &mut ParallelBatch<M>, batchSlot: usize) -> Probe ! OutOfMemoryError | TextError | FragmentationError ? &mut Allocator {
+  let id = item.id
+  if batchSlot != NO_NODE {
+    run batch.commitJob(nodes, &mut output, &mut measurer, batchSlot)
+  } else {
+    let finalInput = aheadFinalInput(nodes, &item.*, childInput, horizontal, mainKnown)
+    if !run layoutEmptyLeafInPlace(nodes, &mut output, id, &finalInput) {
+      run layoutNodeInPlace(nodes, &mut output, &mut measurer, id, &finalInput)
+    }
   }
   let layout = &output.boxes[id]
   item.early = true
@@ -281,6 +326,355 @@ effect fn layoutAhead<'pass, 'source, M: Measure + TextMeasure, S: LayoutSource>
   item.earlyCross = axisSize(layout.size, !horizontal)
   return Probe { size: layout.size, preferredRatio: layout.preferredRatio, ratioBorderBox: layout.ratioBorderBox }
 }
+effect fn layoutAhead<'pass, 'source, M: Measure + TextMeasure, S: LayoutSource>(nodes: &BoxTree<'source, S>, output: &mut LayoutPass<'pass, 'source>, measurer: &mut M, item: &mut Item, childInput: &Input, horizontal: bool, mainKnown: bool) -> Probe ! OutOfMemoryError | TextError | FragmentationError ? &mut Allocator {
+  let mut noBatch = ParallelBatch<M>.make()
+  return run layoutAheadBatched(nodes, &mut output, &mut measurer, &mut item, childInput, horizontal, mainKnown, &mut noBatch, NO_NODE)
+}
+struct FlexChunkOutcome {
+  ok: bool,
+  hasAutoScrollbars: bool,
+  gutterScrollbars: bool,
+  stats: LayoutStats,
+}
+
+impl Copy for FlexChunkOutcome {}
+
+struct FlexPrepareChunk<M> {
+  start: usize,
+  len: usize,
+  ok: bool,
+  hasAutoScrollbars: bool,
+  gutterScrollbars: bool,
+  stats: LayoutStats,
+  measurer: Option<M>,
+}
+
+struct FlexPrepareState<M, S> {
+  nodesPtr: *const u8,
+  factsPtr: *const u8,
+  boxesPtr: *mut Layout,
+  boxesLen: usize,
+  deferSticky: bool,
+  selectionsPtr: Option<*const u8>,
+  selectionsLen: usize,
+  itemsPtr: *mut Item,
+  itemsLen: usize,
+  jobIndicesPtr: *const usize,
+  jobIndicesLen: usize,
+  childInput: Input,
+  axis: Axes,
+  parentStylePtr: *const Style,
+  mainConstraint: AvailableSpace,
+  intrinsic: bool,
+  containerMainDefinite: bool,
+  chunksPtr: *mut FlexPrepareChunk<M>,
+  chunksLen: usize,
+}
+
+effect fn executeFlexPrepareChunk<'chunk, 'source, M: Measure + TextMeasure, S: LayoutSource>(
+  nodes: &BoxTree<'source, S>,
+  facts: &'chunk BoxFacts,
+  boxes: &'chunk mut [Layout],
+  deferSticky: bool,
+  selectionsPtr: Option<*const u8>,
+  selectionsLen: usize,
+  items: &'chunk mut [Item],
+  jobIndices: &[usize],
+  childInput: &Input,
+  axis: &Axes,
+  parentStyle: &Style,
+  mainConstraint: AvailableSpace,
+  intrinsic: bool,
+  containerMainDefinite: bool,
+  start: usize,
+  len: usize,
+  measurer: &mut M,
+) -> FlexChunkOutcome ! OutOfMemoryError | TextError | FragmentationError ? &mut Allocator {
+  let mut state = PassState.make()
+  state.cache.skipFinals(true)
+  let mut fragments = FragmentArena.make()
+  let mut pass = run LayoutPass.over(
+    move boxes,
+    &mut fragments,
+    nodes.source,
+    &mut state.cache,
+    &mut state.previous,
+    &mut state.writes,
+    facts,
+  )
+  pass.tracking = false
+  pass.deferSticky = deferSticky
+  pass.setSharedSelections(selectionsPtr, selectionsLen)
+
+  let mut noBatch = ParallelBatch<M>.make()
+  let mut ok = true
+  let end = start + len
+  let mut j = start
+  while j < end {
+    let itemIdx = jobIndices[j]
+    if axis.horizontal {
+      run prepareFresh(
+        nodes,
+        &mut pass,
+        &mut measurer,
+        &mut items[itemIdx],
+        childInput,
+        axis,
+        parentStyle,
+        mainConstraint,
+        intrinsic,
+        containerMainDefinite,
+        false,
+        true,
+        &mut noBatch,
+        NO_NODE,
+      )
+    } else {
+      run prepareFresh(
+        nodes,
+        &mut pass,
+        &mut measurer,
+        &mut items[itemIdx],
+        childInput,
+        axis,
+        parentStyle,
+        mainConstraint,
+        intrinsic,
+        containerMainDefinite,
+        false,
+        false,
+        &mut noBatch,
+        NO_NODE,
+      )
+    }
+    if pass.foundExclusions.length() != 0 || pass.exclusions.length() != 0 {
+      ok = false
+      break
+    }
+    j = j + 1
+  }
+
+  return FlexChunkOutcome {
+    ok: ok,
+    hasAutoScrollbars: pass.hasAutoScrollbars,
+    gutterScrollbars: pass.gutterScrollbars,
+    stats: pass.stats,
+  }
+}
+
+pub fn runFlexPrepareChunk<M: Measure + TextMeasure, S: LayoutSource>(ctx: *const u8, chunkIdx: usize) -> () {
+  let mut heap = Allocator.systemAllocatorProvider()
+  let stateAnchor = ()
+  let state = unsafe Pointer.borrow<(), FlexPrepareState<M, S>>(
+    &stateAnchor,
+    unsafe Intrinsic.pointerReinterpret<*const u8, *const FlexPrepareState<M, S>>(ctx),
+  )
+  let nodesAnchor = ()
+  let nodes = unsafe Pointer.borrow<(), BoxTree<'static, S>>(
+    &nodesAnchor,
+    unsafe Intrinsic.pointerReinterpret<*const u8, *const BoxTree<'static, S>>(state.nodesPtr),
+  )
+  let factsAnchor = ()
+  let facts = unsafe Pointer.borrow<(), BoxFacts>(
+    &factsAnchor,
+    unsafe Intrinsic.pointerReinterpret<*const u8, *const BoxFacts>(state.factsPtr),
+  )
+  let mut boxesAnchor = ()
+  let mut boxes = unsafe Pointer.borrowManyMut<(), Layout>(
+    &mut boxesAnchor,
+    unsafe Pointer.assumeManyMut<Layout>(state.boxesPtr),
+    state.boxesLen,
+  )
+  let mut itemsAnchor = ()
+  let mut items = unsafe Pointer.borrowManyMut<(), Item>(
+    &mut itemsAnchor,
+    unsafe Pointer.assumeManyMut<Item>(state.itemsPtr),
+    state.itemsLen,
+  )
+  let jobIndicesAnchor = ()
+  let jobIndices = unsafe Pointer.borrowMany<(), usize>(
+    &jobIndicesAnchor,
+    unsafe Pointer.assumeMany<usize>(state.jobIndicesPtr),
+    state.jobIndicesLen,
+  )
+  let styleAnchor = ()
+  let parentStyle = unsafe Pointer.borrow<(), Style>(&styleAnchor, state.parentStylePtr)
+  let mut chunksAnchor = ()
+  let mut chunks = unsafe Pointer.borrowManyMut<(), FlexPrepareChunk<M>>(
+    &mut chunksAnchor,
+    unsafe Pointer.assumeManyMut<FlexPrepareChunk<M>>(state.chunksPtr),
+    state.chunksLen,
+  )
+
+  let chunk = &mut chunks[chunkIdx]
+  let takenMeasurer = Intrinsic.replace(chunk.measurer, Option<M>.None)
+  match move takenMeasurer {
+    Option<M>.None => {
+      chunk.ok = false
+      return ()
+    }
+    Option<M>.Some { value } => {
+      let mut workerMeasurer = move value
+      let outcome = run Effect.result(
+        executeFlexPrepareChunk<M, S>(
+          nodes,
+          facts,
+          move boxes,
+          state.deferSticky,
+          state.selectionsPtr,
+          state.selectionsLen,
+          move items,
+          jobIndices,
+          &state.childInput,
+          &state.axis,
+          parentStyle,
+          state.mainConstraint,
+          state.intrinsic,
+          state.containerMainDefinite,
+          chunk.start,
+          chunk.len,
+          &mut workerMeasurer,
+        ),
+      ) |> Effect.provideMut<Allocator>(&mut heap)
+      chunk.measurer = Option<M>.some(move workerMeasurer)
+      match move outcome {
+        Result.Success { value: outcomeVal } => {
+          chunk.ok = outcomeVal.ok
+          chunk.hasAutoScrollbars = outcomeVal.hasAutoScrollbars
+          chunk.gutterScrollbars = outcomeVal.gutterScrollbars
+          chunk.stats = outcomeVal.stats
+        }
+        Result.Failure { error: _ } => {
+          chunk.ok = false
+        }
+      }
+    }
+  }
+}
+
+/// Probes independent `!early` flex items in parallel across `EnginePool` into `items`,
+/// leaving `prepStates` as 0 for any failed chunk so the caller falls back serially.
+effect fn runParallelFlexPrepare<'pass, 'source, M: Measure + TextMeasure, S: LayoutSource>(
+  nodes: &BoxTree<'source, S>,
+  output: &mut LayoutPass<'pass, 'source>,
+  measurer: &mut M,
+  items: &mut [Item],
+  jobIndices: &[usize],
+  prepStates: &mut [u8],
+  childInput: &Input,
+  axis: &Axes,
+  parentStyle: &Style,
+  mainConstraint: AvailableSpace,
+  intrinsic: bool,
+  containerMainDefinite: bool,
+) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let totalJobs = jobIndices.length
+  if totalJobs < PARALLEL_LAYOUT_MIN || items.length == 0 || output.frame != NO_NODE
+    || output.exclusions.length() != 0 || output.hasFrameSelections() || output.boxes.length == 0 {
+    return false
+  }
+  let workers = Measure.parallelWorkers(&measurer)
+  if workers <= 1 { return false }
+
+  let chunkCount = pickChunkCount(workers, totalJobs)
+  let mut chunks = List<FlexPrepareChunk<M>>.make()
+  run chunks.reserveExact(chunkCount)
+  let baseLen = totalJobs / chunkCount
+  let remainder = totalJobs % chunkCount
+  let mut start: usize = 0
+  let mut c: usize = 0
+  while c < chunkCount {
+    let extra: usize = if c < remainder { 1 } else { 0 }
+    let len = baseLen + extra
+    let forked = run Measure.forkForWorker(&measurer)
+    match move forked {
+      Option<M>.None => {
+        chunks.clear()
+        return false
+      }
+      Option<M>.Some { value: worker } => {
+        run chunks.append(FlexPrepareChunk {
+          start: start,
+          len: len,
+          ok: false,
+          hasAutoScrollbars: false,
+          gutterScrollbars: false,
+          stats: LayoutStats.zero(),
+          measurer: Option<M>.some(move worker),
+        })
+      }
+    }
+    start = start + len
+    c = c + 1
+  }
+
+  if output.inPlace || output.tracking {
+    let mut j: usize = 0
+    while j < totalJobs {
+      run prepProbeSubtree(nodes, &mut output, items[jobIndices[j]].id)
+      j = j + 1
+    }
+  }
+
+  let state = FlexPrepareState<M, S> {
+    nodesPtr: unsafe Intrinsic.pointerReinterpret<*const BoxTree<'source, S>, *const u8>(Pointer.fromRef(nodes)),
+    factsPtr: unsafe Intrinsic.pointerReinterpret<*const BoxFacts, *const u8>(Pointer.fromRef(output.facts)),
+    boxesPtr: Pointer.fromMutRef<Layout>(&mut output.boxes[0]),
+    boxesLen: output.boxes.length,
+    deferSticky: output.deferSticky,
+    selectionsPtr: output.selectionsRawPtr(),
+    selectionsLen: output.selectionsCount(),
+    itemsPtr: Pointer.fromMutRef<Item>(&mut items[0]),
+    itemsLen: items.length,
+    jobIndicesPtr: Pointer.fromRef<usize>(&jobIndices[0]),
+    jobIndicesLen: totalJobs,
+    childInput: childInput.*,
+    axis: axis.*,
+    parentStylePtr: Pointer.fromRef<Style>(parentStyle),
+    mainConstraint: mainConstraint,
+    intrinsic: intrinsic,
+    containerMainDefinite: containerMainDefinite,
+    chunksPtr: Pointer.fromMutRef<FlexPrepareChunk<M>>(&mut chunks.asMutSlice()[0]),
+    chunksLen: chunkCount,
+  }
+  let payloadPtr = unsafe Intrinsic.pointerReinterpret<*const FlexPrepareState<M, S>, *const u8>(
+    Pointer.fromRef(&state),
+  )
+  let dispatched = run Measure.dispatchFlexPrepare(&mut measurer, chunkCount, payloadPtr)
+  if !dispatched {
+    chunks.clear()
+    return false
+  }
+
+  let mut fontKeyRemap = List<usize>.make()
+  let mut shapeKeyRemap = List<u32>.make()
+  c = 0
+  while c < chunkCount {
+    let chunkSlice = chunks.asMutSlice()
+    let workerOpt = Intrinsic.replace(chunkSlice[c].measurer, Option<M>.None)
+    if chunkSlice[c].ok {
+      if let Option<M>.Some { value: workerMeasurer } = move workerOpt {
+        run Measure.mergeWorker(&mut measurer, move workerMeasurer, &mut fontKeyRemap, &mut shapeKeyRemap)
+        mergeChunkStats(&mut output, chunkSlice[c].hasAutoScrollbars, chunkSlice[c].gutterScrollbars, &chunkSlice[c].stats)
+      } else {
+        chunkSlice[c].ok = false
+      }
+    } else {
+      drop workerOpt
+    }
+    if !chunkSlice[c].ok {
+      let end = chunkSlice[c].start + chunkSlice[c].len
+      let mut j = chunkSlice[c].start
+      while j < end {
+        prepStates[jobIndices[j]] = 0
+        j = j + 1
+      }
+    }
+    c = c + 1
+  }
+  return true
+}
+
 // prepareFresh, or what it made of the item before under the same arguments.
 // `request` is FlexMemos.request for the container pass.
 effect fn prepare<'pass, 'source, M: Measure + TextMeasure, S: LayoutSource>(nodes: &BoxTree<'source, S>, output: &mut LayoutPass<'pass, 'source>, measurer: &mut M, item: &mut Item, childInput: &Input, axis: &Axes, parentStyle: &Style, mainConstraint: AvailableSpace, intrinsic: bool, containerMainDefinite: bool, request: usize) ! OutOfMemoryError | TextError | FragmentationError ? &mut Allocator {
@@ -293,12 +687,13 @@ effect fn prepare<'pass, 'source, M: Measure + TextMeasure, S: LayoutSource>(nod
       return
     }
   }
+  let mut noBatch = ParallelBatch<M>.make()
   // Specialized per main axis so the axis selects fold away.
-  if axis.horizontal { run prepareFresh(nodes, &mut output, &mut measurer, &mut item, &childInput, &axis, &parentStyle, mainConstraint, intrinsic, containerMainDefinite, false, true) }
-  else { run prepareFresh(nodes, &mut output, &mut measurer, &mut item, &childInput, &axis, &parentStyle, mainConstraint, intrinsic, containerMainDefinite, false, false) }
+  if axis.horizontal { run prepareFresh(nodes, &mut output, &mut measurer, &mut item, &childInput, &axis, &parentStyle, mainConstraint, intrinsic, containerMainDefinite, false, true, &mut noBatch, NO_NODE) }
+  else { run prepareFresh(nodes, &mut output, &mut measurer, &mut item, &childInput, &axis, &parentStyle, mainConstraint, intrinsic, containerMainDefinite, false, false, &mut noBatch, NO_NODE) }
   if memoable { run output.cache.flexMemos.remember(id, request, &item) }
 }
-effect fn prepareFresh<'pass, 'source, M: Measure + TextMeasure, S: LayoutSource>(nodes: &BoxTree<'source, S>, output: &mut LayoutPass<'pass, 'source>, measurer: &mut M, item: &mut Item, childInput: &Input, axis: &Axes, parentStyle: &Style, mainConstraint: AvailableSpace, intrinsic: bool, containerMainDefinite: bool, early: bool, static horizontal: bool) ! OutOfMemoryError | TextError | FragmentationError ? &mut Allocator {
+effect fn prepareFresh<'pass, 'source, M: Measure + TextMeasure, S: LayoutSource>(nodes: &BoxTree<'source, S>, output: &mut LayoutPass<'pass, 'source>, measurer: &mut M, item: &mut Item, childInput: &Input, axis: &Axes, parentStyle: &Style, mainConstraint: AvailableSpace, intrinsic: bool, containerMainDefinite: bool, early: bool, horizontal: bool, aheadBatch: &mut ParallelBatch<M>, aheadSlot: usize) ! OutOfMemoryError | TextError | FragmentationError ? &mut Allocator {
   let id = item.id
   let style = nodes.style(id)
   let box = shapedBox(&output, style, id, &childInput)
@@ -368,9 +763,7 @@ effect fn prepareFresh<'pass, 'source, M: Measure + TextMeasure, S: LayoutSource
   let mut haveMaxProbe = false
   // An item whose block-axis content size is its laid out size is laid out
   // once, with its final request less the main size, in place of the probe.
-  let ahead = early && !horizontal && style.writingMode == WritingMode.HorizontalTb && style.aspectRatio == 0.0 && !style.replaced && nodes.node(id).measurement != Measurement.Natural
-    && preferred.kind == DimensionKind.Auto && style.flexBasis.kind == DimensionKind.Auto
-    && blockAxisConstraint(style, horizontal, AvailableSpace.minContent()).kind == AvailableKind.MaxContent
+  let ahead = canRunAhead(nodes, id, style, preferred.kind, early, horizontal)
   // §4.5: the automatic minimum is at most the preferred size. When the flex
   // base is at least that large, the minimum cannot change the hypothetical
   // size or a growing line; only a shrinking line reads it, so measure the
@@ -396,7 +789,7 @@ effect fn prepareFresh<'pass, 'source, M: Measure + TextMeasure, S: LayoutSource
       minProbe = Probe { size: Size { width: item.inset, height: crossSize }, preferredRatio: 0.0, ratioBorderBox: false }
     } else {
       let mut measured = minProbe
-      if ahead { measured = run layoutAhead(nodes, &mut output, &mut measurer, &mut item, &childInput, horizontal, false) }
+      if ahead { measured = run layoutAheadBatched(nodes, &mut output, &mut measurer, &mut item, &childInput, horizontal, false, &mut aheadBatch, aheadSlot) }
       else {
         let constraint = blockAxisConstraint(style, horizontal, AvailableSpace.minContent())
         measured = run probe(nodes, &mut output, &mut measurer, id, &childInput, horizontal, constraint, crossDefinite, crossSize)
@@ -414,7 +807,7 @@ effect fn prepareFresh<'pass, 'source, M: Measure + TextMeasure, S: LayoutSource
   let mut contentCross = crossSize
   if !basisDefinite || (intrinsic && !deferMinimum) || minimumDimension.kind == DimensionKind.MaxContent || maximumDimension.kind == DimensionKind.MaxContent || minimumDimension.kind == DimensionKind.FitContent || maximumDimension.kind == DimensionKind.FitContent {
     let mut measured = minProbe
-    if ahead { if !item.early { measured = run layoutAhead(nodes, &mut output, &mut measurer, &mut item, &childInput, horizontal, false) } }
+    if ahead { if !item.early { measured = run layoutAheadBatched(nodes, &mut output, &mut measurer, &mut item, &childInput, horizontal, false, &mut aheadBatch, aheadSlot) } }
     else if !haveMaxProbe { measured = run probe(nodes, &mut output, &mut measurer, id, &childInput, horizontal, AvailableSpace.maxContent(), crossDefinite, crossSize) }
     maxContent = axisSize(measured.size, horizontal)
     contentCross = axisSize(measured.size, !horizontal)
@@ -1487,12 +1880,99 @@ effect fn layoutFlexPass<'pass, 'source, M: Measure + TextMeasure, S: LayoutSour
     weighed = request != 0 && output.cache.flexMemos.earlier
   }
   let found = output.cache.flexMemos.found
+  let mut aheadBatch = ParallelBatch<M>.make()
+  let mut aheadSlots = List<usize>.make()
+  let mut aheadRan = false
+  let mut prepStates = List<u8>.make()
+  let mut prepRan = false
+  if early && count >= PARALLEL_LAYOUT_MIN && output.frame == NO_NODE && output.exclusions.length() == 0 && !output.hasFrameSelections() && Measure.parallelWorkers(&measurer) > 1 {
+    run aheadSlots.reserveExact(count)
+    let mut scan: usize = 0
+    while scan < count {
+      let itemId = scratch.items.asSlice()[scan].id
+      let itemStyle = nodes.style(itemId)
+      let preferred = axisDimension(itemStyle, false)
+      let mut slot = NO_NODE
+      if canRunAhead(nodes, itemId, itemStyle, preferred.kind, true, false) {
+        let mut probeItem = scratch.items.asSlice()[scan]
+        let box = shapedBox(&output, itemStyle, itemId, &childInput)
+        probeItem.crossMin = axisSize(box.min, true)
+        probeItem.crossMax = axisSize(box.max, true)
+        probeItem.crossStart = edgeStart(box.margin, true, axis.crossReverse)
+        probeItem.crossEnd = edgeEnd(box.margin, true, axis.crossReverse)
+        probeItem.autoCrossStart = autoMargin(itemStyle, true, axis.crossReverse)
+        probeItem.autoCrossEnd = autoMargin(itemStyle, true, !axis.crossReverse)
+        probeItem.align = alignment(itemStyle, style)
+        probeItem.crossAuto = axisDimension(itemStyle, true).kind == DimensionKind.Auto
+        let mut basis = itemStyle.flexBasis
+        if basis.kind == DimensionKind.Auto { basis = preferred }
+        probeItem.mainDefinite = mainDefinite || sizeResolves(basis, mainDefinite)
+        let aheadInput = aheadFinalInput(nodes, &probeItem, &childInput, false, false)
+        slot = run aheadBatch.tryEnqueue(nodes, &output, itemId, &aheadInput)
+      }
+      run aheadSlots.append(slot)
+      scan = scan + 1
+    }
+    if aheadBatch.jobCount() >= PARALLEL_LAYOUT_MIN {
+      aheadRan = run aheadBatch.runBatch(nodes, &mut output, &mut measurer)
+    }
+  } else if !early && count >= PARALLEL_LAYOUT_MIN && !input.fragmentation.active && input.gridContext == 0
+    && !nodes.columnSets && output.frame == NO_NODE && output.exclusions.length() == 0
+    && !output.hasFrameSelections() && output.boxes.length != 0 && Measure.parallelWorkers(&measurer) > 1 {
+    run prepStates.reserveExact(count)
+    let mut prepJobs = List<usize>.make()
+    let mut scan: usize = 0
+    while scan < count {
+      let itemId = scratch.items.asSlice()[scan].id
+      if request != 0 {
+        let memo = output.cache.flexMemos.find(itemId, request)
+        if memo != NO_NODE {
+          scratch.items.set(scan, output.cache.flexMemos.entries.asSlice()[memo].item)
+          run prepStates.append(1)
+          scan = scan + 1
+          continue
+        }
+      }
+      if run probeSubtreeEligible(nodes, itemId) {
+        run prepJobs.append(scan)
+        run prepStates.append(2)
+      } else {
+        run prepStates.append(0)
+      }
+      scan = scan + 1
+    }
+    if prepJobs.length() >= PARALLEL_LAYOUT_MIN {
+      prepRan = run runParallelFlexPrepare(
+        nodes,
+        &mut output,
+        &mut measurer,
+        scratch.items.asMutSlice(),
+        prepJobs.asSlice(),
+        prepStates.asMutSlice(),
+        &childInput,
+        &axis,
+        style,
+        mainConstraint,
+        !mainKnown,
+        mainDefinite,
+      )
+    }
+  }
   while index < count {
     if early {
-      run prepareFresh(nodes, &mut output, &mut measurer, &mut scratch.items.asMutSlice()[index], &childInput, &axis, style, mainConstraint, !mainKnown, mainDefinite, true, false)
+      let aheadSlot = if aheadRan && index < aheadSlots.length() { aheadSlots.get(index) } else { NO_NODE }
+      run prepareFresh(nodes, &mut output, &mut measurer, &mut scratch.items.asMutSlice()[index], &childInput, &axis, style, mainConstraint, !mainKnown, mainDefinite, true, false, &mut aheadBatch, aheadSlot)
       if !scratch.items.asSlice()[index].early { drop run layoutAhead(nodes, &mut output, &mut measurer, &mut scratch.items.asMutSlice()[index], &childInput, false, true) }
     } else {
-      run prepare(nodes, &mut output, &mut measurer, &mut scratch.items.asMutSlice()[index], &childInput, &axis, style, mainConstraint, !mainKnown, mainDefinite, request)
+      let state: u8 = if index < prepStates.length() { prepStates.get(index) } else { 0 }
+      if state == 1 {
+      } else if state == 2 && prepRan {
+        if request != 0 {
+          run output.cache.flexMemos.remember(scratch.items.asSlice()[index].id, request, &scratch.items.asSlice()[index])
+        }
+      } else {
+        run prepare(nodes, &mut output, &mut measurer, &mut scratch.items.asMutSlice()[index], &childInput, &axis, style, mainConstraint, !mainKnown, mainDefinite, request)
+      }
     }
     hasCollapsed = hasCollapsed || scratch.items.asSlice()[index].collapsed
     index = index + 1
@@ -1692,6 +2172,33 @@ effect fn placeFlexLines<'pass, 'source, M: Measure + TextMeasure, S: LayoutSour
   }
   // One request for every item: each item resets the fields it sets.
   let mut finalInput = childInput.*
+  let mut placeBatch = ParallelBatch<M>.make()
+  let mut placeSlots = List<usize>.make()
+  let mut placeRan = false
+  if childInput.performLayout && !input.fragmentation.active && output.frame == NO_NODE
+    && output.exclusions.length() == 0 && !output.hasFrameSelections()
+    && items.length >= PARALLEL_LAYOUT_MIN && Measure.parallelWorkers(&measurer) > 1 {
+    run placeSlots.reserveExact(items.length)
+    run placeSlots.appendRepeated(NO_NODE, items.length)
+    let mut scanLine: usize = 0
+    while scanLine < lines.length {
+      let line = lines[scanLine]
+      let mut scan = line.start
+      while scan < line.end {
+        let item = &items[scan]
+        if active(item, collapsed) && !item.early {
+          finalInput = placeItemInput(nodes, &childInput, item, &axis, line.cross, finalInput)
+          let slot = run placeBatch.tryEnqueue(nodes, &output, item.id, &finalInput)
+          placeSlots.set(scan, slot)
+        }
+        scan = scan + 1
+      }
+      scanLine = scanLine + 1
+    }
+    if placeBatch.jobCount() >= PARALLEL_LAYOUT_MIN {
+      placeRan = run placeBatch.runBatch(nodes, &mut output, &mut measurer)
+    }
+  }
   let mut summary = EdgeSummary.none()
   summary.plain = lines.length == 1 && axis.row
   lineIndex = 0
@@ -1718,20 +2225,7 @@ effect fn placeFlexLines<'pass, 'source, M: Measure + TextMeasure, S: LayoutSour
       let item = &items[index]
       if !active(item, collapsed) { run zeroSubtree(nodes, &mut output, item.id) }
       else {
-        let mut childCross = item.cross
-        finalInput.known = childInput.known
-        finalInput.indefiniteWidth = childInput.indefiniteWidth
-        finalInput.indefiniteHeight = childInput.indefiniteHeight
-        finalInput.availableWidth = childInput.availableWidth
-        finalInput.availableHeight = childInput.availableHeight
-        setKnown(&mut finalInput, axis.horizontal, item.target)
-        setIndefinite(&mut finalInput, axis.horizontal, !item.mainDefinite)
-        if stretchesCross(item) {
-          childCross = clamp(line.cross - item.crossStart - item.crossEnd, item.crossMin, item.crossMax)
-          setKnown(&mut finalInput, !axis.horizontal, childCross)
-        } else if axisDimension(nodes.style(item.id), !axis.horizontal).kind == DimensionKind.FitContent {
-          setAvailable(&mut finalInput, !axis.horizontal, AvailableSpace.definite(line.cross))
-        }
+        finalInput = placeItemInput(nodes, &childInput, item, &axis, line.cross, finalInput)
         // Hypothetical cross sizing needs only metrics. Materialize descendants
         // once, with the final cross constraint and percentage definiteness.
         if input.performLayout && input.fragmentation.active {
@@ -1742,7 +2236,10 @@ effect fn placeFlexLines<'pass, 'source, M: Measure + TextMeasure, S: LayoutSour
         } else {
           // Unfragmented, layoutNode already stored the child's layout: place
           // it there instead of copying the whole result out.
-          if !item.early && !run layoutEmptyLeafInPlace(nodes, &mut output, item.id, &finalInput) {
+          let placeSlot = if placeRan && index < placeSlots.length() { placeSlots.get(index) } else { NO_NODE }
+          if placeSlot != NO_NODE {
+            run placeBatch.commitJob(nodes, &mut output, &mut measurer, placeSlot)
+          } else if !item.early && !run layoutEmptyLeafInPlace(nodes, &mut output, item.id, &finalInput) {
             run layoutNodeInPlace(nodes, &mut output, &mut measurer, item.id, &finalInput)
           }
           let mut usedMargin = output.boxes[item.id].usedMargin

@@ -392,12 +392,12 @@ cases.push({ name: 'promise-combinators-mixed', args: [join(directory, 'promise-
 // node:zlib on Silk code (ZLIB_NOTES.md): the programs of tests/fixtures/zlib, which print what
 // zlib reports and digests of the compressed bytes, which must be Node's.
 for (const name of ['common.cjs', 'streams.json', 'behaviour.cjs', 'fuzz.cjs', 'bytes.cjs']) file('zlib/' + name, readFileSync(new URL('./fixtures/zlib/' + name, import.meta.url)));
-cases.push({ name: 'zlib-behaviour-matrix', args: [join(directory, 'zlib/behaviour.cjs')] });
-cases.push({ name: 'zlib-compressed-bytes-matrix', args: [join(directory, 'zlib/bytes.cjs')] });
+cases.push({ name: 'zlib-behaviour-matrix', args: [join(directory, 'zlib/behaviour.cjs')], timeout: CHILD_PROCESS_TIMEOUT });
+cases.push({ name: 'zlib-compressed-bytes-matrix', args: [join(directory, 'zlib/bytes.cjs')], timeout: CHILD_PROCESS_TIMEOUT });
 // A small async write runs on the main thread (internal/compression/handle.js); its callback
 // still comes later, in the caller's async context, and in Node's order.
 add('zlib-small-async-write-context', `const z=require('zlib'),{AsyncLocalStorage}=require('async_hooks');const als=new AsyncLocalStorage(),out=[];als.run({id:1},()=>z.deflate(Buffer.from('hello'),(e,b)=>{out.push(['deflate',als.getStore()?.id,e,b.length]);als.run({id:2},()=>{const s=z.createGunzip();s.on('data',d=>out.push(['data',als.getStore()?.id,d.toString()]));s.on('end',()=>{out.push(['end',als.getStore()?.id]);console.log(JSON.stringify(out))});s.end(z.gzipSync('world'))})}));z.inflate(Buffer.from('bad'),e=>out.push(['err',e.code,e.errno,als.getStore()]));const s=z.createDeflate();let sync=true;s.write('x',()=>out.push(['write callback later',!sync]));sync=false;s.end();`);
-for (const seed of ['7', '99', '2026']) cases.push({ name: 'zlib-fuzz-roundtrips-and-damage-' + seed, args: [join(directory, 'zlib/fuzz.cjs'), seed] });
+for (const seed of ['7', '99', '2026']) cases.push({ name: 'zlib-fuzz-roundtrips-and-damage-' + seed, args: [join(directory, 'zlib/fuzz.cjs'), seed], timeout: CHILD_PROCESS_TIMEOUT });
 registerZstd(file, cases, directory);
 let passed = 0, failed = 0;
 try {

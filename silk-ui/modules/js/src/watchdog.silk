@@ -1,0 +1,305 @@
+//! Cooperative main-thread watchdog and out-of-band interrupt handler for JS execution.
+//!
+//! Tracks active JS task wall-clock duration on a monotonic clock, samples backtraces once
+//! a task crosses [`DEFAULT_THRESHOLD_MS`] (50 ms) while immediately freeing temporary GC
+//! values via `gc.release`, and aborts execution either when an out-of-band [`AtomicSignal`]
+//! is raised (DevTools `break`) or when an optional hard limit (`SILK_UI_JS_HARD_LIMIT_MS`)
+//! is exceeded.
+import ui_transport.cancel { AtomicSignal }
+import silk.collections.list { List }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f64
+import silk.num.i64
+import silk.num.u8
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+import silk.text.string { String }
+import silkjs.js_backtrace as backtrace
+import silkjs.js_engine { Engine }
+import silkjs.js_engine_host { EngineServices }
+import silkjs.js_heap { HeapHeader }
+import silkjs.js_owned_value { Value }
+import silkjs.js_string_types { StringLengthError }
+import silkjs.js_strings { Strings }
+import silkjs.js_value { ValueBits }
+
+/// VM interrupt hook ID installed for [`Watchdog`] (`silkjs-runtime` also dispatches 6098).
+pub const WATCHDOG_INTERRUPT: u32 = 6098
+
+/// Default long-task sampling threshold in milliseconds.
+pub const DEFAULT_THRESHOLD_MS: f64 = 50.0
+
+const LONG_TASK_CAP: usize = 64
+
+/// One recorded slow or interrupted JavaScript task.
+pub struct LongTaskSample {
+  pub durationMs: f64,
+  pub stack: String,
+  pub interrupted: bool,
+}
+
+static if Intrinsic.targetArchitecture() != "wasm32" {
+  import silk.system.monotonic_clock { MonotonicClock }
+  import silk.system.monotonic_clock_native { OsMonotonicClock }
+
+  fn monotonicMs() -> f64 {
+    let mut clock = OsMonotonicClock.make()
+    let now = run MonotonicClock.now() |> Effect.provideMut<MonotonicClock>(&mut clock)
+    return i64.toF64(now.seconds()) * 1000.0
+      + i64.toF64(u32.toI64(now.subsecondNanoseconds())) / 1000000.0
+  }
+} else {
+  fn monotonicMs() -> f64 {
+    return 0.0
+  }
+}
+
+fn parseMilliseconds(bytes: &[u8]) -> f64 {
+  if bytes.length == 0 {
+    return 0.0
+  }
+  let mut whole: f64 = 0.0
+  let mut frac: f64 = 0.0
+  let mut div: f64 = 1.0
+  let mut seenDot = false
+  let mut seenDigit = false
+  let mut i: usize = 0
+  while i < bytes.length {
+    let b = bytes[i]
+    if b >= 48 && b <= 57 {
+      seenDigit = true
+      let d = u8.toF64(b - 48)
+      if !seenDot {
+        whole = whole * 10.0 + d
+      } else {
+        div = div * 10.0
+        frac = frac + d / div
+      }
+    } else if b == 46 && !seenDot {
+      seenDot = true
+    } else {
+      return 0.0
+    }
+    i = i + 1
+  }
+  if !seenDigit {
+    return 0.0
+  }
+  return whole + frac
+}
+
+static if Intrinsic.targetArchitecture() == "wasm32" {
+  /// Reads `SILK_UI_JS_HARD_LIMIT_MS` (returns `0.0` on `wasm32` or when unset/invalid).
+  pub fn readHardLimitEnv() -> f64 {
+    return 0.0
+  }
+} else static if Intrinsic.targetOperatingSystem() == "darwin" || Intrinsic.targetOperatingSystem() == "linux" {
+  import silk.collections.bytes { Bytes }
+  import silk.system.host_input { HostInput }
+  import silk.platform.native.host_input { NativeHostInput }
+  import silk.system.host_input_native { OsHostInput }
+
+  effect fn readLimitVar() -> f64 ? &mut HostInput | &mut Allocator {
+    let found = run Effect.result(HostInput.variableNamed("SILK_UI_JS_HARD_LIMIT_MS"))
+    return match move found {
+      Result.Success { value: maybe } => match move maybe {
+        Option<Bytes>.Some { value: raw } => parseMilliseconds(Bytes.asSlice(&raw))
+        Option<Bytes>.None => 0.0
+      }
+      Result.Failure { error } => {
+        drop error
+        0.0
+      }
+    }
+  }
+
+  /// Reads `SILK_UI_JS_HARD_LIMIT_MS` from the process environment (`0.0` when unset/invalid).
+  pub fn readHardLimitEnv() -> f64 {
+    let mut allocator = Allocator.systemAllocatorProvider()
+    let captured = run Effect.result(unsafe NativeHostInput.environmentSnapshot())
+      |> Effect.provideMut<Allocator>(&mut allocator)
+    let snapshot = match move captured {
+      Result.Success { value } => move value
+      Result.Failure { error } => {
+        drop error
+        return 0.0
+      }
+    }
+    let mut inputs = OsHostInput.make(move snapshot)
+    return run (readLimitVar() |> Effect.provideMut<HostInput>(&mut inputs))
+      |> Effect.provideMut<Allocator>(&mut allocator)
+  }
+} else {
+  /// Reads `SILK_UI_JS_HARD_LIMIT_MS` (`0.0` when unset).
+  pub fn readHardLimitEnv() -> f64 {
+    return 0.0
+  }
+}
+
+unsafe effect fn captureStack<'m, S: EngineServices>(engine: &mut Engine<'m, S>, runtime: *mut HeapHeader) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let formatted = run Effect.result(unsafe backtrace.format(runtime, Option<ValueBits>.None, 0, 0, 0))
+  let bits = match move formatted {
+    Result<ValueBits, OutOfMemoryError | StringLengthError>.Success { value } => value
+    Result<ValueBits, OutOfMemoryError | StringLengthError>.Failure { error } => match move error {
+      OutOfMemoryError allocation => { fail move allocation }
+      StringLengthError _ => { return String.make() }
+    }
+  }
+  let owned = unsafe Value.adoptBits(bits)
+  let utf8 = run Effect.result(Strings.toUtf8(owned.borrow().view(), false))
+  unsafe Value.release(move owned, &mut engine.*, runtime)
+  return match move utf8 {
+    Result<List<u8>, OutOfMemoryError>.Success { value } => run String.copy(unsafe String.fromUtf8Unchecked(value.asSlice()))
+    Result<List<u8>, OutOfMemoryError>.Failure { error } => { fail move error }
+  }
+}
+
+/// Watches JS main-thread task duration and handles out-of-band interrupt signals.
+pub struct Watchdog {
+  signal: AtomicSignal,
+  thresholdMs: f64,
+  hardLimitMs: f64,
+  depth: u32,
+  taskStartMs: f64,
+  sampledThisTask: bool,
+  sampleStack: String,
+  longTasks: List<LongTaskSample>,
+  interrupted: u64,
+}
+
+impl Watchdog {
+  /// Creates a watchdog with a 50 ms sampling threshold and an optional hard limit from env.
+  pub effect fn make() -> Watchdog
+    ! OutOfMemoryError {
+    let signal = run AtomicSignal.make()
+    return Watchdog {
+      signal: move signal,
+      thresholdMs: DEFAULT_THRESHOLD_MS,
+      hardLimitMs: readHardLimitEnv(),
+      depth: 0,
+      taskStartMs: 0.0,
+      sampledThisTask: false,
+      sampleStack: String.make(),
+      longTasks: List<LongTaskSample>.make(),
+      interrupted: 0,
+    }
+  }
+
+  /// Returns a clonable handle to the out-of-band break signal checked in VM interrupt ticks.
+  pub fn breakSignal(self: &Self) -> AtomicSignal {
+    return self.signal.clone()
+  }
+
+  /// Sets the long-task sampling threshold in milliseconds.
+  pub fn setThresholdMs(self: &mut Self, ms: f64) -> () {
+    self.thresholdMs = if ms >= 0.0 { ms } else { 0.0 }
+  }
+
+  /// Sets the optional hard execution time limit per top-level task in milliseconds (`0.0` disables).
+  pub fn setHardLimitMs(self: &mut Self, ms: f64) -> () {
+    self.hardLimitMs = if ms > 0.0 { ms } else { 0.0 }
+  }
+
+  /// Number of tasks terminated by an out-of-band break signal or hard time limit.
+  pub fn interruptedCount(self: &Self) -> u64 {
+    return self.interrupted
+  }
+
+  /// Drains completed or interrupted long-task samples recorded since the last call.
+  pub fn takeLongTasks(self: &mut Self) -> List<LongTaskSample> {
+    return Intrinsic.replace(self.longTasks, List<LongTaskSample>.make())
+  }
+
+  /// Marks the start of a JS task (supports re-entrant calls cleanly via nesting depth).
+  pub fn beginTask(self: &mut Self) -> () {
+    if self.depth == 0 {
+      self.taskStartMs = monotonicMs()
+      self.sampledThisTask = false
+      self.sampleStack.clear()
+    }
+    self.depth = self.depth + 1
+  }
+
+  /// Marks the end of a JS task and records a long-task entry if the threshold was crossed.
+  pub effect fn endTask(self: &mut Self) -> ()
+    ? &mut Allocator {
+    if self.depth == 0 {
+      return ()
+    }
+    self.depth = self.depth - 1
+    if self.depth == 0 {
+      let now = monotonicMs()
+      let elapsed = if now > self.taskStartMs { now - self.taskStartMs } else { 0.0 }
+      let stack = Intrinsic.replace(self.sampleStack, String.make())
+      let sampled = self.sampledThisTask
+      self.sampledThisTask = false
+      if elapsed >= self.thresholdMs || sampled {
+        let finalDuration = if elapsed < self.thresholdMs && sampled { self.thresholdMs } else { elapsed }
+        drop run Effect.result(self.recordSample(finalDuration, move stack, false))
+      }
+    }
+  }
+
+  effect fn recordSample(self: &mut Self, durationMs: f64, stack: String, interrupted: bool) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.longTasks.append(LongTaskSample {
+      durationMs: durationMs,
+      stack: move stack,
+      interrupted: interrupted,
+    })
+    if self.longTasks.length() > LONG_TASK_CAP {
+      drop self.longTasks.remove(0)
+    }
+  }
+
+  /// Runs inside the SilkJS VM interrupt callback: checks out-of-band break signal, samples
+  /// stacks past [`thresholdMs`], and enforces [`hardLimitMs`] if configured.
+  pub unsafe effect fn onInterrupt<'m, S: EngineServices>(self: &mut Self, engine: &mut Engine<'m, S>, runtime: *mut HeapHeader) -> bool
+    ? &mut Allocator {
+    let elapsed = if self.depth != 0 {
+      let now = monotonicMs()
+      if now > self.taskStartMs { now - self.taskStartMs } else { 0.0 }
+    } else {
+      0.0
+    }
+    if self.signal.isRaised() && self.signal.take() {
+      let mut stack = String.make()
+      if let Result<String, OutOfMemoryError>.Success { value } = move run Effect.result(unsafe captureStack(&mut engine.*, runtime)) {
+        stack = move value
+      }
+      drop run Effect.result(self.recordSample(elapsed, move stack, true))
+      self.interrupted = self.interrupted + 1
+      self.depth = 0
+      self.sampledThisTask = false
+      self.sampleStack.clear()
+      return true
+    }
+    if self.depth == 0 {
+      return false
+    }
+    if elapsed >= self.thresholdMs && !self.sampledThisTask {
+      let mut stack = String.make()
+      if let Result<String, OutOfMemoryError>.Success { value } = move run Effect.result(unsafe captureStack(&mut engine.*, runtime)) {
+        stack = move value
+      }
+      self.sampleStack = move stack
+      self.sampledThisTask = true
+    }
+    if self.hardLimitMs > 0.0 && elapsed >= self.hardLimitMs {
+      let stack = Intrinsic.replace(self.sampleStack, String.make())
+      drop run Effect.result(self.recordSample(elapsed, move stack, true))
+      self.interrupted = self.interrupted + 1
+      self.depth = 0
+      self.sampledThisTask = false
+      return true
+    }
+    return false
+  }
+}

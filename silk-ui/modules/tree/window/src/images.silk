@@ -5,6 +5,11 @@
 // Native only: a WebAssembly host has no files or HTTP client here (see `remote`).
 static if Intrinsic.targetArchitecture() != "wasm32" {
   import background { Background, Cancellation }
+  import platform_thread { Nudge }
+  import ui_transport.cancel { CancellationToken }
+  import ui_transport.pool { ClaimHandle, WorkPoolHandle }
+  import ui_transport.wake { WakeHandle }
+  import silk.concurrency.sync { Arc, Mutex }
   import ui_tree.legacy { UiTree, TreeError, Batch, Mutation }
   import codec.image { Image }
   import codec.decode
@@ -71,17 +76,110 @@ static if Intrinsic.targetArchitecture() != "wasm32" {
 
   impl Transferable for LoadOutput {}
 
+  struct LoadCell {
+    done: bool,
+    output: Option<LoadOutput>,
+  }
+
+  impl Transferable for LoadCell {}
+
   struct Entry {
     load: ImageLoad,
     source: Option<Source>,
     icon: bool,
   }
 
+  struct LoadPayload {
+    input: LoadInput,
+    result: Arc<Mutex<LoadCell>>,
+    wake: Option<Nudge>,
+  }
+
+  impl Transferable for LoadPayload {}
+
+  fn runPooledLoad(payload: LoadPayload, token: &CancellationToken) -> () {
+    let LoadPayload { input, result, wake } = move payload
+    let output = if token.check() || input.cancel.cancelled() {
+      LoadOutput { value: Loaded.Cancelled }
+    } else {
+      LoadOutput {
+        value: load(
+          move input.source,
+          input.icon,
+          input.font,
+          input.sheet,
+          move input.cancel,
+        ),
+      }
+    }
+    let mut guard = result.get().lock()
+    let slot = guard.getMut()
+    slot.output = Option<LoadOutput>.some(move output)
+    slot.done = true
+    drop guard
+    if let Option<Nudge>.Some { value: w } = &wake {
+      w.nudge()
+    }
+  }
+
   struct Load {
     resource: u32,
     generation: u64,
     cancel: Cancellation,
-    task: Background<LoadOutput>,
+    token: Option<CancellationToken>,
+    claim: Option<ClaimHandle>,
+    pooled: Option<Arc<Mutex<LoadCell>>>,
+    task: Option<Background<LoadOutput>>,
+  }
+
+  impl Load {
+    fn ready(self: &Self) -> bool {
+      if let Option<ClaimHandle>.Some { value: claim } = &self.claim {
+        if claim.isDone() {
+          return true
+        }
+        if let Option<Arc<Mutex<LoadCell>>>.Some { value: res } = &self.pooled {
+          return res.get().lock().get().done
+        }
+        return false
+      }
+      if let Option<Background<LoadOutput>>.Some { value: task } = &self.task {
+        return task.ready()
+      }
+      return true
+    }
+
+    fn cancelJob(self: &Self) -> () {
+      self.cancel.cancel()
+      if let Option<CancellationToken>.Some { value: t } = &self.token {
+        t.request()
+      }
+      if let Option<ClaimHandle>.Some { value: c } = &self.claim {
+        c.cancel()
+      }
+    }
+
+    fn takeOutput(self: &mut Self) -> Option<LoadOutput> {
+      if let Option<ClaimHandle>.Some { value: c } = move Intrinsic.replace(
+        self.claim,
+        Option<ClaimHandle>.None,
+      ) {
+        c.wait()
+        if let Option<Arc<Mutex<LoadCell>>>.Some { value: res } = &self.pooled {
+          let mut guard = res.get().lock()
+          return Intrinsic.replace(guard.getMut().output, Option<LoadOutput>.None)
+        }
+        return Option<LoadOutput>.None
+      }
+      if let Option<Background<LoadOutput>>.Some { value } = move Intrinsic.replace(
+        self.task,
+        Option<Background<LoadOutput>>.None,
+      ) {
+        let mut task = move value
+        return task.poll()
+      }
+      return Option<LoadOutput>.None
+    }
   }
 
   /// Resource ids belong to the caller. Use a different id for each concurrently displayed image.
@@ -94,6 +192,9 @@ static if Intrinsic.targetArchitecture() != "wasm32" {
     sheets: bool,
     /// Stylesheets read and not yet taken.
     finished: List<SheetData>,
+    ioPool: Option<WorkPoolHandle>,
+    groupId: u32,
+    wake: Option<Nudge>,
   }
 
   /// A font stylesheet a worker read (see `Images.forSheets`).
@@ -111,6 +212,9 @@ static if Intrinsic.targetArchitecture() != "wasm32" {
         fonts: false,
         sheets: false,
         finished: List<SheetData>.make(),
+        ioPool: Option<WorkPoolHandle>.None,
+        groupId: 1,
+        wake: Option<Nudge>.None,
       }
     }
 
@@ -123,6 +227,9 @@ static if Intrinsic.targetArchitecture() != "wasm32" {
         fonts: true,
         sheets: false,
         finished: List<SheetData>.make(),
+        ioPool: Option<WorkPoolHandle>.None,
+        groupId: 1,
+        wake: Option<Nudge>.None,
       }
     }
 
@@ -135,7 +242,27 @@ static if Intrinsic.targetArchitecture() != "wasm32" {
         fonts: false,
         sheets: true,
         finished: List<SheetData>.make(),
+        ioPool: Option<WorkPoolHandle>.None,
+        groupId: 1,
+        wake: Option<Nudge>.None,
       }
+    }
+
+    /// Dispatches file and HTTP loads through `ioPool` under `groupId` and wakes via `wake`.
+    pub fn attachPool(
+      self: &mut Self,
+      ioPool: WorkPoolHandle,
+      groupId: u32,
+      wake: Nudge,
+    ) -> () {
+      self.ioPool = Option<WorkPoolHandle>.some(move ioPool)
+      self.groupId = groupId
+      self.wake = Option<Nudge>.some(move wake)
+    }
+
+    /// Whether completions wake the owning group thread directly without timer polling.
+    pub fn wakesOnCompletion(self: &Self) -> bool {
+      return self.wake.isSome()
     }
 
     /// Queues reading the stylesheet at local `path` as sheet `id` (see `forSheets`).
@@ -288,7 +415,7 @@ static if Intrinsic.targetArchitecture() != "wasm32" {
       let mut j: usize = 0
       while j < running.length {
         if running[j].resource == resource {
-          running[j].cancel.cancel()
+          running[j].cancelJob()
         }
         j = j + 1
       }
@@ -350,12 +477,12 @@ static if Intrinsic.targetArchitecture() != "wasm32" {
       let mut changed = false
       let mut i: usize = 0
       while i < self.running.length() {
-        if !self.running.asSlice()[i].task.ready() {
+        if !self.running.asSlice()[i].ready() {
           i = i + 1
           continue
         }
         let mut job = self.running.remove(i)
-        let completed = job.task.poll()
+        let completed = job.takeOutput()
         if job.cancel.cancelled() {
           continue
         }
@@ -421,6 +548,10 @@ static if Intrinsic.targetArchitecture() != "wasm32" {
         ) {
           let mut allocator = Allocator.systemAllocatorProvider()
           let cancel = run Cancellation.make() |> Effect.provideMut<Allocator>(&mut allocator)
+          let wake = match &self.wake {
+            Option<Nudge>.Some { value } => Option<Nudge>.some(value.clone())
+            Option<Nudge>.None => Option<Nudge>.None
+          }
           let input = LoadInput {
             source: move source,
             icon: entries[i].icon,
@@ -428,37 +559,76 @@ static if Intrinsic.targetArchitecture() != "wasm32" {
             sheet: sheets,
             cancel: cancel.clone(),
           }
-          let start = run Effect.result(
-            Background<LoadOutput>.start(
-              || -> LoadOutput {
-                return LoadOutput {
-                  value: load(
-                    move input.source,
-                    input.icon,
-                    input.font,
-                    input.sheet,
-                    move input.cancel,
-                  ),
-                }
-              },
-            ),
-          )
-          match move start {
-            Result.Success { value: task } => {
-              run self.running.append(
-                Load {
-                  resource: entries[i].load.resource,
-                  generation: entries[i].load.generation,
-                  cancel: move cancel,
-                  task: move task,
-                },
-              )
+          if let Option<WorkPoolHandle>.Some { value: pool } = &self.ioPool {
+            let token = run CancellationToken.make()
+            let cell = run Mutex<LoadCell>.make(LoadCell { done: false, output: Option<LoadOutput>.None })
+              |> Effect.provideMut<Allocator>(&mut allocator)
+            let resultBox = run Arc<Mutex<LoadCell>>.make(move cell)
+              |> Effect.provideMut<Allocator>(&mut allocator)
+            let payload = LoadPayload {
+              input: move input,
+              result: resultBox.clone(),
+              wake: move wake,
             }
-            Result.Failure { error } => {
-              drop error
-              let generation = entries[i].load.generation
-              drop entries[i].load.finish(generation, ImageError.Start)
-              changed = true
+            let claim = run pool.submitWith(
+              self.groupId,
+              move payload,
+              runPooledLoad,
+              token.clone(),
+              WakeHandle.noop(),
+            )
+            run self.running.append(
+              Load {
+                resource: entries[i].load.resource,
+                generation: entries[i].load.generation,
+                cancel: move cancel,
+                token: Option<CancellationToken>.some(move token),
+                claim: Option<ClaimHandle>.some(move claim),
+                pooled: Option<Arc<Mutex<LoadCell>>>.some(move resultBox),
+                task: Option<Background<LoadOutput>>.None,
+              },
+            )
+          } else {
+            let start = run Effect.result(
+              Background<LoadOutput>.start(
+                || -> LoadOutput {
+                  let wake = move wake
+                  let out = LoadOutput {
+                    value: load(
+                      move input.source,
+                      input.icon,
+                      input.font,
+                      input.sheet,
+                      move input.cancel,
+                    ),
+                  }
+                  if let Option<Nudge>.Some { value: w } = &wake {
+                    w.nudge()
+                  }
+                  return move out
+                },
+              ),
+            )
+            match move start {
+              Result.Success { value: task } => {
+                run self.running.append(
+                  Load {
+                    resource: entries[i].load.resource,
+                    generation: entries[i].load.generation,
+                    cancel: move cancel,
+                    token: Option<CancellationToken>.None,
+                    claim: Option<ClaimHandle>.None,
+                    pooled: Option<Arc<Mutex<LoadCell>>>.None,
+                    task: Option<Background<LoadOutput>>.some(move task),
+                  },
+                )
+              }
+              Result.Failure { error } => {
+                drop error
+                let generation = entries[i].load.generation
+                drop entries[i].load.finish(generation, ImageError.Start)
+                changed = true
+              }
             }
           }
         }

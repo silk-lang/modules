@@ -47,7 +47,7 @@ export interface ListenerSignal {
   readonly aborted: boolean;
   addEventListener(type: "abort", listener: () => void, options?: { once?: boolean }): void;
 }
-export type ListenerOptions = boolean | { capture?: boolean; once?: boolean; signal?: ListenerSignal };
+export type ListenerOptions = boolean | { capture?: boolean; once?: boolean; passive?: boolean; signal?: ListenerSignal };
 
 /** Live tokens in a node's class attribute. */
 export class ClassList implements Iterable<string> {
@@ -1261,3 +1261,20 @@ export class MutationObserver {
   disconnect(): void;
   takeRecords(): MutationRecord[];
 }
+
+export interface ComputeOptions {
+  /** Ownership-transferred objects (such as `ArrayBuffer` or `MessagePort`). */
+  transfer?: unknown[];
+  /** Aborts a queued or running computation (terminating and replacing busy workers). */
+  signal?: ListenerSignal & { readonly reason?: unknown; removeEventListener?(type: "abort", listener: () => void): void };
+}
+
+/** Runs a pure function off the Document Thread on a pooled bridge-less worker. */
+export function compute<TInput, TResult>(
+  fn: (input: TInput) => TResult | Promise<TResult>,
+  input?: TInput,
+  options?: ComputeOptions,
+): Promise<TResult>;
+
+/** Terminates workers held by `@silkui/core`'s `compute()` pool. */
+export function terminateComputePool(): void;

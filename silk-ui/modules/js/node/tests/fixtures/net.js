@@ -41,6 +41,24 @@ async function main() {
   let ticked = false;
   await new Promise((resolve) => setTimeout(() => { ticked = true; resolve(); }, 10));
   check(ticked, "timers");
+
+  check(typeof navigator !== "undefined" && "gpu" in navigator && typeof globalThis.__ui.gpuLoad === "function", "navigator.gpu");
+
+  const workerResult = await new Promise((resolve, reject) => {
+    const worker = new Worker(
+      "data:text/javascript,self.onmessage = (e) => self.postMessage({ doubled: e.data * 2, hasUi: typeof globalThis.__ui !== 'undefined' });",
+    );
+    worker.onmessage = (event) => {
+      worker.terminate();
+      resolve(event.data);
+    };
+    worker.onerror = (event) => {
+      worker.terminate();
+      reject(event.error ?? new Error(event.message ?? "worker error"));
+    };
+    worker.postMessage(21);
+  });
+  check(workerResult && workerResult.doubled === 42 && workerResult.hasUi === false, "worker");
 }
 
 main().then(() => process.exit(0), (error) => { console.error(error); process.exit(1); });

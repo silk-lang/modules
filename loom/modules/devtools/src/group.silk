@@ -1,0 +1,815 @@
+//! Isolated DevTools window-group host (`DEVTOOLS_GROUP`).
+//!
+//! Runs the in-process DevTools `UiTree` and `Runtime<Devtools, Message, Command>` on its own
+//! dedicated group thread, talking to the inspected application over an asynchronous
+//! `MemoryChannel` woken via `Waiter` and `appWake.nudge()`. A stalled primary app never freezes
+//! DevTools input, scrolling, or window closing.
+import devtools { Devtools, Message, Command, FONT, MONO }
+import embedded { shortcut }
+import theme { UI_FAMILIES, MONO_FAMILIES }
+import link { Link, Requests }
+import remote { ViewHost, isViewBatch }
+import loom.app { Perform }
+import loom.runtime { Runtime, pump, drain, tick }
+import loom.ui { ROOT_ID }
+import loom_tree.lib { frame }
+import ui_inspect_server.channel { Channel, MemoryChannel }
+import ui_transport.wake { Waiter }
+import ui_tree.legacy { UiTree, TreeError, FrameInput, Batch }
+import ui_tree.lib { RootSupport, ExtraRoot }
+import ui_tree.mutation { FIRST_ROOT }
+import ui_tree.input { Input }
+import ui_tree_window.adapter { fastScrollOf, modifierBits, reportWindow, toInputAt }
+import ui_tree_window.clock { Clock }
+import ui_tree_window.compositor_thread {
+  CompositorHandle,
+  CompositorToGroup,
+  DEVTOOLS_GROUP,
+  GroupKind,
+  GroupServices
+}
+import ui_tree_window.group_host {
+  GroupStopFlag,
+  SecondaryGroupContext,
+  SecondaryGroupHandle,
+  spawnGroupThread
+}
+import ui_tree_window.input_router {
+  GestureAck,
+  GlobalShortcut,
+  HitRegion,
+  HitTestSurface,
+  RegionKind
+}
+import ui_tree_window.keys { codeName }
+import ui_tree_window.platform_thread { Nudge, OpenedWindow, PlatformClient }
+import ui_scene.scroll { ScrollGroup, ScrollPosition }
+import font_collection.lib { FontCollection }
+import window.event { Event, Key, Modifiers }
+import window.keys { KeyCode }
+import window.types { WindowError, WindowId }
+import silk.collections.list { List }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.geometry.rect { Rect }
+import silk.geometry.size { Size2 }
+import silk.json.scanner { JsonError }
+import silk.json.value { Json, Value }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f32
+import silk.num.f64
+import silk.num.u32
+import silk.num.u64
+import silk.system.host_input { HostInput, HostInputError }
+import silk.text.string { String }
+
+static if Intrinsic.targetArchitecture() != "wasm32" {
+  import font_collection.system as fontFiles
+  import font_collection.system { Options as FontOptions }
+
+  static if Intrinsic.targetOperatingSystem() == "windows" {
+    import silk.platform.windows.host_input { WindowsHostInput }
+  } else {
+    import silk.platform.native.host_input { NativeHostInput }
+    import silk.system.host_input_native { OsHostInput }
+  }
+}
+
+const DEVTOOLS_WIDTH: f64 = 1280.0
+const DEVTOOLS_HEIGHT: f64 = 800.0
+const SHORTCUT_F12_ID: u32 = 1
+const SHORTCUT_CHORD_ID: u32 = 2
+const REPLY_WAIT_SLICE_NANOS: u64 = 10000000
+const MAX_REPLY_WAIT_SLICES: u32 = 15
+
+/// Launches and isolates DevTools into [`DEVTOOLS_GROUP`] on native desktop hosts.
+pub struct DevtoolsGroup {}
+
+impl DevtoolsGroup {
+  /// Registers DevTools global shortcuts with the compositor, starts the `DEVTOOLS_GROUP` thread,
+  /// and optionally opens the DevTools window at launch. Returns `None` on wasm32 or non-compositing hosts.
+  pub effect fn start(
+    channel: MemoryChannel,
+    appWake: Nudge,
+    openAtStart: bool,
+    services: GroupServices,
+  ) -> Option<SecondaryGroupHandle>
+    ! OutOfMemoryError {
+    static if Intrinsic.targetArchitecture() == "wasm32" {
+      drop channel
+      drop appWake
+      drop openAtStart
+      drop services
+      return Option<SecondaryGroupHandle>.None
+    } else {
+      if services.compositor.isNone() || services.gpu.isNone() || services.platform.isNone() {
+        drop channel
+        drop appWake
+        drop openAtStart
+        drop services
+        return Option<SecondaryGroupHandle>.None
+      }
+      if let Option<CompositorHandle>.Some { value: comp } = &services.compositor {
+        let mut chord = Modifiers.none()
+        static if Intrinsic.targetOperatingSystem() == "darwin" {
+          chord.meta = true
+          chord.alt = true
+        } else {
+          chord.control = true
+          chord.shift = true
+        }
+        let shortcuts = [
+          GlobalShortcut {
+            id: SHORTCUT_F12_ID,
+            code: KeyCode.F12,
+            modifiers: Modifiers.none(),
+            groupId: DEVTOOLS_GROUP,
+          },
+          GlobalShortcut {
+            id: SHORTCUT_CHORD_ID,
+            code: KeyCode.KeyI,
+            modifiers: chord,
+            groupId: DEVTOOLS_GROUP,
+          },
+        ]
+        run comp.setShortcuts(&shortcuts)
+      }
+      let mut movedChannel = move channel
+      let movedWake = move appWake
+      let startOpen = openAtStart
+      return run spawnGroupThread(
+        DEVTOOLS_GROUP,
+        GroupKind.DevTools,
+        move services,
+        |ctx: SecondaryGroupContext| -> i32 {
+          return groupThreadEntry(move ctx, move movedChannel, move movedWake, startOpen)
+        },
+      )
+    }
+  }
+}
+
+static if Intrinsic.targetArchitecture() != "wasm32" {
+  effect fn noFonts(error: HostInputError) -> () {
+    drop error
+  }
+
+  static if Intrinsic.targetOperatingSystem() == "windows" {
+    effect fn loadFonts(collection: &mut FontCollection) -> ()
+      ! HostInputError | OutOfMemoryError
+      ? &mut Allocator {
+      let mut inputs = run WindowsHostInput.capture()
+      drop run fontFiles.load(&mut collection, FontOptions.defaults())
+        |> Effect.provideMut<HostInput>(&mut inputs)
+    }
+  } else {
+    effect fn loadFonts(collection: &mut FontCollection) -> ()
+      ! HostInputError | OutOfMemoryError
+      ? &mut Allocator {
+      let snapshot = run unsafe NativeHostInput.environmentSnapshot()
+      let mut inputs = OsHostInput.make(move snapshot)
+      drop run fontFiles.load(&mut collection, FontOptions.defaults())
+        |> Effect.provideMut<HostInput>(&mut inputs)
+    }
+  }
+
+  effect fn systemFonts() -> FontCollection
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut collection = FontCollection.make()
+    run Effect.catch<HostInputError>(loadFonts(&mut collection), noFonts)
+    return move collection
+  }
+
+  effect fn seconds(clock: &mut Clock) -> f64 {
+    return run clock.seconds()
+  }
+
+  fn devicePixels(logical: f64, scale: f64) -> u32 {
+    return f64.toU32(f64.floor(logical * scale + 0.5))
+  }
+
+  fn isToggleEvent(event: &Event) -> bool {
+    return match &event.* {
+      Event.GlobalShortcut { id } => id == SHORTCUT_F12_ID || id == SHORTCUT_CHORD_ID
+      Event.KeyDown { key, code, modifiers, .. } => {
+        let name = match &key {
+          Key.Character { text } => String.view(&text)
+          Key.Named { .. } => codeName(code)
+        }
+        return shortcut(name, codeName(code), modifierBits(modifiers))
+      }
+      _ => false
+    }
+  }
+
+  fn isRepeatToggle(event: &Event) -> bool {
+    return match &event.* {
+      Event.KeyDown { repeat, .. } => repeat
+      _ => false
+    }
+  }
+
+  effect fn flushViewsOutbox(
+    views: &mut ViewHost,
+    channel: &mut MemoryChannel,
+    appWake: &Nudge,
+  ) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if views.outbox.length() == 0 {
+      return ()
+    }
+    while views.outbox.length() != 0 {
+      let line = views.outbox.remove(0)
+      drop run Channel.send(String.view(&line)) |> Effect.provideMut<Channel>(&mut channel.*)
+    }
+    appWake.nudge()
+  }
+
+  /// Asynchronous `Link` talking to the primary app's `Inspector` over `MemoryChannel`.
+  /// Never hangs if the primary app is stalled: requests wait in short bounded slices and bail
+  /// immediately on timeout, disconnect, or group shutdown.
+  struct GroupLink<'c, 'f> {
+    tree: &'c mut UiTree<'f>,
+    client: &'c mut MemoryChannel,
+    appWake: &'c Nudge,
+    numbering: &'c mut Requests,
+    views: &'c mut ViewHost,
+    waiter: &'c Waiter,
+    stop: &'c GroupStopFlag,
+  }
+
+  impl<'c, 'f> Link for GroupLink<'c, 'f> {
+    effect fn request(self: &mut Self, line: string, reply: &mut String) -> bool
+      ! OutOfMemoryError
+      ? &mut Allocator {
+      reply.clear()
+      let id = run self.numbering.send(line) |> Effect.provideMut<Channel>(&mut self.client.*)
+      if id == 0 {
+        run reply.append("the inspector closed the session")
+        return false
+      }
+      self.appWake.nudge()
+      let mut slice: u32 = 0
+      while slice < MAX_REPLY_WAIT_SLICES {
+        if run self.numbering.collect(id, &mut reply)
+          |> Effect.provideMut<Channel>(&mut self.client.*) {
+          return true
+        }
+        if self.stop.isStopped() || !self.client.open() {
+          run reply.append("the inspector closed the session")
+          return false
+        }
+        drop self.waiter.waitTimeout(REPLY_WAIT_SLICE_NANOS)
+        slice = slice + 1
+      }
+      run reply.append("the app did not answer in time")
+      return false
+    }
+
+    effect fn notify(self: &mut Self, line: string) -> bool
+      ! OutOfMemoryError
+      ? &mut Allocator {
+      let ok = run Channel.send(line) |> Effect.provideMut<Channel>(&mut self.client.*)
+      if ok {
+        self.appWake.nudge()
+      }
+      return ok
+    }
+
+    effect fn ask(self: &mut Self, line: string) -> u64
+      ! OutOfMemoryError
+      ? &mut Allocator {
+      let id = run self.numbering.ask(line) |> Effect.provideMut<Channel>(&mut self.client.*)
+      if id != 0 {
+        self.appWake.nudge()
+      }
+      return id
+    }
+
+    effect fn take(self: &mut Self, out: &mut List<String>) -> bool
+      ! OutOfMemoryError
+      ? &mut Allocator {
+      let mut none = String.make()
+      drop run self.numbering.collect(0, &mut none)
+        |> Effect.provideMut<Channel>(&mut self.client.*)
+      let mut notes = List<String>.make()
+      run self.numbering.takeNotes(&mut notes)
+      while notes.length() != 0 {
+        let line = notes.remove(0)
+        let parsed = run Effect.result(Json.parse(line.ownedUtf8Bytes()))
+        let consumed = match move parsed {
+          Result<Value, JsonError | OutOfMemoryError>.Success { value } => {
+            if isViewBatch(&value) {
+              drop run self.views.apply(&mut self.tree.*, FIRST_ROOT, ROOT_ID, &value)
+              true
+            } else {
+              false
+            }
+          }
+          Result<Value, JsonError | OutOfMemoryError>.Failure { error } => {
+            drop error
+            false
+          }
+        }
+        if !consumed {
+          run out.append(move line)
+        }
+      }
+      run flushViewsOutbox(&mut self.views.*, &mut self.client.*, self.appWake)
+      return self.client.open()
+    }
+  }
+
+  /// Placeholder `Link` used during message pumping so deferred `Command`s run with `GroupLink`.
+  struct IdleLink {}
+
+  impl Link for IdleLink {
+    effect fn request(self: &mut Self, line: string, reply: &mut String) -> bool
+      ! OutOfMemoryError
+      ? &mut Allocator {
+      drop line
+      reply.clear()
+      run reply.append("not now")
+      return false
+    }
+
+    effect fn notify(self: &mut Self, line: string) -> bool
+      ! OutOfMemoryError
+      ? &mut Allocator {
+      drop line
+      return false
+    }
+
+    effect fn ask(self: &mut Self, line: string) -> u64
+      ! OutOfMemoryError
+      ? &mut Allocator {
+      drop line
+      return 0
+    }
+
+    effect fn take(self: &mut Self, out: &mut List<String>) -> bool
+      ! OutOfMemoryError
+      ? &mut Allocator {
+      drop out
+      return true
+    }
+  }
+
+  struct OpenSession<'f> {
+    window: WindowId,
+    surface: u32,
+    surfaceReady: bool,
+    width: f64,
+    height: f64,
+    scale: f64,
+    drawn: u64,
+    commitEpoch: u64,
+    consumedInputSeq: u64,
+    tree: UiTree<'f>,
+    runtime: Runtime<Devtools, Message, Command>,
+    numbering: Requests,
+    views: ViewHost,
+  }
+
+  effect fn buildDevtoolsHitSurface(
+    window: WindowId,
+    commitEpoch: u64,
+    scale: f32,
+    width: f32,
+    height: f32,
+    consumedInputSeq: u64,
+    tree: &UiTree<'_>,
+  ) -> HitTestSurface
+    ! OutOfMemoryError {
+    let mut heap = Allocator.systemAllocatorProvider()
+    let scene = tree.scene()
+    let fast = run fastScrollOf(tree, scale)
+    let mut regions = List<HitRegion>.make()
+    run regions.append(
+      HitRegion {
+        window: window,
+        root: FIRST_ROOT,
+        groupId: DEVTOOLS_GROUP,
+        kind: RegionKind.Document,
+        bounds: Rect<f32>.new(0.0, 0.0, width, height),
+        zOrder: 0,
+        opaque: true,
+        wheelListener: fast.hasPassiveWheel,
+        wheelPassive: true,
+        preventScroll: false,
+      },
+    )
+      |> Effect.provideMut<Allocator>(&mut heap)
+    let mut groups = List<ScrollGroup>.make()
+    run groups.appendSlice(scene.scrollGroups()) |> Effect.provideMut<Allocator>(&mut heap)
+    let mut painted = List<ScrollPosition>.make()
+    run painted.appendSlice(scene.scrolls()) |> Effect.provideMut<Allocator>(&mut heap)
+    return HitTestSurface {
+      window: window,
+      groupId: DEVTOOLS_GROUP,
+      commitEpoch: commitEpoch,
+      targetGeneration: 0,
+      scale: scale,
+      size: Size2<f32>.new(width, height),
+      consumedInputSeq: consumedInputSeq,
+      regions: move regions,
+      groups: move groups,
+      painted: move painted,
+      fast: move fast,
+    }
+  }
+
+  effect fn openWindowSession<'f>(
+    ctx: &SecondaryGroupContext,
+    fonts: &'f FontCollection,
+    now: f64,
+  ) -> Option<OpenSession<'f>>
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    let opened = run Effect.result(
+      ctx.platform.openWindow("Silk devtools", DEVTOOLS_WIDTH, DEVTOOLS_HEIGHT, true),
+    )
+    let win = match move opened {
+      Result<OpenedWindow, WindowError | OutOfMemoryError>.Success { value } => value
+      Result<OpenedWindow, WindowError | OutOfMemoryError>.Failure { error } => match move error {
+        WindowError _ => { return Option<OpenSession<'f>>.None }
+        OutOfMemoryError allocation => { fail move allocation }
+      }
+    }
+    let OpenedWindow { window, size, scale, raw } = win
+    ctx.compositor.registerSurface(window, DEVTOOLS_GROUP)
+    let surface = run ctx.gpu.openSurface(raw, window)
+    let mut tree = run UiTree.make(fonts)
+    tree.setEnginePool(ctx.pools.engine.clone(), DEVTOOLS_GROUP)
+    tree.enableAtlasEpochPinning(true)
+    tree.rootSupport = RootSupport { count: 1, extra: ExtraRoot.Window }
+    let mut batch = Batch.make()
+    run batch.fontFamily(FONT, UI_FAMILIES)
+    run batch.fontFamily(MONO, MONO_FAMILIES)
+    run tree.apply(run batch.take())
+    let model = run Devtools.make("this process")
+    let mut runtime = Runtime<Devtools, Message, Command>.make(move model)
+    runtime.deferCommands()
+    run runtime.start(&mut tree, now)
+    runtime.send(Message.Refresh)
+    run reportWindow(&mut tree, &Event.Resized { window: window, size: size, scaleFactor: scale })
+    run reportWindow(&mut tree, &Event.ScaleFactorChanged { window: window, scaleFactor: scale })
+    return Option<OpenSession<'f>>.some(
+      OpenSession<'f> {
+        window: window,
+        surface: surface,
+        surfaceReady: false,
+        width: size.width,
+        height: size.height,
+        scale: scale,
+        drawn: 0,
+        commitEpoch: 0,
+        consumedInputSeq: 0,
+        tree: move tree,
+        runtime: move runtime,
+        numbering: Requests.make(),
+        views: ViewHost.make(),
+      },
+    )
+  }
+
+  effect fn closeWindowSession<'f>(
+    ctx: &SecondaryGroupContext,
+    channel: &mut MemoryChannel,
+    appWake: &Nudge,
+    session: OpenSession<'f>,
+  ) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let OpenSession<'f> { window, surface, .. } = move session
+    drop run Channel.send("{\"cmd\":\"highlight\"}") |> Effect.provideMut<Channel>(&mut channel.*)
+    drop run Channel.send("{\"cmd\":\"pickMode\",\"on\":false}")
+      |> Effect.provideMut<Channel>(&mut channel.*)
+    appWake.nudge()
+    if window.value != 0 {
+      ctx.compositor.removeSurface(window)
+      if surface != 0 {
+        ctx.gpu.closeSurface(surface, window, Option<PlatformClient>.some(ctx.platform.clone()))
+      } else {
+        ctx.platform.closeWindow(window)
+      }
+    }
+  }
+
+  effect fn feedGroupInput<'f>(
+    session: &mut OpenSession<'f>,
+    input: Input,
+  ) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    let mut idle = IdleLink {}
+    run session.tree.begin(&input)
+    run session.views.intercept(&mut session.tree.events)
+    drop run pump(&mut session.runtime, &mut session.tree) |> Effect.provideMut<Link>(&mut idle)
+    run session.tree.finish(move input, false)
+    run session.views.intercept(&mut session.tree.events)
+    drop run pump(&mut session.runtime, &mut session.tree) |> Effect.provideMut<Link>(&mut idle)
+    while let Option<Input>.Some { value: next } = session.tree.takeFollowUp() {
+      run session.tree.begin(&next)
+      run session.views.intercept(&mut session.tree.events)
+      drop run pump(&mut session.runtime, &mut session.tree) |> Effect.provideMut<Link>(&mut idle)
+      run session.tree.finish(move next, false)
+      run session.views.intercept(&mut session.tree.events)
+      drop run pump(&mut session.runtime, &mut session.tree) |> Effect.provideMut<Link>(&mut idle)
+    }
+  }
+
+  effect fn settleSession<'f>(
+    ctx: &SecondaryGroupContext,
+    channel: &mut MemoryChannel,
+    appWake: &Nudge,
+    session: &mut OpenSession<'f>,
+  ) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    let mut idle = IdleLink {}
+    let mut rounds: u32 = 0
+    while rounds < 8 && !ctx.stop.isStopped() {
+      drop run drain(&mut session.runtime, &mut session.tree)
+        |> Effect.provideMut<Link>(&mut idle)
+      if session.runtime.deferred() == 0 {
+        break
+      }
+      while session.runtime.deferred() != 0 && !ctx.stop.isStopped() {
+        let command = session.runtime.takeDeferred()
+        let mut link = GroupLink<'_, 'f> {
+          tree: &mut session.tree,
+          client: &mut channel,
+          appWake: appWake,
+          numbering: &mut session.numbering,
+          views: &mut session.views,
+          waiter: &ctx.waiter,
+          stop: &ctx.stop,
+        }
+        let message = run Perform<Message, OutOfMemoryError ? &mut Link | &mut Allocator>.perform(
+          move command,
+        )
+          |> Effect.provideMut<Link>(&mut link)
+        session.runtime.send(move message)
+      }
+      rounds = rounds + 1
+    }
+    run flushViewsOutbox(&mut session.views, &mut channel, appWake)
+  }
+
+  effect fn devtoolsRun<'f>(
+    ctx: SecondaryGroupContext,
+    channel: MemoryChannel,
+    appWake: Nudge,
+    openAtStart: bool,
+    fonts: &'f FontCollection,
+  ) -> i32
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    let mut ctx = move ctx
+    let mut channel = move channel
+    channel.setUnparker(ctx.waiter.unparker())
+    let mut clock = Clock.make()
+    let started = run seconds(&mut clock)
+    let mut session = Option<OpenSession<'f>>.None
+    let mut wantedOpen = openAtStart
+
+    while !ctx.stop.isStopped() {
+      let mut inbox = List<CompositorToGroup>.make()
+      drop run ctx.rx.drain(&mut inbox, 0)
+
+      if wantedOpen && session.isNone() {
+        let now = (run seconds(&mut clock)) - started
+        session = run openWindowSession(&ctx, fonts, now)
+        if session.isNone() {
+          wantedOpen = false
+        }
+      }
+
+      while inbox.length() != 0 {
+        match inbox.remove(0) {
+          CompositorToGroup.SurfaceOpened { surface, window, made } => {
+            if let Option<OpenSession<'f>>.Some { value: cur } = &mut session {
+              if surface == cur.surface && window.value == cur.window.value {
+                if made {
+                  cur.surfaceReady = true
+                } else {
+                  ctx.compositor.removeSurface(cur.window)
+                  ctx.platform.closeWindow(cur.window)
+                  session = Option<OpenSession<'f>>.None
+                  wantedOpen = false
+                }
+              }
+            }
+          }
+          CompositorToGroup.SurfaceClosed { .. } => ()
+          CompositorToGroup.Presented { .. } => ()
+          CompositorToGroup.CommitInstalled { .. } => ()
+          CompositorToGroup.GpuFinished { window, atlasFrame, .. } => {
+            if let Option<OpenSession<'f>>.Some { value: cur } = &mut session {
+              if window.value == cur.window.value && atlasFrame != 0 {
+                cur.tree.setGpuFinishedAtlasFrame(atlasFrame)
+              }
+            }
+          }
+          CompositorToGroup.Scroll { update } => {
+            if let Option<OpenSession<'f>>.Some { value: cur } = &mut session {
+              if update.consumedInputSeq > cur.consumedInputSeq {
+                cur.consumedInputSeq = update.consumedInputSeq
+              }
+              if update.window.value == cur.window.value {
+                let s = f64.toF32(cur.scale)
+                if s > 0.0 {
+                  run cur.tree.scrolledElsewhere(update.scrolled.node, update.scrolled.x / s, update.scrolled.y / s)
+                }
+              }
+            }
+          }
+          CompositorToGroup.Input { routed } => {
+            if routed.target.gestureId != 0 {
+              ctx.compositor.ackGesture(
+                GestureAck {
+                  gestureId: routed.target.gestureId,
+                  inputSeq: routed.target.inputSeq,
+                  window: routed.target.window,
+                  groupId: DEVTOOLS_GROUP,
+                  consumed: false,
+                },
+              )
+            }
+            if isToggleEvent(&routed.event) {
+              if !isRepeatToggle(&routed.event) {
+                if let Option<OpenSession<'f>>.Some { value: closing } = Intrinsic.replace(
+                  session,
+                  Option<OpenSession<'f>>.None,
+                ) {
+                  run closeWindowSession(&ctx, &mut channel, &appWake, move closing)
+                  wantedOpen = false
+                } else {
+                  wantedOpen = true
+                }
+              }
+              continue
+            }
+            if let Option<OpenSession<'f>>.Some { value: cur } = &mut session {
+              if routed.target.inputSeq > cur.consumedInputSeq {
+                cur.consumedInputSeq = routed.target.inputSeq
+              }
+              match &routed.event {
+                Event.CloseRequested { .. } => {
+                  wantedOpen = false
+                }
+                Event.Resized { size, .. } => {
+                  cur.width = size.width
+                  cur.height = size.height
+                  run reportWindow(&mut cur.tree, &routed.event)
+                }
+                Event.ScaleFactorChanged { scaleFactor, .. } => {
+                  cur.scale = scaleFactor
+                  run reportWindow(&mut cur.tree, &routed.event)
+                }
+                _ => {
+                  let now = (run seconds(&mut clock)) - started
+                  if let Option<Input>.Some { value: input } = run toInputAt(&routed.event, now) {
+                    run feedGroupInput(&mut cur, move input)
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+
+      if !wantedOpen {
+        if let Option<OpenSession<'f>>.Some { value: closing } = Intrinsic.replace(
+          session,
+          Option<OpenSession<'f>>.None,
+        ) {
+          run closeWindowSession(&ctx, &mut channel, &appWake, move closing)
+        }
+      } else if session.isNone() {
+        let now = (run seconds(&mut clock)) - started
+        session = run openWindowSession(&ctx, fonts, now)
+        if session.isNone() {
+          wantedOpen = false
+        }
+      }
+
+      if let Option<OpenSession<'f>>.Some { value: cur } = &mut session {
+        let now = (run seconds(&mut clock)) - started
+        if channel.pending() {
+          cur.runtime.send(Message.Pull)
+        }
+        let mut idle = IdleLink {}
+        drop run pump(&mut cur.runtime, &mut cur.tree) |> Effect.provideMut<Link>(&mut idle)
+        run tick(&mut cur.runtime, &mut cur.tree, now, false) |> Effect.provideMut<Link>(&mut idle)
+        run settleSession(&ctx, &mut channel, &appWake, &mut cur)
+        if cur.surfaceReady && (cur.tree.needsFrame() || cur.drawn == 0) {
+          let w = f64.toF32(cur.width)
+          let h = f64.toF32(cur.height)
+          let s = f64.toF32(cur.scale)
+          if w > 0.0 && h > 0.0 && s > 0.0 {
+            let fi = FrameInput { width: w, height: h, scale: s, time: now }
+            run frame(&mut cur.runtime, &mut cur.tree, fi) |> Effect.provideMut<Link>(&mut idle)
+            run settleSession(&ctx, &mut channel, &appWake, &mut cur)
+            cur.commitEpoch = cur.commitEpoch + 1
+            let immediate = cur.drawn == 0
+            let hit = run buildDevtoolsHitSurface(
+              cur.window,
+              cur.commitEpoch,
+              s,
+              w,
+              h,
+              cur.consumedInputSeq,
+              &cur.tree,
+            )
+            ctx.compositor.commitHitSurface(move hit, immediate)
+            let devW = devicePixels(cur.width, cur.scale)
+            let devH = devicePixels(cur.height, cur.scale)
+            run ctx.gpu.submitSurface(
+              cur.surface,
+              cur.tree.scene(),
+              &cur.tree.atlas,
+              cur.tree.pendingUploads(),
+              devW,
+              devH,
+              cur.commitEpoch,
+            )
+            cur.tree.clearUploads()
+            cur.drawn = cur.drawn + 1
+          }
+        }
+      }
+
+      if ctx.stop.isStopped() {
+        break
+      }
+      if channel.pending() {
+        continue
+      }
+      match &session {
+        Option<OpenSession<'f>>.Some { value: cur } => {
+          match cur.runtime.nextDeadline() {
+            Option<f64>.Some { value: due } => {
+              let now = (run seconds(&mut clock)) - started
+              let remaining = due - now
+              if remaining > 0.0 {
+                let nanos = f64.toU64(f64.floor(remaining * 1000000000.0))
+                drop ctx.waiter.waitTimeout(if nanos > 0 { nanos } else { 1000000 })
+              }
+            }
+            Option<f64>.None => {
+              ctx.waiter.wait()
+            }
+          }
+        }
+        Option<OpenSession<'f>>.None => {
+          ctx.waiter.wait()
+        }
+      }
+    }
+
+    if let Option<OpenSession<'f>>.Some { value: closing } = Intrinsic.replace(
+      session,
+      Option<OpenSession<'f>>.None,
+    ) {
+      run closeWindowSession(&ctx, &mut channel, &appWake, move closing)
+    }
+    channel.close()
+    return 0
+  }
+
+  effect fn devtoolsLoop(
+    ctx: SecondaryGroupContext,
+    channel: MemoryChannel,
+    appWake: Nudge,
+    openAtStart: bool,
+  ) -> i32
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    let fonts = run systemFonts()
+    return run devtoolsRun(move ctx, move channel, move appWake, openAtStart, &fonts)
+  }
+
+  effect fn loopFailed<E>(error: E) -> i32 {
+    drop error
+    return 1
+  }
+
+  fn groupThreadEntry(
+    ctx: SecondaryGroupContext,
+    channel: MemoryChannel,
+    appWake: Nudge,
+    openAtStart: bool,
+  ) -> i32 {
+    let mut heap = Allocator.systemAllocatorProvider()
+    return run Effect.catchAll(
+      devtoolsLoop(move ctx, move channel, move appWake, openAtStart),
+      loopFailed,
+    )
+      |> Effect.provideMut<Allocator>(&mut heap)
+  }
+}

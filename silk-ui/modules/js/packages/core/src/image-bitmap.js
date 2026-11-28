@@ -34,7 +34,14 @@ export class ImageBitmap {
 
 const pixels = (width, height, data = new Uint8ClampedArray(width * height * 4)) => ({ width, height, data });
 
-function decode(bytes) {
+async function decode(bytes) {
+  if (native?.imageDecodeAsync) {
+    try {
+      return await native.imageDecodeAsync(bytes);
+    } catch {
+      throw domError("InvalidStateError", "The source image could not be decoded.");
+    }
+  }
   if (!native?.imageDecode || native.imageDecode(bytes) !== 2) throw domError("InvalidStateError", "The source image could not be decoded.");
   const width = native.geometry(0);
   const height = native.geometry(1);
@@ -63,7 +70,7 @@ async function sourcePixels(image) {
     if (!image._pixels) throw domError("InvalidStateError", "The image bitmap is closed.");
     return image._pixels;
   }
-  if (typeof Blob === "function" && image instanceof Blob) return decode(new Uint8Array(await image.arrayBuffer()));
+  if (typeof Blob === "function" && image instanceof Blob) return await decode(new Uint8Array(await image.arrayBuffer()));
   if (image && typeof image.getContext === "function") {
     const width = image.width | 0, height = image.height | 0;
     if (!width || !height) throw domError("InvalidStateError", "The canvas has no pixels.");
@@ -76,7 +83,7 @@ async function sourcePixels(image) {
     const read = image._readPixels();
     if (read && read.width && read.height) return read;
   }
-  if (image && typeof image.src === "string") return decode(await addressBytes(image.src));
+  if (image && typeof image.src === "string") return await decode(await addressBytes(image.src));
   throw new TypeError("createImageBitmap takes a Blob, ImageData, ImageBitmap, canvas or image.");
 }
 

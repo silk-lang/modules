@@ -1,0 +1,536 @@
+//! Retained compositor layer state, strict 1-in-flight commit protocol, and GPU epoch retirement.
+//!
+//! Designed so both the Document/Engine producer and Compositor/GPU consumer keep coherent state
+//! across out-of-order frames, dropped commits, and GPU execution latency:
+//! - [`CommitTracker`] enforces at most one unacknowledged [`LayerCommit`] per window, coalesces
+//!   edits while a commit is in flight, and switches to [`LayerCommitKind.Keyframe`] on resync.
+//! - [`RetainedLayerStore`] validates `commitEpoch` monotonicity (idempotent replay) and `baseEpoch`
+//!   matching on deltas, returning `needsKeyframe = true` on mismatch without corrupting state.
+//! - [`EpochRetirementQueue`] defers destruction/eviction of GPU-referenced resources until
+//!   `gpuFinishedEpoch` advances past `retireAfterEpoch`.
+
+import silk.collections.list { List }
+import silk.concurrency.thread { Transferable }
+import silk.core.equal { Equal }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.geometry.rect { Rect }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.usize
+import ui_scene.property_tree { ClipNode, EffectNode, LayerOverride, ScrollNode, TransformNode }
+import window.types { WindowId }
+
+/// Monotonic lifecycle epochs for a single window's retained layer tree.
+pub struct SurfaceEpochs {
+  pub commitEpoch: u64,
+  pub activeEpoch: u64,
+  pub presentedEpoch: u64,
+  pub gpuFinishedEpoch: u64,
+}
+
+impl Copy for SurfaceEpochs {}
+
+impl SurfaceEpochs {
+  pub fn empty() -> SurfaceEpochs {
+    return SurfaceEpochs {
+      commitEpoch: 0,
+      activeEpoch: 0,
+      presentedEpoch: 0,
+      gpuFinishedEpoch: 0,
+    }
+  }
+}
+
+/// Retained compositor layer record emitted by Document or Engine frames.
+pub struct LayerRecord {
+  pub layerId: u32,
+  pub contentVersion: u64,
+  pub bounds: Rect<f32>,
+  pub transformNode: i32,
+  pub clipNode: i32,
+  pub effectNode: i32,
+  pub scrollNode: i32,
+  pub isOpaque: bool,
+  pub hasTransform: bool,
+}
+
+impl Copy for LayerRecord {}
+
+/// Whether a [`LayerCommit`] carries full state or an incremental delta from `baseEpoch`.
+pub union LayerCommitKind {
+  Keyframe,
+  Delta,
+}
+
+impl Copy for LayerCommitKind {}
+
+impl Equal for LayerCommitKind {
+  fn equals(left: &Self, right: &Self) -> bool {
+    return match left.* {
+      LayerCommitKind.Keyframe => match right.* {
+        LayerCommitKind.Keyframe => true
+        LayerCommitKind.Delta => false
+      }
+      LayerCommitKind.Delta => match right.* {
+        LayerCommitKind.Delta => true
+        LayerCommitKind.Keyframe => false
+      }
+    }
+  }
+}
+
+/// Atomic commit of property trees, retained layer metadata, and initial overrides for a window.
+pub struct LayerCommit {
+  pub windowId: WindowId,
+  pub groupId: u32,
+  pub commitEpoch: u64,
+  pub baseEpoch: u64,
+  pub kind: LayerCommitKind,
+  pub consumedInputSeq: u64,
+  pub viewportWidth: u32,
+  pub viewportHeight: u32,
+  pub deviceScale: f32,
+  pub transforms: List<TransformNode>,
+  pub clips: List<ClipNode>,
+  pub effects: List<EffectNode>,
+  pub scrolls: List<ScrollNode>,
+  pub updatedLayers: List<LayerRecord>,
+  pub removedLayerIds: List<u32>,
+  pub overrides: List<LayerOverride>,
+  pub replaceOverrides: bool,
+  pub atlasFrame: u64,
+  pub needsKeyframe: bool,
+}
+
+impl Transferable for LayerCommit {}
+
+impl LayerCommit {
+  pub fn empty(windowId: WindowId, groupId: u32, commitEpoch: u64, baseEpoch: u64, kind: LayerCommitKind) -> LayerCommit {
+    return LayerCommit {
+      windowId: windowId,
+      groupId: groupId,
+      commitEpoch: commitEpoch,
+      baseEpoch: baseEpoch,
+      kind: kind,
+      consumedInputSeq: 0,
+      viewportWidth: 0,
+      viewportHeight: 0,
+      deviceScale: 1.0,
+      transforms: List<TransformNode>.make(),
+      clips: List<ClipNode>.make(),
+      effects: List<EffectNode>.make(),
+      scrolls: List<ScrollNode>.make(),
+      updatedLayers: List<LayerRecord>.make(),
+      removedLayerIds: List<u32>.make(),
+      overrides: List<LayerOverride>.make(),
+      replaceOverrides: true,
+      atlasFrame: 0,
+      needsKeyframe: false,
+    }
+  }
+
+  /// Deep copies all lists using the active allocator (used to forward or retain commits).
+  pub effect fn clone(self: &Self) -> LayerCommit
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut out = LayerCommit.empty(
+      self.windowId,
+      self.groupId,
+      self.commitEpoch,
+      self.baseEpoch,
+      self.kind,
+    )
+    out.consumedInputSeq = self.consumedInputSeq
+    out.viewportWidth = self.viewportWidth
+    out.viewportHeight = self.viewportHeight
+    out.deviceScale = self.deviceScale
+    out.replaceOverrides = self.replaceOverrides
+    out.atlasFrame = self.atlasFrame
+    out.needsKeyframe = self.needsKeyframe
+    run out.transforms.appendSlice(self.transforms.asSlice())
+    run out.clips.appendSlice(self.clips.asSlice())
+    run out.effects.appendSlice(self.effects.asSlice())
+    run out.scrolls.appendSlice(self.scrolls.asSlice())
+    run out.updatedLayers.appendSlice(self.updatedLayers.asSlice())
+    run out.removedLayerIds.appendSlice(self.removedLayerIds.asSlice())
+    run out.overrides.appendSlice(self.overrides.asSlice())
+    return move out
+  }
+}
+
+/// Acknowledgement returned after the compositor/GPU processes a [`LayerCommit`].
+pub struct CommitAck {
+  pub windowId: WindowId,
+  pub groupId: u32,
+  pub commitEpoch: u64,
+  pub activeEpoch: u64,
+  pub applied: bool,
+  pub needsKeyframe: bool,
+}
+
+impl Copy for CommitAck {}
+impl Transferable for CommitAck {}
+
+struct RetiredEntry<T> {
+  retireAfterEpoch: u64,
+  item: T,
+}
+
+impl<T: Transferable> Transferable for RetiredEntry<T> {}
+
+/// Defers freeing or evicting GPU resources until `gpuFinishedEpoch >= retireAfterEpoch`.
+pub struct EpochRetirementQueue<T> {
+  entries: List<RetiredEntry<T>>,
+}
+
+impl<T: Transferable> Transferable for EpochRetirementQueue<T> {}
+
+impl<T> EpochRetirementQueue<T> {
+  pub fn make() -> EpochRetirementQueue<T> {
+    return EpochRetirementQueue<T> { entries: List<RetiredEntry<T>>.make() }
+  }
+
+  pub fn pendingCount(self: &Self) -> usize {
+    return self.entries.length()
+  }
+
+  pub fn clear(self: &mut Self) -> () {
+    self.entries.clear()
+  }
+
+  pub effect fn defer(self: &mut Self, retireAfterEpoch: u64, item: T) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.entries.append(RetiredEntry<T> { retireAfterEpoch: retireAfterEpoch, item: move item })
+  }
+
+  /// Removes and returns every entry whose `retireAfterEpoch <= gpuFinishedEpoch` in FIFO order.
+  pub effect fn drainRetired(self: &mut Self, gpuFinishedEpoch: u64) -> List<T>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut retired = List<T>.make()
+    let mut i: usize = 0
+    while i < self.entries.length() {
+      if self.entries.asSlice()[i].retireAfterEpoch <= gpuFinishedEpoch {
+        let entry = self.entries.remove(i)
+        run retired.append(move entry.item)
+      } else {
+        i = i + 1
+      }
+    }
+    return move retired
+  }
+}
+
+/// Ticket allocated by [`CommitTracker.beginCommit`] for a single outgoing [`LayerCommit`].
+pub struct CommitTicket {
+  pub commitEpoch: u64,
+  pub baseEpoch: u64,
+  pub kind: LayerCommitKind,
+}
+
+impl Copy for CommitTicket {}
+
+/// Enforces strict 1-in-flight commit per window on the UI group side, coalescing edits while
+/// waiting for `CommitAck` and forcing a keyframe whenever resync is requested.
+pub struct CommitTracker {
+  inFlight: bool,
+  activeInFlightEpoch: u64,
+  ackedEpochValue: u64,
+  nextEpoch: u64,
+  pendingDirty: bool,
+  mustSendKeyframe: bool,
+}
+
+impl Copy for CommitTracker {}
+
+impl CommitTracker {
+  pub fn make() -> CommitTracker {
+    return CommitTracker {
+      inFlight: false,
+      activeInFlightEpoch: 0,
+      ackedEpochValue: 0,
+      nextEpoch: 0,
+      pendingDirty: false,
+      mustSendKeyframe: true,
+    }
+  }
+
+  pub fn canSend(self: &Self) -> bool {
+    return !self.inFlight
+  }
+
+  pub fn isInFlight(self: &Self) -> bool {
+    return self.inFlight
+  }
+
+  pub fn inFlightEpoch(self: &Self) -> u64 {
+    return self.activeInFlightEpoch
+  }
+
+  pub fn lastAckedEpoch(self: &Self) -> u64 {
+    return self.ackedEpochValue
+  }
+
+  pub fn needsKeyframe(self: &Self) -> bool {
+    return self.mustSendKeyframe
+  }
+
+  pub fn hasPendingDirty(self: &Self) -> bool {
+    return self.pendingDirty
+  }
+
+  pub fn markDirty(self: &mut Self) -> () {
+    self.pendingDirty = true
+  }
+
+  pub fn forceKeyframe(self: &mut Self) -> () {
+    self.mustSendKeyframe = true
+    self.pendingDirty = true
+  }
+
+  /// Begins a commit if none is currently in flight, upgrading `Delta` to `Keyframe` if needed.
+  pub fn beginCommit(self: &mut Self, requested: LayerCommitKind) -> Option<CommitTicket> {
+    if self.inFlight {
+      self.pendingDirty = true
+      return Option<CommitTicket>.None
+    }
+    let kind = if self.mustSendKeyframe || self.ackedEpochValue == 0 {
+      LayerCommitKind.Keyframe
+    } else {
+      requested
+    }
+    self.nextEpoch = self.nextEpoch + 1
+    let epoch = self.nextEpoch
+    let base = match kind {
+      LayerCommitKind.Keyframe => 0
+      LayerCommitKind.Delta => self.ackedEpochValue
+    }
+    self.inFlight = true
+    self.activeInFlightEpoch = epoch
+    self.pendingDirty = false
+    self.mustSendKeyframe = false
+    return Option<CommitTicket>.some(
+      CommitTicket { commitEpoch: epoch, baseEpoch: base, kind: kind },
+    )
+  }
+
+  /// Records a [`CommitAck`] and returns `true` when another commit should be sent immediately.
+  pub fn onAck(self: &mut Self, ack: CommitAck) -> bool {
+    if ack.commitEpoch >= self.activeInFlightEpoch {
+      self.inFlight = false
+    }
+    if ack.applied && ack.activeEpoch > self.ackedEpochValue {
+      self.ackedEpochValue = ack.activeEpoch
+    }
+    if ack.needsKeyframe {
+      self.mustSendKeyframe = true
+      self.pendingDirty = true
+    }
+    return !self.inFlight && (self.pendingDirty || self.mustSendKeyframe)
+  }
+}
+
+/// Idempotent consumer-side retained layer store on Compositor / GPU.
+pub struct RetainedLayerStore {
+  pub epochs: SurfaceEpochs,
+  pub lastConsumedInputSeq: u64,
+  pub viewportWidth: u32,
+  pub viewportHeight: u32,
+  pub deviceScale: f32,
+  pub transforms: List<TransformNode>,
+  pub clips: List<ClipNode>,
+  pub effects: List<EffectNode>,
+  pub scrolls: List<ScrollNode>,
+  pub layers: List<LayerRecord>,
+  pub overrides: List<LayerOverride>,
+}
+
+impl Transferable for RetainedLayerStore {}
+
+impl RetainedLayerStore {
+  pub fn make() -> RetainedLayerStore {
+    return RetainedLayerStore {
+      epochs: SurfaceEpochs.empty(),
+      lastConsumedInputSeq: 0,
+      viewportWidth: 0,
+      viewportHeight: 0,
+      deviceScale: 1.0,
+      transforms: List<TransformNode>.make(),
+      clips: List<ClipNode>.make(),
+      effects: List<EffectNode>.make(),
+      scrolls: List<ScrollNode>.make(),
+      layers: List<LayerRecord>.make(),
+      overrides: List<LayerOverride>.make(),
+    }
+  }
+
+  pub fn layerCount(self: &Self) -> usize {
+    return self.layers.length()
+  }
+
+  pub fn hasLayer(self: &Self, layerId: u32) -> bool {
+    let slice = self.layers.asSlice()
+    let mut i: usize = 0
+    while i < slice.length {
+      if slice[i].layerId == layerId {
+        return true
+      }
+      i = i + 1
+    }
+    return false
+  }
+
+  pub fn getLayer(self: &Self, layerId: u32) -> Option<LayerRecord> {
+    let slice = self.layers.asSlice()
+    let mut i: usize = 0
+    while i < slice.length {
+      if slice[i].layerId == layerId {
+        return Option<LayerRecord>.some(slice[i])
+      }
+      i = i + 1
+    }
+    return Option<LayerRecord>.None
+  }
+
+  /// Validates and applies `commit` idempotently. Duplicate `commitEpoch` is ignored; a `Delta`
+  /// with mismatched `baseEpoch` preserves prior state and returns `needsKeyframe = true`.
+  pub effect fn applyCommit(self: &mut Self, commit: &LayerCommit) -> CommitAck
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if commit.commitEpoch == 0 || commit.commitEpoch <= self.epochs.activeEpoch {
+      return CommitAck {
+        windowId: commit.windowId,
+        groupId: commit.groupId,
+        commitEpoch: commit.commitEpoch,
+        activeEpoch: self.epochs.activeEpoch,
+        applied: false,
+        needsKeyframe: false,
+      }
+    }
+
+    let isDelta = match commit.kind {
+      LayerCommitKind.Delta => true
+      LayerCommitKind.Keyframe => false
+    }
+    if isDelta && (self.epochs.activeEpoch == 0 || commit.baseEpoch != self.epochs.activeEpoch || commit.needsKeyframe) {
+      return CommitAck {
+        windowId: commit.windowId,
+        groupId: commit.groupId,
+        commitEpoch: commit.commitEpoch,
+        activeEpoch: self.epochs.activeEpoch,
+        applied: false,
+        needsKeyframe: true,
+      }
+    }
+
+    if !isDelta {
+      self.transforms.clear()
+      run self.transforms.appendSlice(commit.transforms.asSlice())
+      self.clips.clear()
+      run self.clips.appendSlice(commit.clips.asSlice())
+      self.effects.clear()
+      run self.effects.appendSlice(commit.effects.asSlice())
+      self.scrolls.clear()
+      run self.scrolls.appendSlice(commit.scrolls.asSlice())
+      self.layers.clear()
+      run self.layers.appendSlice(commit.updatedLayers.asSlice())
+      self.overrides.clear()
+      run self.overrides.appendSlice(commit.overrides.asSlice())
+    } else {
+      if commit.transforms.length() != 0 {
+        self.transforms.clear()
+        run self.transforms.appendSlice(commit.transforms.asSlice())
+      }
+      if commit.clips.length() != 0 {
+        self.clips.clear()
+        run self.clips.appendSlice(commit.clips.asSlice())
+      }
+      if commit.effects.length() != 0 {
+        self.effects.clear()
+        run self.effects.appendSlice(commit.effects.asSlice())
+      }
+      if commit.scrolls.length() != 0 {
+        self.scrolls.clear()
+        run self.scrolls.appendSlice(commit.scrolls.asSlice())
+      }
+      if commit.replaceOverrides || commit.overrides.length() != 0 {
+        self.overrides.clear()
+        run self.overrides.appendSlice(commit.overrides.asSlice())
+      }
+      let removed = commit.removedLayerIds.asSlice()
+      let mut r: usize = 0
+      while r < removed.length {
+        self.removeLayer(removed[r])
+        r = r + 1
+      }
+      let updates = commit.updatedLayers.asSlice()
+      let mut u: usize = 0
+      while u < updates.length {
+        run self.upsertLayer(updates[u])
+        u = u + 1
+      }
+    }
+
+    self.epochs.commitEpoch = commit.commitEpoch
+    self.epochs.activeEpoch = commit.commitEpoch
+    if commit.consumedInputSeq > self.lastConsumedInputSeq {
+      self.lastConsumedInputSeq = commit.consumedInputSeq
+    }
+    if commit.viewportWidth > 0 {
+      self.viewportWidth = commit.viewportWidth
+    }
+    if commit.viewportHeight > 0 {
+      self.viewportHeight = commit.viewportHeight
+    }
+    if commit.deviceScale > 0.0 {
+      self.deviceScale = commit.deviceScale
+    }
+    return CommitAck {
+      windowId: commit.windowId,
+      groupId: commit.groupId,
+      commitEpoch: commit.commitEpoch,
+      activeEpoch: self.epochs.activeEpoch,
+      applied: true,
+      needsKeyframe: false,
+    }
+  }
+
+  fn removeLayer(self: &mut Self, layerId: u32) -> () {
+    let mut i: usize = 0
+    while i < self.layers.length() {
+      if self.layers.asSlice()[i].layerId == layerId {
+        drop self.layers.remove(i)
+      } else {
+        i = i + 1
+      }
+    }
+  }
+
+  effect fn upsertLayer(self: &mut Self, record: LayerRecord) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let slice = self.layers.asMutSlice()
+    let mut i: usize = 0
+    while i < slice.length {
+      if slice[i].layerId == record.layerId {
+        slice[i] = record
+        return ()
+      }
+      i = i + 1
+    }
+    run self.layers.append(record)
+  }
+
+  pub fn onPresented(self: &mut Self, epoch: u64) -> () {
+    if epoch > self.epochs.presentedEpoch {
+      self.epochs.presentedEpoch = epoch
+    }
+  }
+
+  pub fn onGpuFinished(self: &mut Self, epoch: u64) -> () {
+    if epoch > self.epochs.gpuFinishedEpoch {
+      self.epochs.gpuFinishedEpoch = epoch
+    }
+  }
+}

@@ -9,6 +9,8 @@ struct Quad {
   borderColor: vec4f,
   paint: Paint,
   maskRadii: Radii,
+  // x is the scroll group (a `Placement`).
+  extra: vec4f,
 }
 @group(0) @binding(1) var<storage, read> quads: array<Quad>;
 
@@ -19,7 +21,10 @@ fn transformOf(q: Quad) -> u32 { return u32(q.paint.stops.w); }
 
 @vertex fn vs(@builtin(vertex_index) v: u32, @builtin(instance_index) index: u32) -> Varying {
   let q = quads[index];
-  let placed = place(q.bounds, q.mask, transformOf(q), v);
+  let pl = placements[u32(q.extra.x)];
+  let own = q.mask + pl.offset.xyxy;
+  let clipRect = vec4f(max(own.xy, pl.clip.xy), min(own.zw, pl.clip.zw));
+  let placed = place(q.bounds + pl.offset.xyxy, clipRect, transformOf(q), v);
   return Varying(placed.position, index, placed.local);
 }
 
@@ -90,15 +95,19 @@ fn dashCoverage(s: f32, w: f32) -> f32 {
 
 @fragment fn fs(v: Varying) -> @location(0) vec4f {
   let q = quads[v.index];
+  let pl = placements[u32(q.extra.x)];
   let at = spot(v.position, v.local, transformOf(q));
   let p = at.p;
-  let clip = areaInAt(q.mask, p, at.scale) * cornerCoverageAt(q.mask, q.maskRadii, p, at.scale) * at.keep;
+  let own = q.mask + pl.offset.xyxy;
+  let clipRect = vec4f(max(own.xy, pl.clip.xy), min(own.zw, pl.clip.zw));
+  let clip = areaInAt(clipRect, p, at.scale) * cornerCoverageAt(own, q.maskRadii, p, at.scale) * cornerCoverageAt(pl.clip, pl.clipRadii, p, at.scale) * at.keep;
   if clip <= 0.0 { discard; }
+  let lp = p - pl.offset.xy;
   // The device pixels in one of the quad's, for the edges no normal is known for.
   let unit = sqrt(at.scale.x * at.scale.y);
   let radii = q.radii;
-  let outer = roundedCoverage(p, q.bounds, radii, at.scale);
-  let background = shade(q.paint, p) * outer;
+  let outer = roundedCoverage(lp, q.bounds, radii, at.scale);
+  let background = shade(q.paint, lp) * outer;
 
   var border = vec4f(0.0);
   let w = q.borders;
@@ -108,10 +117,10 @@ fn dashCoverage(s: f32, w: f32) -> f32 {
     let inner = vec4f(q.bounds.x + w.w, q.bounds.y + w.x, q.bounds.z - w.y, q.bounds.w - w.z);
     var inside = 0.0;
     if inner.x < inner.z && inner.y < inner.w {
-      let c = p - (inner.xy + inner.zw) * 0.5;
+      let c = lp - (inner.xy + inner.zw) * 0.5;
       let sides = vec2f(select(w.y, w.w, c.x < 0.0), select(w.z, w.x, c.y < 0.0));
       let e = pickRadii(c, radii) - sides;
-      inside = coverage(ellipticRectSdf(p, inner, max(e, vec2f(0.0))) * unit);
+      inside = coverage(ellipticRectSdf(lp, inner, max(e, vec2f(0.0))) * unit);
     }
     var band = max(outer - inside, 0.0);
     if q.paint.kind.z == 1u && band > 0.0 {
@@ -122,7 +131,7 @@ fn dashCoverage(s: f32, w: f32) -> f32 {
       let tr = max(vec2f(radii.x.y - w.y * 0.5, radii.y.y - w.x * 0.5), vec2f(0.0));
       let br = max(vec2f(radii.x.z - w.y * 0.5, radii.y.z - w.z * 0.5), vec2f(0.0));
       let bl = max(vec2f(radii.x.w - w.w * 0.5, radii.y.w - w.z * 0.5), vec2f(0.0));
-      band = band * dashCoverage(perimeterPosition(p, mid, tl, tr, br, bl) * unit, widest * unit);
+      band = band * dashCoverage(perimeterPosition(lp, mid, tl, tr, br, bl) * unit, widest * unit);
     }
     border = premultiply(q.borderColor) * band;
   }

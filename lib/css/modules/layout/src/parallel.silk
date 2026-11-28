@@ -1,0 +1,680 @@
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.mem.pointer { Pointer }
+import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.core.effect { Effect }
+import silk.core.result { Result }
+import silk.num.usize
+import box_tree { BoxTree }
+import context { Input, outOfFlow }
+import engine { layoutNodeInPlace, cacheKey, keptEmptyBox }
+import fragmentation { FragmentationError, StaticAnchor }
+import fragments { FragmentArena }
+import geometry { Layout, Point, Measure }
+import layout_cache { BoxFacts, REUSE_INDEPENDENT }
+import layout_pass { LayoutPass, PassState }
+import source { LayoutSource }
+import style { WrapFlow }
+import text { TextMeasure, TextError }
+import tree { NO_NODE, LayoutStats }
+
+/// Minimum independent sibling jobs before fanning layout out across `EnginePool`.
+pub const PARALLEL_LAYOUT_MIN: usize = 16
+
+struct SubtreeJob {
+  id: usize,
+  input: Input,
+  key: Input,
+  maxBox: usize,
+  anchorStart: usize,
+  anchorEnd: usize,
+}
+
+impl Copy for SubtreeJob {}
+
+struct SubtreeResult {
+  ok: bool,
+  chunk: usize,
+  fragStart: usize,
+  fragEnd: usize,
+  anchorStart: usize,
+  anchorEnd: usize,
+}
+
+impl Copy for SubtreeResult {}
+
+struct CapturedAnchor {
+  box: usize,
+  anchor: StaticAnchor,
+}
+
+impl Copy for CapturedAnchor {}
+
+struct ChunkState<M> {
+  start: usize,
+  len: usize,
+  maxBox: usize,
+  ok: bool,
+  hasAutoScrollbars: bool,
+  gutterScrollbars: bool,
+  stats: LayoutStats,
+  measurer: Option<M>,
+  fragments: FragmentArena,
+  anchors: List<CapturedAnchor>,
+}
+
+struct ParallelDispatchState<M, S> {
+  nodesPtr: *const u8,
+  factsPtr: *const u8,
+  boxesPtr: *mut Layout,
+  boxesLen: usize,
+  deferSticky: bool,
+  selectionsPtr: Option<*const u8>,
+  selectionsLen: usize,
+  jobsPtr: *const SubtreeJob,
+  jobsLen: usize,
+  anchorTargetsPtr: *const usize,
+  anchorTargetsLen: usize,
+  chunksPtr: *mut ChunkState<M>,
+  chunksLen: usize,
+  resultsPtr: *mut SubtreeResult,
+  resultsLen: usize,
+}
+
+struct ChunkOutcome {
+  ok: bool,
+  hasAutoScrollbars: bool,
+  gutterScrollbars: bool,
+  stats: LayoutStats,
+}
+
+impl Copy for ChunkOutcome {}
+
+/// Batches independent sibling subtrees for deterministic worker-chunk layout and serial commit.
+pub struct ParallelBatch<M: Measure + TextMeasure> {
+  jobs: List<SubtreeJob>,
+  anchorTargets: List<usize>,
+  chunks: List<ChunkState<M>>,
+  results: List<SubtreeResult>,
+  ran: bool,
+}
+
+effect fn walkSubtreeEligible<S: LayoutSource>(
+  nodes: &BoxTree<'_, S>,
+  root: usize,
+  collectAnchors: bool,
+  maxBoxOut: &mut usize,
+  anchorTargets: &mut List<usize>,
+) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let startTargets = anchorTargets.length()
+  let mut maxBox = root
+  let mut stack = List<usize>.make()
+  run stack.append(root)
+  while stack.length() > 0 {
+    let top = stack.length() - 1
+    let id = stack.get(top)
+    stack.truncate(top)
+    if id > maxBox { maxBox = id }
+    let node = nodes.node(id)
+    let style = nodes.style(id)
+    if node.columnSet || node.columnFlow || node.previousContinuation() != NO_NODE
+      || node.nextContinuation() != NO_NODE || node.interruptionFirst() != NO_NODE
+      || style.wrapFlow != WrapFlow.Auto {
+      if collectAnchors { anchorTargets.truncate(startTargets) }
+      return false
+    }
+    let mut child = node.firstChild()
+    while child != NO_NODE {
+      if outOfFlow(nodes.style(child)) {
+        if collectAnchors {
+          if child > maxBox { maxBox = child }
+          run anchorTargets.append(child)
+        }
+      } else {
+        run stack.append(child)
+      }
+      child = nodes.node(child).nextSibling()
+    }
+  }
+  maxBoxOut.* = maxBox
+  return true
+}
+
+/// Checks whether a candidate subtree rooted at `id` is free of continuations, exclusions, and columns,
+/// returning `true` while populating `maxBoxOut` and appending direct out-of-flow children to `anchorTargets`.
+effect fn subtreeEligible<S: LayoutSource>(
+  nodes: &BoxTree<'_, S>,
+  root: usize,
+  maxBoxOut: &mut usize,
+  anchorTargets: &mut List<usize>,
+) -> bool ! OutOfMemoryError ? &mut Allocator {
+  return run walkSubtreeEligible(nodes, root, true, &mut maxBoxOut, &mut anchorTargets)
+}
+
+/// Checks whether an item's in-flow subtree can safely run flex intrinsic probing in parallel.
+pub effect fn probeSubtreeEligible<S: LayoutSource>(
+  nodes: &BoxTree<'_, S>,
+  root: usize,
+) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let mut maxBox = root
+  let mut noTargets = List<usize>.make()
+  return run walkSubtreeEligible(nodes, root, false, &mut maxBox, &mut noTargets)
+}
+
+/// Marks in-flow boxes of `root` as relaid out on the engine thread before parallel dispatch,
+/// preserving previous `BoxWrites` while leaving out-of-flow descendants untouched.
+effect fn prepInFlowSubtree<'pass, 'source, S: LayoutSource>(
+  nodes: &BoxTree<'source, S>,
+  output: &mut LayoutPass<'pass, 'source>,
+  root: usize,
+) ! OutOfMemoryError ? &mut Allocator {
+  let mut stack = List<usize>.make()
+  run stack.append(root)
+  while stack.length() > 0 {
+    let top = stack.length() - 1
+    let id = stack.get(top)
+    stack.truncate(top)
+    if output.inPlace || output.tracking { run output.relayout(id) }
+    output.boxes[id] = Layout.zero()
+    let mut child = nodes.node(id).firstChild()
+    while child != NO_NODE {
+      if !outOfFlow(nodes.style(child)) { run stack.append(child) }
+      child = nodes.node(child).nextSibling()
+    }
+  }
+}
+
+/// Preserves previous box layouts and `written` marks for an item subtree before parallel probing
+/// without clearing `keptRange`, allowing final layout to reuse untouched subtrees.
+pub effect fn prepProbeSubtree<'pass, 'source, S: LayoutSource>(
+  nodes: &BoxTree<'source, S>,
+  output: &mut LayoutPass<'pass, 'source>,
+  root: usize,
+) ! OutOfMemoryError ? &mut Allocator {
+  let mut stack = List<usize>.make()
+  run stack.append(root)
+  while stack.length() > 0 {
+    let top = stack.length() - 1
+    let id = stack.get(top)
+    stack.truncate(top)
+    run output.touch(id)
+    let mut child = nodes.node(id).firstChild()
+    while child != NO_NODE {
+      if !outOfFlow(nodes.style(child)) { run stack.append(child) }
+      child = nodes.node(child).nextSibling()
+    }
+  }
+}
+
+pub fn pickChunkCount(workers: usize, totalJobs: usize) -> usize {
+  let mut chunkCount = workers * 2
+  if totalJobs / 4 < chunkCount { chunkCount = totalJobs / 4 }
+  if chunkCount < 2 { chunkCount = 2 }
+  if chunkCount > totalJobs { chunkCount = totalJobs }
+  return chunkCount
+}
+
+effect fn appendForkedChunk<M: Measure + TextMeasure>(
+  chunks: &mut List<ChunkState<M>>,
+  measurer: &M,
+  start: usize,
+  len: usize,
+  maxBox: usize,
+) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let forked = run Measure.forkForWorker(measurer)
+  match move forked {
+    Option<M>.None => { return false }
+    Option<M>.Some { value: worker } => {
+      run chunks.append(ChunkState {
+        start: start,
+        len: len,
+        maxBox: maxBox,
+        ok: false,
+        hasAutoScrollbars: false,
+        gutterScrollbars: false,
+        stats: LayoutStats.zero(),
+        measurer: Option<M>.some(move worker),
+        fragments: FragmentArena.make(),
+        anchors: List<CapturedAnchor>.make(),
+      })
+      return true
+    }
+  }
+}
+
+/// Merges a completed parallel chunk's scrollbar flags and counters into `output`.
+pub fn mergeChunkStats(
+  output: &mut LayoutPass<'_, '_>,
+  hasAutoScrollbars: bool,
+  gutterScrollbars: bool,
+  stats: &LayoutStats,
+) {
+  if hasAutoScrollbars { output.hasAutoScrollbars = true }
+  if gutterScrollbars { output.gutterScrollbars = true }
+  output.stats.fullLayouts = output.stats.fullLayouts + stats.fullLayouts
+  output.stats.sizeProbes = output.stats.sizeProbes + stats.sizeProbes
+  output.stats.cacheHits = output.stats.cacheHits + stats.cacheHits
+  output.stats.reusedLayouts = output.stats.reusedLayouts + stats.reusedLayouts
+  output.stats.inlineLayouts = output.stats.inlineLayouts + stats.inlineLayouts
+  output.stats.plainLines = output.stats.plainLines + stats.plainLines
+  output.stats.linesEmitted = output.stats.linesEmitted + stats.linesEmitted
+}
+
+fn absorbChunkOutcome<M: Measure + TextMeasure>(
+  output: &mut LayoutPass<'_, '_>,
+  chunk: &ChunkState<M>,
+) {
+  mergeChunkStats(&mut output, chunk.hasAutoScrollbars, chunk.gutterScrollbars, &chunk.stats)
+}
+
+effect fn executeChunkJobs<'chunk, 'source, M: Measure + TextMeasure, S: LayoutSource>(
+  nodes: &BoxTree<'source, S>,
+  facts: &'chunk BoxFacts,
+  boxes: &'chunk mut [Layout],
+  deferSticky: bool,
+  selectionsPtr: Option<*const u8>,
+  selectionsLen: usize,
+  jobs: &[SubtreeJob],
+  anchorTargets: &[usize],
+  start: usize,
+  len: usize,
+  maxBox: usize,
+  measurer: &mut M,
+  fragments: &'chunk mut FragmentArena,
+  anchors: &mut List<CapturedAnchor>,
+  results: &mut [SubtreeResult],
+  chunkIdx: usize,
+) -> ChunkOutcome ! OutOfMemoryError | TextError | FragmentationError ? &mut Allocator {
+  let mut state = PassState.make()
+  state.cache.skipFinals(true)
+  run fragments.prepare(maxBox + 1)
+  let mut pass = run LayoutPass.over(
+    move boxes,
+    move fragments,
+    nodes.source,
+    &mut state.cache,
+    &mut state.previous,
+    &mut state.writes,
+    facts,
+  )
+  pass.tracking = false
+  pass.deferSticky = deferSticky
+  pass.setSharedSelections(selectionsPtr, selectionsLen)
+
+  let mut ok = true
+  let end = start + len
+  let mut j = start
+  while j < end {
+    let job = jobs[j]
+    let fragStart = pass.fragments.checkpoint()
+    let laid = run Effect.result(layoutNodeInPlace(nodes, &mut pass, &mut measurer, job.id, &job.input))
+    if let Result.Failure { error: _ } = move laid {
+      ok = false
+      break
+    }
+    if pass.cache.gridGeometry.hasEntries() || pass.foundExclusions.length() != 0 || pass.exclusions.length() != 0 {
+      ok = false
+      break
+    }
+    let anchorStart = anchors.length()
+    if pass.anchorCount() != 0 && job.anchorStart < job.anchorEnd {
+      let mut a = job.anchorStart
+      while a < job.anchorEnd {
+        let target = anchorTargets[a]
+        let anc = pass.anchorAt(target)
+        if anc.valid {
+          run anchors.append(CapturedAnchor { box: target, anchor: anc })
+          pass.clearAnchor(target)
+        }
+        a = a + 1
+      }
+    }
+    results[j] = SubtreeResult {
+      ok: true,
+      chunk: chunkIdx,
+      fragStart: fragStart,
+      fragEnd: pass.fragments.checkpoint(),
+      anchorStart: anchorStart,
+      anchorEnd: anchors.length(),
+    }
+    j = j + 1
+  }
+
+  return ChunkOutcome {
+    ok: ok,
+    hasAutoScrollbars: pass.hasAutoScrollbars,
+    gutterScrollbars: pass.gutterScrollbars,
+    stats: pass.stats,
+  }
+}
+
+pub fn runLayoutChunk<M: Measure + TextMeasure, S: LayoutSource>(ctx: *const u8, chunkIdx: usize) -> () {
+  let mut heap = Allocator.systemAllocatorProvider()
+  let stateAnchor = ()
+  let state = unsafe Pointer.borrow<(), ParallelDispatchState<M, S>>(
+    &stateAnchor,
+    unsafe Intrinsic.pointerReinterpret<*const u8, *const ParallelDispatchState<M, S>>(ctx),
+  )
+  let nodesAnchor = ()
+  let nodes = unsafe Pointer.borrow<(), BoxTree<'static, S>>(
+    &nodesAnchor,
+    unsafe Intrinsic.pointerReinterpret<*const u8, *const BoxTree<'static, S>>(state.nodesPtr),
+  )
+  let factsAnchor = ()
+  let facts = unsafe Pointer.borrow<(), BoxFacts>(
+    &factsAnchor,
+    unsafe Intrinsic.pointerReinterpret<*const u8, *const BoxFacts>(state.factsPtr),
+  )
+  let mut boxesAnchor = ()
+  let mut boxes = unsafe Pointer.borrowManyMut<(), Layout>(
+    &mut boxesAnchor,
+    unsafe Pointer.assumeManyMut<Layout>(state.boxesPtr),
+    state.boxesLen,
+  )
+  let mut chunksAnchor = ()
+  let mut chunks = unsafe Pointer.borrowManyMut<(), ChunkState<M>>(
+    &mut chunksAnchor,
+    unsafe Pointer.assumeManyMut<ChunkState<M>>(state.chunksPtr),
+    state.chunksLen,
+  )
+
+  let chunk = &mut chunks[chunkIdx]
+  let takenMeasurer = Intrinsic.replace(chunk.measurer, Option<M>.None)
+  match move takenMeasurer {
+    Option<M>.None => {
+      chunk.ok = false
+      return ()
+    }
+    Option<M>.Some { value } => {
+      let mut workerMeasurer = move value
+      let mut fragments = Intrinsic.replace(chunk.fragments, FragmentArena.make())
+      let start = chunk.start
+      let len = chunk.len
+      let jobsAnchor = ()
+      let jobs = unsafe Pointer.borrowMany<(), SubtreeJob>(
+        &jobsAnchor,
+        unsafe Pointer.assumeMany<SubtreeJob>(state.jobsPtr),
+        state.jobsLen,
+      )
+      let targetsAnchor = ()
+      let anchorTargets = unsafe Pointer.borrowMany<(), usize>(
+        &targetsAnchor,
+        unsafe Pointer.assumeMany<usize>(state.anchorTargetsPtr),
+        state.anchorTargetsLen,
+      )
+      let mut resultsAnchor = ()
+      let mut results = unsafe Pointer.borrowManyMut<(), SubtreeResult>(
+        &mut resultsAnchor,
+        unsafe Pointer.assumeManyMut<SubtreeResult>(state.resultsPtr),
+        state.resultsLen,
+      )
+      let mut anchors = Intrinsic.replace(chunk.anchors, List<CapturedAnchor>.make())
+      let maxBox = chunk.maxBox
+      let outcome = run Effect.result(
+        executeChunkJobs<M, S>(
+          nodes,
+          facts,
+          move boxes,
+          state.deferSticky,
+          state.selectionsPtr,
+          state.selectionsLen,
+          jobs,
+          anchorTargets,
+          start,
+          len,
+          maxBox,
+          &mut workerMeasurer,
+          &mut fragments,
+          &mut anchors,
+          move results,
+          chunkIdx,
+        ),
+      ) |> Effect.provideMut<Allocator>(&mut heap)
+      chunk.fragments = move fragments
+      chunk.anchors = move anchors
+      chunk.measurer = Option<M>.some(move workerMeasurer)
+      match move outcome {
+        Result.Success { value: outcomeVal } => {
+          chunk.ok = outcomeVal.ok
+          chunk.hasAutoScrollbars = outcomeVal.hasAutoScrollbars
+          chunk.gutterScrollbars = outcomeVal.gutterScrollbars
+          chunk.stats = outcomeVal.stats
+        }
+        Result.Failure { error: _ } => {
+          chunk.ok = false
+        }
+      }
+    }
+  }
+}
+
+impl<M: Measure + TextMeasure> ParallelBatch<M> {
+  pub fn make() -> ParallelBatch<M> {
+    return ParallelBatch {
+      jobs: List<SubtreeJob>.make(),
+      anchorTargets: List<usize>.make(),
+      chunks: List<ChunkState<M>>.make(),
+      results: List<SubtreeResult>.make(),
+      ran: false,
+    }
+  }
+
+  pub fn active(self: &Self) -> bool {
+    return self.ran
+  }
+
+  pub fn jobCount(self: &Self) -> usize {
+    return self.jobs.length()
+  }
+
+  pub fn jobId(self: &Self, index: usize) -> usize {
+    return self.jobs.get(index).id
+  }
+
+  /// Checks whether `id` can be safely laid out as an independent parallel subtree under `input`,
+  /// returning its job index in this batch or `NO_NODE` if it should remain serial.
+  pub effect fn tryEnqueue<S: LayoutSource>(
+    self: &mut Self,
+    nodes: &BoxTree<'_, S>,
+    output: &LayoutPass<'_, '_>,
+    id: usize,
+    input: &Input,
+  ) -> usize ! OutOfMemoryError ? &mut Allocator {
+    if !input.performLayout || input.fragmentation.active || input.gridContext != 0 || nodes.columnSets {
+      return NO_NODE
+    }
+    let key = cacheKey(output.keyShape(id), input, output.viewportFree(id))
+    if output.canReuseFinal(id, &key, REUSE_INDEPENDENT) || keptEmptyBox(nodes, output, id, input) {
+      return NO_NODE
+    }
+    let anchorStart = self.anchorTargets.length()
+    let mut maxBox = id
+    if !run subtreeEligible(nodes, id, &mut maxBox, &mut self.anchorTargets) {
+      return NO_NODE
+    }
+    let anchorEnd = self.anchorTargets.length()
+    let mut normalized = input.*
+    normalized.bfcContentOrigin = Point { x: 0.0, y: 0.0 }
+    let index = self.jobs.length()
+    run self.jobs.append(SubtreeJob {
+      id: id,
+      input: normalized,
+      key: key,
+      maxBox: maxBox,
+      anchorStart: anchorStart,
+      anchorEnd: anchorEnd,
+    })
+    return index
+  }
+
+  /// Forks worker state, prepares affected boxes on the engine thread, executes queued subtrees in parallel,
+  /// and deterministically merges font/shaping keys in ascending chunk order.
+  pub effect fn runBatch<'pass, 'source, S: LayoutSource>(
+    self: &mut Self,
+    nodes: &BoxTree<'source, S>,
+    output: &mut LayoutPass<'pass, 'source>,
+    measurer: &mut M,
+  ) -> bool ! OutOfMemoryError ? &mut Allocator {
+    if self.jobs.length() < PARALLEL_LAYOUT_MIN || output.frame != NO_NODE
+      || output.exclusions.length() != 0 || output.hasFrameSelections() || output.boxes.length == 0 {
+      return false
+    }
+    let workers = Measure.parallelWorkers(&measurer)
+    if workers <= 1 { return false }
+
+    let totalJobs = self.jobs.length()
+    let chunkCount = pickChunkCount(workers, totalJobs)
+
+    self.chunks.clear()
+    run self.chunks.reserveExact(chunkCount)
+    let jobSlice = self.jobs.asSlice()
+    let baseLen = totalJobs / chunkCount
+    let remainder = totalJobs % chunkCount
+    let mut start: usize = 0
+    let mut c: usize = 0
+    while c < chunkCount {
+      let extra: usize = if c < remainder { 1 } else { 0 }
+      let len = baseLen + extra
+      let mut maxBox: usize = 0
+      let mut j = start
+      while j < start + len {
+        if jobSlice[j].maxBox > maxBox { maxBox = jobSlice[j].maxBox }
+        j = j + 1
+      }
+      if !run appendForkedChunk(&mut self.chunks, &measurer, start, len, maxBox) {
+        self.chunks.clear()
+        return false
+      }
+      start = start + len
+      c = c + 1
+    }
+
+    let mut j: usize = 0
+    while j < totalJobs {
+      run prepInFlowSubtree(nodes, &mut output, self.jobs.get(j).id)
+      j = j + 1
+    }
+
+    self.results.clear()
+    run self.results.reserveExact(totalJobs)
+    let emptyResult = SubtreeResult {
+      ok: false,
+      chunk: 0,
+      fragStart: 0,
+      fragEnd: 0,
+      anchorStart: 0,
+      anchorEnd: 0,
+    }
+    run self.results.appendRepeated(emptyResult, totalJobs)
+
+    let mut emptyAnchorTarget: usize = 0
+    let anchorTargetsPtr = if self.anchorTargets.length() == 0 {
+      Pointer.fromRef<usize>(&emptyAnchorTarget)
+    } else {
+      Pointer.fromRef<usize>(&self.anchorTargets.asSlice()[0])
+    }
+    let boxesPtr = Pointer.fromMutRef<Layout>(&mut output.boxes[0])
+    let jobsPtr = Pointer.fromRef<SubtreeJob>(&self.jobs.asSlice()[0])
+    let chunksPtr = Pointer.fromMutRef<ChunkState<M>>(&mut self.chunks.asMutSlice()[0])
+    let resultsPtr = Pointer.fromMutRef<SubtreeResult>(&mut self.results.asMutSlice()[0])
+    let state = ParallelDispatchState<M, S> {
+      nodesPtr: unsafe Intrinsic.pointerReinterpret<*const BoxTree<'source, S>, *const u8>(Pointer.fromRef(nodes)),
+      factsPtr: unsafe Intrinsic.pointerReinterpret<*const BoxFacts, *const u8>(Pointer.fromRef(output.facts)),
+      boxesPtr: boxesPtr,
+      boxesLen: output.boxes.length,
+      deferSticky: output.deferSticky,
+      selectionsPtr: output.selectionsRawPtr(),
+      selectionsLen: output.selectionsCount(),
+      jobsPtr: jobsPtr,
+      jobsLen: totalJobs,
+      anchorTargetsPtr: anchorTargetsPtr,
+      anchorTargetsLen: self.anchorTargets.length(),
+      chunksPtr: chunksPtr,
+      chunksLen: chunkCount,
+      resultsPtr: resultsPtr,
+      resultsLen: totalJobs,
+    }
+    let ctxPtr = unsafe Intrinsic.pointerReinterpret<*const ParallelDispatchState<M, S>, *const u8>(
+      Pointer.fromRef(&state),
+    )
+    let dispatched = run Measure.dispatchParallel(&mut measurer, chunkCount, ctxPtr)
+    if !dispatched {
+      self.chunks.clear()
+      self.results.clear()
+      return false
+    }
+
+    let mut fontKeyRemap = List<usize>.make()
+    let mut shapeKeyRemap = List<u32>.make()
+    c = 0
+    while c < chunkCount {
+      let chunkSlice = self.chunks.asMutSlice()
+      let workerOpt = Intrinsic.replace(chunkSlice[c].measurer, Option<M>.None)
+      if chunkSlice[c].ok {
+        if let Option<M>.Some { value: workerMeasurer } = move workerOpt {
+          run Measure.mergeWorker(&mut measurer, move workerMeasurer, &mut fontKeyRemap, &mut shapeKeyRemap)
+          chunkSlice[c].fragments.remapTextKeys(fontKeyRemap.asSlice(), shapeKeyRemap.asSlice())
+          absorbChunkOutcome(&mut output, &chunkSlice[c])
+        } else {
+          chunkSlice[c].ok = false
+        }
+      } else {
+        drop workerOpt
+      }
+      c = c + 1
+    }
+
+    self.ran = true
+    return true
+  }
+
+  /// Commits worker output for `jobIndex` into `output` in serial tree order, or falls back to
+  /// `layoutNodeInPlace` when the batch/chunk failed or fragment splicing could not preserve structure.
+  pub effect fn commitJob<'pass, 'source, S: LayoutSource>(
+    self: &mut Self,
+    nodes: &BoxTree<'source, S>,
+    output: &mut LayoutPass<'pass, 'source>,
+    measurer: &mut M,
+    jobIndex: usize,
+  ) ! OutOfMemoryError | TextError | FragmentationError ? &mut Allocator {
+    let job = self.jobs.get(jobIndex)
+    if !self.ran || jobIndex >= self.results.length() {
+      run layoutNodeInPlace(nodes, &mut output, &mut measurer, job.id, &job.input)
+      return
+    }
+    let res = self.results.get(jobIndex)
+    if !res.ok || res.chunk >= self.chunks.length() || !self.chunks.asSlice()[res.chunk].ok {
+      run layoutNodeInPlace(nodes, &mut output, &mut measurer, job.id, &job.input)
+      return
+    }
+    let fragStart = output.fragments.checkpoint()
+    let appended = run output.fragments.appendSubtree(
+      &self.chunks.asSlice()[res.chunk].fragments,
+      res.fragStart,
+      res.fragEnd,
+      output.fragmentParent,
+      &mut output.overflowEscapes,
+    )
+    if !appended {
+      run output.fragments.rollback(fragStart)
+      run layoutNodeInPlace(nodes, &mut output, &mut measurer, job.id, &job.input)
+      return
+    }
+    let anchors = self.chunks.asSlice()[res.chunk].anchors.asSlice()
+    let mut a = res.anchorStart
+    while a < res.anchorEnd {
+      let cap = anchors[a]
+      let mappedParent = if cap.anchor.parentFragment == NO_NODE {
+        NO_NODE
+      } else {
+        fragStart + (cap.anchor.parentFragment - res.fragStart)
+      }
+      run output.setStaticAnchor(cap.box, mappedParent, cap.anchor.rect, cap.anchor.inlineLevel)
+      a = a + 1
+    }
+    let jobLayout = output.boxes[job.id]
+    run output.recordFinal(job.id, &job.key, &jobLayout, fragStart, false)
+    Measure.noteParallelLaidOut(&mut measurer, 1)
+  }
+}

@@ -22,6 +22,15 @@ the shaped glyphs of every fragment for [font-raster](https://github.com/silk-la
   `hhea` or the typographic `OS/2` metrics, rounded to whole pixels as Chrome does, x height,
   cap height, the `0` and space advances, baselines and sub and superscript offsets.
 
+Lines of plain words (printable ASCII between spaces, one font, left to right, no spacing,
+transform or justification) take one run per word from a table of runs shaped before
+(`token_runs.silk`), as browsers keep shaped words. A line goes that way only when every
+character in it is word-safe for its shaping plan (font-shape's `wordSafeAscii`): no lookup that
+involves the space glyph, such as a kerning pair with the space or a context that looks across it,
+can start at any glyph the character becomes. Shaping the line whole then gives the glyphs of its
+words shaped alone. Other lines are itemized and shaped as before; `Shaping.plainWords` (and
+`Shaping.reuse`) switch the table off.
+
 Layout handles justification (extra space on word separators, or on every cluster for
 `text-justify: inter-character`), soft hyphens (U+2010, or `-` when the font lacks it) and
 `unicode-bidi` on inline boxes.

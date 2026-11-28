@@ -19,7 +19,7 @@ the same machine before and after a change, and to prove a change keeps the outp
 
 ## Build and run
 
-From the repository root (`/home/user/modules`):
+From the repository root:
 
 ```sh
 export PATH=$HOME/.silk/bin:$PATH
@@ -65,7 +65,25 @@ node silk-ui/modules/bench/chat/scripts/generate.mjs   # [count], default 1000
 - `paint_ms` (`--paint`): the first `Tree.frame` after layout.
 - Counts: `ui_nodes` (live tree nodes), `text_nodes`, `analyze_calls`, `shape_calls`
   (`TextSystem.shapeCalls`, lines asked, cache hits included), `line_cache_hits`, `shape_tokens`,
-  `text_fragments` (fragment text runs), `glyphs`, `glyph_runs`.
+  `text_fragments` (fragment text runs), `glyphs`, `glyph_runs`; then `plain_lines` (lines that
+  took ui-text's plain-word runs, `token_runs.silk`), `plain_hits` and `plain_misses` (runs found
+  kept, and runs shaped for them), and `shaper_calls` (calls the shaper itself answered).
 - `checksum`: FNV-style hash over every text fragment run (source range, location, size, bidi
   level, face) and its glyphs (id, cluster, x, y, advance), as in `ui-text-bench`. An
   optimization that keeps the output keeps it. Runs that differ print a warning.
+
+## Results
+
+Medians of `--runs 7` on one 4-core x86_64 cloud machine (2.1 GHz Xeon), 2026-11-28. The
+checksum was `0x69a01e8ce1e1779f` in every row and equal to `--fresh`.
+
+| ui-text | text_ms | of which shape | layout_ms | provider instructions (callgrind) |
+| --- | ---: | ---: | ---: | ---: |
+| before plain-word runs | 202.9 | 192.0 | 455.1 | 1,664 M |
+| with plain-word runs | 38.9 | 30.5 | 258.5 | 245 M |
+
+Chromium 158 (the one Playwright ships) on the same machine, the same page built from the same
+generator with bench.css and chat.css, fonts loaded first, 1040 x 720 at scale 2: the trace's
+`InlineNode::ShapeTextIncludingFirstLine` events (13,045, one per text node) take 101.2 ms
+(median of 5), inside a first `Layout` of 205.8 ms.
+

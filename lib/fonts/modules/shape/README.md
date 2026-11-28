@@ -60,6 +60,20 @@ variations, scaling, custom callbacks, tracing and serialization.
 The package is still imported as `harfrust` by its dependents, so the dependency key in their
 manifests is `harfrust`.
 
+## Keeping glyphs across a cut
+
+`GlyphInfo.unsafeToBreak` says where text shaped as a whole may be cut. It says nothing about
+text that grows afterwards: words added after it can complete a match that reaches back over
+a cut the shorter text had as safe. `separable.separation(data, plan, glyph)` reads which of a
+plan's lookups can match on past a glyph, usually the space, and which glyphs they take as
+input. `Separation.separates` then tells whether a cut right after that glyph shapes the same on
+either side. When no lookup reads past a space, every such cut holds. When some do, the cut
+holds unless one of their inputs is within their reach. In Inter, for example, `calt` gives a
+closing bracket the case form of its opening one, and gives `- : + =` between capitals their
+case forms, across spaces. A cut with such punctuation near it is not trusted.
+`font-shape-space-separable FONT [TEXT]` prints what a font's default plan does across a space,
+and with `TEXT` whether each cut after a space holds.
+
 ## Packages
 
 | Path | Package | What it is |
@@ -67,6 +81,7 @@ manifests is `harfrust`.
 | `modules/shape` | `font-shape` | The shaping library |
 | `font-shape-test-harness` | `font-shape-test-harness` | Internal validation executable and runner for the pinned test suite |
 | `modules/shape/tools/wasm` | `font-shape-wasm` | WebAssembly build with a typed JavaScript wrapper ([README](tools/wasm/README.md)) |
+| `modules/shape/tools/space-separable` | `font-shape-space-separable` | Prints which lookups of a font read past a space, and which cuts after a space hold |
 
 `modules/shape/test-data/harfrust` is the pinned harfrust checkout. It supplies the test fonts
 and expectations and is never modified.

@@ -1368,7 +1368,7 @@ export class Node {
     if (!list) listeners.set(type, (list = []));
     if (list.some((entry) => entry.listener === listener && entry.capture === capture)) return;
     list.push({ listener, capture, once: !!options?.once, passive: resolvePassive(this, type, options) });
-    if (kind !== undefined) this._relisten();
+    if (kind !== undefined) this.#want(kind);
     signal?.addEventListener("abort", () => this.removeEventListener(type, listener, capture), { once: true });
   }
 
@@ -1380,7 +1380,7 @@ export class Node {
     if (index < 0) return;
     list.splice(index, 1);
     const kind = KIND_OF.get(LISTENS_AS.get(type) ?? type);
-    if (kind !== undefined) this._relisten();
+    if (kind !== undefined) this.#want(kind);
   }
 
   /** Sends `event` (an `Event` or `CustomEvent`) through the tree from this node, as on the web. */

@@ -1,0 +1,309 @@
+//! Asynchronous image decoding (`createImageBitmap`) and PNG encoding (`Canvas.toBlob`)
+//! dispatched onto `AppPool`.
+//!
+//! `Canvas.toDataURL` remains synchronous via `__ui.pngEncode`/`__ui.pngTake`; async requests
+//! from `__ui.imageDecodeStart`/`__ui.pngEncodeStart` run off the Document Thread and wake it
+//! with `Nudge` when finished.
+import ui_js.bridge { CodecReply, CodecRequest }
+import ui_tree_window.background { Background }
+import ui_tree_window.platform_thread { Nudge }
+import ui_transport.cancel { CancellationToken }
+import ui_transport.channel {
+  TryRecvError,
+  UnboundedChannel,
+  UnboundedPair,
+  UnboundedReceiver,
+  UnboundedSender,
+}
+import ui_transport.pool { WorkPoolHandle }
+import ui_transport.wake { WakeHandle }
+import codec.decode
+import codec.png
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.concurrency.thread { Transferable }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.u8
+import silk.num.u32
+
+struct RunningCodec {
+  call: u32,
+  job: Background<CodecReply>,
+}
+
+struct PooledCodec {
+  request: CodecRequest,
+  doneTx: UnboundedSender<CodecReply>,
+  wake: Nudge,
+}
+
+impl Transferable for PooledCodec {}
+
+fn straightAlphaCopy(from: &[u8], into: &mut [u8]) -> () {
+  let length = if from.length < into.length { from.length } else { into.length }
+  let mut i: usize = 0
+  while i + 3 < length {
+    let alpha = u8.toU32(from[i + 3])
+    if alpha == 255 || alpha == 0 {
+      into[i] = from[i]
+      into[i + 1] = from[i + 1]
+      into[i + 2] = from[i + 2]
+    } else {
+      into[i] = u32.toU8((u8.toU32(from[i]) * 255 + alpha / 2) / alpha)
+      into[i + 1] = u32.toU8((u8.toU32(from[i + 1]) * 255 + alpha / 2) / alpha)
+      into[i + 2] = u32.toU8((u8.toU32(from[i + 2]) * 255 + alpha / 2) / alpha)
+    }
+    into[i + 3] = from[i + 3]
+    i = i + 4
+  }
+}
+
+effect fn executeCodec(request: CodecRequest) -> CodecReply
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  match move request {
+    CodecRequest.Decode { call, bytes } => {
+      let decoded = run Effect.result(decode.decodeSrgb(bytes.asSlice()))
+      return match move decoded {
+        Result.Success { value: picture } => {
+          let src = picture.data()
+          let mut straight = run Bytes.zeroed(src.length)
+          let mut dst = Bytes.asMutSlice(&mut straight)
+          straightAlphaCopy(src, &mut dst)
+          let mut pixels = List<u8>.make()
+          run pixels.appendSlice(Bytes.asSlice(&straight))
+          CodecReply.Decoded {
+            call: call,
+            width: picture.width(),
+            height: picture.height(),
+            pixels: move pixels,
+          }
+        }
+        Result.Failure { error } => {
+          drop error
+          CodecReply.Failed { call: call }
+        }
+      }
+    }
+    CodecRequest.EncodePng { call, width, height, pixels } => {
+      let src = pixels.asSlice()
+      let mut premul = run Bytes.zeroed(src.length)
+      let dst = Bytes.asMutSlice(&mut premul)
+      let mut i: usize = 0
+      while i + 3 < src.length {
+        let a = u8.toU32(src[i + 3])
+        if a == 255 {
+          dst[i] = src[i]
+          dst[i + 1] = src[i + 1]
+          dst[i + 2] = src[i + 2]
+        } else if a == 0 {
+          dst[i] = 0
+          dst[i + 1] = 0
+          dst[i + 2] = 0
+        } else {
+          dst[i] = u32.toU8((u8.toU32(src[i]) * a + 127) / 255)
+          dst[i + 1] = u32.toU8((u8.toU32(src[i + 1]) * a + 127) / 255)
+          dst[i + 2] = u32.toU8((u8.toU32(src[i + 2]) * a + 127) / 255)
+        }
+        dst[i + 3] = src[i + 3]
+        i = i + 4
+      }
+      let encoded = run Effect.result(png.encodePixels(width, height, Bytes.asSlice(&premul)))
+      return match move encoded {
+        Result.Success { value } => {
+          let mut pngBytes = List<u8>.make()
+          run pngBytes.appendSlice(Bytes.asSlice(&value))
+          CodecReply.EncodedPng { call: call, bytes: move pngBytes }
+        }
+        Result.Failure { error } => {
+          drop error
+          CodecReply.Failed { call: call }
+        }
+      }
+    }
+  }
+}
+
+fn callNumber(request: &CodecRequest) -> u32 {
+  return match &request.* {
+    CodecRequest.Decode { call, .. } => call
+    CodecRequest.EncodePng { call, .. } => call
+  }
+}
+
+fn runCodec(request: CodecRequest) -> CodecReply {
+  let call = callNumber(&request)
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let ran = run Effect.result(executeCodec(move request)) |> Effect.provideMut<Allocator>(&mut allocator)
+  return match move ran {
+    Result<CodecReply, OutOfMemoryError>.Success { value } => move value
+    Result<CodecReply, OutOfMemoryError>.Failure { .. } => CodecReply.Failed { call: call }
+  }
+}
+
+fn runPooledCodec(payload: PooledCodec, cancel: &CancellationToken) -> () {
+  let PooledCodec { request, doneTx, wake } = move payload
+  let _unused = cancel.check()
+  let reply = runCodec(move request)
+  drop run Effect.result(doneTx.send(move reply))
+  wake.nudge()
+}
+
+/// Manages off-thread image decodes and PNG encodes for `JsClient` / `NodeClient`.
+pub struct CodecJobs {
+  running: List<RunningCodec>,
+  inlineDone: List<CodecReply>,
+  appPool: Option<WorkPoolHandle>,
+  groupId: u32,
+  wake: Option<Nudge>,
+  doneTx: Option<UnboundedSender<CodecReply>>,
+  doneRx: Option<UnboundedReceiver<CodecReply>>,
+  inFlight: usize,
+}
+
+impl CodecJobs {
+  pub fn make() -> CodecJobs {
+    return CodecJobs {
+      running: List<RunningCodec>.make(),
+      inlineDone: List<CodecReply>.make(),
+      appPool: Option<WorkPoolHandle>.None,
+      groupId: 1,
+      wake: Option<Nudge>.None,
+      doneTx: Option<UnboundedSender<CodecReply>>.None,
+      doneRx: Option<UnboundedReceiver<CodecReply>>.None,
+      inFlight: 0,
+    }
+  }
+
+  /// Dispatches codec jobs onto `appPool` under `groupId` and wakes via `wake`.
+  pub effect fn attachPool(
+    self: &mut Self,
+    appPool: WorkPoolHandle,
+    groupId: u32,
+    wake: Nudge,
+  ) -> ()
+    ! OutOfMemoryError {
+    let pair = run UnboundedChannel.make<CodecReply>(WakeHandle.noop())
+    let UnboundedPair<CodecReply> { sender, receiver } = move pair
+    self.appPool = Option<WorkPoolHandle>.some(move appPool)
+    self.groupId = groupId
+    self.wake = Option<Nudge>.some(move wake)
+    self.doneTx = Option<UnboundedSender<CodecReply>>.some(move sender)
+    self.doneRx = Option<UnboundedReceiver<CodecReply>>.some(move receiver)
+  }
+
+  /// Whether completed codec jobs wake the owning group directly without polling.
+  pub fn wakesOnCompletion(self: &Self) -> bool {
+    return self.wake.isSome()
+  }
+
+  /// Whether at least one async codec job is still running or awaiting pickup.
+  pub fn pending(self: &Self) -> bool {
+    return self.inFlight != 0 || self.running.length() != 0 || self.inlineDone.length() != 0
+  }
+
+  /// Starts each of `requests` on `AppPool`, or on a fallback thread (inline on `wasm32`).
+  pub effect fn start(self: &mut Self, requests: List<CodecRequest>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut items = move requests
+    while items.length() > 0 {
+      let request = items.remove(0)
+      let mut fallback = Option<CodecRequest>.None
+      if let Option<WorkPoolHandle>.Some { value: pool } = &self.appPool {
+        if let Option<UnboundedSender<CodecReply>>.Some { value: tx } = &self.doneTx {
+          if let Option<Nudge>.Some { value: wake } = &self.wake {
+            let cancelToken = run CancellationToken.make()
+            let payload = PooledCodec {
+              request: move request,
+              doneTx: tx.clone(),
+              wake: wake.clone(),
+            }
+            drop run pool.submitWith(
+              self.groupId,
+              move payload,
+              runPooledCodec,
+              move cancelToken,
+              WakeHandle.noop(),
+            )
+            self.inFlight = self.inFlight + 1
+          } else {
+            fallback = Option<CodecRequest>.some(move request)
+          }
+        } else {
+          fallback = Option<CodecRequest>.some(move request)
+        }
+      } else {
+        fallback = Option<CodecRequest>.some(move request)
+      }
+      let fallbackReq = match move fallback {
+        Option<CodecRequest>.Some { value } => move value
+        Option<CodecRequest>.None => { continue }
+      }
+      static if Intrinsic.targetArchitecture() == "wasm32" {
+        run self.inlineDone.append(runCodec(move fallbackReq))
+      } else {
+        let call = callNumber(&fallbackReq)
+        let begun = run Effect.result(
+          Background<CodecReply>.start(
+            || -> CodecReply {
+              return runCodec(move fallbackReq)
+            },
+          ),
+        )
+        match move begun {
+          Result.Success { value } => {
+            run self.running.append(RunningCodec { call: call, job: move value })
+          }
+          Result.Failure { error } => {
+            drop error
+            run self.inlineDone.append(CodecReply.Failed { call: call })
+          }
+        }
+      }
+    }
+  }
+
+  /// Returns finished codec replies, oldest first.
+  pub effect fn finished(self: &mut Self) -> List<CodecReply>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut done = Intrinsic.replace(self.inlineDone, List<CodecReply>.make())
+    if let Option<UnboundedReceiver<CodecReply>>.Some { value: rx } = &mut self.doneRx {
+      while true {
+        match rx.tryRecv() {
+          Result.Success { value } => {
+            if self.inFlight > 0 {
+              self.inFlight = self.inFlight - 1
+            }
+            run done.append(move value)
+          }
+          Result.Failure { error } => match error {
+            TryRecvError.Empty => { break }
+            TryRecvError.Closed => { break }
+          }
+        }
+      }
+    }
+    let mut at: usize = 0
+    while at < self.running.length() {
+      if !self.running.asSlice()[at].job.ready() {
+        at = at + 1
+        continue
+      }
+      let mut entry = self.running.remove(at)
+      match entry.job.poll() {
+        Option<CodecReply>.Some { value } => {
+          run done.append(move value)
+        }
+        Option<CodecReply>.None => {
+          run done.append(CodecReply.Failed { call: entry.call })
+        }
+      }
+    }
+    return move done
+  }
+}

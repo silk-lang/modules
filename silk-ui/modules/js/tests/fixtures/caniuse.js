@@ -408,7 +408,7 @@ check("webnfc", false, () => global("NDEFReader"));
 check("websockets", NODE, () => typeof WebSocket === "function" && WebSocket.OPEN === 1);
 check("webtransport", false, () => global("WebTransport"));
 check("webusb", false, () => typeof navigator.usb === "object");
-check("webworkers", false, () => global("Worker"));
+check("webworkers", NODE, () => global("Worker"));
 check("webxr", false, () => typeof navigator.xr === "object");
 check("xhr2", false, () => global("XMLHttpRequest"));
 

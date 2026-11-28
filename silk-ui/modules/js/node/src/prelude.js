@@ -151,6 +151,209 @@
     });
   }
 
+  // WebGPU (`navigator.gpu` and GPU* globals, evaluated on first use), matching the engine runtime.
+  let gpuApi = null;
+  const gpu = (native.gpuLoad = () => (native.gpuEnabled?.() ? (gpuApi ??= (0, eval)(native.gpuApi())(native)) : null));
+  if (!("gpu" in globalThis.navigator)) {
+    Object.defineProperty(globalThis.navigator, "gpu", { get: () => gpu()?.gpu, enumerable: true, configurable: true });
+  }
+  for (const name of ["GPU", "GPUAdapter", "GPUAdapterInfo", "GPUDevice", "GPUQueue", "GPUBuffer", "GPUTexture", "GPUTextureView", "GPUSampler", "GPUBindGroupLayout", "GPUPipelineLayout", "GPUBindGroup", "GPUShaderModule", "GPUCompilationInfo", "GPURenderPipeline", "GPUComputePipeline", "GPUCommandEncoder", "GPUCommandBuffer", "GPURenderPassEncoder", "GPUComputePassEncoder", "GPUCanvasContext", "GPUSupportedFeatures", "GPUSupportedLimits", "GPUDeviceLostInfo", "GPUError", "GPUValidationError", "GPUOutOfMemoryError", "GPUInternalError", "GPUPipelineError", "GPUUncapturedErrorEvent", "GPURenderBundleEncoder", "GPURenderBundle", "GPUQuerySet", "GPUExternalTexture", "GPUBufferUsage", "GPUTextureUsage", "GPUShaderStage", "GPUMapMode", "GPUColorWrite"]) {
+    if (name in globalThis) continue;
+    Object.defineProperty(globalThis, name, {
+      get: () => {
+        const value = gpu()?.globals[name];
+        if (value !== undefined) own(name, value);
+        return value;
+      },
+      set: (value) => own(name, value),
+      configurable: true,
+    });
+  }
+
+  // Asynchronous image decode and PNG encode on `AppPool`, with synchronous fallback.
+  const codecCalls = new Map();
+  let nextCodecCall = 0;
+  const byteView = (value) => (value instanceof ArrayBuffer ? new Uint8Array(value) : value);
+  native.codecDone = function (call, ok, width, height, byteLength, errorText) {
+    const pending = codecCalls.get(call);
+    if (!pending) return;
+    codecCalls.delete(call);
+    if (!ok) {
+      pending.reject(new Error(errorText || "Codec operation failed"));
+      return;
+    }
+    const bytes = new Uint8Array(byteLength);
+    if (byteLength > 0 && native.codecTake) native.codecTake(bytes);
+    if (pending.kind === "decode") {
+      pending.resolve({ width, height, data: new Uint8ClampedArray(bytes.buffer, bytes.byteOffset, bytes.byteLength) });
+    } else {
+      pending.resolve(bytes);
+    }
+  };
+  native.imageDecodeAsync = function (bytes) {
+    const view = byteView(bytes);
+    if (!view || typeof view.byteLength !== "number") {
+      return Promise.reject(new TypeError("imageDecodeAsync requires typed array bytes"));
+    }
+    if (native.imageDecodeStart) {
+      const call = ++nextCodecCall;
+      const entry = { kind: "decode", resolve: null, reject: null };
+      const promise = new Promise((resolve, reject) => {
+        entry.resolve = resolve;
+        entry.reject = reject;
+      });
+      codecCalls.set(call, entry);
+      if (native.imageDecodeStart(call, view) === 1) return promise;
+      codecCalls.delete(call);
+    }
+    if (!native.imageDecode || native.imageDecode(view) !== 2) {
+      return Promise.reject(new Error("The source image could not be decoded."));
+    }
+    const width = native.geometry(0);
+    const height = native.geometry(1);
+    const data = new Uint8ClampedArray(width * height * 4);
+    native.imageTake(data);
+    return Promise.resolve({ width, height, data });
+  };
+  native.pngEncodeAsync = function (width, height, rgba) {
+    const view = byteView(rgba);
+    if (native.pngEncodeStart) {
+      const call = ++nextCodecCall;
+      const entry = { kind: "encode", resolve: null, reject: null };
+      const promise = new Promise((resolve, reject) => {
+        entry.resolve = resolve;
+        entry.reject = reject;
+      });
+      codecCalls.set(call, entry);
+      if (native.pngEncodeStart(call, width, height, view) === 1) return promise;
+      codecCalls.delete(call);
+    }
+    if (!native.pngEncode || !native.pngTake) return Promise.resolve(null);
+    const len = native.pngEncode(width, height, view);
+    if (!len || len <= 0) return Promise.resolve(null);
+    const bytes = new Uint8Array(len);
+    native.pngTake(bytes);
+    return Promise.resolve(bytes);
+  };
+
+  // Bridge-less Web Worker backed by node:worker_threads (workers receive an inert UiApi).
+  if (typeof globalThis.Worker === "undefined") {
+    const workerThreads = process.getBuiltinModule("node:worker_threads");
+    const nodeUrl = process.getBuiltinModule("node:url");
+    if (workerThreads?.Worker) {
+      const NodeWorker = workerThreads.Worker;
+      const WEB_WORKER_BOOTSTRAP = `(() => {
+  const wt = process.getBuiltinModule("node:worker_threads");
+  const port = wt?.parentPort;
+  if (typeof globalThis.self === "undefined") globalThis.self = globalThis;
+  const target = typeof EventTarget === "function" ? new EventTarget() : null;
+  const listeners = new Map();
+  if (typeof globalThis.addEventListener !== "function") {
+    globalThis.addEventListener = target
+      ? target.addEventListener.bind(target)
+      : (type, fn) => {
+          if (typeof fn !== "function") return;
+          let set = listeners.get(type);
+          if (!set) listeners.set(type, (set = new Set()));
+          set.add(fn);
+        };
+    globalThis.removeEventListener = target
+      ? target.removeEventListener.bind(target)
+      : (type, fn) => {
+          listeners.get(type)?.delete(fn);
+        };
+    globalThis.dispatchEvent = target
+      ? target.dispatchEvent.bind(target)
+      : (event) => {
+          const set = listeners.get(event?.type);
+          if (set) for (const fn of [...set]) fn.call(globalThis, event);
+          return true;
+        };
+  }
+  if (!("onmessage" in globalThis)) globalThis.onmessage = null;
+  globalThis.postMessage = (message, transfer) => {
+    if (transfer !== undefined) port?.postMessage(message, transfer);
+    else port?.postMessage(message);
+  };
+  globalThis.close = () => {
+    try { port?.close?.(); } catch {}
+    process.exit(0);
+  };
+  const deliver = (data) => {
+    const event = typeof globalThis.MessageEvent === "function"
+      ? new globalThis.MessageEvent("message", { data })
+      : (typeof Event === "function" ? Object.assign(new Event("message"), { data }) : { type: "message", data });
+    if (typeof globalThis.onmessage === "function") globalThis.onmessage(event);
+    globalThis.dispatchEvent(event);
+  };
+  globalThis.__silkWorkerQueue = null;
+  globalThis.__silkWorkerDeliverReady = () => {
+    const queued = globalThis.__silkWorkerQueue;
+    globalThis.__silkWorkerQueue = null;
+    if (queued) for (const item of queued) deliver(item);
+  };
+  port?.on("message", (data) => {
+    if (globalThis.__silkWorkerQueue) globalThis.__silkWorkerQueue.push(data);
+    else deliver(data);
+  });
+})();`;
+      const dataWorkerSource = (address) => {
+        const comma = address.indexOf(",");
+        if (comma < 0) return null;
+        const meta = address.slice(5, comma);
+        const body = address.slice(comma + 1);
+        if (meta.endsWith(";base64") && typeof globalThis.atob === "function") {
+          return globalThis.atob(body);
+        }
+        return decodeURIComponent(body);
+      };
+      class WebWorker extends EventTarget {
+        #worker;
+        onmessage = null;
+        onmessageerror = null;
+        onerror = null;
+        constructor(scriptURL, _options) {
+          super();
+          const raw = scriptURL instanceof URL ? scriptURL.href : String(scriptURL);
+          if (raw.startsWith("data:")) {
+            const code = dataWorkerSource(raw);
+            if (code === null) throw new SyntaxError("Invalid data: worker URL");
+            this.#worker = new NodeWorker(`${WEB_WORKER_BOOTSTRAP}\n${code}`, { eval: true });
+          } else {
+            const targetUrl = raw.startsWith("file://")
+              ? raw
+              : (nodeUrl?.pathToFileURL ? nodeUrl.pathToFileURL(raw).href : raw);
+            const loader = `${WEB_WORKER_BOOTSTRAP}\nglobalThis.__silkWorkerQueue = [];\nimport(${JSON.stringify(targetUrl)}).then(() => globalThis.__silkWorkerDeliverReady(), (err) => { throw err; });`;
+            this.#worker = new NodeWorker(loader, { eval: true });
+          }
+          this.#worker.on("message", (data) => {
+            const event = typeof globalThis.MessageEvent === "function"
+              ? new globalThis.MessageEvent("message", { data })
+              : Object.assign(new Event("message"), { data });
+            if (typeof this.onmessage === "function") this.onmessage(event);
+            this.dispatchEvent(event);
+          });
+          this.#worker.on("error", (err) => {
+            const event = Object.assign(new Event("error", { cancelable: true }), {
+              message: err?.message ?? String(err),
+              error: err,
+            });
+            if (typeof this.onerror === "function") this.onerror(event);
+            this.dispatchEvent(event);
+          });
+        }
+        postMessage(message, transfer) {
+          if (transfer !== undefined) this.#worker.postMessage(message, transfer);
+          else this.#worker.postMessage(message);
+        }
+        terminate() {
+          return this.#worker.terminate();
+        }
+      }
+      globalThis.Worker = WebWorker;
+    }
+  }
+
   // As `window.open` in a browser, for an address outside the application: the host opens
   // it with the system's browser or mail program. Only http, https and mailto addresses go.
   globalThis.open = (url) => {

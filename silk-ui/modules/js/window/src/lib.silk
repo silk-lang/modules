@@ -22,10 +22,13 @@
 //! run app.close()
 //! ```
 import ui_js_calls.gpu { GpuReply }
-import ui_js.lib { JsHost, JsError, ShellRequest, ClipboardRequest, ClipboardData, EncodedItem, encodeItem, imageLoadable, imageBuild, engineBuild }
+import ui_js.lib { JsHost, JsError, ShellRequest, ClipboardRequest, ClipboardData, EncodedItem, encodeItem, imageLoadable, imageBuild, engineBuild, LongTaskSample }
+import ui_inspect_server.lib { Inspector, LongTaskRecord }
+import ui_transport.cancel { AtomicSignal }
 import opener { Openers }
 import shell { serveShell, deliverShell, ShellAnswer }
 import natives { NativeJobs, Finished }
+import codecs { CodecJobs }
 import ui_tree.style_assets { StyleAssets }
 import ui_tree_window.style_watch { SheetWatch }
 import ui_tree.legacy { FrameInput }
@@ -45,7 +48,8 @@ import silk.num.u32
 import ui_tree_window.console { StderrWriter }
 import ui_tree_window.canvas_frames { CanvasPresenter }
 import ui_tree_window.canvas_bitmaps { presentCanvasBitmaps }
-import ui_js_gpu.service { GpuService }
+import ui_js_gpu.service { SurfaceUpdate }
+import ui_js_gpu.thread { GpuServiceThread }
 import ui_tree.legacy { Batch }
 import silkjs.js_atomics_native { Domain }
 import silkjs.runtime_memory { RuntimeAllocator, AllocationObserver }
@@ -90,11 +94,15 @@ pub struct JsApp<'m> {
   traced: bool,
   /// The bytes JavaScript used after the last [`JsApp.release`].
   settled: usize,
-  /// Runs JavaScript's WebGPU calls on the application's own GPU device, once the window
-  /// gave the handle canvases present through ([`JsApp.canvases`]).
-  gpu: Option<GpuService>,
+  /// Runs JavaScript's WebGPU calls on a dedicated GPU thread once the window
+  /// gives the handle canvases present through ([`JsApp.canvases`]).
+  gpu: Option<GpuServiceThread>,
+  /// Wake handle registered on `GpuServiceThread` once services attach or window opens.
+  gpuWake: Option<Nudge>,
   /// Where the bitmaps of 2D canvases are shown from, the same handle the GPU canvases use.
   presenter: Option<CanvasPresenter>,
+  /// Whether `breakSignal` was already handed to the inspector.
+  watchdogAttached: bool,
   /// The page zoom JavaScript last heard of, to tell it when a zoom key changes it.
   zoom: f32,
   /// The web views JavaScript opened, each shown at its node.
@@ -273,8 +281,10 @@ impl<'m> JsApp<'m> {
       image: b"",
       openers: Openers.make(),
       settled: 0,
-      gpu: Option<GpuService>.None,
+      gpu: Option<GpuServiceThread>.None,
+      gpuWake: Option<Nudge>.None,
       presenter: Option<CanvasPresenter>.None,
+      watchdogAttached: false,
       webViews: List<HostedView>.make(),
       placesPending: false,
       nudge: Option<Nudge>.None,
@@ -437,6 +447,7 @@ impl<'m> JsApp<'m> {
   /// the old one when there is not.
   pub effect fn fresh(self: &mut Self, tree: &mut UiTree<'_>) -> bool ! TreeError | OutOfMemoryError ? &mut Allocator {
     self.host.attach(&mut tree)
+    let codecEnabled = self.host.asyncCodecsEnabled()
     let compiler = self.host.stylesheetCompiler()
     let unloaded = run Effect.result(self.host.unload()) |> Effect.provideMut<Allocator>(&mut self.allocator)
     run self.settle(move unloaded)
@@ -451,10 +462,16 @@ impl<'m> JsApp<'m> {
         self.host = move value
         self.host.advance(clock)
         self.host.attach(&mut tree)
-        if let Option<GpuService>.Some { value: runner } = &mut self.gpu {
-          runner.reset()
+        if codecEnabled { self.host.enableAsyncCodecs() }
+        if let Option<CanvasPresenter>.Some { value: presenter } = &self.presenter {
+          let mut thread = run GpuServiceThread.start(presenter.clone())
+          if let Option<Nudge>.Some { value: wake } = &self.gpuWake {
+            thread.setWake(wake.clone())
+          }
+          self.gpu = Option<GpuServiceThread>.some(move thread)
           self.host.enableGpu()
         }
+        self.watchdogAttached = false
       }
       Result<JsHost<'m>, OutOfMemoryError | JsError>.Failure { error } => match move error {
         OutOfMemoryError allocation => { fail move allocation }
@@ -672,40 +689,97 @@ impl<'m> JsApp<'m> {
   }
 
   /// Gives JavaScript `navigator.gpu`: its canvases present their frames through `presenter`.
-  pub fn canvases(self: &mut Self, presenter: CanvasPresenter) -> () {
+  pub effect fn canvases(self: &mut Self, presenter: CanvasPresenter) -> () ! OutOfMemoryError ? &mut Allocator {
     self.presenter = Option<CanvasPresenter>.some(presenter.clone())
-    self.gpu = Option<GpuService>.some(GpuService.make(move presenter))
+    let mut thread = run GpuServiceThread.start(move presenter)
+    if let Option<Nudge>.Some { value: wake } = &self.gpuWake {
+      thread.setWake(wake.clone())
+    }
+    self.gpu = Option<GpuServiceThread>.some(move thread)
     self.host.enableGpu()
   }
 
-  /// Runs the WebGPU commands JavaScript wrote on the application's GPU device, presents the
-  /// canvases they drew, and settles the promises they answer. Says whether that changed the
-  /// tree or left commands for the next turn.
+  /// Registers the wake handle used by the dedicated GPU service thread.
+  pub fn setGpuWake(self: &mut Self, wake: Nudge) -> () {
+    self.gpuWake = Option<Nudge>.some(wake.clone())
+    if let Option<GpuServiceThread>.Some { value: thread } = &mut self.gpu {
+      thread.setWake(move wake)
+    }
+  }
+
+  fn gpuPending(self: &Self) -> bool {
+    return match &self.gpu {
+      Option<GpuServiceThread>.Some { value: thread } => thread.pending()
+      Option<GpuServiceThread>.None => false
+    }
+  }
+
+  fn gpuWakes(self: &Self) -> bool {
+    return match &self.gpu {
+      Option<GpuServiceThread>.Some { value: thread } => thread.wakesOnCompletion()
+      Option<GpuServiceThread>.None => false
+    }
+  }
+
+  /// Drains finished WebGPU replies and canvas surface updates without blocking, then
+  /// submits any newly written WebGPU commands to the dedicated GPU service thread.
   effect fn graphics(self: &mut Self, tree: &mut UiTree<'_>) -> bool ! TreeError | OutOfMemoryError ? &mut Allocator {
-    let mut changed = run self.show2d(&mut tree)
-    let mut round: usize = 0
-    while round < GPU_ROUNDS {
-      let commands = self.host.takeGpuCommands()
-      if commands.length() == 0 { return changed }
-      let mut batch = Batch.make()
-      let mut replies = List<GpuReply>.make()
-      if let Option<GpuService>.Some { value: runner } = &mut self.gpu {
-        run runner.serve(commands.asSlice(), &mut batch)
-        replies = runner.takeReplies()
+    let mut changed = run self.host.pollCanvas2d(&mut tree)
+    if run self.show2d(&mut tree) { changed = true }
+    let mut replies = List<GpuReply>.make()
+    let mut updates = List<SurfaceUpdate>.make()
+    let drained = match &mut self.gpu {
+      Option<GpuServiceThread>.Some { value: thread } => run thread.drain(&mut replies, &mut updates)
+      Option<GpuServiceThread>.None => false
+    }
+    if drained {
+      if updates.length() != 0 {
+        let mut batch = Batch.make()
+        let items = updates.asSlice()
+        let mut i: usize = 0
+        while i < items.length {
+          let u = items[i]
+          run batch.canvasSurface(u.node, u.surface, u.width, u.height, u.opaque)
+          i = i + 1
+        }
+        if batch.length() != 0 {
+          run tree.apply(run batch.take())
+          changed = true
+        }
       }
-      if self.traced {
-        StderrWriter.print("silkui: gpu, {} command bytes, {} answers\n", &(commands.length(), replies.length()))
-      }
-      if batch.length() != 0 {
-        run tree.apply(run batch.take())
+      if replies.length() != 0 {
+        self.host.attach(&mut tree)
+        let answered = run Effect.result(self.host.answerGpu(move replies)) |> Effect.provideMut<Allocator>(&mut self.allocator)
+        run self.settle(move answered)
+        run self.host.flushRaw(&mut tree)
         changed = true
       }
-      self.host.attach(&mut tree)
-      let answered = run Effect.result(self.host.answerGpu(move replies)) |> Effect.provideMut<Allocator>(&mut self.allocator)
-      run self.settle(move answered)
-      run self.host.flushRaw(&mut tree)
-      round = round + 1
     }
+    let commands = self.host.takeGpuCommands()
+    if commands.length() != 0 {
+      if self.traced {
+        StderrWriter.print("silkui: gpu, {} command bytes submitted\n", &.(commands.length()))
+      }
+      if let Option<GpuServiceThread>.Some { value: thread } = &mut self.gpu {
+        run thread.submit(move commands)
+      }
+    }
+    return changed
+  }
+
+  /// Starts async image decode / PNG encode jobs on `AppPool` and settles completed promises.
+  effect fn codecs(self: &mut Self, jobs: &mut CodecJobs, tree: &mut UiTree<'_>) -> bool ! TreeError | OutOfMemoryError ? &mut Allocator {
+    self.host.attach(&mut tree)
+    let requests = self.host.takeCodecRequests()
+    if requests.length() != 0 { run jobs.start(move requests) }
+    let mut done = run jobs.finished()
+    if done.length() == 0 { return false }
+    while done.length() > 0 {
+      let reply = done.remove(0)
+      let answered = run Effect.result(self.host.answerCodec(move reply)) |> Effect.provideMut<Allocator>(&mut self.allocator)
+      run self.settle(move answered)
+    }
+    run self.host.flushRaw(&mut tree)
     return true
   }
 
@@ -870,11 +944,13 @@ pub struct JsClient<T> {
   pub loader: Loader,
   /// The `fn.async(...)` calls of exported Silk functions running on threads.
   jobs: NativeJobs,
+  /// Async image decodes and PNG encodes running on `AppPool`.
+  codecs: CodecJobs,
 }
 
 impl<T: JsTools> JsClient<T> {
   pub fn make(tools: T) -> JsClient<T> {
-    return JsClient<T> { tools: move tools, titleBar: TitleBar.Standard, titleBarHeight: 0.0, controlsLeft: 0.0, controlsTop: 0.0, windowDrag: false, stylesheets: StyleAssets.make(), stylesheetUpdates: SheetWatch.make(), loader: Loader.make(), jobs: NativeJobs.make() }
+    return JsClient<T> { tools: move tools, titleBar: TitleBar.Standard, titleBarHeight: 0.0, controlsLeft: 0.0, controlsTop: 0.0, windowDrag: false, stylesheets: StyleAssets.make(), stylesheetUpdates: SheetWatch.make(), loader: Loader.make(), jobs: NativeJobs.make(), codecs: CodecJobs.make() }
   }
 }
 
@@ -962,14 +1038,15 @@ impl<'m, T: JsTools> WindowClient<JsApp<'m>, never, never> for JsClient<T> {
     let shell = run state.shell(&mut tree, &mut platform.*, window)
     let views = run state.webViewTurn(&mut tree, &mut platform.*)
     let natives = run state.natives(&mut self.jobs, &mut tree)
+    let codecs = run state.codecs(&mut self.codecs, &mut tree)
     let graphics = run state.graphics(&mut tree)
-    return clipboard || shell || views || natives || graphics
+    return clipboard || shell || views || natives || codecs || graphics
   }
 
   effect fn canvases(self: &mut Self, state: &mut JsApp<'m>, presenter: CanvasPresenter) -> ()
     ! OutOfMemoryError
     ? &mut Allocator {
-    state.canvases(move presenter)
+    run state.canvases(move presenter)
   }
 
   effect fn start(self: &mut Self, state: &mut JsApp<'m>, tree: &mut UiTree<'_>) -> ()
@@ -983,18 +1060,45 @@ impl<'m, T: JsTools> WindowClient<JsApp<'m>, never, never> for JsClient<T> {
     run self.load(&mut state, &mut tree)
   }
 
+  effect fn report(self: &mut Self, state: &mut JsApp<'m>, inspector: &mut Inspector) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if !state.watchdogAttached {
+      if let Option<AtomicSignal>.Some { value: sig } = state.host.breakSignal() {
+        inspector.attachBreakSignal(move sig)
+        state.watchdogAttached = true
+      }
+    }
+    let mut tasks = state.host.takeLongTasks()
+    while tasks.length() != 0 {
+      let LongTaskSample { durationMs, stack, interrupted } = tasks.remove(0)
+      run inspector.recordLongTask(LongTaskRecord {
+        durationMs: durationMs,
+        stack: move stack,
+        interrupted: interrupted,
+      })
+    }
+  }
+
   effect fn attachServices(self: &mut Self, state: &mut JsApp<'m>, services: GroupServices) -> ()
     ! OutOfMemoryError
     ? &mut Allocator {
-    drop state
     self.loader.attachPool(services.pools.io.clone(), services.groupId, services.wake.clone())
+    state.host.attachCanvas2dPool(services.pools.app.clone(), services.groupId, services.wake.wakeHandle())
+    state.host.enableAsyncCodecs()
+    state.setGpuWake(services.wake.clone())
+    run self.codecs.attachPool(services.pools.app.clone(), services.groupId, services.wake.clone())
     run self.jobs.attachPool(move services.pools.app, services.groupId, move services.wake)
   }
 
   effect fn opened(self: &mut Self, state: &mut JsApp<'m>, platform: &mut HostPlatform, window: WindowId) -> ()
     ! WindowError | OutOfMemoryError
     ? &mut Allocator {
-    state.nudge = Option<Nudge>.some(platform.nudge())
+    let nudge = platform.nudge()
+    state.nudge = Option<Nudge>.some(nudge.clone())
+    if !state.gpuWakes() {
+      state.setGpuWake(move nudge)
+    }
     run self.tools.opened(&mut state, &platform.*)
   }
 
@@ -1007,15 +1111,19 @@ impl<'m, T: JsTools> WindowClient<JsApp<'m>, never, never> for JsClient<T> {
     let loaded = run self.loader.serve(&mut tree)
     if loaded { drop run state.handle(&mut tree) }
     let natives = run state.natives(&mut self.jobs, &mut tree)
+    let codecs = run state.codecs(&mut self.codecs, &mut tree)
     let graphics = run state.graphics(&mut tree)
-    return styled || polled || loaded || natives || graphics
+    return styled || polled || loaded || natives || codecs || graphics
   }
 
   fn wakeAfter(self: &Self, state: &JsApp<'m>) -> Option<f64> {
     let wanted = self.loader.watchAfter(self.stylesheetUpdates.wakeAfter(self.tools.wakeAfter()))
     let loadingPolls = self.loader.pending() && !self.loader.wakesOnCompletion()
     let jobsPoll = self.jobs.pending() && !self.jobs.wakesOnCompletion()
-    if !loadingPolls && !jobsPoll { return wanted }
+    let codecsPoll = self.codecs.pending() && !self.codecs.wakesOnCompletion()
+    let gpuPoll = state.gpuPending() && !state.gpuWakes()
+    let canvasPoll = state.host.canvas2dPending() && !state.host.canvas2dWakesOnCompletion()
+    if !loadingPolls && !jobsPoll && !codecsPoll && !gpuPoll && !canvasPoll { return wanted }
     // Fallback poll interval when running without wake-capable shared pools.
     return match wanted {
       Option<f64>.Some { value } => Option<f64>.some(f64.min(value, 0.016))

@@ -15,7 +15,7 @@
 // a dispatch queued. Calls made outside a turn (a timer, a fetch, an animation frame) ask the
 // window for a frame. Timers, animation frames, fetch, console and the clipboard are the
 // browser's own, so what an animation frame callback changes is painted in the next frame.
-import { runApp, unsupported } from '/ui/tree/window/browser/app-host.js';
+import { runApp, unsupported, selectExecutionMode } from '/ui/tree/window/browser/app-host.js';
 import { CANVAS_USAGE } from '/ui/tree/window/browser/page-canvases.mjs';
 
 export { unsupported };
@@ -259,7 +259,7 @@ export class JsHost {
       markdown: (text, flags) => this.markdown(text, flags),
       svgMeasure: (op, packed, distance) => this.svgMeasure(op, packed, distance),
       // WebGPU is the browser's own (`navigator.gpu`); a canvas node asks here for its context.
-      gpuLoad: () => (this.canvases && navigator.gpu && typeof OffscreenCanvas === 'function' ? this.gpu : null),
+      gpuLoad: () => (this.canvases && globalThis.navigator?.gpu && typeof OffscreenCanvas === 'function' ? this.gpu : null),
       log(level, text) { (level >= 3 ? console.error : level === 2 ? console.warn : console.log)(text); },
       now: () => performance.now(),
       // The page's JavaScript heap has no standard measure: only the wasm tree's memory counts.
@@ -297,13 +297,17 @@ export class JsHost {
           return 0;
         }
       },
-      ready: new WebAssembly.Suspending(() => this.ran),
-      settle: new WebAssembly.Suspending(async () => {
-        // The promise jobs a listener queued (a framework's render) ran before this one.
-        await null;
-        await null;
-        this.report();
-      }),
+      ready: typeof WebAssembly?.Suspending === 'function'
+        ? new WebAssembly.Suspending(() => this.ran)
+        : () => {},
+      settle: typeof WebAssembly?.Suspending === 'function'
+        ? new WebAssembly.Suspending(async () => {
+            // The promise jobs a listener queued (a framework's render) ran before this one.
+            await null;
+            await null;
+            this.report();
+          })
+        : () => {},
     };
   }
 
@@ -384,14 +388,37 @@ export class JsHost {
 
 /**
  * Starts the wasm and then the application, and resolves with `main`'s exit status when the
- * window closes. `app` is the bundle's URL, or a function that imports it. The other options
- * are `runApp`'s (app-host.js). The application runs while the wasm waits for the GPU, so
- * building its first tree overlaps starting the renderer.
+ * window closes. `app` is the bundle's URL, or a function that imports it.
+ *
+ * When `app` is a URL string and Dedicated Worker + OffscreenCanvas support is available (without
+ * requiring `SharedArrayBuffer`/COOP-COEP), both the wasm engine and `app` run together in one
+ * Worker while the main thread runs the platform shim and `WebCompositor`. Otherwise falls back
+ * transparently to single-thread JSPI inline mode.
  */
-export function runJsApp({ app, ...options }) {
+export function runJsApp({ app, worker = 'auto', ...options }) {
+  const appUrl = typeof app === 'string' && typeof globalThis.location?.href === 'string'
+    ? new URL(app, globalThis.location.href).href
+    : app;
+  const mode = typeof appUrl === 'string'
+    ? selectExecutionMode({
+        worker,
+        check: options.check,
+        hasCustomImports: Boolean(options.imports && Object.keys(options.imports).length > 0),
+        hasStartedHook: typeof options.started === 'function',
+      })
+    : 'inline';
+  if (mode === 'worker') {
+    return runApp({
+      ...options,
+      worker: true,
+      app: appUrl,
+      jsHostUrl: import.meta.url,
+    });
+  }
   const host = new JsHost();
   return runApp({
     ...options,
+    worker: false,
     imports: { ...options.imports, silkui: host.imports },
     started: ({ instance, windowHost, canvases }) => {
       host.instance = instance;
@@ -400,7 +427,7 @@ export function runJsApp({ app, ...options }) {
       canvases.wake = () => host.wake();
       // After `main` first suspends: `ready` waits for it.
       host.ran = Promise.resolve()
-        .then(() => (typeof app === 'function' ? app() : import(new URL(app, location.href).href)))
+        .then(() => (typeof app === 'function' ? app() : import(appUrl)))
         .then(() => undefined, error => { reportError(error); });
     },
   });

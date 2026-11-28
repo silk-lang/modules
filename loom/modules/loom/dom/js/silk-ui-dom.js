@@ -340,6 +340,56 @@ class Writer {
 }
 
 /**
+ * Chooses whether `loom-dom` runs WASM inside a dedicated Web Worker (`"worker"`) or on the
+ * main thread (`"main"`). Main-thread mode stays for SSR hydration, custom host `imports`,
+ * explicit `worker: false`, or environments lacking `Worker`.
+ */
+export function selectDomMode({
+  worker = "auto",
+  hasSsrNodes = false,
+  hasCustomImports = false,
+  hasWorker = typeof Worker === "function",
+} = {}) {
+  if (worker === false) return "main";
+  if (worker === true) return "worker";
+  return !hasSsrNodes && !hasCustomImports && hasWorker ? "worker" : "main";
+}
+
+function hasCustomImportFunctions(imports) {
+  if (!imports) return false;
+  for (const mod of Object.values(imports)) {
+    if (mod && Object.keys(mod).length > 0) return true;
+  }
+  return false;
+}
+
+async function prepareWorkerWasm(wasm) {
+  if (wasm instanceof WebAssembly.Module) return { kind: "module", value: wasm, transfer: [] };
+  if (wasm instanceof ArrayBuffer) {
+    const copy = wasm.slice(0);
+    return { kind: "bytes", value: copy, transfer: [copy] };
+  }
+  if (ArrayBuffer.isView(wasm)) {
+    const copy = wasm.buffer.slice(wasm.byteOffset, wasm.byteOffset + wasm.byteLength);
+    return { kind: "bytes", value: copy, transfer: [copy] };
+  }
+  wasm = await wasm;
+  if (wasm instanceof Response) {
+    if (!wasm.ok) throw new Error(`silk-ui: ${wasm.url} answered ${wasm.status}`);
+    const buffer = await wasm.arrayBuffer();
+    return { kind: "bytes", value: buffer, transfer: [buffer] };
+  }
+  if (wasm instanceof ArrayBuffer) {
+    const copy = wasm.slice(0);
+    return { kind: "bytes", value: copy, transfer: [copy] };
+  }
+  const url = typeof wasm === "string" || wasm instanceof URL
+    ? (typeof globalThis.location?.href === "string" ? new URL(wasm, globalThis.location.href).href : String(wasm))
+    : String(wasm);
+  return { kind: "url", value: url, transfer: [] };
+}
+
+/**
  * Runs the program in `wasm` (a URL, a Response, bytes or a compiled module) inside `root`.
  *
  * `fonts` names the font families the program's `css.fontFamilyNumber(n)` numbers stand for,
@@ -350,13 +400,33 @@ class Writer {
  * Blob or an address. `base` is what comes before a link's path
  * in its address when the site is not at the root of its origin (`"/docs"`). `imports` adds
  * host modules the program imports besides `dom`, `math` and the standard library's `silk`.
+ * `worker` controls Dedicated Worker hosting (`"auto"` | `true` | `false`, no SAB required).
  *
  * When `root` already holds the markup of a server render (`Html` in `src/html.silk`), the
- * program adopts its nodes instead of making new ones.
+ * program adopts its nodes instead of making new ones (on the main thread).
  */
-export async function mount({ wasm, root, fonts = {}, loaders = {}, base = "", imports = {} }) {
+export async function mount({
+  wasm, root, fonts = {}, loaders = {}, base = "", imports = {},
+  worker = "auto", workerUrl, workerFactory, onError,
+}) {
+  const page = new Page(root, { fonts, loaders, base, onError });
+  const hasSsrNodes = page.adopt.size > 0;
+  const hasCustomImports = hasCustomImportFunctions(imports);
+  const hasWorker = typeof workerFactory === "function" || typeof Worker === "function";
+  const mode = selectDomMode({ worker, hasSsrNodes, hasCustomImports, hasWorker });
+  if (mode === "worker") {
+    if (!hasWorker) {
+      page.close();
+      throw new Error("silk-ui: Web Worker support is unavailable in this environment");
+    }
+    const instance = typeof workerFactory === "function"
+      ? workerFactory()
+      : new Worker(workerUrl ?? import.meta.url, { type: "module" });
+    const payload = await prepareWorkerWasm(wasm);
+    await page.startWorker(instance, payload);
+    return page;
+  }
   const module = await compile(wasm);
-  const page = new Page(root, { fonts, loaders, base });
   const wanted = {};
   for (const entry of WebAssembly.Module.imports(module)) {
     const group = (wanted[entry.module] ??= {});
@@ -383,10 +453,11 @@ export async function mount({ wasm, root, fonts = {}, loaders = {}, base = "", i
 // `OsSystemClock` and `OsMonotonicClock` for `silk.clock`. A program that uses them needs
 // nothing from the page.
 const standardImports = {
-  random: (page) => (pointer, length) => {
+  random: (target) => (pointer, length) => {
+    const memory = target.exports ? target.exports.memory : target.memory();
     // `crypto.getRandomValues` fills at most 65536 bytes at a time.
     for (let at = 0; at < length; at += 65536) {
-      crypto.getRandomValues(new Uint8Array(page.exports.memory.buffer, pointer + at, Math.min(65536, length - at)));
+      crypto.getRandomValues(new Uint8Array(memory.buffer, pointer + at, Math.min(65536, length - at)));
     }
   },
   clock: () => (monotonic) => (monotonic ? performance.now() : performance.timeOrigin + performance.now()),
@@ -500,8 +571,13 @@ export class RuntimeSheets {
 }
 
 class Page {
-  constructor(root, { fonts, loaders = {}, base }) {
+  constructor(root, { fonts = {}, loaders = {}, base = "", onError } = {}) {
     this.root = root;
+    this.onError = onError;
+    this.mode = "main";
+    this.worker = null;
+    this.abort = null;
+    this.closed = false;
     this.loaders = Object.fromEntries(Object.entries(loaders).map(([scheme, load]) => [scheme.toLowerCase(), load]));
     this.base = base.replace(/\/$/, "");
     this.fonts = new Map(Object.entries(fonts).map(([id, names]) => [String(id), names]));
@@ -512,6 +588,7 @@ class Page {
     this.faces = new Map();
     // The stylesheets of font rules linked so far.
     this.stylesheets = new Set();
+    this.styleNodes = [];
     this.runtimeSheets = new RuntimeSheets(document, url => this.resolve(url));
     for (const node of root.querySelectorAll("[data-silk-runtime]")) {
       const id = Number(node.getAttribute("data-silk-runtime"));
@@ -521,6 +598,7 @@ class Page {
     // Addresses this page made for resources the program defined, to revoke.
     this.made = new Map();
     this.anchored = new Set();
+    this.geometryNodes = new Set();
     // By node id: ids are small and dense, so arrays beat maps here.
     const miss = (id) => this.fill(id);
     this.nodes = new IdTable(miss);
@@ -556,24 +634,33 @@ class Page {
     reset.textContent = RESET;
     // First in the document, so its layer is the lowest: layers rank in order of appearance.
     document.head.prepend(reset);
+    this.styleNodes.push(reset);
     this.sheets = STATES.map(() => null);
     for (const state of STATE_ORDER) {
       const style = document.createElement("style");
       document.head.append(style);
+      this.styleNodes.push(style);
       this.sheets[state] = { sheet: style.sheet, rules: new Map() };
     }
     const keyframes = document.createElement("style");
     document.head.append(keyframes);
+    this.styleNodes.push(keyframes);
     this.keyframes = { sheet: keyframes.sheet, rules: new Map() };
-    this.layout = new ResizeObserver((entries) => {
+    const observe = typeof ResizeObserver === "function"
+      ? (cb) => new ResizeObserver(cb)
+      : () => ({ observe() {}, unobserve() {}, disconnect() {} });
+    this.layout = observe((entries) => {
       for (const entry of entries) {
         const id = this.idOf(entry.target);
         // The whole path, as for every other record: a handler under `h.map` is found along it.
         if (id) this.send(this.record(EVENT.layout, entry.target, this.pathTo(entry.target)));
       }
     });
-    this.canvases = new ResizeObserver((entries) => {
+    this.canvases = observe((entries) => {
       for (const entry of entries) this.paint(this.idOf(entry.target));
+    });
+    this.geometryObserver = observe(() => {
+      if (this.mode === "worker") this.pushGeometry();
     });
     // Virtual lists (op 41), by the id of their scroll container. The program keeps each
     // list's controller; the page shows spacers in place of unmounted rows and reports, once
@@ -581,14 +668,14 @@ class Page {
     this.virtuals = new Map();
     this.virtualSizes = new Map();
     this.virtualFrame = 0;
-    this.rowSizes = new ResizeObserver((entries) => {
+    this.rowSizes = observe((entries) => {
       for (const entry of entries) {
         const id = this.idOf(entry.target);
         if (id) this.virtualSizes.set(id, entry.borderBoxSize?.[0]?.blockSize ?? entry.target.getBoundingClientRect().height);
       }
       this.virtualSoon();
     });
-    this.portSizes = new ResizeObserver(() => this.virtualSoon());
+    this.portSizes = observe(() => this.virtualSoon());
   }
 
   // The spacers of virtual list `id`: `rows` holds each bound row's id and the space before
@@ -667,7 +754,7 @@ class Page {
   }
 
   reportVirtual() {
-    if (this.busy || this.failed) return this.virtualSoon();
+    if (this.busy || this.failed || this.closed) return this.virtualSoon();
     const focus = document.activeElement;
     const target = focus?.getAttribute?.("aria-activedescendant");
     const described = target ? document.getElementById(target) : null;
@@ -686,8 +773,8 @@ class Page {
     this.virtualSizes.clear();
     if (!lists.length && !sizes.length) return;
     const length = 8 + lists.length * 20 + sizes.length * 8;
-    const at = this.call(CALL_SCRATCH, length);
-    const view = new DataView(this.exports.memory.buffer, at, length);
+    const bytes = new Uint8Array(length);
+    const view = new DataView(bytes.buffer);
     let offset = 0;
     const word = (value) => { view.setUint32(offset, value, true); offset += 4; };
     const float = (value) => { view.setFloat32(offset, value, true); offset += 4; };
@@ -697,6 +784,13 @@ class Page {
     }
     word(sizes.length);
     for (const [id, height] of sizes) { word(id); float(height); }
+    if (this.mode === "worker" && this.worker) {
+      const buffer = bytes.buffer;
+      this.worker.postMessage({ type: "virtual", buffer }, [buffer]);
+      return;
+    }
+    const at = this.call(CALL_SCRATCH, length);
+    new Uint8Array(this.exports.memory.buffer, at, length).set(bytes);
     this.call(CALL_VIRTUAL, length);
   }
 
@@ -743,6 +837,12 @@ class Page {
    * that started something slow, such as a request.
    */
   post(name, text = "") {
+    if (this.mode === "worker") {
+      if (!this.failed && !this.closed && this.worker) {
+        this.worker.postMessage({ type: "post", name, text: String(text) });
+      }
+      return;
+    }
     const port = encoder.encode(name);
     const body = encoder.encode(String(text));
     const at = this.call(CALL_SCRATCH, port.length + body.length);
@@ -753,6 +853,12 @@ class Page {
   }
 
   locate() {
+    if (this.mode === "worker") {
+      if (!this.failed && !this.closed && this.worker) {
+        this.worker.postMessage({ type: "location", path: this.where() });
+      }
+      return;
+    }
     const bytes = encoder.encode(this.where());
     const at = this.call(CALL_SCRATCH, bytes.length);
     new Uint8Array(this.exports.memory.buffer, at, bytes.length).set(bytes);
@@ -760,6 +866,7 @@ class Page {
   }
 
   start(exports) {
+    this.mode = "main";
     this.exports = exports;
     this.token = exports.silk_ui_open();
     if (!this.token) throw new Error("silk-ui: the program did not start");
@@ -767,7 +874,10 @@ class Page {
     const size = this.size();
     this.locate();
     this.call(CALL_START, size.width, size.height, now());
+    this.finishAdoption();
+  }
 
+  finishAdoption() {
     // What the first render did not adopt was not the program's.
     for (const node of this.adopt.values()) node.remove();
     this.adopt.clear();
@@ -779,6 +889,148 @@ class Page {
     }
   }
 
+  async startWorker(worker, wasmPayload) {
+    this.mode = "worker";
+    this.worker = worker;
+    let started = false;
+    let resolveReady;
+    let rejectReady;
+    const readyPromise = new Promise((resolve, reject) => {
+      resolveReady = resolve;
+      rejectReady = reject;
+    });
+    const onMessage = (incoming) => {
+      if (this.closed) return;
+      const msg = incoming?.data ?? incoming;
+      if (!msg || typeof msg !== "object") return;
+      switch (msg.type) {
+        case "apply": {
+          this.applyBytes(msg.buffer, 0, msg.buffer.byteLength);
+          this.pushGeometry();
+          break;
+        }
+        case "navigate":
+          history.pushState(null, "", this.address(msg.path));
+          break;
+        case "schedule":
+          if (msg.frames && !this.frame && !this.failed && !this.closed) {
+            this.frame = requestAnimationFrame(() => {
+              this.frame = 0;
+              if (!this.failed && !this.closed && this.worker) {
+                this.worker.postMessage({ type: "tick", now: now(), frame: true });
+              }
+            });
+          }
+          break;
+        case "ready":
+          started = true;
+          this.finishAdoption();
+          this.listen();
+          this.pushGeometry();
+          if (msg.frames && !this.frame && !this.failed && !this.closed) {
+            this.frame = requestAnimationFrame(() => {
+              this.frame = 0;
+              if (!this.failed && !this.closed && this.worker) {
+                this.worker.postMessage({ type: "tick", now: now(), frame: true });
+              }
+            });
+          }
+          resolveReady();
+          break;
+        case "error": {
+          this.failed = true;
+          const err = new Error(msg.message || "silk-ui: worker failed");
+          if (!started) rejectReady(err);
+          else if (this.onError) this.onError(err);
+          else console.error(err);
+          break;
+        }
+      }
+    };
+    const onWorkerError = (ev) => {
+      this.failed = true;
+      const err = ev?.error instanceof Error ? ev.error : new Error(ev?.message || "silk-ui: worker error");
+      if (!started) rejectReady(err);
+      else if (this.onError) this.onError(err);
+      else console.error(err);
+    };
+    if (typeof worker.addEventListener === "function") {
+      worker.addEventListener("message", onMessage);
+      worker.addEventListener("error", onWorkerError);
+    } else {
+      worker.onmessage = onMessage;
+      worker.onerror = onWorkerError;
+    }
+    this.workerCleanup = () => {
+      if (typeof worker.removeEventListener === "function") {
+        worker.removeEventListener("message", onMessage);
+        worker.removeEventListener("error", onWorkerError);
+      } else {
+        worker.onmessage = null;
+        worker.onerror = null;
+      }
+    };
+    const size = this.size();
+    worker.postMessage(
+      {
+        type: "init",
+        wasmKind: wasmPayload.kind,
+        wasm: wasmPayload.value,
+        location: this.where(),
+        width: size.width,
+        height: size.height,
+        now: now(),
+      },
+      wasmPayload.transfer,
+    );
+    await readyPromise;
+  }
+
+  collectGeometryEntries() {
+    if (!this.geometryNodes?.size) return [];
+    const entries = [];
+    for (const id of this.geometryNodes) {
+      const measured = this.measureNode(id);
+      if (measured) entries.push([id, ...measured]);
+    }
+    return entries;
+  }
+
+  pushGeometry() {
+    if (this.mode !== "worker" || this.failed || this.closed || !this.worker || !this.geometryNodes?.size) return;
+    const entries = this.collectGeometryEntries();
+    if (entries.length) this.worker.postMessage({ type: "geometry", entries });
+  }
+
+  close() {
+    if (this.closed) return;
+    this.closed = true;
+    clearTimeout(this.timer);
+    if (this.frame) cancelAnimationFrame(this.frame);
+    if (this.virtualFrame) cancelAnimationFrame(this.virtualFrame);
+    this.frame = 0;
+    this.virtualFrame = 0;
+    this.abort?.abort();
+    this.layout?.disconnect?.();
+    this.canvases?.disconnect?.();
+    this.geometryObserver?.disconnect?.();
+    this.rowSizes?.disconnect?.();
+    this.portSizes?.disconnect?.();
+    this.runtimeSheets?.close?.();
+    for (const url of this.made.values()) {
+      try { URL.revokeObjectURL(url); } catch {}
+    }
+    this.made.clear();
+    if (this.worker) {
+      try { this.worker.postMessage({ type: "stop" }); } catch {}
+      this.workerCleanup?.();
+      this.worker.terminate?.();
+      this.worker = null;
+    }
+    for (const style of this.styleNodes) style.remove?.();
+    this.styleNodes = [];
+  }
+
   size() {
     return { width: this.root.clientWidth, height: this.root.clientHeight || window.innerHeight };
   }
@@ -786,7 +1038,7 @@ class Page {
   // Calls into the program. The DOM work a call causes can raise events (a focus change, a
   // layout): they wait in `queued` until the call is over.
   call(op, a = 0, b = 0, c = 0) {
-    if (this.failed) return 0;
+    if (this.failed || this.closed) return 0;
     this.busy = true;
     let result;
     try {
@@ -823,9 +1075,15 @@ class Page {
     }
   }
 
-  // Sends a record. Returns whether a handler prevented the default action.
+  // Sends a record. In worker mode transfers the byte record directly without waiting for a
+  // reply (declarative prevention already ran synchronously in the DOM listener).
   send(record) {
-    if (!record) return false;
+    if (!record || this.failed || this.closed) return false;
+    if (this.mode === "worker" && this.worker) {
+      const buffer = record.bytes.slice(0, record.at).buffer;
+      this.worker.postMessage({ type: "event", buffer, now: now() }, [buffer]);
+      return false;
+    }
     if (this.busy) {
       this.queued.push(record);
       return false;
@@ -843,7 +1101,11 @@ class Page {
   // Mutations.
 
   apply(pointer, length) {
-    const r = new Reader(this.exports.memory.buffer, pointer, length);
+    Page.prototype.applyBytes.call(this, this.exports.memory.buffer, pointer, length);
+  }
+
+  applyBytes(buffer, offset = 0, length = buffer.byteLength) {
+    const r = new Reader(buffer, offset, length);
     while (!r.done) {
       const op = r.u8();
       if (op !== 4 && this.destroyed.length) this.removeDestroyed();
@@ -920,7 +1182,23 @@ class Page {
           this.setText(this.nodes.get(r.u32()), r.text());
           break;
         case 45: {
-          for (let count = r.u32(); count > 0; count--) r.u32();
+          const next = new Set();
+          for (let count = r.u32(); count > 0; count--) next.add(r.u32());
+          if (this.geometryNodes) {
+            for (const prev of this.geometryNodes) {
+              if (!next.has(prev)) {
+                const prevNode = this.nodes.get(prev);
+                if (prevNode?.nodeType === 1) this.geometryObserver?.unobserve?.(prevNode);
+              }
+            }
+            for (const id of next) {
+              if (!this.geometryNodes.has(id)) {
+                const node = this.nodes.get(id);
+                if (node?.nodeType === 1) this.geometryObserver?.observe?.(node);
+              }
+            }
+          }
+          this.geometryNodes = next;
           break;
         }
         case 8: {
@@ -1192,7 +1470,7 @@ class Page {
     if (this.relating) this.relate();
     this.place();
     // An active descendant may have moved to another row.
-    this.virtualSoon();
+    this.virtualSoon?.();
   }
 
   // Writes each relation's targets as their element ids, giving a target without one
@@ -1582,6 +1860,7 @@ class Page {
         const meta = this.meta.get(id);
         if (meta?.observed) this.layout.unobserve(node);
         if (meta?.kind === KIND_CANVAS) this.canvases.unobserve(node);
+        if (this.geometryNodes?.delete(id) && node.nodeType === 1) this.geometryObserver?.unobserve?.(node);
         if (ruled) for (const state of STATE_ORDER) this.dropRule(id, state);
         if (this.anchored.size) this.anchored.delete(id);
         if (this.nodes.get(id) === node) {
@@ -1853,19 +2132,40 @@ class Page {
     return next;
   }
 
-  measure(id, out) {
+  measureNode(id) {
     const node = this.nodes.get(id);
-    if (!node || node.nodeType !== 1 || !node.isConnected) return 0;
+    if (!node || node.nodeType !== 1 || !node.isConnected) return null;
     const box = node.getBoundingClientRect();
     const origin = this.root.getBoundingClientRect();
+    let pressed = false;
+    let hovered = false;
+    try {
+      pressed = node.matches(":active");
+      hovered = node.matches(":hover");
+    } catch {}
+    const focused = typeof document !== "undefined" ? node === document.activeElement : false;
+    return [
+      box.left - origin.left,
+      box.top - origin.top,
+      box.width,
+      box.height,
+      pressed ? 1 : 0,
+      hovered ? 1 : 0,
+      focused ? 1 : 0,
+    ];
+  }
+
+  measure(id, out) {
+    const measured = this.measureNode(id);
+    if (!measured) return 0;
     const view = new DataView(this.exports.memory.buffer, out, 19);
-    view.setFloat32(0, box.left - origin.left, true);
-    view.setFloat32(4, box.top - origin.top, true);
-    view.setFloat32(8, box.width, true);
-    view.setFloat32(12, box.height, true);
-    view.setUint8(16, node.matches(":active") ? 1 : 0);
-    view.setUint8(17, node.matches(":hover") ? 1 : 0);
-    view.setUint8(18, node === document.activeElement ? 1 : 0);
+    view.setFloat32(0, measured[0], true);
+    view.setFloat32(4, measured[1], true);
+    view.setFloat32(8, measured[2], true);
+    view.setFloat32(12, measured[3], true);
+    view.setUint8(16, measured[4]);
+    view.setUint8(17, measured[5]);
+    view.setUint8(18, measured[6]);
     return 1;
   }
 
@@ -2000,8 +2300,15 @@ class Page {
   }
 
   listen() {
+    this.abort?.abort();
+    this.abort = typeof AbortController === "function" ? new AbortController() : null;
+    const signal = this.abort?.signal;
+    const withSignal = (options = {}) => (signal ? { ...options, signal } : options);
     const root = this.root;
-    const on = (name, handler, options) => root.addEventListener(name, handler, options);
+    const on = (name, handler, options) => {
+      const opts = typeof options === "boolean" ? { capture: options } : options;
+      root.addEventListener(name, handler, withSignal(opts));
+    };
 
     on("pointerdown", (event) => {
       this.pointer = event.pointerId;
@@ -2149,19 +2456,42 @@ class Page {
         }
       }
     };
-    window.addEventListener("keydown", key(EVENT.keyDown));
-    window.addEventListener("keyup", key(EVENT.keyUp));
+    window.addEventListener("keydown", key(EVENT.keyDown), signal ? { signal } : undefined);
+    window.addEventListener("keyup", key(EVENT.keyUp), signal ? { signal } : undefined);
 
-    new ResizeObserver(() => {
-      const size = this.size();
-      this.call(CALL_RESIZE, size.width, size.height);
-      this.place();
-    }).observe(root);
-    window.addEventListener("scroll", () => this.place(), { capture: true, passive: true });
-    window.addEventListener("resize", () => this.place());
+    if (typeof ResizeObserver === "function") {
+      this.rootResize = new ResizeObserver(() => {
+        const size = this.size();
+        if (this.mode === "worker" && this.worker) {
+          this.worker.postMessage({ type: "resize", width: size.width, height: size.height });
+        } else {
+          this.call(CALL_RESIZE, size.width, size.height);
+        }
+        this.place();
+        if (this.mode === "worker") this.pushGeometry();
+      });
+      this.rootResize.observe(root);
+      signal?.addEventListener("abort", () => this.rootResize?.disconnect(), { once: true });
+    }
+    window.addEventListener(
+      "scroll",
+      () => {
+        this.place();
+        if (this.mode === "worker") this.pushGeometry();
+      },
+      signal ? { capture: true, passive: true, signal } : { capture: true, passive: true },
+    );
+    window.addEventListener(
+      "resize",
+      () => {
+        this.place();
+        if (this.mode === "worker") this.pushGeometry();
+      },
+      signal ? { signal } : undefined,
+    );
 
     // Back and forward: the program goes where the document's history went.
-    window.addEventListener("popstate", () => this.locate());
+    window.addEventListener("popstate", () => this.locate(), signal ? { signal } : undefined);
   }
 }
 
@@ -2183,4 +2513,227 @@ function spacer() {
 
 function now() {
   return performance.now() / 1000;
+}
+
+/**
+ * Worker-side Loom DOM host: runs Loom WASM inside a Dedicated Web Worker (no
+ * `SharedArrayBuffer` required) and streams transferable `wire.silk` mutation batches
+ * (`dom#apply`) plus navigation (`dom#navigate`) and frame/timer schedules to the main thread.
+ */
+export function createDomWorkerHost(port) {
+  let exports = null;
+  let token = 0;
+  let failed = false;
+  let stopped = false;
+  let timer = 0;
+  let timeOffset = 0;
+  const measured = new Map();
+
+  const workerNow = () => now() + timeOffset;
+
+  const scheduleNext = () => {
+    clearTimeout(timer);
+    if (failed || stopped || !exports || !token) return;
+    const deadline = exports.silk_ui_call(token, CALL_DEADLINE, 0, 0, 0);
+    if (deadline >= 0) {
+      const wait = Math.max(0, (deadline - workerNow()) * 1000);
+      timer = setTimeout(() => runCall(CALL_TICK, workerNow(), 0), wait);
+    }
+    const frames = exports.silk_ui_call(token, CALL_FRAMES, 0, 0, 0) === 1;
+    port.postMessage({ type: "schedule", deadline, frames });
+    return { deadline, frames };
+  };
+
+  const runCall = (op, a = 0, b = 0, c = 0, skipSchedule = false) => {
+    if (failed || stopped || !exports) return 0;
+    let result;
+    try {
+      result = exports.silk_ui_call(token, op, a, b, c);
+    } catch (error) {
+      failed = true;
+      port.postMessage({ type: "error", message: String(error?.message ?? error) });
+      return 0;
+    }
+    if (result === -2) {
+      failed = true;
+      port.postMessage({ type: "error", message: `silk-ui: call ${op} failed` });
+      return 0;
+    }
+    if (!skipSchedule && op !== CALL_SCRATCH && op !== CALL_DEADLINE && op !== CALL_FRAMES) {
+      scheduleNext();
+    }
+    return result;
+  };
+
+  const updateMeasuredFromEvent = (buffer) => {
+    if (!buffer || buffer.byteLength < 25) return;
+    const view = new DataView(buffer);
+    const id = view.getUint32(1, true);
+    const pathLen = view.getUint32(5, true);
+    const boxOffset = 9 + pathLen * 4;
+    if (!id || boxOffset + 16 > buffer.byteLength) return;
+    const prev = measured.get(id);
+    measured.set(id, {
+      left: view.getFloat32(boxOffset, true),
+      top: view.getFloat32(boxOffset + 4, true),
+      width: view.getFloat32(boxOffset + 8, true),
+      height: view.getFloat32(boxOffset + 12, true),
+      pressed: prev?.pressed ?? 0,
+      hovered: prev?.hovered ?? 0,
+      focused: prev?.focused ?? 0,
+    });
+  };
+
+  const writeScratch = (bytes) => {
+    const ptr = runCall(CALL_SCRATCH, bytes.length, 0, 0, true);
+    if (!ptr && bytes.length) return -1;
+    new Uint8Array(exports.memory.buffer, ptr, bytes.length).set(bytes);
+    return bytes.length;
+  };
+
+  const domImports = {
+    apply: (pointer, length) => {
+      if (!exports || !length) return;
+      const copy = new Uint8Array(exports.memory.buffer, pointer, length).slice();
+      port.postMessage({ type: "apply", buffer: copy.buffer }, [copy.buffer]);
+    },
+    measure: (id, out) => {
+      const box = measured.get(id);
+      if (!box || !exports) return 0;
+      const view = new DataView(exports.memory.buffer, out, 19);
+      view.setFloat32(0, box.left, true);
+      view.setFloat32(4, box.top, true);
+      view.setFloat32(8, box.width, true);
+      view.setFloat32(12, box.height, true);
+      view.setUint8(16, box.pressed ? 1 : 0);
+      view.setUint8(17, box.hovered ? 1 : 0);
+      view.setUint8(18, box.focused ? 1 : 0);
+      return 1;
+    },
+    navigate: (pointer, length) => {
+      if (!exports) return;
+      const path = decoder.decode(new Uint8Array(exports.memory.buffer, pointer, length));
+      port.postMessage({ type: "navigate", path });
+    },
+  };
+
+  const handleInit = async (msg) => {
+    timeOffset = typeof msg.now === "number" ? msg.now - now() : 0;
+    const wasmInput = msg.wasmKind === "module" || msg.wasmKind === "bytes" ? msg.wasm : msg.wasm;
+    const module = await compile(wasmInput);
+    const memoryRef = { memory: () => exports.memory };
+    const wanted = {};
+    for (const entry of WebAssembly.Module.imports(module)) {
+      const group = (wanted[entry.module] ??= {});
+      if (entry.module === "dom") {
+        group[entry.name] = domImports[entry.name];
+      } else if (entry.module === "math" && typeof Math[entry.name] === "function") {
+        group[entry.name] = Math[entry.name];
+      } else if (entry.module === "silk" && standardImports[entry.name]) {
+        group[entry.name] = standardImports[entry.name](memoryRef);
+      } else if (entry.kind === "function") {
+        group[entry.name] = () => {
+          throw new Error(`silk-ui: no host function ${entry.module}#${entry.name}`);
+        };
+      }
+    }
+    const instance = await WebAssembly.instantiate(module, wanted);
+    exports = instance.exports;
+    token = exports.silk_ui_open();
+    if (!token) throw new Error("silk-ui: the program did not start");
+    if (typeof msg.location === "string") {
+      const locBytes = encoder.encode(msg.location);
+      if (writeScratch(locBytes) >= 0) runCall(CALL_LOCATION, locBytes.length, 0, 0, true);
+    }
+    runCall(CALL_START, msg.width ?? 0, msg.height ?? 0, msg.now ?? workerNow(), true);
+    const sched = scheduleNext() ?? { deadline: -1, frames: false };
+    port.postMessage({ type: "ready", deadline: sched.deadline, frames: sched.frames });
+  };
+
+  const onMessage = async (incoming) => {
+    if (stopped) return;
+    const msg = incoming?.data ?? incoming;
+    if (!msg || typeof msg !== "object") return;
+    try {
+      switch (msg.type) {
+        case "init":
+          await handleInit(msg);
+          break;
+        case "event": {
+          updateMeasuredFromEvent(msg.buffer);
+          const bytes = new Uint8Array(msg.buffer);
+          const length = writeScratch(bytes);
+          if (length >= 0) runCall(CALL_EVENT, length, msg.now ?? workerNow());
+          break;
+        }
+        case "tick":
+          runCall(CALL_TICK, msg.now ?? workerNow(), msg.frame ? 1 : 0);
+          break;
+        case "resize":
+          runCall(CALL_RESIZE, msg.width ?? 0, msg.height ?? 0);
+          break;
+        case "location": {
+          const bytes = encoder.encode(String(msg.path ?? "/"));
+          const length = writeScratch(bytes);
+          if (length >= 0) runCall(CALL_LOCATION, length);
+          break;
+        }
+        case "post": {
+          const name = encoder.encode(String(msg.name ?? ""));
+          const text = encoder.encode(String(msg.text ?? ""));
+          const total = name.length + text.length;
+          const ptr = runCall(CALL_SCRATCH, total, 0, 0, true);
+          if (ptr || !total) {
+            const dst = new Uint8Array(exports.memory.buffer, ptr, total);
+            dst.set(name);
+            dst.set(text, name.length);
+            runCall(CALL_POST, name.length, text.length);
+          }
+          break;
+        }
+        case "virtual": {
+          const bytes = new Uint8Array(msg.buffer);
+          const length = writeScratch(bytes);
+          if (length >= 0) runCall(CALL_VIRTUAL, length);
+          break;
+        }
+        case "geometry":
+          for (const [id, left, top, width, height, pressed, hovered, focused] of msg.entries ?? []) {
+            measured.set(id, { left, top, width, height, pressed, hovered, focused });
+          }
+          break;
+        case "stop":
+          stopped = true;
+          clearTimeout(timer);
+          break;
+      }
+    } catch (error) {
+      failed = true;
+      port.postMessage({ type: "error", message: String(error?.message ?? error) });
+    }
+  };
+
+  if (typeof port.addEventListener === "function") {
+    port.addEventListener("message", onMessage);
+  } else {
+    port.onmessage = onMessage;
+  }
+  port.start?.();
+  return {
+    stop() {
+      stopped = true;
+      clearTimeout(timer);
+      if (typeof port.removeEventListener === "function") port.removeEventListener("message", onMessage);
+      else if (port.onmessage === onMessage) port.onmessage = null;
+    },
+  };
+}
+
+if (
+  typeof window === "undefined" &&
+  typeof document === "undefined" &&
+  typeof self !== "undefined" &&
+  typeof self.postMessage === "function"
+) {
+  createDomWorkerHost(self);
 }

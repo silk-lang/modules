@@ -50,12 +50,72 @@ const EVENT = {
   selectionChange: 27,
   pointerOver: 28,
   pointerOut: 29,
+  touchStart: 30,
+  touchMove: 31,
+  touchEnd: 32,
+  touchCancel: 33,
+  copy: 34,
+  cut: 35,
+  paste: 36,
+  beforeInput: 37,
+  closeRequest: 38,
+  navigate: 39,
 };
 
 // The listener flag of event kind `k` is `1 << k`.
 const PREVENT_FOCUS = 1;
 const PREVENT_SCROLL = 2;
 const PREVENT_KEYS = 4;
+const PREVENT_COPY = 8;
+const PREVENT_CUT = 16;
+const PREVENT_PASTE = 32;
+const PREVENT_BEFORE_INPUT = 64;
+
+function isNamedKey(key) {
+  switch (key) {
+    case "Enter":
+    case "Tab":
+    case "Backspace":
+    case "Escape":
+    case "Delete":
+    case "Insert":
+    case "Home":
+    case "End":
+    case "PageUp":
+    case "PageDown":
+    case "ArrowUp":
+    case "ArrowDown":
+    case "ArrowLeft":
+    case "ArrowRight":
+      return true;
+  }
+  return /^F(?:[1-9]|1[0-9]|2[0-4])$/.test(key);
+}
+
+function matchesKeyRule(rule, event) {
+  if (rule.requireNotComposing && event.isComposing) return false;
+  const held =
+    (event.shiftKey ? 1 : 0) |
+    (event.ctrlKey ? 2 : 0) |
+    (event.altKey ? 4 : 0) |
+    (event.metaKey ? 8 : 0);
+  if (rule.modifiersMask !== 0 && (held & rule.modifiersMask) !== rule.modifiersValue) return false;
+  if (rule.anyModifierMask !== 0 && (held & rule.anyModifierMask) === 0) return false;
+  const key = event.key ?? "";
+  const code = event.code ?? "";
+  switch (rule.matchKind) {
+    case 0:
+      return rule.caseInsensitive ? key.toLowerCase() === rule.value.toLowerCase() : key === rule.value;
+    case 1:
+      return code === rule.value;
+    case 2:
+      return isNamedKey(key);
+    case 3:
+      return true;
+    default:
+      return false;
+  }
+}
 
 // Later sheets win: a pressed node shows its active look over its hover look.
 // The starting look (5) is an `@starting-style` block holding the node's rule.
@@ -848,6 +908,21 @@ class Page {
         case 7:
           this.setText(this.nodes.get(r.u32()), r.text());
           break;
+        case 43: {
+          const id = r.u32();
+          const value = r.text();
+          r.u32();
+          r.u32();
+          this.setText(this.nodes.get(id), value);
+          break;
+        }
+        case 44:
+          this.setText(this.nodes.get(r.u32()), r.text());
+          break;
+        case 45: {
+          for (let count = r.u32(); count > 0; count--) r.u32();
+          break;
+        }
         case 8: {
           const node = this.nodes.get(r.u32());
           const anchor = r.u32();
@@ -1721,6 +1796,40 @@ class Page {
         }
         break;
       }
+      case 23: {
+        const actions = r.u32();
+        const keyRules = [];
+        for (let count = r.u32(); count > 0; count--) {
+          keyRules.push({
+            action: r.u8(),
+            matchKind: r.u8(),
+            value: r.text(),
+            modifiersMask: r.u32(),
+            modifiersValue: r.u32(),
+            anyModifierMask: r.u32(),
+            requireNotComposing: r.u8() === 1,
+            caseInsensitive: r.u8() === 1,
+          });
+        }
+        meta.preventRules = { actions, keyRules };
+        break;
+      }
+      case 24:
+        meta.dragRegion = r.u8() === 1;
+        break;
+      case 25: {
+        const ownership = r.u8();
+        const maxLength = r.u32();
+        const allowedChars = r.u8();
+        const allowed = r.text();
+        const caseTransform = r.u8();
+        const rejectWhitespace = r.u8() === 1;
+        meta.editMode = {
+          ownership,
+          filter: { maxLength, allowedChars, allowed, caseTransform, rejectWhitespace },
+        };
+        break;
+      }
       default:
         throw new Error(`silk-ui: unknown attribute ${code}`);
     }
@@ -1811,7 +1920,31 @@ class Page {
   }
 
   prevents(path, action) {
-    return path.some((node) => (this.meta.get(this.idOf(node))?.prevent ?? 0) & action);
+    return path.some((node) => {
+      const meta = this.meta.get(this.idOf(node));
+      return ((meta?.prevent ?? 0) & action) !== 0 || ((meta?.preventRules?.actions ?? 0) & action) !== 0;
+    });
+  }
+
+  preventsKey(path, event) {
+    const composing = !!event.isComposing;
+    for (let i = path.length - 1; i >= 0; i--) {
+      const meta = this.meta.get(this.idOf(path[i]));
+      const rules = meta?.preventRules;
+      if (rules) {
+        let matched = null;
+        for (const rule of rules.keyRules) {
+          if (matchesKeyRule(rule, event)) {
+            matched = rule.action === 0;
+            break;
+          }
+        }
+        if (matched !== null) return matched;
+        if ((rules.actions & PREVENT_KEYS) !== 0 && !composing) return true;
+      }
+      if (((meta?.prevent ?? 0) & PREVENT_KEYS) !== 0 && !composing) return true;
+    }
+    return false;
   }
 
   record(kind, target, path, event = {}, extra = {}) {
@@ -1851,12 +1984,11 @@ class Page {
   forward(kind, event, target = event.target, extra = {}) {
     const path = this.pathTo(target);
     if (!path.length || !(this.hears(path, kind) || (kind === EVENT.click && this.links(path)))) {
-      return { path, prevented: false };
+      return { path };
     }
     const element = path[path.length - 1];
-    const prevented = this.send(this.record(kind, element, path, event, extra));
-    if (prevented && event.cancelable) event.preventDefault();
-    return { path, prevented };
+    this.send(this.record(kind, element, path, event, extra));
+    return { path };
   }
 
   // Non-bubbling kinds go to the one node, if it listens.
@@ -1873,8 +2005,8 @@ class Page {
 
     on("pointerdown", (event) => {
       this.pointer = event.pointerId;
-      const { path, prevented } = this.forward(EVENT.pointerDown, event);
-      this.skipMouseDown = prevented || this.prevents(path, PREVENT_FOCUS);
+      const { path } = this.forward(EVENT.pointerDown, event);
+      this.skipMouseDown = this.prevents(path, PREVENT_FOCUS);
     });
     on("mousedown", (event) => {
       // Focus moves on mousedown: this is where a prevented press keeps it where it is.
@@ -1888,7 +2020,20 @@ class Page {
     on("pointerout", (event) => this.forward(EVENT.pointerOut, event));
     on("gotpointercapture", (event) => this.forward(EVENT.gotPointerCapture, event));
     on("lostpointercapture", (event) => this.forward(EVENT.lostPointerCapture, event));
-    on("click", (event) => this.forward(EVENT.click, event));
+    on("click", (event) => {
+      const { path } = this.forward(EVENT.click, event);
+      if (
+        this.links(path) &&
+        event.button === 0 &&
+        !event.shiftKey &&
+        !event.ctrlKey &&
+        !event.altKey &&
+        !event.metaKey &&
+        event.cancelable
+      ) {
+        event.preventDefault();
+      }
+    });
     // An image's load and error do not bubble; the root hears them while capturing.
     on("load", (event) => event.target instanceof HTMLImageElement && this.direct(EVENT.load, event.target, event), true);
     on("error", (event) => event.target instanceof HTMLImageElement && this.direct(EVENT.error, event.target, event), true);
@@ -1903,7 +2048,29 @@ class Page {
     on("animationiteration", motion(EVENT.animationIteration, "animationName"));
     on("animationend", motion(EVENT.animationEnd, "animationName"));
     on("animationcancel", motion(EVENT.animationCancel, "animationName"));
+    on("beforeinput", (event) => {
+      const path = this.pathTo(event.target);
+      if (!path.length) return;
+      const targetMeta = this.meta.get(this.idOf(path[path.length - 1]));
+      const appOwned = targetMeta?.editMode?.ownership === 2 && !event.isComposing;
+      if ((appOwned || this.prevents(path, PREVENT_BEFORE_INPUT)) && event.cancelable) {
+        event.preventDefault();
+      }
+      this.forward(EVENT.beforeInput, event, event.target, { text: event.data ?? "" });
+    });
     on("input", (event) => this.forward(EVENT.input, event));
+    on("copy", (event) => {
+      const { path } = this.forward(EVENT.copy, event);
+      if (this.prevents(path, PREVENT_COPY) && event.cancelable) event.preventDefault();
+    });
+    on("cut", (event) => {
+      const { path } = this.forward(EVENT.cut, event);
+      if (this.prevents(path, PREVENT_CUT) && event.cancelable) event.preventDefault();
+    });
+    on("paste", (event) => {
+      const { path } = this.forward(EVENT.paste, event);
+      if (this.prevents(path, PREVENT_PASTE) && event.cancelable) event.preventDefault();
+    });
     // An input's selectionchange bubbles from the input, as the tree's does.
     on("selectionchange", (event) => {
       if (event.target.nodeType === 1) this.forward(EVENT.selectionChange, event);
@@ -1958,9 +2125,9 @@ class Page {
       if (!inside && event.target !== document.body && event.target !== document.documentElement) return;
       const target = inside ? event.target : this.nodes.get(this.rootId);
       if (!target) return;
-      const { path, prevented } = this.forward(kind, event, target);
-      if (kind !== EVENT.keyDown || prevented) return;
-      if (this.prevents(path, PREVENT_KEYS)) {
+      const { path } = this.forward(kind, event, target);
+      if (kind !== EVENT.keyDown) return;
+      if (this.preventsKey(path, event)) {
         event.preventDefault();
         return;
       }

@@ -1,0 +1,439 @@
+//! Stage 5 real 2-thread integration tests: blocked App thread does not block Engine input
+//! and optimistic `EngineOwned` editing; async event->commit->snapshot round-trips; optimistic
+//! revision reconciliation; and zero-polling `compute` on `AppPool` with cancellation.
+import loom.lib { Document, Node }
+import loom.program { CommandSet, Hosted, NoOutput, Program, Run, Update }
+import loom.runtime { Runtime }
+import loom_window.app_thread { NoAppBridge, runSplitAppLoop }
+import loom_window.engine_group { spawnTestEngineThread }
+import loom_window.protocol { AppToEngine, AppToEngineTx, EngineToApp, EngineWakeSlot }
+import loom_window.task { compute }
+import ui_fixtures.fixtures as fixtures
+import ui_protocol.editing { EditConfig }
+import ui_protocol.input { Input }
+import ui_protocol.mutation { Mutation }
+import ui_transport.cancel { CancellationToken }
+import ui_transport.channel { UnboundedChannel, UnboundedPair, UnboundedReceiver }
+import ui_transport.pool { Pools }
+import ui_transport.wake { Waiter, WakeHandle }
+import ui_tree.legacy { TreeError }
+import window.types { WindowError }
+import silk.collections.list { List }
+import silk.concurrency.sync { Arc, Mutex }
+import silk.concurrency.thread { Transferable }
+import silk.concurrency.thread_native { NativeThread, SpawnError }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.ownership { Drop }
+import silk.core.result { Result }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.i64
+import silk.num.u32
+import silk.system.monotonic_clock { MonotonicClock }
+import silk.system.monotonic_clock_native { OsMonotonicClock }
+import silk.testing.testing { Testing, AssertionError }
+import silk.text.string { String }
+
+struct SharedSignal {
+  blocked: bool,
+  completed: bool,
+  clicks: i64,
+}
+
+impl Transferable for SharedSignal {}
+
+union SplitMsg {
+  BlockApp,
+  Unblocked,
+  InputChanged { val: String },
+  ResetText,
+}
+
+union SplitCmd {
+  SleepMs { ms: u64, shared: Arc<Mutex<SharedSignal>> },
+}
+
+impl Transferable for SplitCmd {}
+
+impl CommandSet<SplitMsg ? never> for SplitCmd {
+  effect fn execute(self: Self) -> SplitMsg
+    ! OutOfMemoryError {
+    match move self {
+      SplitCmd.SleepMs { ms, shared } => {
+        let mut g0 = shared.get().lock()
+        let s0 = g0.getMut()
+        s0.blocked = true
+        drop g0
+        let w = run Waiter.make()
+        drop w.waitTimeout(ms * 1000000)
+        let mut g1 = shared.get().lock()
+        let s1 = g1.getMut()
+        s1.completed = true
+        drop g1
+        return SplitMsg.Unblocked
+      }
+    }
+  }
+}
+
+struct BlockingApp {
+  clicks: i64,
+  text: String,
+  shared: Arc<Mutex<SharedSignal>>,
+}
+
+type BlockingNext = Update<BlockingApp, SplitCmd, NoOutput>
+
+impl Program<SplitMsg, SplitCmd> for BlockingApp {
+  effect fn init() -> BlockingNext
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return BlockingNext.of(
+      BlockingApp {
+        clicks: 0,
+        text: String.make(),
+        shared: run Arc<Mutex<SharedSignal>>.make(
+          run Mutex<SharedSignal>.make(SharedSignal { blocked: false, completed: false, clicks: 0 }),
+        ),
+      },
+    )
+  }
+
+  effect fn update(mut model: BlockingApp, message: SplitMsg) -> BlockingNext
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    match move message {
+      SplitMsg.BlockApp => {
+        model.clicks = model.clicks + 1
+        let mut g = model.shared.get().lock()
+        let s = g.getMut()
+        s.clicks = model.clicks
+        drop g
+        let sig = model.shared.clone()
+        return run BlockingNext.with(move model, SplitCmd.SleepMs { ms: 200, shared: move sig })
+      }
+      SplitMsg.Unblocked => {}
+      SplitMsg.InputChanged { val } => {
+        model.text = move val
+      }
+      SplitMsg.ResetText => {
+        model.text = run String.copy("app-reset")
+      }
+    }
+    return BlockingNext.of(move model)
+  }
+
+  fn view(model: &BlockingApp, h: &Document<SplitMsg>) -> Node {
+    return h.column(
+      &[],
+      &[
+        h.button(&[h.onClick(SplitMsg.BlockApp)], &[h.text("Block")]),
+        h.button(&[h.onClick(SplitMsg.ResetText)], &[h.text("Reset")]),
+        h.input(
+          String.view(&model.text),
+          &[
+            h.label("Search"),
+            h.editMode(EditConfig.engineOwned()),
+            h.onInput(|val| SplitMsg.InputChanged { val: move val }),
+          ],
+        ),
+      ],
+    )
+  }
+}
+
+effect fn secondsNow(os: &mut OsMonotonicClock) -> f64 {
+  let now = run MonotonicClock.now() |> Effect.provideMut<MonotonicClock>(&mut os)
+  return i64.toF64(now.seconds()) + i64.toF64(u32.toI64(now.subsecondNanoseconds())) / 1000000000.0
+}
+
+struct AppThreadArgs {
+  shared: Arc<Mutex<SharedSignal>>,
+  tx: AppToEngineTx,
+  appRx: UnboundedReceiver<EngineToApp>,
+  waiter: Waiter,
+}
+
+impl Transferable for AppThreadArgs {}
+
+struct ShutdownGuard {
+  tx: AppToEngineTx,
+}
+
+impl Drop for ShutdownGuard {
+  fn drop(self: &mut Self) -> () {
+    drop self.tx.send(AppToEngine.Shutdown)
+  }
+}
+
+effect fn appThreadFailed(error: OutOfMemoryError | TreeError) -> i32 {
+  drop error
+  return 2
+}
+
+effect fn splitResponsiveBody() -> ()
+  ! AssertionError<'static> | TreeError | WindowError | OutOfMemoryError | SpawnError
+  ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut os = OsMonotonicClock.make()
+  let signal = run Arc<Mutex<SharedSignal>>.make(
+    run Mutex<SharedSignal>.make(SharedSignal { blocked: false, completed: false, clicks: 0 }),
+  )
+  let waiter = run Waiter.make()
+  let appWake = waiter.handle()
+  let toApp = run UnboundedChannel.make<EngineToApp>(move appWake)
+  let UnboundedPair<EngineToApp> { sender: appTx, receiver: appRx } = move toApp
+  let wakeSlot = run EngineWakeSlot.make()
+  let toEngine = run UnboundedChannel.make<AppToEngine>(WakeHandle.noop())
+  let UnboundedPair<AppToEngine> { sender: engineTx, receiver: engineRx } = move toEngine
+  let tx = AppToEngineTx.make(move engineTx, wakeSlot.clone())
+
+  let mut engine = run spawnTestEngineThread(
+    &fonts,
+    List<Mutation>.make(),
+    400.0,
+    300.0,
+    tx.clone(),
+    move engineRx,
+    move appTx,
+    move wakeSlot,
+  )
+
+  let sigClone = signal.clone()
+  let shutdownTx = tx.clone()
+  let appArgs = AppThreadArgs {
+    shared: move sigClone,
+    tx: move tx,
+    appRx: move appRx,
+    waiter: move waiter,
+  }
+  let appThread = run NativeThread.spawn(
+    || -> i32 {
+      let AppThreadArgs { shared: sArg, tx: txArg, appRx: rxArg, waiter: waiterArg } = move appArgs
+      let mut allocator = Allocator.systemAllocatorProvider()
+      let initial = BlockingApp {
+        clicks: 0,
+        text: String.make(),
+        shared: move sArg,
+      }
+      let mut runtime = Runtime<Hosted<BlockingApp>, SplitMsg, Run<SplitCmd>>.make(
+        Hosted<BlockingApp> { value: move initial },
+      )
+      let mut bridge = NoAppBridge {}
+      return run Effect.catchAll(
+        runSplitAppLoop<Hosted<BlockingApp>, SplitMsg, Run<SplitCmd>, NoAppBridge, OutOfMemoryError, never>(
+          &mut runtime,
+          &mut bridge,
+          move txArg,
+          move rxArg,
+          move waiterArg,
+          400.0,
+          300.0,
+          false,
+        ),
+        appThreadFailed,
+      )
+        |> Effect.provideMut<Allocator>(&mut allocator)
+    },
+  )
+  let _shutdown = ShutdownGuard { tx: move shutdownTx }
+
+  // Wait until initial App commit is applied by Engine (appliedSeq >= 1).
+  let pollWait = run Waiter.make()
+  let mut applied: u64 = 0
+  let mut waitTries: u32 = 0
+  while applied == 0 && waitTries < 200 {
+    if let Option.Some { value: snap } = run engine.snapshot() {
+      applied = snap.appliedSeq
+    }
+    if applied == 0 {
+      drop pollWait.waitTimeout(5000000)
+    }
+    waitTries = waitTries + 1
+  }
+  run Testing.expect(applied >= 1, "App initial commit reached headless Engine thread")
+
+  let searchId = run engine.findNode("Search")
+  run Testing.expect(searchId != 0, "Engine tree has Search input node")
+
+  // Focus Search and trigger Block click -> App starts blocking for 200ms inside SplitCmd.
+  drop run engine.clickNode("Block")
+
+  let mut isBlocked = false
+  waitTries = 0
+  while !isBlocked && waitTries < 200 {
+    let g = signal.get().lock()
+    isBlocked = g.get().blocked
+    drop g
+    if !isBlocked {
+      drop pollWait.waitTimeout(2000000)
+    }
+    waitTries = waitTries + 1
+  }
+  run Testing.expect(isBlocked, "App thread is blocked inside SplitCmd.execute")
+
+  // While App thread is STILL blocked for ~200ms, focus Search and type on Engine thread!
+  let t0 = run secondsNow(&mut os)
+  drop run engine.clickNode("Search")
+  drop engine.injectInput(Input.TextInput { text: run String.copy("live") })
+  let maybeSnap = run engine.snapshot()
+  let mut searchRev: u64 = 0
+  if let Option.Some { value: snap } = move maybeSnap {
+    if let Option.Some { value: rev } = snap.inputRevision(searchId) {
+      searchRev = rev
+    }
+  }
+  let typedText = match move run engine.nodeText(searchId) {
+    Option<String>.Some { value } => move value
+    Option<String>.None => String.make()
+  }
+  let elapsed = (run secondsNow(&mut os)) - t0
+  let gMid = signal.get().lock()
+  let finishedDuringTyping = gMid.get().completed
+  drop gMid
+
+  run Testing.expect(String.view(&typedText) == "live", "Engine thread updated EngineOwned input while App thread was blocked")
+  run Testing.expect(searchRev >= 1, "Engine incremented input revision before App unblocked")
+  run Testing.expect(!finishedDuringTyping && elapsed < 0.15, "Engine typed and snapshotted faster than blocked App finished")
+
+  // Wait for App block to finish and reconcile state through async round-trip.
+  waitTries = 0
+  let mut done = false
+  while !done && waitTries < 200 {
+    let g = signal.get().lock()
+    done = g.get().completed
+    drop g
+    if !done {
+      drop pollWait.waitTimeout(5000000)
+    }
+    waitTries = waitTries + 1
+  }
+  run Testing.expect(done, "App unblocked cleanly")
+
+  // Click Reset button so App emits a reconciliation write back to Engine.
+  let seqBeforeReset = match run engine.snapshot() {
+    Option.Some { value: s } => s.appliedSeq
+    Option.None => 0
+  }
+  drop run engine.clickNode("Reset")
+  let mut resetDone = false
+  waitTries = 0
+  while !resetDone && waitTries < 200 {
+    if let Option<String>.Some { value: cur } = move run engine.nodeText(searchId) {
+      if String.view(&cur) == "app-reset" {
+        resetDone = true
+      }
+    }
+    if !resetDone {
+      drop pollWait.waitTimeout(5000000)
+    }
+    waitTries = waitTries + 1
+  }
+  run Testing.expect(resetDone, "App message->update->commit->Engine SetValue round-trip reconciled text")
+  let seqAfterReset = match run engine.snapshot() {
+    Option.Some { value: s } => s.appliedSeq
+    Option.None => 0
+  }
+  run Testing.expect(seqAfterReset > seqBeforeReset, "appliedSeq advanced after Reset commit")
+
+  drop engine.stop()
+  let code = appThread.join()
+  run Testing.expect(code == 0, "Split App+Engine threads joined cleanly on shutdown")
+}
+
+test effect fn stage5SplitEngineResponsiveWhileAppBlocked() -> ()
+  ! AssertionError<'static> | TreeError | WindowError | OutOfMemoryError | SpawnError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run splitResponsiveBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+fn slowWork(n: i32, cancel: CancellationToken) -> i32 {
+  if cancel.isRequested() {
+    return -1
+  }
+  return n * 3
+}
+
+struct CancelWorkPayload {
+  started: Arc<Mutex<bool>>,
+  wake: WakeHandle,
+}
+
+impl Transferable for CancelWorkPayload {}
+
+fn cancellableWork(payload: CancelWorkPayload, cancel: CancellationToken) -> i32 {
+  let mut guard = payload.started.get().lock()
+  let flag = guard.getMut()
+  flag.* = true
+  drop guard
+  payload.wake.wake()
+  if let Result.Success { value: waiter } = move run Effect.result(Waiter.make()) {
+    let mut ticks: u32 = 0
+    while !cancel.isRequested() && ticks < 200 {
+      drop waiter.waitTimeout(2000000)
+      ticks = ticks + 1
+    }
+  }
+  return if cancel.isRequested() { -1 } else { 99 }
+}
+
+effect fn computeBody() -> ()
+  ! AssertionError<'static> | OutOfMemoryError | SpawnError
+  ? &mut Allocator {
+  let mut pools = run Pools.make()
+  let waiter = run Waiter.make()
+  let mut handle = run compute(
+    &pools.app.handle(),
+    1,
+    14,
+    slowWork,
+    waiter.handle(),
+  )
+  let mut got = Option<i32>.None
+  let mut tries: u32 = 0
+  while got.isNone() && tries < 100 {
+    got = handle.poll()
+    if got.isNone() {
+      drop waiter.waitTimeout(20000000)
+    }
+    tries = tries + 1
+  }
+  let okVal = match got {
+    Option.Some { value } => value == 42
+    Option.None => false
+  }
+  run Testing.expect(okVal && handle.isDone(), "compute runs on AppPool and wakes Waiter cleanly")
+
+  let started = run Arc<Mutex<bool>>.make(run Mutex<bool>.make(false))
+  let cancelPayload = CancelWorkPayload {
+    started: started.clone(),
+    wake: waiter.handle(),
+  }
+  let mut cancelled = run compute(&pools.app.handle(), 1, move cancelPayload, cancellableWork, waiter.handle())
+  let mut startSpins: u32 = 0
+  let mut hasStarted = false
+  while !hasStarted && startSpins < 100 {
+    let g = started.get().lock()
+    hasStarted = g.get().*
+    drop g
+    if !hasStarted {
+      drop waiter.waitTimeout(5000000)
+    }
+    startSpins = startSpins + 1
+  }
+  run Testing.expect(hasStarted, "cancellable compute started on AppPool")
+  cancelled.cancel()
+  let mut waitCancel: u32 = 0
+  while !cancelled.isDone() && waitCancel < 200 {
+    drop waiter.waitTimeout(5000000)
+    waitCancel = waitCancel + 1
+  }
+  run Testing.expect(cancelled.isDone() && cancelled.poll().isNone(), "cancelled compute does not deliver result")
+  pools.stop()
+}
+
+test effect fn stage5ComputeRunsOnAppPoolAndCancels() -> ()
+  ! AssertionError<'static> | OutOfMemoryError | SpawnError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run computeBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}

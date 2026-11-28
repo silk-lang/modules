@@ -1,0 +1,1215 @@
+//! Engine window group runner: owns `UiTree`, `HostPlatform`, `Loader`, `StyleAssets`,
+//! `Inspector`, and `EmbeddedDevtools` on its dedicated thread (`GroupKind.Engine`).
+import extension { EngineExtension }
+import protocol {
+  AppToEngine,
+  AppToEngineTx,
+  EngineReadyInfo,
+  EngineToApp,
+  EngineWakeSlot,
+  ShellCommand,
+  ShellEvent
+}
+import loom_inspect.lib { SilkUi, ID as SILK_UI }
+import ui_devtools.embedded { EmbeddedDevtools, Placement }
+import ui_inspect_server.lib { Inspector }
+import ui_protocol.input { Input }
+import ui_protocol.record { Event as TreeEvent }
+import ui_protocol.root { RootEvent }
+import ui_protocol.snapshot { FrameSnapshot }
+import ui_transport.channel {
+  TryRecvError,
+  UnboundedChannel,
+  UnboundedPair,
+  UnboundedReceiver,
+  UnboundedSender
+}
+import ui_transport.wake { Waiter, WakeHandle }
+import ui_tree.inspect { NodeInfo, findAll, info }
+import ui_tree.legacy { BUTTON_PRIMARY, FrameInput, Mutation, NONE, TreeError, UiTree }
+import ui_tree.style_assets { StyleAssets }
+import ui_tree_window.compositor_thread { GroupServices }
+import ui_tree_window.group_host as groupHost
+import ui_tree_window.host { RunOptions, WindowClient }
+import ui_tree_window.loader { Loader }
+import ui_tree_window.platform_thread { HostPlatform, Launched, Nudge, PlatformClient }
+import ui_tree_window.style_watch { SheetWatch }
+import atlas.atlas { AtlasError }
+import font_collection.lib { FontCollection }
+import vector.geometry_error { GeometryError }
+import webgpu.runtime { GpuError }
+import window.event { Event as WindowEvent }
+import window.types { Appearance, WindowError, WindowId, WindowOptions }
+import silk.collections.list { List }
+import silk.concurrency.thread { Transferable }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.ownership { Drop }
+import silk.core.result { Result }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.mem.pointer { Pointer }
+import silk.num.f32
+import silk.num.f64
+import silk.text.string { String }
+
+static if Intrinsic.targetArchitecture() != "wasm32" {
+  import silk.concurrency.thread_native { JoinHandle, NativeThread, SpawnError }
+}
+
+/// Static asset carried by a Loom program for relative URLs.
+pub struct CarriedFile {
+  pub path: string<'static>,
+  pub data: &'static [u8],
+}
+
+impl Transferable for CarriedFile {}
+
+/// Dummy state for `WindowClient<EngineState, ...>`; all state lives on `EngineClient`.
+pub struct EngineState {
+  marker: u8,
+}
+
+impl EngineState {
+  pub fn make() -> EngineState {
+    return EngineState { marker: 0 }
+  }
+}
+
+/// Window client running on the Engine thread (`GroupKind.Engine`).
+pub struct EngineClient<Ext> {
+  extension: Ext,
+  loader: Loader,
+  stylesheets: StyleAssets,
+  stylesheetUpdates: SheetWatch,
+  silkUi: SilkUi,
+  engineRx: UnboundedReceiver<AppToEngine>,
+  appTx: UnboundedSender<EngineToApp>,
+  wakeSlot: EngineWakeSlot,
+  pendingShell: List<ShellCommand>,
+  groupId: u32,
+  appliedSeq: u64,
+  appWantsFrames: bool,
+  appNeedsFrame: bool,
+  interceptClose: bool,
+  quitting: bool,
+  inspectorEnabled: bool,
+  check: bool,
+  initialWidth: f64,
+  initialHeight: f64,
+  initialDark: bool,
+  servicesPlatform: Option<PlatformClient>,
+  fallbackLaunched: bool,
+}
+
+impl<Ext: EngineExtension> EngineClient<Ext> {
+  pub fn make(
+    extension: Ext,
+    stylesheets: StyleAssets,
+    updates: SheetWatch,
+    engineRx: UnboundedReceiver<AppToEngine>,
+    appTx: UnboundedSender<EngineToApp>,
+    wakeSlot: EngineWakeSlot,
+    check: bool,
+    width: f64,
+    height: f64,
+    dark: bool,
+  ) -> EngineClient<Ext> {
+    return EngineClient<Ext> {
+      extension: move extension,
+      loader: Loader.make(),
+      stylesheets: move stylesheets,
+      stylesheetUpdates: move updates,
+      silkUi: SilkUi.make(),
+      engineRx: move engineRx,
+      appTx: move appTx,
+      wakeSlot: move wakeSlot,
+      pendingShell: List<ShellCommand>.make(),
+      groupId: 1,
+      appliedSeq: 0,
+      appWantsFrames: false,
+      appNeedsFrame: false,
+      interceptClose: false,
+      quitting: false,
+      inspectorEnabled: false,
+      check: check,
+      initialWidth: width,
+      initialHeight: height,
+      initialDark: dark,
+      servicesPlatform: Option<PlatformClient>.None,
+      fallbackLaunched: false,
+    }
+  }
+
+  fn emit(self: &Self, msg: EngineToApp) -> () {
+    drop run Effect.result(self.appTx.send(move msg))
+  }
+
+  effect fn applyOneAppMessage(
+    self: &mut Self,
+    tree: &mut UiTree<'_>,
+    msg: AppToEngine,
+  ) -> bool
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    return match move msg {
+      AppToEngine.Commit { seq, needsFrame, wantsFrames, interceptClose, mutations } => {
+        self.appliedSeq = seq
+        self.appNeedsFrame = needsFrame
+        self.appWantsFrames = wantsFrames
+        self.interceptClose = interceptClose
+        let mut applied = false
+        if mutations.length() != 0 {
+          run tree.apply(move mutations)
+          applied = true
+        }
+        applied || needsFrame
+      }
+      AppToEngine.Shell { command } => {
+        if let ShellCommand.Quit = &command {
+          self.quitting = true
+          return false
+        }
+        run self.pendingShell.append(move command)
+        false
+      }
+      AppToEngine.Inspect { report } => {
+        run self.silkUi.applyReport(move report)
+        false
+      }
+      AppToEngine.Shutdown => {
+        self.quitting = true
+        false
+      }
+    }
+  }
+
+  /// Drains queued App messages, returning whether tree mutations/redraw came in.
+  effect fn drainApp(self: &mut Self, tree: &mut UiTree<'_>) -> bool
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    let mut changed = false
+    while true {
+      match self.engineRx.tryRecv() {
+        Result.Success { value: msg } => {
+          if run self.applyOneAppMessage(&mut tree, move msg) {
+            changed = true
+          }
+        }
+        Result.Failure { error } => match error {
+          TryRecvError.Empty => { break }
+          TryRecvError.Closed => {
+            self.quitting = true
+            break
+          }
+        }
+      }
+    }
+    if changed {
+      drop run self.loader.serve(&mut tree)
+    }
+    return changed
+  }
+
+  /// Sends queued tree/root events + current snapshot to the App thread if any occurred.
+  effect fn flushEvents(self: &mut Self, tree: &mut UiTree<'_>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut events = List<TreeEvent>.make()
+    run tree.takeEvents(&mut events)
+    let mut rootEvents = List<RootEvent>.make()
+    run tree.takeRootEvents(&mut rootEvents)
+    if events.length() == 0 && rootEvents.length() == 0 {
+      return ()
+    }
+    let snapshot = run tree.collectSnapshot(self.groupId, self.appliedSeq)
+    self.emit(
+      EngineToApp.Events {
+        events: move events,
+        rootEvents: move rootEvents,
+        snapshot: move snapshot,
+      },
+    )
+  }
+
+  /// Check-mode only: waits up to ~5s for App commit sequence `targetSeq` so scripted checks see
+  /// rendered mutations deterministically before capture. Never used in normal mode.
+  effect fn waitCheckCommit(self: &mut Self, tree: &mut UiTree<'_>, targetSeq: u64) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    static if Intrinsic.targetArchitecture() != "wasm32" {
+      let wait = run Waiter.make()
+      let mut spins: u32 = 0
+      while self.appliedSeq < targetSeq && !self.quitting && spins < 5000 {
+        drop run self.drainApp(&mut tree)
+        if self.appliedSeq >= targetSeq || self.quitting {
+          break
+        }
+        drop wait.waitTimeout(1000000)
+        spins = spins + 1
+      }
+    } else {
+      drop tree
+      drop targetSeq
+    }
+  }
+}
+
+impl<Ext: EngineExtension> WindowClient<EngineState, never, never> for EngineClient<Ext> {
+  effect fn setup(self: &mut Self, state: &mut EngineState, tree: &mut UiTree<'_>) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    drop state
+    drop tree
+    run EngineExtension.files(&mut self.extension, &mut self.loader)
+  }
+
+  effect fn attachServices(self: &mut Self, state: &mut EngineState, services: GroupServices) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    drop state
+    self.groupId = services.groupId
+    self.wakeSlot.attach(services.wake.clone())
+    self.loader.attachPool(services.pools.io.clone(), services.groupId, services.wake.clone())
+    self.emit(
+      EngineToApp.Services {
+        groupId: services.groupId,
+        pools: move services.pools,
+        platform: move services.platform,
+      },
+    )
+  }
+
+  fn configure(self: &Self, state: &EngineState, options: &mut WindowOptions<'_>) -> () {
+    drop state
+    EngineExtension.configure(&self.extension, &mut options)
+  }
+
+  effect fn opened(
+    self: &mut Self,
+    state: &mut EngineState,
+    platform: &mut HostPlatform,
+    window: WindowId,
+  ) -> ()
+    ! WindowError | OutOfMemoryError
+    ? &mut Allocator {
+    drop state
+    self.wakeSlot.attach(platform.nudge())
+    run EngineExtension.opened(&mut self.extension, &mut platform, window, &self.appTx)
+  }
+
+  effect fn event(
+    self: &mut Self,
+    state: &mut EngineState,
+    tree: &mut UiTree<'_>,
+    event: &WindowEvent,
+  ) -> bool
+    ! WindowError | TreeError | AtlasError | GeometryError | OutOfMemoryError
+    ? &mut Allocator {
+    drop state
+    return run EngineExtension.event(&mut self.extension, &mut tree, event, &self.appTx)
+  }
+
+  effect fn update(
+    self: &mut Self,
+    state: &mut EngineState,
+    tree: &mut UiTree<'_>,
+    platform: &mut HostPlatform,
+    window: WindowId,
+  ) -> bool
+    ! WindowError | TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    drop state
+    let mut changed = false
+    while self.pendingShell.length() != 0 {
+      let cmd = self.pendingShell.remove(0)
+      if run EngineExtension.onShellCommand(&mut self.extension, move cmd, &mut platform, window, &self.appTx) {
+        changed = true
+      }
+    }
+    if run EngineExtension.update(&mut self.extension, &mut tree, &mut platform, window, &self.appTx) {
+      changed = true
+    }
+    return changed
+  }
+
+  effect fn closing(self: &mut Self, state: &mut EngineState) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    drop state
+    if self.quitting || !self.interceptClose {
+      return true
+    }
+    self.emit(EngineToApp.Shell { event: ShellEvent.CloseRequested })
+    return false
+  }
+
+  fn quitting(self: &Self, state: &EngineState) -> bool {
+    drop state
+    return self.quitting
+  }
+
+  fn needsFrame(self: &Self, state: &EngineState, tree: &UiTree<'_>) -> bool {
+    drop state
+    return tree.needsFrame() || self.appNeedsFrame
+  }
+
+  fn profile(self: &Self, state: &EngineState) -> bool {
+    drop state
+    return EngineExtension.profile(&self.extension)
+  }
+
+  effect fn poll(
+    self: &mut Self,
+    state: &mut EngineState,
+    tree: &mut UiTree<'_>,
+    time: f64,
+  ) -> bool
+    ! WindowError | TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    drop state
+    let appChanged = run self.drainApp(&mut tree)
+    let styled = run self.stylesheetUpdates.poll(&mut self.stylesheets, &mut tree, time)
+    run self.loader.watch(time)
+    let loaded = run self.loader.serve(&mut tree)
+    if loaded {
+      run self.flushEvents(&mut tree)
+    }
+    let extPolled = run EngineExtension.poll(&mut self.extension, &mut tree, time, &self.appTx)
+    return appChanged || styled || loaded || extPolled
+  }
+
+  fn wakeAfter(self: &Self, state: &EngineState) -> Option<f64> {
+    drop state
+    return self.loader.watchAfter(
+      self.stylesheetUpdates.wakeAfter(EngineExtension.wakeAfter(&self.extension)),
+    )
+  }
+
+  effect fn report(self: &mut Self, state: &mut EngineState, inspector: &mut Inspector) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    drop state
+    if !self.inspectorEnabled && inspector.enabled() {
+      self.inspectorEnabled = true
+      self.emit(EngineToApp.InspectorState { enabled: true })
+    }
+    run inspector.serveExtension(SILK_UI, &mut self.silkUi)
+    if let Option.Some { value: restore } = move run self.silkUi.takeWantedJson() {
+      self.emit(EngineToApp.RestoreModel { json: move restore.json, label: move restore.label })
+    }
+  }
+
+  effect fn start(self: &mut Self, state: &mut EngineState, tree: &mut UiTree<'_>) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    drop state
+    let snapshot = run tree.collectSnapshot(self.groupId, self.appliedSeq)
+    self.emit(
+      EngineToApp.Ready {
+        info: EngineReadyInfo {
+          width: self.initialWidth,
+          height: self.initialHeight,
+          dark: self.initialDark,
+          inspectorEnabled: self.inspectorEnabled,
+          groupId: self.groupId,
+        },
+        snapshot: move snapshot,
+      },
+    )
+    if self.check {
+      run self.waitCheckCommit(&mut tree, 1)
+    }
+  }
+
+  effect fn pump(self: &mut Self, state: &mut EngineState, tree: &mut UiTree<'_>) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    drop state
+    run self.flushEvents(&mut tree)
+  }
+
+  effect fn decide(self: &mut Self, state: &mut EngineState, tree: &mut UiTree<'_>) -> bool
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    drop state
+    drop tree
+    return false
+  }
+
+  effect fn tick(
+    self: &mut Self,
+    state: &mut EngineState,
+    tree: &mut UiTree<'_>,
+    time: f64,
+    animation: bool,
+  ) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    drop state
+    if animation && self.appWantsFrames {
+      self.emit(EngineToApp.Tick { time: time, animation: true })
+    } else if !animation {
+      drop run self.drainApp(&mut tree)
+    }
+  }
+
+  effect fn resize(
+    self: &mut Self,
+    state: &mut EngineState,
+    tree: &mut UiTree<'_>,
+    width: f32,
+    height: f32,
+  ) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    drop state
+    drop tree
+    self.emit(EngineToApp.Resize { width: width, height: height })
+    self.emit(
+      EngineToApp.Shell {
+        event: ShellEvent.Resized { width: f32.toF64(width), height: f32.toF64(height) },
+      },
+    )
+  }
+
+  effect fn layout(self: &mut Self, state: &mut EngineState, tree: &mut UiTree<'_>, input: FrameInput) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    drop state
+    drop run self.drainApp(&mut tree)
+    let root = tree.current
+    drop run self.stylesheets.serve(&mut tree, root)
+    run tree.frame(input)
+    if run self.loader.serve(&mut tree) {
+      run self.flushEvents(&mut tree)
+    }
+    drop run EngineExtension.afterLayout(&mut self.extension, &mut tree, &self.appTx)
+    self.appNeedsFrame = false
+    let snapshot = run tree.collectSnapshot(self.groupId, self.appliedSeq)
+    self.emit(EngineToApp.Snapshot { snapshot: move snapshot })
+  }
+
+  effect fn layoutRoot(
+    self: &mut Self,
+    state: &mut EngineState,
+    tree: &mut UiTree<'_>,
+    root: u32,
+    input: FrameInput,
+  ) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    drop state
+    drop run self.drainApp(&mut tree)
+    drop run self.stylesheets.serve(&mut tree, root)
+    run tree.frameRoot(root, input)
+    if run self.loader.serve(&mut tree) {
+      run self.flushEvents(&mut tree)
+    }
+    let snapshot = run tree.collectSnapshot(self.groupId, self.appliedSeq)
+    self.emit(EngineToApp.Snapshot { snapshot: move snapshot })
+  }
+
+  fn wantsFrames(self: &Self, state: &EngineState) -> bool {
+    drop state
+    return self.appWantsFrames
+  }
+
+  effect fn checkInput(
+    self: &mut Self,
+    state: &mut EngineState,
+    tree: &mut UiTree<'_>,
+    input: FrameInput,
+    name: string,
+  ) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    run self.layout(&mut state, &mut tree, input)
+    let mut found = List<u32>.make()
+    run findAll(&tree, name, &mut found)
+    if found.length() > 0 {
+      if let Option<NodeInfo>.Some { value } = run info(&tree, found.get(0)) {
+        let x = (value.bounds.xMin + value.bounds.xMax) * 0.5
+        let y = (value.bounds.yMin + value.bounds.yMax) * 0.5
+        let target0 = self.appliedSeq + 1
+        run tree.dispatch(Input.PointerMove { x: x, y: y, modifiers: 0 })
+        run self.flushEvents(&mut tree)
+        run self.waitCheckCommit(&mut tree, target0)
+        run self.layout(&mut state, &mut tree, input)
+
+        let target1 = self.appliedSeq + 1
+        run tree.dispatch(
+          Input.PointerDown { x: x, y: y, button: BUTTON_PRIMARY, modifiers: 0, clickCount: 1 },
+        )
+        run self.flushEvents(&mut tree)
+        run self.waitCheckCommit(&mut tree, target1)
+        run self.layout(&mut state, &mut tree, input)
+
+        let target2 = self.appliedSeq + 1
+        run tree.dispatch(
+          Input.PointerUp { x: x, y: y, button: BUTTON_PRIMARY, modifiers: 0 },
+        )
+        run self.flushEvents(&mut tree)
+        run self.waitCheckCommit(&mut tree, target2)
+      }
+    }
+    run self.layout(&mut state, &mut tree, input)
+    let keyTarget0 = self.appliedSeq + 1
+    run tree.dispatch(
+      Input.KeyDown {
+        key: run String.copy("Tab"),
+        code: run String.copy("Tab"),
+        modifiers: 0,
+        repeat: false,
+      },
+    )
+    run self.flushEvents(&mut tree)
+    run self.waitCheckCommit(&mut tree, keyTarget0)
+
+    let keyTarget1 = self.appliedSeq + 1
+    run tree.dispatch(
+      Input.KeyUp {
+        key: run String.copy("Tab"),
+        code: run String.copy("Tab"),
+        modifiers: 0,
+      },
+    )
+    run self.flushEvents(&mut tree)
+    run self.waitCheckCommit(&mut tree, keyTarget1)
+  }
+}
+
+static if Intrinsic.targetArchitecture() != "wasm32" {
+  import ui_tree_window.console { StderrWriter }
+
+  struct BorrowedFonts {
+    ptr: *const FontCollection,
+  }
+
+  impl Transferable for BorrowedFonts {}
+
+  struct EngineLaunchArgs<Ext> {
+    fonts: BorrowedFonts,
+    resources: List<Mutation>,
+    options: RunOptions,
+    inspector: Inspector,
+    stylesheets: StyleAssets,
+    updates: SheetWatch,
+    extension: Ext,
+    engineRx: UnboundedReceiver<AppToEngine>,
+    appTx: UnboundedSender<EngineToApp>,
+    wakeSlot: EngineWakeSlot,
+  }
+
+  impl<Ext: Transferable> Transferable for EngineLaunchArgs<Ext> {}
+
+  /// RAII owner of the spawned Engine OS thread; always signals shutdown and joins before exit
+  /// so borrowed `&FontCollection` outlives the Engine thread cleanly.
+  pub struct EngineThreadGuard {
+    handle: Option<JoinHandle<i32>>,
+    tx: AppToEngineTx,
+  }
+
+  impl EngineThreadGuard {
+    /// Stops the Engine thread (if still running) and returns its exit code.
+    pub fn finish(self: &mut Self) -> i32 {
+      drop self.tx.send(AppToEngine.Shutdown)
+      return match move Intrinsic.replace(self.handle, Option<JoinHandle<i32>>.None) {
+        Option<JoinHandle<i32>>.Some { value } => value.join()
+        Option<JoinHandle<i32>>.None => 0
+      }
+    }
+  }
+
+  impl Drop for EngineThreadGuard {
+    fn drop(self: &mut Self) -> () {
+      drop self.finish()
+    }
+  }
+
+  effect fn engineWindowFailed(error: WindowError) -> i32 {
+    drop error
+    StderrWriter.print("silk-ui: could not open a window (no display server?)\n", &())
+    return 2
+  }
+
+  effect fn engineGpuFailed(error: GpuError) -> i32 {
+    StderrWriter.print("silk-ui: GPU error {}\n", &.(error.code))
+    return 2
+  }
+
+  effect fn engineFailed<E>(error: E) -> i32 {
+    drop error
+    StderrWriter.print("silk-ui: engine failed (tree, atlas, geometry or allocation)\n", &())
+    return 2
+  }
+
+  effect fn ignoreRegistrationError<E>(error: E) -> () {
+    drop error
+  }
+
+  effect fn defaultDevtools<E>(error: E) -> EmbeddedDevtools {
+    drop error
+    return EmbeddedDevtools.make(false, false, Option<Placement>.None)
+  }
+
+  effect fn registerExtension(inspector: &mut Inspector) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run inspector.extend(run SilkUi.extension())
+  }
+
+  fn runEngineBody<Ext: EngineExtension>(args: EngineLaunchArgs<Ext>) -> i32 {
+    let EngineLaunchArgs<Ext> {
+      fonts,
+      resources,
+      options,
+      inspector,
+      stylesheets,
+      updates,
+      extension,
+      engineRx,
+      appTx,
+      wakeSlot,
+    } = move args
+    let mut allocator = Allocator.systemAllocatorProvider()
+    let initialDark = match &options.platform {
+      Option<Launched>.Some { value: launched } => launched.appearance() == Appearance.Dark
+      Option<Launched>.None => false
+    }
+    let check = options.check
+    let width = options.width
+    let height = options.height
+    let closeTx = appTx.clone()
+    let closeSlot = wakeSlot.clone()
+    let mut client = EngineClient<Ext>.make(
+      move extension,
+      move stylesheets,
+      move updates,
+      move engineRx,
+      move appTx,
+      move wakeSlot,
+      check,
+      width,
+      height,
+      initialDark,
+    )
+    let mut inspector = move inspector
+    run Effect.catchAll(registerExtension(&mut inspector), ignoreRegistrationError)
+      |> Effect.provideMut<Allocator>(&mut allocator)
+    let mut state = EngineState.make()
+    let anchor = ()
+    let collection = unsafe Pointer.borrow(&anchor, fonts.ptr)
+    let mut devtools = run Effect.catchAll(
+      EmbeddedDevtools.fromEnvironment(),
+      defaultDevtools,
+    )
+      |> Effect.provideMut<Allocator>(&mut allocator)
+    let code = run Effect.catchAll(
+      Effect.catch<GpuError>(
+        Effect.catch<WindowError>(
+          groupHost.runEngineWindowWith<EngineClient<Ext>, EmbeddedDevtools, EngineState, never, never>(
+            &mut state,
+            collection,
+            move resources,
+            move options,
+            move inspector,
+            &mut client,
+            &mut devtools,
+          ),
+          engineWindowFailed,
+        ),
+        engineGpuFailed,
+      ),
+      engineFailed,
+    )
+      |> Effect.provideMut<Allocator>(&mut allocator)
+    closeSlot.close()
+    drop run Effect.result(closeTx.send(EngineToApp.Closed { exitCode: code }))
+    return code
+  }
+
+  /// Spawns the dedicated Engine thread running `runEngineWindowWith`.
+  pub effect fn spawnEngineThread<Ext: 'static + Transferable + EngineExtension>(
+    collection: &FontCollection,
+    resources: List<Mutation>,
+    options: RunOptions,
+    inspector: Inspector,
+    stylesheets: StyleAssets,
+    updates: SheetWatch,
+    extension: Ext,
+    engineRx: UnboundedReceiver<AppToEngine>,
+    appTx: UnboundedSender<EngineToApp>,
+    wakeSlot: EngineWakeSlot,
+    appToEngineTx: AppToEngineTx,
+  ) -> EngineThreadGuard
+    ! WindowError | OutOfMemoryError {
+    let mut heap = Allocator.systemAllocatorProvider()
+    let args = EngineLaunchArgs<Ext> {
+      fonts: BorrowedFonts { ptr: Pointer.fromRef<FontCollection>(collection) },
+      resources: move resources,
+      options: move options,
+      inspector: move inspector,
+      stylesheets: move stylesheets,
+      updates: move updates,
+      extension: move extension,
+      engineRx: move engineRx,
+      appTx: move appTx,
+      wakeSlot: move wakeSlot,
+    }
+    let spawned = run Effect.result(
+      NativeThread.spawn(|| -> i32 { return runEngineBody<Ext>(move args) }),
+    )
+      |> Effect.provideMut<Allocator>(&mut heap)
+    let handle = match move spawned {
+      Result<JoinHandle<i32>, SpawnError | OutOfMemoryError>.Success { value } => move value
+      Result<JoinHandle<i32>, SpawnError | OutOfMemoryError>.Failure { error } => match move error {
+        SpawnError err => {
+          drop err
+          fail WindowError.CreationFailed
+        }
+        OutOfMemoryError oom => { fail move oom }
+      }
+    }
+    return EngineThreadGuard { handle: Option<JoinHandle<i32>>.some(move handle), tx: move appToEngineTx }
+  }
+
+  /// Synthetic command sent to the headless test Engine thread in [`spawnTestEngineThread`].
+  pub union TestEngineCmd {
+    InjectInput { pub input: Input },
+    ClickNode { pub name: String },
+    FindNode { pub name: String, pub tx: UnboundedSender<u32> },
+    ReadSnapshot { pub tx: UnboundedSender<FrameSnapshot> },
+    ReadNodeText { pub id: u32, pub tx: UnboundedSender<String> },
+    LayoutNow,
+    Stop,
+  }
+
+  impl Transferable for TestEngineCmd {}
+
+  struct TestEngineLaunch {
+    fonts: BorrowedFonts,
+    resources: List<Mutation>,
+    width: f32,
+    height: f32,
+    engineRx: UnboundedReceiver<AppToEngine>,
+    appTx: UnboundedSender<EngineToApp>,
+    cmdRx: UnboundedReceiver<TestEngineCmd>,
+    waiter: Waiter,
+  }
+
+  impl Transferable for TestEngineLaunch {}
+
+  /// Handle owning the headless test Engine thread for multi-thread integration tests.
+  pub struct TestEngineHandle {
+    handle: Option<JoinHandle<i32>>,
+    cmdTx: UnboundedSender<TestEngineCmd>,
+    appTx: AppToEngineTx,
+    wakeHandle: WakeHandle,
+  }
+
+  impl TestEngineHandle {
+    /// Sends synthetic `Input` directly into the Engine thread (`UiTree.dispatch`), waking it
+    /// immediately even if the App thread is blocked.
+    pub fn injectInput(self: &Self, input: Input) -> bool {
+      let ok = match move run Effect.result(self.cmdTx.send(TestEngineCmd.InjectInput { input: move input })) {
+        Result.Success { .. } => true
+        Result.Failure { error } => {
+          drop error
+          false
+        }
+      }
+      if ok {
+        self.wakeHandle.wake()
+      }
+      return ok
+    }
+
+    pub fn requestLayout(self: &Self) -> bool {
+      let ok = match move run Effect.result(self.cmdTx.send(TestEngineCmd.LayoutNow)) {
+        Result.Success { .. } => true
+        Result.Failure { error } => {
+          drop error
+          false
+        }
+      }
+      if ok {
+        self.wakeHandle.wake()
+      }
+      return ok
+    }
+
+    /// Dispatches a pointer click (Move -> Down -> Up) onto the named node on the Engine thread.
+    pub effect fn clickNode(self: &Self, name: string) -> bool
+      ! OutOfMemoryError {
+      let mut heap = Allocator.systemAllocatorProvider()
+      let copy = run String.copy(name) |> Effect.provideMut<Allocator>(&mut heap)
+      let ok = match move run Effect.result(self.cmdTx.send(TestEngineCmd.ClickNode { name: move copy })) {
+        Result.Success { .. } => true
+        Result.Failure { error } => {
+          drop error
+          false
+        }
+      }
+      if ok {
+        self.wakeHandle.wake()
+      }
+      return ok
+    }
+
+    /// Finds the id of the first node whose testId, label, or text matches `name`.
+    pub effect fn findNode(self: &Self, name: string) -> u32
+      ! OutOfMemoryError {
+      let mut heap = Allocator.systemAllocatorProvider()
+      let replyWaiter = run Waiter.make()
+      let pair = run UnboundedChannel.make<u32>(replyWaiter.handle())
+      let UnboundedPair<u32> { sender, receiver } = move pair
+      let mut rx = move receiver
+      let copy = run String.copy(name) |> Effect.provideMut<Allocator>(&mut heap)
+      match move run Effect.result(self.cmdTx.send(TestEngineCmd.FindNode { name: move copy, tx: move sender })) {
+        Result.Success { .. } => {}
+        Result.Failure { error } => {
+          drop error
+          return 0
+        }
+      }
+      self.wakeHandle.wake()
+      let mut spins: u32 = 0
+      while spins < 200 {
+        match rx.tryRecv() {
+          Result.Success { value } => { return value }
+          Result.Failure { error } => match error {
+            TryRecvError.Empty => {}
+            TryRecvError.Closed => { return 0 }
+          }
+        }
+        drop replyWaiter.waitTimeout(10000000)
+        spins = spins + 1
+      }
+      return 0
+    }
+
+    /// Queries the current immutable `FrameSnapshot` directly from the Engine thread.
+    pub effect fn snapshot(self: &Self) -> Option<FrameSnapshot>
+      ! OutOfMemoryError {
+      let replyWaiter = run Waiter.make()
+      let pair = run UnboundedChannel.make<FrameSnapshot>(replyWaiter.handle())
+      let UnboundedPair<FrameSnapshot> { sender, receiver } = move pair
+      let mut rx = move receiver
+      match move run Effect.result(self.cmdTx.send(TestEngineCmd.ReadSnapshot { tx: move sender })) {
+        Result.Success { .. } => {}
+        Result.Failure { error } => {
+          drop error
+          return Option<FrameSnapshot>.None
+        }
+      }
+      self.wakeHandle.wake()
+      let mut spins: u32 = 0
+      while spins < 200 {
+        match rx.tryRecv() {
+          Result.Success { value } => { return Option<FrameSnapshot>.some(move value) }
+          Result.Failure { error } => match error {
+            TryRecvError.Empty => {}
+            TryRecvError.Closed => { return Option<FrameSnapshot>.None }
+          }
+        }
+        drop replyWaiter.waitTimeout(10000000)
+        spins = spins + 1
+      }
+      return Option<FrameSnapshot>.None
+    }
+
+    /// Reads the current text value of node `id` directly from the Engine thread.
+    pub effect fn nodeText(self: &Self, id: u32) -> Option<String>
+      ! OutOfMemoryError {
+      let replyWaiter = run Waiter.make()
+      let pair = run UnboundedChannel.make<String>(replyWaiter.handle())
+      let UnboundedPair<String> { sender, receiver } = move pair
+      let mut rx = move receiver
+      match move run Effect.result(self.cmdTx.send(TestEngineCmd.ReadNodeText { id: id, tx: move sender })) {
+        Result.Success { .. } => {}
+        Result.Failure { error } => {
+          drop error
+          return Option<String>.None
+        }
+      }
+      self.wakeHandle.wake()
+      let mut spins: u32 = 0
+      while spins < 200 {
+        match rx.tryRecv() {
+          Result.Success { value } => { return Option<String>.some(move value) }
+          Result.Failure { error } => match error {
+            TryRecvError.Empty => {}
+            TryRecvError.Closed => { return Option<String>.None }
+          }
+        }
+        drop replyWaiter.waitTimeout(10000000)
+        spins = spins + 1
+      }
+      return Option<String>.None
+    }
+
+    pub fn stop(self: &mut Self) -> i32 {
+      drop run Effect.result(self.cmdTx.send(TestEngineCmd.Stop))
+      drop self.appTx.send(AppToEngine.Shutdown)
+      self.wakeHandle.wake()
+      return match move Intrinsic.replace(self.handle, Option<JoinHandle<i32>>.None) {
+        Option<JoinHandle<i32>>.Some { value } => value.join()
+        Option<JoinHandle<i32>>.None => 0
+      }
+    }
+  }
+
+  impl Drop for TestEngineHandle {
+    fn drop(self: &mut Self) -> () {
+      drop self.stop()
+    }
+  }
+
+  effect fn runHeadlessEngine(args: TestEngineLaunch) -> i32
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    let TestEngineLaunch { fonts, resources, width, height, engineRx: rawEngineRx, appTx, cmdRx: rawCmdRx, waiter } = move args
+    let mut engineRx = move rawEngineRx
+    let mut cmdRx = move rawCmdRx
+    let anchor = ()
+    let collection = unsafe Pointer.borrow(&anchor, fonts.ptr)
+    let mut tree = run UiTree.make(collection)
+    if resources.length() != 0 {
+      run tree.apply(move resources)
+    }
+    let mut appliedSeq: u64 = 0
+    let mut stopped = false
+    let viewport = FrameInput { width: width, height: height, scale: 1.0, time: 0.0 }
+    run tree.frame(viewport)
+    let initSnap = run tree.collectSnapshot(1, appliedSeq)
+    drop run Effect.result(
+      appTx.send(
+        EngineToApp.Ready {
+          info: EngineReadyInfo {
+            width: f32.toF64(width),
+            height: f32.toF64(height),
+            dark: false,
+            inspectorEnabled: false,
+            groupId: 1,
+          },
+          snapshot: move initSnap,
+        },
+      ),
+    )
+
+    while !stopped {
+      let mut dirty = false
+      while true {
+        match cmdRx.tryRecv() {
+          Result.Success { value: cmd } => match move cmd {
+            TestEngineCmd.InjectInput { input } => {
+              run tree.dispatch(move input)
+              let mut evs = List<TreeEvent>.make()
+              run tree.takeEvents(&mut evs)
+              let mut roots = List<RootEvent>.make()
+              run tree.takeRootEvents(&mut roots)
+              run tree.frame(viewport)
+              let snap = run tree.collectSnapshot(1, appliedSeq)
+              if evs.length() != 0 || roots.length() != 0 {
+                drop run Effect.result(
+                  appTx.send(
+                    EngineToApp.Events {
+                      events: move evs,
+                      rootEvents: move roots,
+                      snapshot: move snap,
+                    },
+                  ),
+                )
+              } else {
+                drop run Effect.result(appTx.send(EngineToApp.Snapshot { snapshot: move snap }))
+              }
+            }
+            TestEngineCmd.ClickNode { name } => {
+              run tree.frame(viewport)
+              let mut found = List<u32>.make()
+              run findAll(&tree, String.view(&name), &mut found)
+              if found.length() > 0 {
+                if let Option<NodeInfo>.Some { value } = run info(&tree, found.get(0)) {
+                  let x = (value.bounds.xMin + value.bounds.xMax) * 0.5
+                  let y = (value.bounds.yMin + value.bounds.yMax) * 0.5
+                  run tree.dispatch(Input.PointerMove { x: x, y: y, modifiers: 0 })
+                  run tree.dispatch(Input.PointerDown { x: x, y: y, button: BUTTON_PRIMARY, modifiers: 0, clickCount: 1 })
+                  run tree.dispatch(Input.PointerUp { x: x, y: y, button: BUTTON_PRIMARY, modifiers: 0 })
+                }
+              }
+              let mut evs = List<TreeEvent>.make()
+              run tree.takeEvents(&mut evs)
+              let mut roots = List<RootEvent>.make()
+              run tree.takeRootEvents(&mut roots)
+              run tree.frame(viewport)
+              let snap = run tree.collectSnapshot(1, appliedSeq)
+              if evs.length() != 0 || roots.length() != 0 {
+                drop run Effect.result(
+                  appTx.send(
+                    EngineToApp.Events {
+                      events: move evs,
+                      rootEvents: move roots,
+                      snapshot: move snap,
+                    },
+                  ),
+                )
+              } else {
+                drop run Effect.result(appTx.send(EngineToApp.Snapshot { snapshot: move snap }))
+              }
+            }
+            TestEngineCmd.FindNode { name, tx } => {
+              run tree.frame(viewport)
+              let mut found = List<u32>.make()
+              run findAll(&tree, String.view(&name), &mut found)
+              let id = if found.length() > 0 { found.get(0) } else { 0 }
+              drop run Effect.result(tx.send(id))
+            }
+            TestEngineCmd.ReadSnapshot { tx } => {
+              let snap = run tree.collectSnapshot(1, appliedSeq)
+              drop run Effect.result(tx.send(move snap))
+            }
+            TestEngineCmd.ReadNodeText { id, tx } => {
+              let slot = tree.slotOf(id)
+              let text = if slot != NONE {
+                run String.copy(String.view(&tree.node(slot).text))
+              } else {
+                String.make()
+              }
+              drop run Effect.result(tx.send(move text))
+            }
+            TestEngineCmd.LayoutNow => {
+              dirty = true
+            }
+            TestEngineCmd.Stop => {
+              stopped = true
+              break
+            }
+          }
+          Result.Failure { error } => match error {
+            TryRecvError.Empty => { break }
+            TryRecvError.Closed => {
+              stopped = true
+              break
+            }
+          }
+        }
+      }
+      if stopped {
+        break
+      }
+      while true {
+        match engineRx.tryRecv() {
+          Result.Success { value: msg } => match move msg {
+            AppToEngine.Commit { seq, mutations, .. } => {
+              appliedSeq = seq
+              if mutations.length() != 0 {
+                run tree.apply(move mutations)
+              }
+              dirty = true
+            }
+            AppToEngine.Shell { command } => {
+              if let ShellCommand.Quit = &command {
+                stopped = true
+              }
+            }
+            AppToEngine.Inspect { report } => { drop report }
+            AppToEngine.Shutdown => {
+              stopped = true
+            }
+          }
+          Result.Failure { error } => match error {
+            TryRecvError.Empty => { break }
+            TryRecvError.Closed => {
+              stopped = true
+              break
+            }
+          }
+        }
+      }
+      if stopped {
+        break
+      }
+      if dirty {
+        run tree.frame(viewport)
+        let mut evs = List<TreeEvent>.make()
+        run tree.takeEvents(&mut evs)
+        let mut roots = List<RootEvent>.make()
+        run tree.takeRootEvents(&mut roots)
+        let snap = run tree.collectSnapshot(1, appliedSeq)
+        if evs.length() != 0 || roots.length() != 0 {
+          drop run Effect.result(
+            appTx.send(
+              EngineToApp.Events {
+                events: move evs,
+                rootEvents: move roots,
+                snapshot: move snap,
+              },
+            ),
+          )
+        } else {
+          drop run Effect.result(appTx.send(EngineToApp.Snapshot { snapshot: move snap }))
+        }
+      } else {
+        waiter.wait()
+      }
+    }
+    drop run Effect.result(appTx.send(EngineToApp.Closed { exitCode: 0 }))
+    return 0
+  }
+
+  /// Spawns a headless `UiTree` Engine thread driven purely by `Waiter` for Stage 5 integration tests.
+  pub effect fn spawnTestEngineThread(
+    collection: &FontCollection,
+    resources: List<Mutation>,
+    width: f32,
+    height: f32,
+    appToEngineTx: AppToEngineTx,
+    engineRx: UnboundedReceiver<AppToEngine>,
+    appTx: UnboundedSender<EngineToApp>,
+    wakeSlot: EngineWakeSlot,
+  ) -> TestEngineHandle
+    ! WindowError | OutOfMemoryError {
+    let mut heap = Allocator.systemAllocatorProvider()
+    let waiter = run Waiter.make()
+    let engineWake = waiter.handle()
+    wakeSlot.attach(Nudge.fromWake(engineWake.clone()))
+    let cmdPair = run UnboundedChannel.make<TestEngineCmd>(engineWake.clone())
+    let UnboundedPair<TestEngineCmd> { sender: cmdTx, receiver: cmdRx } = move cmdPair
+    let launch = TestEngineLaunch {
+      fonts: BorrowedFonts { ptr: Pointer.fromRef<FontCollection>(collection) },
+      resources: move resources,
+      width: width,
+      height: height,
+      engineRx: move engineRx,
+      appTx: move appTx,
+      cmdRx: move cmdRx,
+      waiter: move waiter,
+    }
+    let spawned = run Effect.result(
+      NativeThread.spawn(
+        || -> i32 {
+          let mut allocator = Allocator.systemAllocatorProvider()
+          return run Effect.catchAll(runHeadlessEngine(move launch), engineFailed)
+            |> Effect.provideMut<Allocator>(&mut allocator)
+        },
+      ),
+    )
+      |> Effect.provideMut<Allocator>(&mut heap)
+    let handle = match move spawned {
+      Result<JoinHandle<i32>, SpawnError | OutOfMemoryError>.Success { value } => move value
+      Result<JoinHandle<i32>, SpawnError | OutOfMemoryError>.Failure { error } => match move error {
+        SpawnError err => {
+          drop err
+          fail WindowError.CreationFailed
+        }
+        OutOfMemoryError oom => { fail move oom }
+      }
+    }
+    return TestEngineHandle {
+      handle: Option<JoinHandle<i32>>.some(move handle),
+      cmdTx: move cmdTx,
+      appTx: move appToEngineTx,
+      wakeHandle: move engineWake,
+    }
+  }
+}

@@ -10,7 +10,7 @@ export function installMock() {
   };
   const native = {};
   for (const name of [
-    "create", "append", "insertBefore", "root", "setText", "listen", "style", "clearStyle",
+    "create", "append", "insertBefore", "root", "setText", "listen", "listenPassive", "style", "clearStyle",
     "attribute", "focus", "capture", "remove", "destroy", "scrollTo", "select", "fontFamily", "open",
     "defineIcon", "source", "release", "load",
     "keyframe", "keyframes", "styleSheet",

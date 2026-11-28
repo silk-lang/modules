@@ -1,0 +1,423 @@
+//! Dedicated App (`Runtime`) thread event loop backed purely by `SnapshotBackend`, `Waiter`,
+//! and immutable `FrameSnapshot` / `AppToEngine` / `EngineToApp` messages.
+import protocol { AppToEngine, AppToEngineTx, EngineReadyInfo, EngineToApp, ShellEvent }
+import loom.app { App, Perform }
+import loom.backend { Backend, TreeError }
+import loom.runtime { Runtime, drain, pump, resize, tick }
+import loom.snapshot_backend { SnapshotBackend }
+import loom_inspect.lib { collectProgramReport }
+import ui_protocol.root { ExtraRoot, RootSupport }
+import ui_transport.channel { TryRecvError, UnboundedReceiver }
+import ui_transport.pool { PoolHandles }
+import ui_transport.wake { Waiter, WakeHandle }
+import ui_tree_window.platform_thread { PlatformClient }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.geometry.rect { Rect }
+import silk.json.scanner { JsonError }
+import silk.json.value { Json, Value }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f64
+import silk.num.i64
+import silk.num.u32
+import silk.text.string { String }
+
+static if Intrinsic.targetArchitecture() != "wasm32" {
+  import silk.system.monotonic_clock { MonotonicClock }
+  import silk.system.monotonic_clock_native { OsMonotonicClock }
+
+  struct AppClock {
+    os: OsMonotonicClock,
+  }
+
+  impl AppClock {
+    fn make() -> AppClock {
+      return AppClock { os: OsMonotonicClock.make() }
+    }
+
+    effect fn seconds(self: &mut Self) -> f64 {
+      let now = run MonotonicClock.now() |> Effect.provideMut<MonotonicClock>(&mut self.os)
+      return i64.toF64(now.seconds())
+        + i64.toF64(u32.toI64(now.subsecondNanoseconds())) / 1000000000.0
+    }
+  }
+} else {
+  struct AppClock {}
+
+  impl AppClock {
+    fn make() -> AppClock {
+      return AppClock {}
+    }
+
+    effect fn seconds(self: &mut Self) -> f64 {
+      return 0.0
+    }
+  }
+}
+
+/// Optional App-thread bridge used by `program.silk` for `Desk`, `Poster`, `Keeper`, and worker pools.
+pub interface AppBridge<A, M, C> {
+  effect fn onReady(
+    self: &mut Self,
+    app: &mut Runtime<A, M, C>,
+    info: EngineReadyInfo,
+    wake: WakeHandle,
+  ) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    drop app
+    drop info
+    drop wake
+  }
+
+  effect fn onServices(
+    self: &mut Self,
+    groupId: u32,
+    pools: PoolHandles,
+    platform: Option<PlatformClient>,
+    wake: WakeHandle,
+  ) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    drop groupId
+    drop pools
+    drop platform
+    drop wake
+  }
+
+  effect fn onShellEvent(
+    self: &mut Self,
+    app: &mut Runtime<A, M, C>,
+    event: ShellEvent,
+  ) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    drop app
+    drop event
+  }
+
+  effect fn pollExternal(
+    self: &mut Self,
+    app: &mut Runtime<A, M, C>,
+    backend: &mut SnapshotBackend,
+    now: f64,
+  ) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    drop app
+    drop backend
+    drop now
+    return false
+  }
+
+  fn runsCommands(self: &Self) -> bool {
+    return false
+  }
+
+  effect fn afterTurn(self: &mut Self, app: &Runtime<A, M, C>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    drop app
+  }
+
+  fn interceptClose(self: &Self, app: &mut Runtime<A, M, C>) -> bool {
+    drop app
+    return false
+  }
+
+  fn quitting(self: &Self) -> bool {
+    return false
+  }
+}
+
+/// Default no-op [`AppBridge`] for `runWindow`, `runWindowWith`, and `runSystemWindow`.
+pub struct NoAppBridge {}
+
+impl<A, M, C> AppBridge<A, M, C> for NoAppBridge {}
+
+fn waitingCommands<A: App<M, C>, M, C, Br: AppBridge<A, M, C>>(
+  app: &Runtime<A, M, C>,
+  bridge: &Br,
+) -> usize {
+  return if AppBridge<A, M, C>.runsCommands(bridge) {
+    app.deferredOn(true)
+  } else {
+    app.deferred()
+  }
+}
+
+effect fn runDeferredCommands<A: App<M, C>, M, C: Perform<M, E, R>, Br: AppBridge<A, M, C>, E, ? R>(
+  app: &mut Runtime<A, M, C>,
+  bridge: &Br,
+) -> bool
+  ! E | OutOfMemoryError
+  ? R | &mut Allocator {
+  let mut left = waitingCommands(&app.*, bridge)
+  if left == 0 {
+    return false
+  }
+  let all = !AppBridge<A, M, C>.runsCommands(bridge)
+  while left != 0 {
+    let held = if all {
+      run app.takeWork()
+    } else {
+      run app.takeWorkOn(true)
+    }
+    let message = run Perform<M, E, R>.perform(move held.command)
+    drop app.finish(held.ticket, move message)
+    left = left - 1
+  }
+  return true
+}
+
+effect fn flushBackend<A: App<M, C>, M, C: Perform<M, E, R>, Br: AppBridge<A, M, C>, E, ? R>(
+  app: &mut Runtime<A, M, C>,
+  bridge: &Br,
+  backend: &mut SnapshotBackend,
+  tx: &AppToEngineTx,
+  commitSeq: &mut u64,
+  lastWantsFrames: &mut bool,
+  lastInterceptClose: &mut bool,
+) -> ()
+  ! E | TreeError | OutOfMemoryError
+  ? R | &mut Allocator {
+  drop backend.takeNavigated()
+  let wants = app.wantsFrames()
+  let intercept = AppBridge<A, M, C>.interceptClose(bridge, &mut app)
+  let hasMut = backend.hasPendingMutations()
+  if !hasMut && wants == lastWantsFrames.* && intercept == lastInterceptClose.* {
+    return ()
+  }
+  lastWantsFrames.* = wants
+  lastInterceptClose.* = intercept
+  commitSeq.* = commitSeq.* + 1
+  let mutations = backend.takeMutations()
+  drop tx.send(
+    AppToEngine.Commit {
+      seq: commitSeq.*,
+      needsFrame: hasMut,
+      wantsFrames: wants,
+      interceptClose: intercept,
+      mutations: move mutations,
+    },
+  )
+}
+
+/// Runs the wake-driven Loom App loop against `SnapshotBackend` until the Engine closes or App quits.
+pub effect fn runSplitAppLoop<
+  A: App<M, C>,
+  M,
+  C: Perform<M, E, R>,
+  Br: AppBridge<A, M, C>,
+  E,
+  ? R
+>(
+  app: &mut Runtime<A, M, C>,
+  bridge: &mut Br,
+  tx: AppToEngineTx,
+  rx: UnboundedReceiver<EngineToApp>,
+  waiter: Waiter,
+  initialWidth: f32,
+  initialHeight: f32,
+  supportsWindows: bool,
+) -> i32
+  ! E | TreeError | OutOfMemoryError
+  ? R | &mut Allocator {
+  let mut rx = move rx
+  let mut clock = AppClock.make()
+  let startedAt = run clock.seconds()
+  let support = if supportsWindows {
+    RootSupport { count: 4, extra: ExtraRoot.Window }
+  } else {
+    RootSupport.single()
+  }
+  let mut backend = SnapshotBackend.make(1, support, Rect<f32>.new(0.0, 0.0, initialWidth, initialHeight))
+  let wake = waiter.handle()
+  let mut started = false
+  let mut inspectorEnabled = false
+  let mut commitSeq: u64 = 0
+  let mut lastWantsFrames = false
+  let mut lastHadWork = false
+  let mut lastInterceptClose = AppBridge<A, M, C>.interceptClose(&bridge.*, &mut app)
+  let mut exitCode: i32 = 0
+  let mut closed = false
+
+  while !closed {
+    let now = (run clock.seconds()) - startedAt
+    let mut dirty = false
+
+    // 1. Drain all pending messages from Engine without blocking.
+    while true {
+      match rx.tryRecv() {
+        Result.Success { value: msg } => match move msg {
+          EngineToApp.Ready { info, snapshot } => {
+            inspectorEnabled = info.inspectorEnabled
+            backend.applySnapshot(move snapshot)
+            run AppBridge<A, M, C>.onReady(&mut bridge, &mut app, move info, wake.clone())
+            if !started {
+              started = true
+              run app.start(&mut backend, now)
+              run drain(&mut app, &mut backend)
+            }
+            dirty = true
+          }
+          EngineToApp.Services { groupId, pools, platform } => {
+            run AppBridge<A, M, C>.onServices(&mut bridge, groupId, move pools, move platform, wake.clone())
+          }
+          EngineToApp.Snapshot { snapshot } => {
+            backend.applySnapshot(move snapshot)
+            // Only emit a new Commit if syncing virtual/anchors produced new mutations.
+            if run app.syncVirtual(&mut backend) {
+              run drain(&mut app, &mut backend)
+            }
+            if backend.hasPendingMutations() {
+              dirty = true
+            }
+          }
+          EngineToApp.Events { events, rootEvents, snapshot } => {
+            backend.applySnapshot(move snapshot)
+            run backend.pushEvents(move events)
+            run backend.pushRootEvents(move rootEvents)
+            if started && run pump(&mut app, &mut backend) {
+              dirty = true
+            } else if started && backend.hasPendingMutations() {
+              dirty = true
+            }
+          }
+          EngineToApp.Tick { time, animation } => {
+            drop time
+            if started && animation && app.wantsFrames() {
+              run tick(&mut app, &mut backend, now, true)
+              dirty = true
+            }
+          }
+          EngineToApp.Resize { width, height } => {
+            backend.setViewport(Rect<f32>.new(0.0, 0.0, width, height))
+            if started {
+              run resize(&mut app, &mut backend, width, height)
+              if backend.hasPendingMutations() {
+                dirty = true
+              }
+            }
+          }
+          EngineToApp.Shell { event } => {
+            run AppBridge<A, M, C>.onShellEvent(&mut bridge, &mut app, move event)
+            if app.pending() {
+              run drain(&mut app, &mut backend)
+              dirty = true
+            }
+          }
+          EngineToApp.InspectorState { enabled } => {
+            inspectorEnabled = enabled
+          }
+          EngineToApp.RestoreModel { json, label } => {
+            if let Result<Value, JsonError | OutOfMemoryError>.Success { value } = move run Effect.result(
+              Json.parse(json.ownedUtf8Bytes()),
+            ) {
+              drop run app.restoreModel(&mut backend, &value, "devtools", String.view(&label))
+              dirty = true
+            }
+          }
+          EngineToApp.Closed { exitCode: code } => {
+            exitCode = code
+            closed = true
+            break
+          }
+        }
+        Result.Failure { error } => match error {
+          TryRecvError.Empty => { break }
+          TryRecvError.Closed => {
+            closed = true
+            break
+          }
+        }
+      }
+    }
+    if closed {
+      break
+    }
+
+    // 2. Drain bridge external inputs (Poster posts, AppPool worker completions).
+    if started && run AppBridge<A, M, C>.pollExternal(&mut bridge, &mut app, &mut backend, now) {
+      if app.pending() {
+        run drain(&mut app, &mut backend)
+      }
+      dirty = true
+    }
+
+    // 3. Fire due timers on exact deadlines.
+    if started {
+      if let Option<f64>.Some { value: due } = app.nextDeadline() {
+        if due <= now {
+          run tick(&mut app, &mut backend, now, false)
+          dirty = true
+        }
+      }
+    }
+
+    // 4. Execute waiting UI-thread commands immediately upon turn readiness (no FRAME_PATIENCE).
+    if started && run runDeferredCommands<A, M, C, Br, E, R>(&mut app, &bridge) {
+      if app.pending() {
+        run drain(&mut app, &mut backend)
+      }
+      dirty = true
+    }
+
+    if started && AppBridge<A, M, C>.runsCommands(&bridge.*) && app.deferredOn(false) != 0 {
+      if run AppBridge<A, M, C>.pollExternal(&mut bridge, &mut app, &mut backend, now) {
+        run drain(&mut app, &mut backend)
+        dirty = true
+      }
+    }
+
+    // 5. Commit emitted mutations + frame/close flags back to Engine (only if changed).
+    if started {
+      let currentIntercept = AppBridge<A, M, C>.interceptClose(&bridge.*, &mut app)
+      if dirty || backend.hasPendingMutations() || app.wantsFrames() != lastWantsFrames || currentIntercept != lastInterceptClose {
+        run flushBackend<A, M, C, Br, E, R>(
+          &mut app,
+          &bridge.*,
+          &mut backend,
+          &tx,
+          &mut commitSeq,
+          &mut lastWantsFrames,
+          &mut lastInterceptClose,
+        )
+      }
+      if inspectorEnabled {
+        let report = run collectProgramReport(&mut app)
+        let hasWork = report.work.length() != 0
+        if report.hasSteps || hasWork || lastHadWork {
+          drop tx.send(AppToEngine.Inspect { report: move report })
+        }
+        lastHadWork = hasWork
+      }
+      run AppBridge<A, M, C>.afterTurn(&mut bridge, &app.*)
+    }
+
+    if AppBridge<A, M, C>.quitting(&bridge.*) {
+      drop tx.send(AppToEngine.Shutdown)
+      break
+    }
+
+    if started && (app.pending() || waitingCommands(&app.*, &bridge.*) != 0) {
+      continue
+    }
+
+    // 6. Sleep strictly until next timer deadline or next wakeup event (zero polling).
+    let nextDue = if started { app.nextDeadline() } else { Option<f64>.None }
+    if let Option<f64>.Some { value: due } = nextDue {
+      let after = (run clock.seconds()) - startedAt
+      if due > after {
+        let nanosF = (due - after) * 1000000000.0
+        let nanosI = if nanosF >= 1.0 { f64.toI64(nanosF) } else { 1 }
+        let nanos = if nanosI > 0 { i64.toU64(nanosI) } else { 1 }
+        drop waiter.waitTimeout(nanos)
+      }
+    } else {
+      waiter.wait()
+    }
+  }
+  return exitCode
+}

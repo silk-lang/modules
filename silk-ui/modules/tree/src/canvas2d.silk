@@ -46,6 +46,7 @@ import vector.stroke { Stroke, Stroker }
 import silk.collections.list { List }
 import silk.collections.slice { Slice }
 import silk.color.rgba { Rgba }
+import silk.concurrency.thread { Transferable }
 import silk.core.effect { Effect }
 import silk.core.option { Option }
 import silk.core.ownership { Copy }
@@ -184,9 +185,40 @@ struct GlyphPage {
   bytes: List<u8>,
 }
 
+/// Serializable single-canvas bitmap snapshot moved between the Document Thread and `AppPool`.
+pub struct BitmapTransfer {
+  pub node: u32,
+  pub width: u32,
+  pub height: u32,
+  pub opaque: bool,
+  pub drawn: bool,
+  pub resized: bool,
+  pub pixels: List<u8>,
+  pub mask: List<u8>,
+}
+
+impl Transferable for BitmapTransfer {}
+
+/// Surface id retained on the Document Thread while a canvas bitmap is being rasterized on `AppPool`.
+struct ParkedSurface {
+  node: u32,
+  surface: u32,
+}
+
+struct PreparedDraw {
+  at: usize,
+  clip: Rect<f32>,
+  width: u32,
+  height: u32,
+  layered: bool,
+}
+
+impl Copy for PreparedDraw {}
+
 /// The 2D canvases of a tree.
 pub struct Canvas2d<'a> {
   bitmaps: List<Bitmap>,
+  parked: List<ParkedSurface>,
   fonts: List<Font>,
   faces: List<FaceSlot<'a>>,
   renderer: CpuRenderer,
@@ -312,6 +344,7 @@ impl<'a> Canvas2d<'a> {
   pub fn make() -> Canvas2d<'a> {
     return Canvas2d<'a> {
       bitmaps: List<Bitmap>.make(),
+      parked: List<ParkedSurface>.make(),
       fonts: List<Font>.make(),
       faces: List<FaceSlot<'a>>.make(),
       renderer: CpuRenderer.make(),
@@ -349,6 +382,73 @@ impl<'a> Canvas2d<'a> {
   /// The bitmaps, for the window to show the ones drawn into.
   pub fn drawn(self: &mut Self) -> &mut [Bitmap] {
     return self.bitmaps.asMutSlice()
+  }
+
+  /// Extracts `node`'s bitmap into a transferable snapshot, parking any assigned surface id so
+  /// concurrent presentation frames do not tear down the surface while `AppPool` draws.
+  pub effect fn takeBitmapTransfer(self: &mut Self, node: u32) -> Option<BitmapTransfer>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let at = self.find(node)
+    if at == usize.MAX { return Option<BitmapTransfer>.None }
+    let mut taken = self.bitmaps.remove(at)
+    if taken.surface != 0xffffffff {
+      run self.parked.append(ParkedSurface { node: taken.node, surface: taken.surface })
+    }
+    let width = taken.pixels.width()
+    let height = taken.pixels.height()
+    let mut pixels = List<u8>.make()
+    run pixels.appendSlice(taken.pixels.data())
+    return Option<BitmapTransfer>.some(BitmapTransfer {
+      node: taken.node,
+      width: width,
+      height: height,
+      opaque: taken.opaque,
+      drawn: taken.drawn,
+      resized: taken.resized,
+      pixels: move pixels,
+      mask: move taken.mask,
+    })
+  }
+
+  /// Installs a transferable bitmap snapshot for `data.node`, preserving its existing or parked surface id.
+  pub effect fn installBitmapTransfer(self: &mut Self, data: BitmapTransfer) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let BitmapTransfer { node, width, height, opaque, drawn, resized, pixels, mask } = move data
+    let mut surface: u32 = 0xffffffff
+    let mut p: usize = 0
+    while p < self.parked.length() {
+      if self.parked.asSlice()[p].node == node {
+        surface = self.parked.remove(p).surface
+      } else {
+        p = p + 1
+      }
+    }
+    let pixmap = Pixmap.fromBytes(width, height, move pixels)
+    let at = self.find(node)
+    if at == usize.MAX {
+      run self.bitmaps.append(Bitmap {
+        node: node,
+        surface: surface,
+        opaque: opaque,
+        drawn: drawn,
+        resized: resized,
+        pixels: move pixmap,
+        mask: move mask,
+      })
+      return ()
+    }
+    let slot = &mut self.bitmaps.asMutSlice()[at]
+    if slot.surface == 0xffffffff && surface != 0xffffffff {
+      slot.surface = surface
+      slot.resized = true
+    }
+    slot.opaque = opaque
+    slot.drawn = slot.drawn || drawn
+    slot.resized = slot.resized || resized
+    slot.pixels = move pixmap
+    slot.mask = move mask
   }
 
   /// Forgets the bitmap of `node` and returns it.
@@ -462,9 +562,14 @@ impl<'a> Canvas2d<'a> {
     run self.flush()
   }
 
-  effect fn one(self: &mut Self, text: &mut TextSystem<'a>, r: &mut Reader<'_>) -> () ! OutOfMemoryError ? &mut Allocator {
-    let op = r.word()
-    let node = r.word()
+  /// Prepares non-text command framing (`SIZE`, bitmap lookup, `clip`, `EFFECTS`, `CLIP_MASK`).
+  /// Returns `Some` when the draw body still needs to execute.
+  effect fn prepareCommand(
+    self: &mut Self,
+    r: &mut Reader<'_>,
+    op: u32,
+    node: u32,
+  ) -> Option<PreparedDraw> ! OutOfMemoryError ? &mut Allocator {
     if op == SIZE {
       run self.flush()
       let width = maxU(r.word(), 1)
@@ -483,44 +588,111 @@ impl<'a> Canvas2d<'a> {
         bitmap.drawn = true
         bitmap.resized = true
       }
-      return ()
+      return Option<PreparedDraw>.None
     }
     let at = self.find(node)
-    if at == usize.MAX { return () }
+    if at == usize.MAX { return Option<PreparedDraw>.None }
     let width = self.bitmaps.asSlice()[at].pixels.width()
     let height = self.bitmaps.asSlice()[at].pixels.height()
     let whole = Rect<f32>.new(0.0, 0.0, u32.toF32(width), u32.toF32(height))
     let clip = intersect(r.rect(), whole)
     if op == EFFECTS {
       run self.readEffects(&mut r)
-      return ()
+      return Option<PreparedDraw>.None
     }
     let layered = self.effects.on
     self.effects.on = false
-    if !nonEmpty(clip) { return () }
+    if !nonEmpty(clip) { return Option<PreparedDraw>.None }
     if op == CLIP_MASK {
       run self.flush()
       run self.clipMask(at, clip, &mut r)
-      return ()
+      return Option<PreparedDraw>.None
     }
     let items = self.bitmaps.asMutSlice()
     items[at].drawn = true
-    if layered && op != CLEAR_RECT && op != PUT_PIXELS {
+    return Option<PreparedDraw>.some(PreparedDraw {
+      at: at,
+      clip: clip,
+      width: width,
+      height: height,
+      layered: layered,
+    })
+  }
+
+  effect fn one(self: &mut Self, text: &mut TextSystem<'a>, r: &mut Reader<'_>) -> () ! OutOfMemoryError ? &mut Allocator {
+    let op = r.word()
+    let node = r.word()
+    let prep = match run self.prepareCommand(&mut r, op, node) {
+      Option<PreparedDraw>.Some { value } => value
+      Option<PreparedDraw>.None => { return () }
+    }
+    if prep.layered && op != CLEAR_RECT && op != PUT_PIXELS {
       run self.flush()
-      run self.prepareLayer(width, height)
+      run self.prepareLayer(prep.width, prep.height)
       self.intoLayer = true
-      run self.body(&mut text, &mut r, op, node, at, clip)
+      run self.body(&mut text, &mut r, op, node, prep.at, prep.clip)
       run self.flush()
       self.intoLayer = false
-      run self.finishLayer(at, clip)
+      run self.finishLayer(prep.at, prep.clip)
       return ()
     }
-    run self.body(&mut text, &mut r, op, node, at, clip)
+    run self.body(&mut text, &mut r, op, node, prep.at, prep.clip)
+  }
+
+  effect fn oneNoText(self: &mut Self, r: &mut Reader<'_>) -> () ! OutOfMemoryError ? &mut Allocator {
+    let op = r.word()
+    let node = r.word()
+    let prep = match run self.prepareCommand(&mut r, op, node) {
+      Option<PreparedDraw>.Some { value } => value
+      Option<PreparedDraw>.None => { return () }
+    }
+    if op == FILL_TEXT { return () }
+    if prep.layered && op != CLEAR_RECT && op != PUT_PIXELS {
+      run self.flush()
+      run self.prepareLayer(prep.width, prep.height)
+      self.intoLayer = true
+      run self.bodyCore(&mut r, op, prep.at, prep.clip)
+      run self.flush()
+      self.intoLayer = false
+      run self.finishLayer(prep.at, prep.clip)
+      return ()
+    }
+    run self.bodyCore(&mut r, op, prep.at, prep.clip)
   }
 
   /// Draws command `op` into the bitmap at `at`, or into the layer while `intoLayer`.
   effect fn body(self: &mut Self, text: &mut TextSystem<'a>, r: &mut Reader<'_>, op: u32, node: u32, at: usize, clip: Rect<f32>) -> () ! OutOfMemoryError ? &mut Allocator {
     let mask = ContentMask.new(clip)
+    if op == FILL_TEXT {
+      let color = self.colorOf(r.color())
+      let font = r.blob()
+      let value = r.blob()
+      let x = r.number()
+      let y = r.number()
+      let transform = readAffine(&mut r)
+      let align = r.word()
+      let baseline = r.word()
+      let maxWidth = r.float()
+      let stroke = r.word() != 0
+      let place = TextPlace { x: x, y: y, transform: transform, align: align, baseline: baseline, maxWidth: maxWidth }
+      if stroke {
+        let style = run readStroke(&mut r)
+        if self.open != 0 { run self.flush() }
+        run self.outlineText(&mut text, at, font, value, place, Option<Stroke>.some(move style), color, clip)
+      } else if transform.yx == 0.0 && transform.xy == 0.0 && transform.xx == transform.yy && transform.xx > 0.0 {
+        let ox = f64.toF32(transform.xx * x + transform.dx)
+        let oy = f64.toF32(transform.yy * y + transform.dy)
+        run self.fillText(&mut text, node, at, font, value, ox, oy, f64.toF32(transform.xx), align, baseline, maxWidth, color, clip, mask)
+      } else {
+        if self.open != 0 { run self.flush() }
+        run self.outlineText(&mut text, at, font, value, place, Option<Stroke>.None, color, clip)
+      }
+      return ()
+    }
+    run self.bodyCore(&mut r, op, at, clip)
+  }
+
+  effect fn bodyCore(self: &mut Self, r: &mut Reader<'_>, op: u32, at: usize, clip: Rect<f32>) -> () ! OutOfMemoryError ? &mut Allocator {
     if op == CLEAR_RECT {
       run self.flush()
       let area = intersect(r.rect(), clip)
@@ -601,30 +773,6 @@ impl<'a> Canvas2d<'a> {
         let transform = readAffine(&mut r)
         run self.readPath(&mut r)
         run self.strokePathDirect(at, &style, &transform, color, clip)
-      }
-    } else if op == FILL_TEXT {
-      let color = self.colorOf(r.color())
-      let font = r.blob()
-      let value = r.blob()
-      let x = r.number()
-      let y = r.number()
-      let transform = readAffine(&mut r)
-      let align = r.word()
-      let baseline = r.word()
-      let maxWidth = r.float()
-      let stroke = r.word() != 0
-      let place = TextPlace { x: x, y: y, transform: transform, align: align, baseline: baseline, maxWidth: maxWidth }
-      if stroke {
-        let style = run readStroke(&mut r)
-        if self.open != 0 { run self.flush() }
-        run self.outlineText(&mut text, at, font, value, place, Option<Stroke>.some(move style), color, clip)
-      } else if transform.yx == 0.0 && transform.xy == 0.0 && transform.xx == transform.yy && transform.xx > 0.0 {
-        let ox = f64.toF32(transform.xx * x + transform.dx)
-        let oy = f64.toF32(transform.yy * y + transform.dy)
-        run self.fillText(&mut text, node, at, font, value, ox, oy, f64.toF32(transform.xx), align, baseline, maxWidth, color, clip, mask)
-      } else {
-        if self.open != 0 { run self.flush() }
-        run self.outlineText(&mut text, at, font, value, place, Option<Stroke>.None, color, clip)
       }
     }
   }
@@ -1269,6 +1417,72 @@ impl<'a> Canvas2d<'a> {
       row = row + 1
     }
   }
+}
+
+effect fn appendUniqueNode(nodes: &mut List<u32>, node: u32) -> () ! OutOfMemoryError ? &mut Allocator {
+  let items = nodes.asSlice()
+  let mut i: usize = 0
+  while i < items.length {
+    if items[i] == node { return () }
+    i = i + 1
+  }
+  run nodes.append(node)
+}
+
+/// Scans an encoded Canvas 2D command stream, appending referenced canvas node ids into `nodes`.
+/// Returns `true` iff every command can execute off the Document Thread without `TextSystem` or
+/// cross-canvas reads.
+pub effect fn inspectOffload(commands: &[u8], nodes: &mut List<u32>) -> bool
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut stream = Reader<'_> { bytes: commands, at: 0 }
+  let mut offloadable = true
+  while !stream.done() {
+    let mut cmd = Reader<'_> { bytes: stream.blob(), at: 0 }
+    let op = cmd.word()
+    let node = cmd.word()
+    if node != 0 { run appendUniqueNode(&mut nodes, node) }
+    if op == FILL_TEXT {
+      offloadable = false
+    } else if op == DRAW_CANVAS {
+      offloadable = false
+      drop cmd.rect()
+      drop cmd.number()
+      drop cmd.rect()
+      drop cmd.rect()
+      drop readAffine(&mut cmd)
+      drop cmd.word()
+      let from = cmd.word()
+      if from != 0 { run appendUniqueNode(&mut nodes, from) }
+    }
+  }
+  return offloadable
+}
+
+/// Executes a single-canvas, text-free Canvas 2D command batch on a standalone rasterizer
+/// (`AppPool` worker), returning the updated bitmap snapshot.
+pub effect fn drawStaticNoText(bitmap: Option<BitmapTransfer>, commands: &[u8]) -> Option<BitmapTransfer>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut targetNode: u32 = 0
+  let mut worker = Canvas2d<'static>.make()
+  if let Option<BitmapTransfer>.Some { value } = move bitmap {
+    targetNode = value.node
+    run worker.installBitmapTransfer(move value)
+  }
+  let mut stream = Reader<'_> { bytes: commands, at: 0 }
+  while !stream.done() {
+    let frame = stream.blob()
+    let mut cmd = Reader<'_> { bytes: frame, at: 0 }
+    let mut peek = Reader<'_> { bytes: frame, at: 0 }
+    let _op = peek.word()
+    let node = peek.word()
+    if targetNode == 0 && node != 0 { targetNode = node }
+    run worker.oneNoText(&mut cmd)
+  }
+  run worker.flush()
+  if targetNode == 0 { return Option<BitmapTransfer>.None }
+  return run worker.takeBitmapTransfer(targetNode)
 }
 
 fn minU(a: u32, b: u32) -> u32 { return if a < b { a } else { b } }

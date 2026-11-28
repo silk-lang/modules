@@ -1,0 +1,833 @@
+//! Stage 4 compositor & GPU-indirection integration and Risk 4 protocol tests:
+//! - Risk 4: 1-in-flight `CommitTracker`, idempotent `RetainedLayerStore` replay & keyframe resync,
+//!   `EpochRetirementQueue` deferred destruction, and `Atlas` epoch pinning.
+//! - Compositor animations, Scroll/Pointer timelines, sub-stepped springs, and zero-poll idle.
+//! - Full scroll physics: touch pan + exponential fling, `overscroll-behavior` (`Auto`/`Contain`/`None`),
+//!   scroll snap (`Mandatory`, `Proximity`, `stopAlways`), smooth scroll cancel, thumb drag.
+//! - `EnginePool` parallel glyph, path, and icon raster parity + `UiTree` frame CPU pixel parity.
+import atlas.atlas { Atlas, AtlasError, AtlasOptions, AtlasTile, Kind }
+import css_style.colors { Color as SvgColor, Context as ColorContext, SystemColor, systemIndex }
+import css_style.media_features { Environment as MediaEnvironment }
+import css_style.tokens { Limits as CssLimits }
+import font_raster.cache { GlyphCache }
+import font_raster.color { PaletteChoice }
+import font_raster.face { FontFace }
+import font_raster.key { GlyphKey }
+import font_raster.lines { LineCache }
+import font_types.lib { F2Dot14 }
+import harfrust.lib { ShaperData }
+import read_fonts.lib { ReadError }
+import sprites.icons { IconCache, IconOptions, IconStyle, PreparedIcon }
+import svg_core.resources { DataOnly, Limits as ResourceLimits, ProcessingMode, Resolver }
+import svg_core.structure { Options as StructureOptions }
+import svg_core.url { Url, UrlError }
+import svg_fonts.database { FontDatabase }
+import svg_render.environment { noHostStyles }
+import svg_render.lib { Environment as SvgEnvironment, RenderError }
+import ui_assets.assets as assets
+import ui_fixtures.fixtures as fixtures
+import ui_scene.color
+import ui_scene.cpu { AtlasPixels, CpuRenderer }
+import ui_scene.path_cache { PathCache, PathWorkItem }
+import ui_scene.primitives { Background, ContentMask }
+import ui_scene.property_tree { LayerOverride }
+import ui_scene.scene { Scene }
+import ui_scene.scroll { ScrollPosition }
+import ui_transport.pool { Pools }
+import ui_tree.engine_raster {
+  GlyphFontCopy,
+  GlyphJob,
+  preRasterizeGlyphs,
+  preRasterizeIcons,
+  preRasterizePaths,
+}
+import ui_tree.legacy { Batch, TreeError, UiTree }
+import ui_tree_window.compositor_state {
+  AnimPropertyKind,
+  CompositorAnimation,
+  EasingKind,
+  OverscrollBehavior,
+  ScrollerPhysicsConfig,
+  SnapPoint,
+  SnapStrictness,
+  SpringSpec,
+  SpringState,
+  TimelineKind,
+  WindowCompositorState,
+  stepSpring,
+}
+import ui_tree_window.browser_commit {
+  BROWSER_COMMIT_VERSION,
+  PREVENT_KEYS_BIT,
+  PREVENT_WHEEL_BIT,
+  decodeBrowserCommitHeader,
+  encodeBrowserCommit,
+}
+import ui_tree_window.layer_commit {
+  CommitTicket,
+  CommitTracker,
+  EpochRetirementQueue,
+  LayerCommit,
+  LayerCommitKind,
+  LayerRecord,
+  RetainedLayerStore,
+}
+import vector.geometry { Affine }
+import vector.geometry_error { GeometryError }
+import vector.path { Path }
+import vector.pixmap { Pixmap }
+import vector.strips { NONZERO }
+import vector.stroke { Stroke }
+import window.types { WindowId }
+import silk.collections.list { List }
+import silk.concurrency.thread_native { SpawnError }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.geometry.rect { Rect }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f32
+import silk.num.i32
+import silk.num.u8
+import silk.num.u32
+import silk.num.usize
+import silk.testing.testing { AssertionError, Testing }
+
+fn rect(x: f32, y: f32, w: f32, h: f32) -> Rect<f32> {
+  return Rect<f32>.new(x, y, x + w, y + h)
+}
+
+fn layerRec(id: u32, ver: u64) -> LayerRecord {
+  return LayerRecord {
+    layerId: id,
+    contentVersion: ver,
+    bounds: rect(0.0, 0.0, 100.0, 40.0),
+    transformNode: 0,
+    clipNode: 0,
+    effectNode: 0,
+    scrollNode: 0,
+    isOpaque: true,
+    hasTransform: false,
+  }
+}
+
+fn findOverrideOpacity(overrides: &[LayerOverride], layerId: u32) -> f32 {
+  let mut i: usize = 0
+  while i < overrides.length {
+    if overrides[i].layerId == layerId && overrides[i].hasOpacity {
+      return overrides[i].opacity
+    }
+    i = i + 1
+  }
+  return -1.0
+}
+
+fn findOverrideTx(overrides: &[LayerOverride], layerId: u32) -> f32 {
+  let mut i: usize = 0
+  while i < overrides.length {
+    if overrides[i].layerId == layerId && overrides[i].hasTransform {
+      return overrides[i].transform.values[6]
+    }
+    i = i + 1
+  }
+  return -9999.0
+}
+
+effect fn mustUrl(path: &[u8]) -> Url
+  ! OutOfMemoryError | UrlError
+  ? &mut Allocator {
+  return run Url.fromFilePath(path)
+}
+
+fn svgEnv<'a>(base: &'a Url, fonts: &'a FontDatabase) -> SvgEnvironment<'a, 'a> {
+  let current = SvgColor.srgb(0.0, 0.0, 0.0, 1.0)
+  let mut system = [current; 19]
+  system[systemIndex(SystemColor.CanvasText)] = current
+  let mut structure = StructureOptions.defaults()
+  structure.policy.mode = ProcessingMode.Animated
+  return SvgEnvironment<'a, 'a> {
+    base: base,
+    media: MediaEnvironment.headless(300.0, 150.0),
+    colors: ColorContext.make(current, system),
+    fontFamily: b"serif",
+    systemFonts: [b"16px serif"; 6],
+    cssLimits: CssLimits.make(),
+    structure: move structure,
+    fonts: fonts,
+    styles: noHostStyles(),
+  }
+}
+
+effect fn snapshotScenePixels(tree: &UiTree<'_>, width: u32, height: u32) -> Pixmap
+  ! GeometryError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut pixels = AtlasPixels.make()
+  run pixels.sync(&tree.atlas)
+  let uploads = tree.pendingUploads()
+  let entries = uploads.entries()
+  let mut i: usize = 0
+  while i < entries.length {
+    pixels.write(entries[i].tile, uploads.pixels(entries[i]))
+    i = i + 1
+  }
+  let mut target = run Pixmap.make(width, height)
+  let mut renderer = CpuRenderer.make()
+  run renderer.draw(tree.scene(), &pixels, &mut target)
+  return move target
+}
+
+test effect fn stage4Risk4CommitProtocolAndEpochRetirement() -> ()
+  ! AssertionError<'static> | AtlasError | OutOfMemoryError {
+  let mut heap = Allocator.systemAllocatorProvider()
+  let win = WindowId { value: 1 }
+
+  // 1. CommitTracker enforces 1-in-flight coalescing & upgrades initial commit to Keyframe.
+  let mut tracker = CommitTracker.make()
+  let firstTicket = match tracker.beginCommit(LayerCommitKind.Delta) {
+    Option<CommitTicket>.Some { value } => value
+    Option<CommitTicket>.None => {
+      run Testing.expect(false, "first beginCommit should succeed")
+      return
+    }
+  }
+  let firstIsKeyframe = match firstTicket.kind {
+    LayerCommitKind.Keyframe => true
+    LayerCommitKind.Delta => false
+  }
+  run Testing.expect(
+    firstIsKeyframe && firstTicket.commitEpoch == 1 && tracker.isInFlight(),
+    "initial commit upgrades to Keyframe epoch 1 and enters in-flight state",
+  )
+  let coalesced = tracker.beginCommit(LayerCommitKind.Delta)
+  run Testing.expect(
+    coalesced.isNone() && tracker.hasPendingDirty(),
+    "second commit while in-flight is coalesced cleanly",
+  )
+
+  let mut store = RetainedLayerStore.make()
+  let mut kf1 = LayerCommit.empty(win, 1, firstTicket.commitEpoch, firstTicket.baseEpoch, firstTicket.kind)
+  run kf1.updatedLayers.append(layerRec(1, 10)) |> Effect.provideMut<Allocator>(&mut heap)
+  let ack1 = run store.applyCommit(&kf1) |> Effect.provideMut<Allocator>(&mut heap)
+  run Testing.expect(
+    ack1.applied && !ack1.needsKeyframe && store.layerCount() == 1 && store.hasLayer(1),
+    "keyframe commit 1 applies cleanly",
+  )
+
+  // Replay same commitEpoch: idempotent no-op.
+  let dupAck = run store.applyCommit(&kf1) |> Effect.provideMut<Allocator>(&mut heap)
+  run Testing.expect(
+    !dupAck.applied && !dupAck.needsKeyframe && store.layerCount() == 1,
+    "duplicate commitEpoch is ignored idempotently without requesting keyframe",
+  )
+
+  let sendMore = tracker.onAck(ack1)
+  run Testing.expect(sendMore && !tracker.isInFlight(), "onAck frees in-flight slot and flags coalesced work")
+
+  // 2. Mismatched baseEpoch Delta preserves state & triggers Keyframe recovery via CommitTracker.
+  let badDelta = LayerCommit.empty(win, 1, 2, 999, LayerCommitKind.Delta)
+  let badAck = run store.applyCommit(&badDelta) |> Effect.provideMut<Allocator>(&mut heap)
+  run Testing.expect(
+    !badAck.applied && badAck.needsKeyframe && store.hasLayer(1) && store.layerCount() == 1,
+    "mismatched Delta preserves prior state and requests keyframe",
+  )
+  let retryMore = tracker.onAck(badAck)
+  run Testing.expect(retryMore && tracker.needsKeyframe(), "CommitTracker switches to Keyframe on resync")
+
+  let recoveryTicket = match tracker.beginCommit(LayerCommitKind.Delta) {
+    Option<CommitTicket>.Some { value } => value
+    Option<CommitTicket>.None => {
+      run Testing.expect(false, "recovery commit should succeed")
+      return
+    }
+  }
+  let recoveryIsKeyframe = match recoveryTicket.kind {
+    LayerCommitKind.Keyframe => true
+    LayerCommitKind.Delta => false
+  }
+  run Testing.expect(recoveryIsKeyframe, "resync beginCommit upgrades Delta to Keyframe")
+  let mut kf2 = LayerCommit.empty(win, 1, recoveryTicket.commitEpoch, recoveryTicket.baseEpoch, recoveryTicket.kind)
+  run kf2.updatedLayers.append(layerRec(1, 20)) |> Effect.provideMut<Allocator>(&mut heap)
+  run kf2.updatedLayers.append(layerRec(2, 20)) |> Effect.provideMut<Allocator>(&mut heap)
+  let ack2 = run store.applyCommit(&kf2) |> Effect.provideMut<Allocator>(&mut heap)
+  run Testing.expect(ack2.applied && !ack2.needsKeyframe && store.layerCount() == 2, "recovery keyframe restores coherent state")
+  drop tracker.onAck(ack2)
+
+  // 3. EpochRetirementQueue defers destruction in FIFO order until gpuFinishedEpoch advances.
+  let mut retire = EpochRetirementQueue<u32>.make()
+  run retire.defer(1, 101) |> Effect.provideMut<Allocator>(&mut heap)
+  run retire.defer(2, 202) |> Effect.provideMut<Allocator>(&mut heap)
+  run retire.defer(2, 303) |> Effect.provideMut<Allocator>(&mut heap)
+  let r1 = run retire.drainRetired(1) |> Effect.provideMut<Allocator>(&mut heap)
+  run Testing.expect(r1.length() == 1 && r1.get(0) == 101 && retire.pendingCount() == 2, "epoch 1 retired, epoch 2 retained")
+  let r2 = run retire.drainRetired(2) |> Effect.provideMut<Allocator>(&mut heap)
+  run Testing.expect(
+    r2.length() == 2 && r2.get(0) == 202 && r2.get(1) == 303 && retire.pendingCount() == 0,
+    "epoch 2 entries retired in FIFO order",
+  )
+
+  // 4. Atlas epoch pinning blocks eviction until GPU finish advances.
+  let mut atlas = Atlas.make(AtlasOptions { textureSize: 64, maxTextureSize: 64, maxTextures: 1, padding: 0 })
+  atlas.enableEpochPinning(true)
+  drop atlas.beginFrame()
+  let t1 = run atlas.allocate(Kind.Monochrome, 50, 50) |> Effect.provideMut<Allocator>(&mut heap)
+  drop atlas.beginFrame()
+  drop atlas.beginFrame()
+  drop atlas.beginFrame()
+  run Testing.expect(!atlas.canEvict(1), "pinned epoch 1 cannot evict while gpuFinished == 0")
+  let blockedRes = run Effect.result(atlas.allocate(Kind.Monochrome, 50, 50))
+    |> Effect.provideMut<Allocator>(&mut heap)
+  let wasFull = match move blockedRes {
+    Result<AtlasTile, AtlasError | OutOfMemoryError>.Failure { .. } => true
+    Result<AtlasTile, AtlasError | OutOfMemoryError>.Success { .. } => false
+  }
+  run Testing.expect(wasFull && atlas.get(t1.id).isSome(), "atlas pinning prevents evicting GPU-active tile")
+  atlas.setGpuFinishedFrame(1)
+  run Testing.expect(atlas.canEvict(1), "advancing gpuFinishedFrame allows eviction")
+  let t2 = run atlas.allocate(Kind.Monochrome, 50, 50) |> Effect.provideMut<Allocator>(&mut heap)
+  run Testing.expect(atlas.get(t1.id).isNone() && atlas.get(t2.id).isSome(), "unpinned tile evicts cleanly for new frame")
+}
+
+test effect fn stage4AnimationsTimelinesSpringsAndIdleWake() -> ()
+  ! AssertionError<'static> | OutOfMemoryError {
+  let mut heap = Allocator.systemAllocatorProvider()
+  let mut comp = WindowCompositorState.make(WindowId { value: 2 })
+
+  // Monotonic opacity + translateX animations -> settle cleanly to hasActiveMotion() == false.
+  let opAnim = CompositorAnimation.keyframed(
+    1,
+    7,
+    AnimPropertyKind.Opacity,
+    TimelineKind.Monotonic,
+    EasingKind.Linear,
+    0.0,
+    100.0,
+    0.0,
+    1.0,
+  )
+  let txAnim = CompositorAnimation.keyframed(
+    2,
+    7,
+    AnimPropertyKind.TranslateX,
+    TimelineKind.Monotonic,
+    EasingKind.Linear,
+    0.0,
+    100.0,
+    0.0,
+    80.0,
+  )
+  // Scroll timeline animation on layer 9 driven by scroller 20 in [0..200].
+  let scrollAnim = CompositorAnimation.keyframed(
+    3,
+    9,
+    AnimPropertyKind.Opacity,
+    TimelineKind.Scroll { scrollerNode: 20, horizontal: false, startOffset: 0.0, endOffset: 200.0 },
+    EasingKind.Linear,
+    0.0,
+    0.0,
+    0.2,
+    1.0,
+  )
+  // Pointer timeline animation on layer 11 driven by pointer X in [0..200].
+  let ptrAnim = CompositorAnimation.keyframed(
+    4,
+    11,
+    AnimPropertyKind.TranslateX,
+    TimelineKind.Pointer { axisX: true, minPos: 0.0, maxPos: 200.0 },
+    EasingKind.Linear,
+    0.0,
+    0.0,
+    0.0,
+    40.0,
+  )
+  run comp.setAnimations(&[opAnim, txAnim, scrollAnim, ptrAnim], 0.0)
+    |> Effect.provideMut<Allocator>(&mut heap)
+  run Testing.expect(comp.hasActiveMotion() && comp.nextWakeMs(10.0).isSome(), "monotonic animation active initially")
+
+  drop run comp.tick(50.0, 0.05) |> Effect.provideMut<Allocator>(&mut heap)
+  let midOp = findOverrideOpacity(comp.overrides(), 7)
+  let midTx = findOverrideTx(comp.overrides(), 7)
+  run Testing.expect(
+    f32.abs(midOp - 0.5) < 0.01 && f32.abs(midTx - 40.0) < 0.01,
+    "monotonic opacity and translateX reach midpoint at 50ms",
+  )
+
+  drop run comp.tick(120.0, 0.07) |> Effect.provideMut<Allocator>(&mut heap)
+  run Testing.expect(
+    f32.abs(findOverrideOpacity(comp.overrides(), 7) - 1.0) < 0.001
+      && f32.abs(findOverrideTx(comp.overrides(), 7) - 80.0) < 0.001,
+    "completed monotonic animations fill forward accurately",
+  )
+  run Testing.expect(
+    !comp.hasActiveMotion() && comp.nextWakeMs(120.0).isNone(),
+    "compositor reports zero-poll idle once monotonic animations complete",
+  )
+
+  // Scroll & Pointer timelines evaluate immediately without timer ticks.
+  let sp = [ScrollPosition { node: 20, x: 0.0, y: 100.0, minX: 0.0, maxX: 0.0, minY: 0.0, maxY: 400.0 }]
+  run comp.setScrollPositions(&sp, 120.0) |> Effect.provideMut<Allocator>(&mut heap)
+  run Testing.expect(
+    f32.abs(findOverrideOpacity(comp.overrides(), 9) - 0.6) < 0.01,
+    "scroll timeline interpolates layer opacity at scroll midpoint",
+  )
+  let movedPtr = run comp.onPointerMove(50.0, 10.0, 120.0) |> Effect.provideMut<Allocator>(&mut heap)
+  run Testing.expect(
+    movedPtr && f32.abs(findOverrideTx(comp.overrides(), 11) - 10.0) < 0.01 && !comp.hasActiveMotion(),
+    "pointer timeline updates translateX immediately while staying zero-poll idle",
+  )
+
+  // Sub-stepped SpringSpec stability at coarse dtSec = 0.1.
+  let mut st = SpringState { value: 0.0, target: 100.0, velocity: 0.0, active: true }
+  let spec = SpringSpec.default()
+  let mut stepCount: u32 = 0
+  while st.active && stepCount < 120 {
+    st = stepSpring(spec, st, 0.1)
+    run Testing.expect(st.value >= -25.0 && st.value <= 135.0, "sub-stepped spring does not diverge at dt=0.1")
+    stepCount = stepCount + 1
+  }
+  run Testing.expect(!st.active && st.value == 100.0, "sub-stepped spring settles to exact target")
+
+  // Spring-driven layer animation settles into idle.
+  let spAnim = CompositorAnimation.springDriven(
+    5,
+    12,
+    AnimPropertyKind.TranslateY,
+    0.0,
+    0.0,
+    50.0,
+    SpringSpec.default(),
+  )
+  run comp.setAnimations(&[spAnim], 0.0) |> Effect.provideMut<Allocator>(&mut heap)
+  run Testing.expect(comp.hasActiveMotion(), "spring animation activates compositor wake")
+  let mut ticks: u32 = 0
+  while comp.hasActiveMotion() && ticks < 150 {
+    drop run comp.tick(usize.toF64(u32.toUsize(ticks + 1)) * 16.0, 0.016)
+      |> Effect.provideMut<Allocator>(&mut heap)
+    ticks = ticks + 1
+  }
+  run Testing.expect(!comp.hasActiveMotion(), "spring-driven layer animation settles cleanly to idle")
+}
+
+test effect fn stage4ScrollPhysicsFlingOverscrollSnapSmoothAndThumb() -> ()
+  ! AssertionError<'static> | OutOfMemoryError {
+  let mut heap = Allocator.systemAllocatorProvider()
+  let mut comp = WindowCompositorState.make(WindowId { value: 3 })
+
+  // Nodes:
+  // 1: Auto parent scroller [0..500]
+  // 2: Auto child scroller [0..200], chains to parent 1
+  // 3: Contain scroller [0..200], rubber-bands internally without chaining to 1
+  // 4: None scroller [0..200], hard-clamps without rubber-band or chaining
+  // 5: Snap Mandatory + stopAlways scroller [0..600]
+  // 6: Snap Proximity scroller [0..600]
+  let mut c1 = ScrollerPhysicsConfig.basic(1, 0.0, 0.0, 0.0, 500.0)
+  let mut c2 = ScrollerPhysicsConfig.basic(2, 0.0, 0.0, 0.0, 200.0)
+  c2.parentNode = 1
+  c2.overscrollY = OverscrollBehavior.Auto
+  let mut c3 = ScrollerPhysicsConfig.basic(3, 0.0, 0.0, 0.0, 200.0)
+  c3.parentNode = 1
+  c3.overscrollY = OverscrollBehavior.Contain
+  let mut c4 = ScrollerPhysicsConfig.basic(4, 0.0, 0.0, 0.0, 200.0)
+  c4.parentNode = 1
+  c4.overscrollY = OverscrollBehavior.None
+  let mut c5 = ScrollerPhysicsConfig.basic(5, 0.0, 0.0, 0.0, 600.0)
+  c5.snapStrictnessY = SnapStrictness.Mandatory
+  run c5.snapPointsY.append(SnapPoint { offset: 0.0, stopAlways: false })
+    |> Effect.provideMut<Allocator>(&mut heap)
+  run c5.snapPointsY.append(SnapPoint { offset: 200.0, stopAlways: true })
+    |> Effect.provideMut<Allocator>(&mut heap)
+  run c5.snapPointsY.append(SnapPoint { offset: 500.0, stopAlways: false })
+    |> Effect.provideMut<Allocator>(&mut heap)
+  let mut c6 = ScrollerPhysicsConfig.basic(6, 0.0, 0.0, 0.0, 600.0)
+  c6.snapStrictnessY = SnapStrictness.Proximity
+  c6.proximityThreshold = 30.0
+  run c6.snapPointsY.append(SnapPoint { offset: 0.0, stopAlways: false })
+    |> Effect.provideMut<Allocator>(&mut heap)
+  run c6.snapPointsY.append(SnapPoint { offset: 300.0, stopAlways: false })
+    |> Effect.provideMut<Allocator>(&mut heap)
+  c1.trackBounds = rect(390.0, 0.0, 10.0, 120.0)
+  c1.thumbSize = 20.0
+
+  run comp.setScrollerConfigs(&[move c1, move c2, move c3, move c4, move c5, move c6])
+    |> Effect.provideMut<Allocator>(&mut heap)
+
+  // 1. Overscroll None clamps strictly.
+  drop run comp.applyWheel(4, 0.0, 250.0, 0.0) |> Effect.provideMut<Allocator>(&mut heap)
+  let p4 = comp.scrollPositionOf(4).unwrapOr(ScrollPosition { node: 4, x: 0.0, y: -1.0, minX: 0.0, maxX: 0.0, minY: 0.0, maxY: 0.0 })
+  let o4 = comp.overscrollOf(4)
+  run Testing.expect(p4.y == 200.0 && o4[1] == 0.0, "OverscrollBehavior.None clamps hard without rubber-band")
+
+  // 2. Overscroll Contain rubber-bands past max without chaining to parent 1.
+  drop run comp.applyWheel(3, 0.0, 250.0, 0.0) |> Effect.provideMut<Allocator>(&mut heap)
+  let o3 = comp.overscrollOf(3)
+  let p1BeforeChain = comp.scrollPositionOf(1).unwrapOr(ScrollPosition { node: 1, x: 0.0, y: 0.0, minX: 0.0, maxX: 0.0, minY: 0.0, maxY: 0.0 })
+  run Testing.expect(
+    o3[1] > 0.0 && p1BeforeChain.y == 0.0,
+    "OverscrollBehavior.Contain absorbs overscroll in rubber-band without chaining",
+  )
+
+  // 3. Overscroll Auto chains unconsumed delta to parent 1.
+  drop run comp.applyWheel(2, 0.0, 260.0, 0.0) |> Effect.provideMut<Allocator>(&mut heap)
+  let p2 = comp.scrollPositionOf(2).unwrapOr(ScrollPosition { node: 2, x: 0.0, y: 0.0, minX: 0.0, maxX: 0.0, minY: 0.0, maxY: 0.0 })
+  let p1AfterChain = comp.scrollPositionOf(1).unwrapOr(ScrollPosition { node: 1, x: 0.0, y: 0.0, minX: 0.0, maxX: 0.0, minY: 0.0, maxY: 0.0 })
+  run Testing.expect(
+    p2.y == 200.0 && p1AfterChain.y > 0.0,
+    "OverscrollBehavior.Auto chains excess scroll to ancestor",
+  )
+
+  // 4. Scrollbar thumb drag shifts parent 1 proportionately.
+  let beforeDragY = p1AfterChain.y
+  run comp.beginThumbDrag(1, 0.0) |> Effect.provideMut<Allocator>(&mut heap)
+  let dragged = run comp.moveThumbDrag(1, 20.0, 10.0) |> Effect.provideMut<Allocator>(&mut heap)
+  comp.endThumbDrag(1)
+  let afterDragY = comp.scrollPositionOf(1).unwrapOr(p1AfterChain).y
+  run Testing.expect(dragged && afterDragY > beforeDragY + 50.0, "thumb drag advances scroll by track-to-content ratio")
+
+  // 5. Smooth scroll starts active motion and cancels immediately upon user wheel input.
+  run comp.startSmoothScroll(1, 0.0, 450.0, 20.0, 200.0) |> Effect.provideMut<Allocator>(&mut heap)
+  run Testing.expect(comp.hasActiveMotion(), "smooth scroll becomes active")
+  drop run comp.tick(60.0, 0.04) |> Effect.provideMut<Allocator>(&mut heap)
+  drop run comp.applyWheel(1, 0.0, -10.0, 70.0) |> Effect.provideMut<Allocator>(&mut heap)
+  let canceledY = comp.scrollPositionOf(1).unwrapOr(p1AfterChain).y
+  drop run comp.tick(200.0, 0.05) |> Effect.provideMut<Allocator>(&mut heap)
+  let afterCancelY = comp.scrollPositionOf(1).unwrapOr(p1AfterChain).y
+  run Testing.expect(
+    f32.abs(afterCancelY - canceledY) < 0.01,
+    "user wheel input immediately cancels smooth scroll transition",
+  )
+
+  // 6. Touch pan + exponential fling on Mandatory/stopAlways snap scroller (node 5).
+  run comp.onTouchBegin(5, 0.0, 500.0, 100.0) |> Effect.provideMut<Allocator>(&mut heap)
+  drop run comp.onTouchMove(5, 0.0, 400.0, 116.0) |> Effect.provideMut<Allocator>(&mut heap)
+  drop run comp.onTouchMove(5, 0.0, 260.0, 132.0) |> Effect.provideMut<Allocator>(&mut heap)
+  drop run comp.onTouchEnd(5, 140.0) |> Effect.provideMut<Allocator>(&mut heap)
+  let startFlingY = comp.scrollPositionOf(5).unwrapOr(p1AfterChain).y
+  let mut flingTicks: u32 = 0
+  while comp.hasActiveMotion() && flingTicks < 240 {
+    drop run comp.tick(140.0 + usize.toF64(u32.toUsize(flingTicks + 1)) * 16.0, 0.016)
+      |> Effect.provideMut<Allocator>(&mut heap)
+    flingTicks = flingTicks + 1
+  }
+  let endSnapY = comp.scrollPositionOf(5).unwrapOr(p1AfterChain).y
+  run Testing.expect(
+    startFlingY > 200.0 && f32.abs(endSnapY - 200.0) < 0.5 && !comp.hasActiveMotion(),
+    "fast fling crossing intermediate stopAlways=true snap point stops at 200 and idles",
+  )
+
+  // 7. Proximity snap stays outside threshold, snaps inside threshold.
+  run comp.onTouchBegin(6, 0.0, 200.0, 300.0) |> Effect.provideMut<Allocator>(&mut heap)
+  drop run comp.onTouchMove(6, 0.0, 80.0, 316.0) |> Effect.provideMut<Allocator>(&mut heap)
+  drop run comp.onTouchEnd(6, 500.0) |> Effect.provideMut<Allocator>(&mut heap)
+  // Wait for smooth snap if any; since dt between move & end was only 16ms velocity was high, settle first:
+  let mut pTicks: u32 = 0
+  while comp.hasActiveMotion() && pTicks < 240 {
+    drop run comp.tick(500.0 + usize.toF64(u32.toUsize(pTicks + 1)) * 16.0, 0.016)
+      |> Effect.provideMut<Allocator>(&mut heap)
+    pTicks = pTicks + 1
+  }
+  // Reset cleanly via wheel inside vs outside threshold on node 6 (threshold 30 around snap point 300):
+  run comp.setScrollPositions(&[ScrollPosition { node: 6, x: 0.0, y: 150.0, minX: 0.0, maxX: 0.0, minY: 0.0, maxY: 600.0 }], 600.0)
+    |> Effect.provideMut<Allocator>(&mut heap)
+  run comp.onTouchBegin(6, 0.0, 200.0, 600.0) |> Effect.provideMut<Allocator>(&mut heap)
+  drop run comp.onTouchEnd(6, 610.0) |> Effect.provideMut<Allocator>(&mut heap)
+  let farY = comp.scrollPositionOf(6).unwrapOr(p1AfterChain).y
+  run Testing.expect(f32.abs(farY - 150.0) < 0.1, "Proximity snap does not pull offset outside threshold")
+  run comp.setScrollPositions(&[ScrollPosition { node: 6, x: 0.0, y: 285.0, minX: 0.0, maxX: 0.0, minY: 0.0, maxY: 600.0 }], 700.0)
+    |> Effect.provideMut<Allocator>(&mut heap)
+  run comp.onTouchBegin(6, 0.0, 200.0, 700.0) |> Effect.provideMut<Allocator>(&mut heap)
+  drop run comp.onTouchEnd(6, 710.0) |> Effect.provideMut<Allocator>(&mut heap)
+  while comp.hasActiveMotion() {
+    drop run comp.tick(720.0, 0.5) |> Effect.provideMut<Allocator>(&mut heap)
+  }
+  let nearY = comp.scrollPositionOf(6).unwrapOr(p1AfterChain).y
+  run Testing.expect(f32.abs(nearY - 300.0) < 0.5, "Proximity snap pulls offset within threshold to 300")
+}
+
+test effect fn stage4EnginePoolParallelRasterAndTreeParity() -> ()
+  ! AssertionError<'static> | AtlasError | GeometryError | OutOfMemoryError | ReadError | RenderError | SpawnError | TreeError | UrlError {
+  let mut heap = Allocator.systemAllocatorProvider()
+  let mut pools = run Pools.make()
+  let poolHandle = pools.engine.handle()
+
+  // 1. Glyph batch parity (parallel vs serial).
+  let fontBytes = assets.regularFont()
+  let face = match run FontFace.fromBytes(1, fontBytes, 0, &[]) |> Effect.provideMut<Allocator>(&mut heap) {
+    Result<FontFace<'_>, ReadError>.Success { value } => move value
+    Result<FontFace<'_>, ReadError>.Failure { error } => {
+      pools.stop()
+      fail error
+    }
+  }
+  let mut lines = LineCache.make()
+  let shaperData = ShaperData.new(&face.font)
+  let shaper = shaperData.shaper()
+  let shapedId = run lines.shape(&shaper, face.id, "Stage 4 Parallel Glyphs!") |> Effect.provideMut<Allocator>(&mut heap)
+  let rawGlyphs = lines.glyphs(shapedId)
+
+  let mut serialGlyphs = GlyphCache.make()
+  let mut serialAtlas = Atlas.make(AtlasOptions.default())
+  drop serialAtlas.beginFrame()
+
+  let mut parGlyphs = GlyphCache.make()
+  let mut parAtlas = Atlas.make(AtlasOptions.default())
+  drop parAtlas.beginFrame()
+
+  let mut fontCopyBytes = List<u8>.make()
+  run fontCopyBytes.appendSlice(fontBytes) |> Effect.provideMut<Allocator>(&mut heap)
+  let mut fontsList = List<GlyphFontCopy>.make()
+  run fontsList.append(
+    GlyphFontCopy { id: face.id, faceIndex: 0, bytes: move fontCopyBytes, coords: List<F2Dot14>.make() },
+  )
+    |> Effect.provideMut<Allocator>(&mut heap)
+  let mut glyphJobs = List<GlyphJob>.make()
+  let mut gKeys = List<GlyphKey>.make()
+  let mut gi: usize = 0
+  while gi < rawGlyphs.length {
+    let k = GlyphKey {
+      font: face.id,
+      glyph: rawGlyphs[gi].glyph,
+      size: 16.0,
+      scale: 2.0,
+      subpixel: i32.toU8(usize.toI32(gi % 4)),
+      color: true,
+      palette: 0,
+      aliased: false,
+    }
+    let mut dup = false
+    let mut d: usize = 0
+    while d < gKeys.length() {
+      let ex = gKeys.get(d)
+      if ex.glyph == k.glyph && ex.subpixel == k.subpixel {
+        dup = true
+        break
+      }
+      d = d + 1
+    }
+    if !dup {
+      run gKeys.append(k) |> Effect.provideMut<Allocator>(&mut heap)
+      run glyphJobs.append(GlyphJob { fontSlot: 0, key: k, palette: PaletteChoice.normal() })
+        |> Effect.provideMut<Allocator>(&mut heap)
+    }
+    gi = gi + 1
+  }
+  let fg = parGlyphs.foregroundColor()
+  let parGlyphCount = run preRasterizeGlyphs(
+    &poolHandle,
+    1,
+    move fontsList,
+    move glyphJobs,
+    fg,
+    &mut parGlyphs,
+    &mut parAtlas,
+  )
+    |> Effect.provideMut<Allocator>(&mut heap)
+  run Testing.expect(parGlyphCount > 0, "parallel glyph batch committed tiles")
+  gi = 0
+  while gi < gKeys.length() {
+    drop run serialGlyphs.glyph(&mut serialAtlas, &face, gKeys.get(gi))
+      |> Effect.provideMut<Allocator>(&mut heap)
+    gi = gi + 1
+  }
+  run Testing.expect(parGlyphs.uploads().length == serialGlyphs.uploads().length, "same glyph upload count")
+  run Testing.expect(parGlyphs.uploadBytes().length == serialGlyphs.uploadBytes().length, "same glyph byte length")
+  let gbPar = parGlyphs.uploadBytes()
+  let gbSer = serialGlyphs.uploadBytes()
+  let mut b: usize = 0
+  while b < gbPar.length {
+    run Testing.expect(gbPar[b] == gbSer[b], "parallel glyph pixels match serial byte-for-byte")
+    b = b + 1
+  }
+
+  // 2. Path batch parity (fill + stroke).
+  let mut serialPaths = PathCache.make()
+  let mut parPaths = PathCache.make()
+  run serialPaths.beginFrame() |> Effect.provideMut<Allocator>(&mut heap)
+  run parPaths.beginFrame() |> Effect.provideMut<Allocator>(&mut heap)
+  let tr = Affine.new(1.0, 0.0, 0.0, 1.0, 40.25, 40.5)
+  let fillKey = parPaths.makeFillKey(1, &tr, NONZERO)
+  let mut strokeStyle = Stroke.make(2.5)
+  let strokeKey = parPaths.makeStrokeKey(2, &strokeStyle, &tr)
+  let mut pathA = Path.make()
+  run pathA.circle(0.0, 0.0, 14.0) |> Effect.provideMut<Allocator>(&mut heap)
+  let mut pathB = Path.make()
+  run pathB.circle(0.0, 0.0, 14.0) |> Effect.provideMut<Allocator>(&mut heap)
+  let mut pathC = Path.make()
+  run pathC.circle(0.0, 0.0, 14.0) |> Effect.provideMut<Allocator>(&mut heap)
+  let mut pathItems = List<PathWorkItem>.make()
+  run pathItems.append(
+    PathWorkItem { key: fillKey, path: move pathB, transform: tr, rule: NONZERO, isStroke: false, stroke: Stroke.make(1.0) },
+  )
+    |> Effect.provideMut<Allocator>(&mut heap)
+  run pathItems.append(
+    PathWorkItem { key: strokeKey, path: move pathC, transform: tr, rule: NONZERO, isStroke: true, stroke: Stroke.make(2.5) },
+  )
+    |> Effect.provideMut<Allocator>(&mut heap)
+  let parPathCount = run preRasterizePaths(&poolHandle, 1, move pathItems, &mut parPaths)
+    |> Effect.provideMut<Allocator>(&mut heap)
+  run Testing.expect(parPathCount == 2, "parallel path batch inserted both fill and stroke")
+  let mut serPathScene = Scene.make()
+  let mut parPathScene = Scene.make()
+  drop run serialPaths.fill(&mut serPathScene, 1, &pathA, &tr, NONZERO, Background.solid(color.black()), ContentMask.new(rect(0.0, 0.0, 100.0, 100.0)))
+    |> Effect.provideMut<Allocator>(&mut heap)
+  drop run serialPaths.stroke(&mut serPathScene, 2, &pathA, &strokeStyle, &tr, Background.solid(color.black()), ContentMask.new(rect(0.0, 0.0, 100.0, 100.0)))
+    |> Effect.provideMut<Allocator>(&mut heap)
+  drop run parPaths.fill(&mut parPathScene, 1, &pathA, &tr, NONZERO, Background.solid(color.black()), ContentMask.new(rect(0.0, 0.0, 100.0, 100.0)))
+    |> Effect.provideMut<Allocator>(&mut heap)
+  drop run parPaths.stroke(&mut parPathScene, 2, &pathA, &strokeStyle, &tr, Background.solid(color.black()), ContentMask.new(rect(0.0, 0.0, 100.0, 100.0)))
+    |> Effect.provideMut<Allocator>(&mut heap)
+  run serPathScene.finish() |> Effect.provideMut<Allocator>(&mut heap)
+  run parPathScene.finish() |> Effect.provideMut<Allocator>(&mut heap)
+  let serAlphas = serPathScene.pathAlphas()
+  let parAlphas = parPathScene.pathAlphas()
+  run Testing.expect(serAlphas.length == parAlphas.length, "same path coverage alpha byte length")
+  let mut aIdx: usize = 0
+  while aIdx < serAlphas.length {
+    run Testing.expect(serAlphas[aIdx] == parAlphas[aIdx], "parallel path coverage matches serial byte-for-byte")
+    aIdx = aIdx + 1
+  }
+
+  // 3. Icon batch parity (Color + Mask).
+  let baseUrl = run mustUrl(b"/icons/icon.svg") |> Effect.provideMut<Allocator>(&mut heap)
+  let svgFonts = FontDatabase.make()
+  let env = svgEnv(&baseUrl, &svgFonts)
+  let mut resolver = DataOnly.make(ResourceLimits.defaults())
+  let mut parIcons = IconCache.make(IconOptions.default())
+  let mut serIcons = IconCache.make(IconOptions.default())
+  let mut parIconAtlas = Atlas.make(AtlasOptions.default())
+  let mut serIconAtlas = Atlas.make(AtlasOptions.default())
+  drop parIconAtlas.beginFrame()
+  drop serIconAtlas.beginFrame()
+  let ic0P = run parIcons.register(assets.icon(0), &env)
+    |> Effect.provideMut<Resolver>(&mut resolver)
+    |> Effect.provideMut<Allocator>(&mut heap)
+  let ic1P = run parIcons.register(assets.icon(1), &env)
+    |> Effect.provideMut<Resolver>(&mut resolver)
+    |> Effect.provideMut<Allocator>(&mut heap)
+  let ic0S = run serIcons.register(assets.icon(0), &env)
+    |> Effect.provideMut<Resolver>(&mut resolver)
+    |> Effect.provideMut<Allocator>(&mut heap)
+  let ic1S = run serIcons.register(assets.icon(1), &env)
+    |> Effect.provideMut<Resolver>(&mut resolver)
+    |> Effect.provideMut<Allocator>(&mut heap)
+  let keyC = match parIcons.makeKey(&env, ic0P, 24, 24, 0.0, 0.0, IconStyle.Color, 0.0) {
+    Option.Some { value } => value
+    Option.None => {
+      run Testing.expect(false, "color icon key should resolve")
+      pools.stop()
+      return
+    }
+  }
+  let keyM = match parIcons.makeKey(&env, ic1P, 20, 20, 0.0, 0.0, IconStyle.Mask, 0.0) {
+    Option.Some { value } => value
+    Option.None => {
+      run Testing.expect(false, "mask icon key should resolve")
+      pools.stop()
+      return
+    }
+  }
+  let mut prepItems = List<PreparedIcon>.make()
+  if let Option<PreparedIcon>.Some { value: pC } = move run parIcons.prepareIcon(&env, keyC, IconStyle.Color)
+    |> Effect.provideMut<Resolver>(&mut resolver)
+    |> Effect.provideMut<Allocator>(&mut heap) {
+    run prepItems.append(move pC) |> Effect.provideMut<Allocator>(&mut heap)
+  }
+  if let Option<PreparedIcon>.Some { value: pM } = move run parIcons.prepareIcon(&env, keyM, IconStyle.Mask)
+    |> Effect.provideMut<Resolver>(&mut resolver)
+    |> Effect.provideMut<Allocator>(&mut heap) {
+    run prepItems.append(move pM) |> Effect.provideMut<Allocator>(&mut heap)
+  }
+  let parIconCount = run preRasterizeIcons(&poolHandle, 1, move prepItems, &mut parIcons, &mut parIconAtlas)
+    |> Effect.provideMut<Allocator>(&mut heap)
+  run Testing.expect(parIconCount == 2, "parallel icon batch committed 2 tiles")
+  drop run serIcons.icon(&mut serIconAtlas, &env, ic0S, 24, 24, IconStyle.Color, 0.0)
+    |> Effect.provideMut<Resolver>(&mut resolver)
+    |> Effect.provideMut<Allocator>(&mut heap)
+  drop run serIcons.icon(&mut serIconAtlas, &env, ic1S, 20, 20, IconStyle.Mask, 0.0)
+    |> Effect.provideMut<Resolver>(&mut resolver)
+    |> Effect.provideMut<Allocator>(&mut heap)
+  run Testing.expect(parIcons.uploads().length == 2 && serIcons.uploads().length == 2, "both caches queued 2 icon uploads")
+  run Testing.expect(parIcons.uploadBytes().length == serIcons.uploadBytes().length, "same icon byte count")
+  let ibP = parIcons.uploadBytes()
+  let ibS = serIcons.uploadBytes()
+  let mut ib: usize = 0
+  while ib < ibP.length {
+    run Testing.expect(ibP[ib] == ibS[ib], "parallel icon upload bytes match serial byte-for-byte")
+    ib = ib + 1
+  }
+
+  // 4. Full UiTree inbox frame parity (with EnginePool vs serial) + CPU pixel check.
+  let col = run fixtures.fonts() |> Effect.provideMut<Allocator>(&mut heap)
+  let mut serTree = run UiTree.make(&col) |> Effect.provideMut<Allocator>(&mut heap)
+  let mut parTree = run UiTree.make(&col) |> Effect.provideMut<Allocator>(&mut heap)
+  parTree.setEnginePool(poolHandle.clone(), 1)
+  parTree.enableAtlasEpochPinning(true)
+
+  let mut serBatch = Batch.make()
+  run fixtures.inbox(&mut serBatch) |> Effect.provideMut<Allocator>(&mut heap)
+  run serTree.apply(run serBatch.take() |> Effect.provideMut<Allocator>(&mut heap))
+    |> Effect.provideMut<Allocator>(&mut heap)
+
+  let mut parBatch = Batch.make()
+  run fixtures.inbox(&mut parBatch) |> Effect.provideMut<Allocator>(&mut heap)
+  run parTree.apply(run parBatch.take() |> Effect.provideMut<Allocator>(&mut heap))
+    |> Effect.provideMut<Allocator>(&mut heap)
+
+  let vp = fixtures.viewport(2)
+  run serTree.frame(vp) |> Effect.provideMut<Allocator>(&mut heap)
+  run parTree.frame(vp) |> Effect.provideMut<Allocator>(&mut heap)
+
+  run Testing.expect(parTree.stats.parallelGlyphs > 0, "UiTree.frame recorded EnginePool parallelGlyphs")
+  run Testing.expect(parTree.atlasFrame() >= 1, "UiTree.frame advanced atlas frame epoch")
+
+  let serPm = run snapshotScenePixels(&serTree, 360, 440) |> Effect.provideMut<Allocator>(&mut heap)
+  let parPm = run snapshotScenePixels(&parTree, 360, 440) |> Effect.provideMut<Allocator>(&mut heap)
+  let mut py: u32 = 0
+  while py < 440 {
+    let mut px: u32 = 0
+    while px < 360 {
+      let a = serPm.pixel(px, py)
+      let c = parPm.pixel(px, py)
+      run Testing.expect(
+        a.r == c.r && a.g == c.g && a.b == c.b && a.a == c.a,
+        "UiTree frame rendered with EnginePool matches serial pixel-for-pixel",
+      )
+      px = px + 1
+    }
+    py = py + 1
+  }
+  pools.stop()
+}
+
+test effect fn browserCommitRoundTrip() -> ()
+  ! AssertionError<'static> | OutOfMemoryError {
+  let mut heap = Allocator.systemAllocatorProvider()
+  let mut scene = Scene.make()
+  run scene.finish() |> Effect.provideMut<Allocator>(&mut heap)
+  let blocked = [Rect<f32>.new(10.0, 20.0, 210.0, 120.0)]
+  let flags = u32.bitOr(PREVENT_WHEEL_BIT, PREVENT_KEYS_BIT)
+  let bytes = run encodeBrowserCommit(
+    WindowId { value: 2 },
+    9,
+    42,
+    1280,
+    720,
+    2.0,
+    flags,
+    &scene,
+    &blocked,
+  )
+    |> Effect.provideMut<Allocator>(&mut heap)
+  let headerOpt = decodeBrowserCommitHeader(bytes.asSlice())
+  run Testing.expect(headerOpt.isSome(), "browser commit header decodes")
+  if let Option.Some { value: header } = headerOpt {
+    run Testing.expect(header.version == BROWSER_COMMIT_VERSION, "version matches v1")
+    run Testing.expect(header.windowId == 2, "windowId preserved")
+    run Testing.expect(header.commitEpoch == 9, "commitEpoch preserved")
+    run Testing.expect(header.consumedInputSeq == 42, "consumedInputSeq preserved")
+    run Testing.expect(header.viewportWidth == 1280, "viewportWidth preserved")
+    run Testing.expect(header.viewportHeight == 720, "viewportHeight preserved")
+    run Testing.expect(header.deviceScale == 2.0, "deviceScale preserved")
+    run Testing.expect(header.preventFlags == flags, "preventFlags preserved")
+  }
+  // 40 header + 4 scrollCount(0) + 4 blockedCount(1) + 16 Rect + 4 layerCount(0) = 68 bytes.
+  run Testing.expect(bytes.length() == 68, "exact binary byte length")
+}

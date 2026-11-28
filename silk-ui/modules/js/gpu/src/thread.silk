@@ -1,0 +1,287 @@
+//! Runs [`GpuService`](service.GpuService) on a dedicated OS thread off the Document Thread.
+//!
+//! JavaScript submits encoded WebGPU command streams with [`GpuServiceThread.submit`] without
+//! blocking the Document Thread. Completed [`GpuReply`](ui_js_calls.gpu.GpuReply) batches and
+//! canvas [`SurfaceUpdate`](service.SurfaceUpdate) records are drained on the Document Thread
+//! via [`GpuServiceThread.drain`], woken by `Nudge` when work finishes.
+import service { GpuService, SurfaceUpdate }
+import ui_js_calls.gpu { GpuReply }
+import ui_transport.channel {
+  SendError,
+  TryRecvError,
+  UnboundedChannel,
+  UnboundedPair,
+  UnboundedReceiver,
+  UnboundedSender,
+}
+import ui_transport.wake { Waiter, WakeHandle }
+import ui_tree_window.canvas_frames { CanvasPresenter }
+import ui_tree_window.platform_thread { Nudge }
+import silk.collections.list { List }
+import silk.concurrency.sync { Arc, Mutex }
+import silk.concurrency.thread { Transferable }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.ownership { Drop }
+import silk.core.result { Result }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.usize
+
+static if Intrinsic.targetArchitecture() != "wasm32" {
+  import silk.concurrency.thread_native { JoinHandle, NativeThread }
+
+  type GpuThreadHandle = JoinHandle<()>
+} else {
+  struct GpuThreadHandle {
+    unused: u8,
+  }
+}
+
+/// One batch of completed GPU work ready for the Document Thread.
+pub struct GpuResult {
+  pub replies: List<GpuReply>,
+  pub updates: List<SurfaceUpdate>,
+}
+
+impl Transferable for GpuResult {}
+
+union GpuWork {
+  Commands { bytes: List<u8> },
+  Shutdown,
+}
+
+impl Transferable for GpuWork {}
+
+/// Owns either a dedicated GPU worker thread (native) or an inline fallback service (`wasm32` or
+/// spawn failure), keeping `GpuService` calls non-blocking on the Document Thread.
+pub struct GpuServiceThread {
+  workTx: Option<UnboundedSender<GpuWork>>,
+  resRx: Option<UnboundedReceiver<GpuResult>>,
+  wakeSlot: Option<Arc<Mutex<Option<Nudge>>>>,
+  thread: Option<GpuThreadHandle>,
+  inFlight: usize,
+  inlineService: Option<GpuService>,
+  inlineResults: List<GpuResult>,
+}
+
+impl GpuServiceThread {
+  /// Starts a dedicated WebGPU service thread presenting canvases through `presenter`.
+  /// Falls back to an inline service on `wasm32` or if thread creation fails.
+  pub effect fn start(presenter: CanvasPresenter) -> GpuServiceThread
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    static if Intrinsic.targetArchitecture() == "wasm32" {
+      return GpuServiceThread {
+        workTx: Option<UnboundedSender<GpuWork>>.None,
+        resRx: Option<UnboundedReceiver<GpuResult>>.None,
+        wakeSlot: Option<Arc<Mutex<Option<Nudge>>>>.None,
+        thread: Option<GpuThreadHandle>.None,
+        inFlight: 0,
+        inlineService: Option<GpuService>.some(GpuService.make(move presenter)),
+        inlineResults: List<GpuResult>.make(),
+      }
+    } else {
+      let mut heap = Allocator.systemAllocatorProvider()
+      let workWaiter = run Waiter.make()
+      let workPair = run UnboundedChannel.make<GpuWork>(workWaiter.handle())
+      let UnboundedPair<GpuWork> { sender: workTx, receiver: workRx } = move workPair
+      let resPair = run UnboundedChannel.make<GpuResult>(WakeHandle.noop())
+      let UnboundedPair<GpuResult> { sender: resTx, receiver: resRx } = move resPair
+      let wakeSlot = run Arc<Mutex<Option<Nudge>>>.make(
+        run Mutex<Option<Nudge>>.make(Option<Nudge>.None) |> Effect.provideMut<Allocator>(&mut heap),
+      )
+        |> Effect.provideMut<Allocator>(&mut heap)
+      let workerWake = wakeSlot.clone()
+      let workerPresenter = presenter.clone()
+      let spawned = run Effect.result(
+        NativeThread.spawn(
+          || -> () {
+            gpuWorkerLoop(move workerPresenter, move workWaiter, move workRx, move resTx, move workerWake)
+          },
+        ),
+      )
+        |> Effect.provideMut<Allocator>(&mut heap)
+      match move spawned {
+        Result.Success { value } => {
+          return GpuServiceThread {
+            workTx: Option<UnboundedSender<GpuWork>>.some(move workTx),
+            resRx: Option<UnboundedReceiver<GpuResult>>.some(move resRx),
+            wakeSlot: Option<Arc<Mutex<Option<Nudge>>>>.some(move wakeSlot),
+            thread: Option<GpuThreadHandle>.some(move value),
+            inFlight: 0,
+            inlineService: Option<GpuService>.None,
+            inlineResults: List<GpuResult>.make(),
+          }
+        }
+        Result.Failure { error } => {
+          drop error
+          return GpuServiceThread {
+            workTx: Option<UnboundedSender<GpuWork>>.None,
+            resRx: Option<UnboundedReceiver<GpuResult>>.None,
+            wakeSlot: Option<Arc<Mutex<Option<Nudge>>>>.None,
+            thread: Option<GpuThreadHandle>.None,
+            inFlight: 0,
+            inlineService: Option<GpuService>.some(GpuService.make(move presenter)),
+            inlineResults: List<GpuResult>.make(),
+          }
+        }
+      }
+    }
+  }
+
+  /// Registers the Document Thread wake handle notified when async GPU results arrive.
+  pub fn setWake(self: &mut Self, wake: Nudge) -> () {
+    if let Option<Arc<Mutex<Option<Nudge>>>>.Some { value: slot } = &self.wakeSlot {
+      let mut guard = slot.get().lock()
+      let state = guard.getMut()
+      state.* = Option<Nudge>.some(move wake)
+    }
+  }
+
+  /// Whether GPU commands have been submitted and their replies/updates have not yet been drained.
+  pub fn pending(self: &Self) -> bool {
+    return self.inFlight != 0 || self.inlineResults.length() != 0
+  }
+
+  /// Whether completed GPU batches wake the owning Document Thread via [`GpuServiceThread.setWake`].
+  pub fn wakesOnCompletion(self: &Self) -> bool {
+    if let Option<Arc<Mutex<Option<Nudge>>>>.Some { value: slot } = &self.wakeSlot {
+      let guard = slot.get().lock()
+      return guard.get().isSome()
+    }
+    return false
+  }
+
+  /// Submits an encoded command stream to run asynchronously on the GPU service thread.
+  pub effect fn submit(self: &mut Self, commands: List<u8>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if let Option<UnboundedSender<GpuWork>>.Some { value: tx } = &self.workTx {
+      let sent = run tx.send(GpuWork.Commands { bytes: move commands })
+      match move sent {
+        Result<(), SendError<GpuWork>>.Success { .. } => {
+          self.inFlight = self.inFlight + 1
+          return ()
+        }
+        Result<(), SendError<GpuWork>>.Failure { .. } => {
+          return ()
+        }
+      }
+    }
+    if let Option<GpuService>.Some { value: svc } = &mut self.inlineService {
+      let mut updates = List<SurfaceUpdate>.make()
+      run svc.serveUpdates(commands.asSlice(), &mut updates)
+      let mut replies = svc.takeReplies()
+      if replies.length() != 0 || updates.length() != 0 {
+        run self.inlineResults.append(GpuResult { replies: move replies, updates: move updates })
+      }
+    }
+  }
+
+  /// Appends all finished GPU replies and canvas surface updates without blocking.
+  /// Returns true if any batch was drained.
+  pub effect fn drain(
+    self: &mut Self,
+    replies: &mut List<GpuReply>,
+    updates: &mut List<SurfaceUpdate>,
+  ) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut drained = false
+    if let Option<UnboundedReceiver<GpuResult>>.Some { value: rx } = &mut self.resRx {
+      let mut batches = List<GpuResult>.make()
+      let count = run rx.drain(&mut batches, 0)
+      if count != 0 {
+        drained = true
+        if self.inFlight >= count {
+          self.inFlight = self.inFlight - count
+        } else {
+          self.inFlight = 0
+        }
+        while batches.length() != 0 {
+          let batch = batches.remove(0)
+          let mut r = move batch.replies
+          let mut u = move batch.updates
+          while r.length() != 0 {
+            run replies.append(r.remove(0))
+          }
+          while u.length() != 0 {
+            run updates.append(u.remove(0))
+          }
+        }
+      }
+    }
+    while self.inlineResults.length() != 0 {
+      drained = true
+      let batch = self.inlineResults.remove(0)
+      let mut r = move batch.replies
+      let mut u = move batch.updates
+      while r.length() != 0 {
+        run replies.append(r.remove(0))
+      }
+      while u.length() != 0 {
+        run updates.append(u.remove(0))
+      }
+    }
+    return drained
+  }
+}
+
+impl Drop for GpuServiceThread {
+  fn drop(self: &mut GpuServiceThread) -> () {
+    static if Intrinsic.targetArchitecture() != "wasm32" {
+      if let Option<UnboundedSender<GpuWork>>.Some { value: tx } = &self.workTx {
+        drop run Effect.result(tx.send(GpuWork.Shutdown))
+        tx.close()
+      }
+      let handle = Intrinsic.replace(self.thread, Option<GpuThreadHandle>.None)
+      if let Option<GpuThreadHandle>.Some { value } = move handle {
+        drop value.join()
+      }
+    }
+  }
+}
+
+static if Intrinsic.targetArchitecture() != "wasm32" {
+  fn gpuWorkerLoop(
+    presenter: CanvasPresenter,
+    workWaiter: Waiter,
+    workRx: UnboundedReceiver<GpuWork>,
+    resTx: UnboundedSender<GpuResult>,
+    wakeSlot: Arc<Mutex<Option<Nudge>>>,
+  ) -> () {
+    let mut allocator = Allocator.systemAllocatorProvider()
+    let mut svc = GpuService.make(move presenter)
+    let mut rx = move workRx
+    while true {
+      match move rx.tryRecv() {
+        Result<GpuWork, TryRecvError>.Success { value } => match move value {
+          GpuWork.Commands { bytes } => {
+            let mut updates = List<SurfaceUpdate>.make()
+            drop run Effect.result(svc.serveUpdates(bytes.asSlice(), &mut updates))
+              |> Effect.provideMut<Allocator>(&mut allocator)
+            let mut replies = svc.takeReplies()
+            drop run Effect.result(
+              resTx.send(GpuResult { replies: move replies, updates: move updates }),
+            )
+            let guard = wakeSlot.get().lock()
+            if let Option<Nudge>.Some { value: wake } = &guard.get().* {
+              wake.nudge()
+            }
+          }
+          GpuWork.Shutdown => {
+            break
+          }
+        }
+        Result<GpuWork, TryRecvError>.Failure { error } => match error {
+          TryRecvError.Closed => {
+            break
+          }
+          TryRecvError.Empty => {
+            workWaiter.wait()
+          }
+        }
+      }
+    }
+  }
+}

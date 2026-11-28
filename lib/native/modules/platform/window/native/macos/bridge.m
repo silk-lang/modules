@@ -1970,7 +1970,9 @@ void silk_macos_clipboard_add(uint32_t kind, const uint8_t *data, size_t length)
 
 uint32_t silk_macos_appearance(void) {
     @autoreleasepool {
-        return started ? current_appearance() : 0;
+        if (started) return current_appearance();
+        NSString *style = [[NSUserDefaults standardUserDefaults] stringForKey:@"AppleInterfaceStyle"];
+        return (style != nil && [style isEqualToString:@"Dark"]) ? 1 : 0;
     }
 }
 

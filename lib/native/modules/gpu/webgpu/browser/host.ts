@@ -92,6 +92,7 @@ export class WebGPUHost {
     this.gpu = options.gpu ?? globalThis.navigator?.gpu;
     if (!this.gpu) throw new Error('navigator.gpu is unavailable: use a secure context and a WebGPU-enabled browser');
     this.onWake = options.onWake;
+    this.onPresent = options.onPresent;
     this.onError = options.onError ?? (error => this.failures.push(String(error?.message ?? error)));
     for (const fn of schema.functions) this.imports[fn.name] = (...args) => this.invoke(fn, args);
     this.imports.webgpu_cancel_future = id => this.cancelFuture(id);
@@ -734,7 +735,7 @@ export class WebGPUHost {
     if (!canvas) throw new TypeError(`No canvas matches ${selector}`);
     const context = canvas.getContext('webgpu');
     if (!context) throw new TypeError('Canvas WebGPU context is unavailable');
-    return this.table.add({ canvas, context, configured: false }, 'WGPUSurface');
+    return this.table.add({ canvas, context, selector, configured: false }, 'WGPUSurface');
   }
   surfaceOperation(op, id, raw) {
     if (op === 'createSurface') {
@@ -764,7 +765,9 @@ export class WebGPUHost {
     if (op === 'unconfigure') { surface.context.unconfigure(); surface.configured = false; return; }
     if (op === 'present') {
       // Canvas textures are presented by the user agent at frame boundaries.
-      return surface.configured ? C.WGPUStatus_Success : C.WGPUStatus_Error;
+      if (!surface.configured) return C.WGPUStatus_Error;
+      this.onPresent?.(surface.selector, surface.canvas);
+      return C.WGPUStatus_Success;
     }
     if (op === 'getCurrentTexture') {
       const texture = surface.context.getCurrentTexture();

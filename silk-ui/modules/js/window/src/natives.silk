@@ -3,7 +3,19 @@
 //! JavaScript once the thread ends (see `ui_js_calls.natives`).
 import ui_js.lib { Natives, NativeCall, Reply, StartedNative }
 import ui_tree_window.background { Background }
+import ui_tree_window.platform_thread { Nudge }
+import ui_transport.cancel { CancellationToken }
+import ui_transport.channel {
+  TryRecvError,
+  UnboundedChannel,
+  UnboundedPair,
+  UnboundedReceiver,
+  UnboundedSender,
+}
+import ui_transport.pool { WorkPoolHandle }
+import ui_transport.wake { WakeHandle }
 import silk.collections.list { List }
+import silk.concurrency.thread { Transferable }
 import silk.core.effect { Effect }
 import silk.core.option { Option }
 import silk.core.result { Result }
@@ -21,11 +33,37 @@ pub struct Finished {
   pub reply: Reply,
 }
 
-/// The calls running on threads.
+impl Transferable for Finished {}
+
+struct PooledNative {
+  token: u32,
+  natives: Natives,
+  call: NativeCall,
+  doneTx: UnboundedSender<Finished>,
+  wake: Nudge,
+}
+
+impl Transferable for PooledNative {}
+
+fn runPooledNative(payload: PooledNative, cancel: &CancellationToken) -> () {
+  let PooledNative { token, natives, call, doneTx, wake } = move payload
+  let _unused = cancel.check()
+  let finished = ran(natives, move call)
+  drop run Effect.result(doneTx.send(Finished { token: token, reply: move finished.reply }))
+  wake.nudge()
+}
+
+/// The calls running on threads or pooled on `AppPool`.
 pub struct NativeJobs {
   running: List<Running>,
   /// Calls that could not start, answered on the next poll.
   refused: List<Finished>,
+  appPool: Option<WorkPoolHandle>,
+  groupId: u32,
+  wake: Option<Nudge>,
+  doneTx: Option<UnboundedSender<Finished>>,
+  doneRx: Option<UnboundedReceiver<Finished>>,
+  inFlight: usize,
 }
 
 effect fn outOfMemory(error: OutOfMemoryError) -> () {
@@ -43,25 +81,89 @@ fn ran(natives: Natives, call: NativeCall) -> NativeCall {
 
 impl NativeJobs {
   pub fn make() -> NativeJobs {
-    return NativeJobs { running: List<Running>.make(), refused: List<Finished>.make() }
+    return NativeJobs {
+      running: List<Running>.make(),
+      refused: List<Finished>.make(),
+      appPool: Option<WorkPoolHandle>.None,
+      groupId: 1,
+      wake: Option<Nudge>.None,
+      doneTx: Option<UnboundedSender<Finished>>.None,
+      doneRx: Option<UnboundedReceiver<Finished>>.None,
+      inFlight: 0,
+    }
+  }
+
+  /// Dispatches `fn.async` calls onto `appPool` under `groupId` and wakes via `wake`.
+  pub effect fn attachPool(
+    self: &mut Self,
+    appPool: WorkPoolHandle,
+    groupId: u32,
+    wake: Nudge,
+  ) -> ()
+    ! OutOfMemoryError {
+    let pair = run UnboundedChannel.make<Finished>(WakeHandle.noop())
+    let UnboundedPair<Finished> { sender, receiver } = move pair
+    self.appPool = Option<WorkPoolHandle>.some(move appPool)
+    self.groupId = groupId
+    self.wake = Option<Nudge>.some(move wake)
+    self.doneTx = Option<UnboundedSender<Finished>>.some(move sender)
+    self.doneRx = Option<UnboundedReceiver<Finished>>.some(move receiver)
+  }
+
+  /// Whether completed native calls wake the owning group directly without polling.
+  pub fn wakesOnCompletion(self: &Self) -> bool {
+    return self.wake.isSome()
   }
 
   /// Whether a call is still running: the loop should come back for it.
   pub fn pending(self: &Self) -> bool {
-    return self.running.length() != 0 || self.refused.length() != 0
+    return self.inFlight != 0 || self.running.length() != 0 || self.refused.length() != 0
   }
 
-  /// Starts each of `started` on a thread of its own.
+  /// Starts each of `started` on the attached `AppPool` or a fallback thread.
   pub effect fn start(self: &mut Self, started: List<StartedNative>, natives: Natives) -> ()
     ! OutOfMemoryError
     ? &mut Allocator {
     let mut calls = move started
     while calls.length() > 0 {
       let StartedNative { token, call } = calls.remove(0)
+      let mut fallback = Option<NativeCall>.None
+      if let Option<WorkPoolHandle>.Some { value: pool } = &self.appPool {
+        if let Option<UnboundedSender<Finished>>.Some { value: tx } = &self.doneTx {
+          if let Option<Nudge>.Some { value: wake } = &self.wake {
+            let cancelToken = run CancellationToken.make()
+            let payload = PooledNative {
+              token: token,
+              natives: natives,
+              call: move call,
+              doneTx: tx.clone(),
+              wake: wake.clone(),
+            }
+            drop run pool.submitWith(
+              self.groupId,
+              move payload,
+              runPooledNative,
+              move cancelToken,
+              WakeHandle.noop(),
+            )
+            self.inFlight = self.inFlight + 1
+          } else {
+            fallback = Option<NativeCall>.some(move call)
+          }
+        } else {
+          fallback = Option<NativeCall>.some(move call)
+        }
+      } else {
+        fallback = Option<NativeCall>.some(move call)
+      }
+      let fallbackCall = match move fallback {
+        Option<NativeCall>.Some { value } => move value
+        Option<NativeCall>.None => { continue }
+      }
       let begun = run Effect.result(
         Background<NativeCall>.start(
           || -> NativeCall {
-            return ran(natives, move call)
+            return ran(natives, move fallbackCall)
           },
         ),
       )
@@ -89,6 +191,22 @@ impl NativeJobs {
     ! OutOfMemoryError
     ? &mut Allocator {
     let mut done = Intrinsic.replace(self.refused, List<Finished>.make())
+    if let Option<UnboundedReceiver<Finished>>.Some { value: rx } = &mut self.doneRx {
+      while true {
+        match rx.tryRecv() {
+          Result.Success { value } => {
+            if self.inFlight > 0 {
+              self.inFlight = self.inFlight - 1
+            }
+            run done.append(move value)
+          }
+          Result.Failure { error } => match error {
+            TryRecvError.Empty => { break }
+            TryRecvError.Closed => { break }
+          }
+        }
+      }
+    }
     let mut at: usize = 0
     while at < self.running.length() {
       if !self.running.asSlice()[at].job.ready() {

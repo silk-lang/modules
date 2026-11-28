@@ -629,12 +629,28 @@ export function updateStyleSheet(id, compiled) {
   }
 }
 
+// Event types whose `passive` option defaults to `true` on root-like targets (`window`,
+// `document`, `<html>`, `<body>`), per DOM Standard. Ordinary elements default `passive: false`.
+const DEFAULT_PASSIVE_TYPES = new Set(["wheel", "mousewheel", "touchstart", "touchmove"]);
+function defaultPassiveFor(target, type) {
+  if (!DEFAULT_PASSIVE_TYPES.has(type)) return false;
+  return target === rootNode || target._tag === "html" || target._tag === "body";
+}
+function resolvePassive(target, type, options) {
+  if (options !== undefined && options !== null && typeof options === "object" && options.passive !== undefined) {
+    return !!options.passive;
+  }
+  return defaultPassiveFor(target, type);
+}
+
 // What few nodes have, made on first use (see `Node`).
 class NodeState {
   listeners = null;
   // The state looks by name.
   looks = null;
   flags = 0;
+  // Listener bits (`LISTEN_*`) whose registered listeners are all `{ passive: true }`.
+  passiveFlags = 0;
   // Kinds the node hears whatever its listeners: an input keeps its value and selection current.
   kept = 0;
   attributes = null;
@@ -1072,16 +1088,51 @@ export class Node {
     native.attribute(this.nodeId, "id", id);
   }
 
-  // Tells the tree which events this node wants: its listeners', and clicks on a link.
+  // Tells the tree which events this node wants: its listeners', and clicks on a link, plus
+  // which of those listener bits hold only passive handlers.
   #want(kind) {
     const [wanted, bit] = this.#wanted(kind);
     const rare = this.#rare;
-    const old = rare?.flags ?? 0;
-    const flags = ((wanted ? old | bit : old & ~bit) | (rare?.kept ?? 0) | (this._extra ?? 0)) >>> 0;
-    if (flags === old) return;
-    this.#more().flags = flags;
-    // A destroyed node has no tree node to tell: effect cleanups remove listeners after React frees it.
-    if (nodes[this.nodeId] !== undefined) native.listen(this.nodeId, flags);
+    const oldFlags = rare?.flags ?? 0;
+    const flags = ((wanted ? oldFlags | bit : oldFlags & ~bit) | (rare?.kept ?? 0) | (this._extra ?? 0)) >>> 0;
+    const oldPassive = rare?.passiveFlags ?? 0;
+    const passiveBit = (1 << bitOf(kind)) >>> 0;
+    const passiveFlags = (this.#passiveWanted(kind) ? oldPassive | passiveBit : oldPassive & ~passiveBit) >>> 0;
+    if (flags !== oldFlags) {
+      this.#more().flags = flags;
+      // A destroyed node has no tree node to tell: effect cleanups remove listeners after React frees it.
+      if (nodes[this.nodeId] !== undefined) native.listen(this.nodeId, flags);
+    }
+    if (passiveFlags !== oldPassive) {
+      this.#more().passiveFlags = passiveFlags;
+      if (nodes[this.nodeId] !== undefined) native.listenPassive?.(this.nodeId, passiveFlags);
+    }
+  }
+
+  // Whether every registered listener sharing `kind`'s bit is passive (and none are kept/link).
+  #passiveWanted(kind) {
+    const listeners = this.#rare?.listeners;
+    if (!listeners) return false;
+    const bit = bitOf(kind);
+    const kinds = SHARES_BIT(kind) ? KINDS_OF_BIT(bit) : [kind];
+    let any = false;
+    for (const each of kinds) {
+      const type = TYPES[each];
+      const names = [type];
+      if (MOUSE_OF.has(type)) names.push(MOUSE_OF.get(type));
+      if (each === SELECTION_CHANGE) names.push("selectstart");
+      for (const name of names) {
+        const entries = listeners.get(name);
+        if (!entries || entries.length === 0) continue;
+        any = true;
+        if (entries.some((entry) => !entry.passive)) return false;
+      }
+    }
+    if (!any) return false;
+    const mask = (1 << bit) >>> 0;
+    if (((this.#rare?.kept ?? 0) & mask) !== 0 || ((this._extra ?? 0) & mask) !== 0) return false;
+    if (bit === CLICK && (this._href || this._activate)) return false;
+    return true;
   }
 
   // Whether this node's listeners (or link) want `kind`, and the flag bit that carries it.
@@ -1092,20 +1143,28 @@ export class Node {
     const type = TYPES[kind];
     const wanted = has(type) || (MOUSE_OF.has(type) && has(MOUSE_OF.get(type))) || (kind === CLICK && (this._href || this._activate))
       || (kind === SELECTION_CHANGE && has("selectstart"));
-    return [wanted, 1 << kind];
+    return [wanted, (1 << kind) >>> 0];
   }
 
   /** Listens again for every kind its listeners, kept kinds and `_extra` flags ask for. */
   _relisten() {
     let flags = (this.#rare?.kept ?? 0) | (this._extra ?? 0);
+    let passiveFlags = 0;
     for (let kind = 0; kind < TYPES.length; kind++) {
       const [wanted, bit] = this.#wanted(kind);
       if (wanted) flags |= bit;
+      if (this.#passiveWanted(kind)) passiveFlags |= (1 << bitOf(kind)) >>> 0;
     }
     flags >>>= 0;
-    if (flags === (this.#rare?.flags ?? 0)) return;
-    this.#more().flags = flags;
-    if (nodes[this.nodeId] !== undefined) native.listen(this.nodeId, flags);
+    passiveFlags >>>= 0;
+    if (flags !== (this.#rare?.flags ?? 0)) {
+      this.#more().flags = flags;
+      if (nodes[this.nodeId] !== undefined) native.listen(this.nodeId, flags);
+    }
+    if (passiveFlags !== (this.#rare?.passiveFlags ?? 0)) {
+      this.#more().passiveFlags = passiveFlags;
+      if (nodes[this.nodeId] !== undefined) native.listenPassive?.(this.nodeId, passiveFlags);
+    }
   }
 
   _keep(...types) {
@@ -1308,7 +1367,7 @@ export class Node {
     let list = listeners.get(type);
     if (!list) listeners.set(type, (list = []));
     if (list.some((entry) => entry.listener === listener && entry.capture === capture)) return;
-    list.push({ listener, capture, once: !!options?.once });
+    list.push({ listener, capture, once: !!options?.once, passive: resolvePassive(this, type, options) });
     if (kind !== undefined) this.#want(kind);
     signal?.addEventListener("abort", () => this.removeEventListener(type, listener, capture), { once: true });
   }
@@ -1338,11 +1397,14 @@ export class Node {
       if (event._immediate) return;
       if (entry.capture !== capture) continue;
       if (entry.once) this.removeEventListener(event.type, entry.listener, entry.capture);
+      if (entry.passive) event._inPassive = (event._inPassive || 0) + 1;
       try {
         if (typeof entry.listener === "function") entry.listener.call(this, event);
         else entry.listener.handleEvent(event);
       } catch (error) {
         reportError(error);
+      } finally {
+        if (entry.passive) event._inPassive--;
       }
     }
   }
@@ -2339,13 +2401,17 @@ export class Canvas extends Node {
     return (this.#context = api.context(this, options));
   }
 
+  #readPixelsForEncode(w, h) {
+    return this.#kind === "2d" && this.#context?.getImageData
+      ? this.#context.getImageData(0, 0, w, h).data
+      : new Uint8ClampedArray(w * h * 4);
+  }
+
   #encodePng() {
     const w = this.#width | 0;
     const h = this.#height | 0;
     if (w <= 0 || h <= 0 || !native.pngEncode || !native.pngTake) return null;
-    const data = this.#kind === "2d" && this.#context?.getImageData
-      ? this.#context.getImageData(0, 0, w, h).data
-      : new Uint8ClampedArray(w * h * 4);
+    const data = this.#readPixelsForEncode(w, h);
     const len = native.pngEncode(w, h, data);
     if (!len || len <= 0) return null;
     const bytes = new Uint8Array(len);
@@ -2355,8 +2421,21 @@ export class Canvas extends Node {
 
   toBlob(callback, _type = "image/png", _quality) {
     if (typeof callback !== "function") throw new TypeError("Canvas.toBlob requires a callback");
-    const bytes = this.#encodePng();
     const BlobClass = globalThis.Blob;
+    const w = this.#width | 0;
+    const h = this.#height | 0;
+    if (w > 0 && h > 0 && native.pngEncodeAsync) {
+      const data = this.#readPixelsForEncode(w, h);
+      native.pngEncodeAsync(w, h, data).then(
+        (bytes) => {
+          const blob = bytes && BlobClass ? new BlobClass([bytes], { type: "image/png" }) : null;
+          callback(blob);
+        },
+        () => callback(null),
+      );
+      return;
+    }
+    const bytes = this.#encodePng();
     const blob = bytes && BlobClass ? new BlobClass([bytes], { type: "image/png" }) : null;
     queueMicrotask(() => callback(blob));
   }
@@ -2862,7 +2941,7 @@ export class SvgElement {
     let list = this._listeners.get(type);
     if (!list) this._listeners.set(type, (list = []));
     if (list.some((entry) => entry.listener === listener && entry.capture === capture)) return;
-    list.push({ listener, capture, once: !!options?.once });
+    list.push({ listener, capture, once: !!options?.once, passive: resolvePassive(this, type, options) });
     svgOwner(this)?._listenShapes();
   }
 
@@ -2904,11 +2983,14 @@ export class SvgElement {
       if (event._immediate) return;
       if (entry.capture !== capture) continue;
       if (entry.once) this.removeEventListener(event.type, entry.listener, entry.capture);
+      if (entry.passive) event._inPassive = (event._inPassive || 0) + 1;
       try {
         if (typeof entry.listener === "function") entry.listener.call(this, event);
         else entry.listener.handleEvent(event);
       } catch (error) {
         reportError(error);
+      } finally {
+        if (entry.passive) event._inPassive--;
       }
     }
   }
@@ -7438,10 +7520,11 @@ export class Event {
     this.timeStamp = typeof native.now === "function" ? native.now() : 0;
     this._stopped = false;
     this._immediate = false;
+    this._inPassive = 0;
   }
 
   preventDefault() {
-    if (this.cancelable) this.defaultPrevented = true;
+    if (this.cancelable && !this._inPassive) this.defaultPrevented = true;
   }
 
   stopPropagation() {
@@ -7697,6 +7780,16 @@ function adopt(event, target) {
       _immediate: { get: () => immediate, configurable: true },
       stopPropagation: { value() { stopped = true; stop?.call(event); }, configurable: true },
       stopImmediatePropagation: { value() { stopped = immediate = true; stopNow?.call(event); }, configurable: true },
+    });
+  }
+  if (!("_inPassive" in event)) {
+    const prevent = event.preventDefault;
+    Object.defineProperties(event, {
+      _inPassive: { value: 0, writable: true, configurable: true },
+      preventDefault: {
+        value() { if (!event._inPassive) prevent?.call(event); },
+        configurable: true,
+      },
     });
   }
   for (const [name, value] of [["target", target], ["currentTarget", null], ["eventPhase", 0]]) {
@@ -18932,4 +19025,305 @@ export class MutationObserver {
     this._records = [];
     return records;
   }
+}
+
+function makeAbortError(signal) {
+  if (signal?.reason !== undefined) return signal.reason;
+  const DOMExceptionClass = globalThis.DOMException;
+  if (DOMExceptionClass) return new DOMExceptionClass("Aborted", "AbortError");
+  const error = new Error("Aborted");
+  error.name = "AbortError";
+  return error;
+}
+
+function getWorkerThreadsModule() {
+  try {
+    return globalThis.process?.getBuiltinModule?.("node:worker_threads") ?? null;
+  } catch {
+    return null;
+  }
+}
+
+const COMPUTE_NODE_WORKER_SOURCE = `
+const wt = typeof require === "function"
+  ? require("node:worker_threads")
+  : globalThis.process?.getBuiltinModule?.("node:worker_threads");
+const port = wt?.parentPort;
+if (port) {
+  port.on("message", async (msg) => {
+    const id = msg?.id;
+    try {
+      const fn = (0, eval)("(" + msg.fnSource + ")");
+      const result = await fn(msg.input);
+      port.postMessage({ id, ok: true, result });
+    } catch (err) {
+      port.postMessage({
+        id,
+        ok: false,
+        message: err && err.message !== undefined ? String(err.message) : String(err),
+        name: err && err.name ? String(err.name) : "Error",
+        stack: err && err.stack ? String(err.stack) : "",
+      });
+    }
+  });
+}
+`;
+
+const COMPUTE_WEB_WORKER_SOURCE = `
+self.onmessage = async (event) => {
+  const msg = event?.data;
+  const id = msg?.id;
+  try {
+    const fn = (0, eval)("(" + msg.fnSource + ")");
+    const result = await fn(msg.input);
+    self.postMessage({ id, ok: true, result });
+  } catch (err) {
+    self.postMessage({
+      id,
+      ok: false,
+      message: err && err.message !== undefined ? String(err.message) : String(err),
+      name: err && err.name ? String(err.name) : "Error",
+      stack: err && err.stack ? String(err.stack) : "",
+    });
+  }
+};
+`;
+
+function reviveWorkerError(msg) {
+  const ErrorClass = (msg.name && typeof globalThis[msg.name] === "function") ? globalThis[msg.name] : Error;
+  const err = new ErrorClass(msg.message ?? "Compute worker failed");
+  if (msg.name && err.name !== msg.name) err.name = msg.name;
+  if (msg.stack) err.stack = msg.stack;
+  return err;
+}
+
+class ComputePool {
+  constructor() {
+    this.workers = [];
+    this.idle = [];
+    this.queue = [];
+    this.nextId = 1;
+    this.webWorkerUrl = null;
+  }
+
+  maxWorkers() {
+    const hw = Number(globalThis.navigator?.hardwareConcurrency) || 4;
+    return Math.max(1, Math.min(4, hw - 1));
+  }
+
+  spawnSlot() {
+    const wt = getWorkerThreadsModule();
+    if (wt?.Worker) {
+      const w = new wt.Worker(COMPUTE_NODE_WORKER_SOURCE, { eval: true });
+      const slot = { kind: "node", worker: w, busy: null, dead: false };
+      w.on("message", (msg) => this.#onMessage(slot, msg));
+      w.on("error", (err) => this.#onCrash(slot, err));
+      w.on("exit", (code) => {
+        if (!slot.dead) this.#onCrash(slot, new Error("Compute worker exited with code " + code));
+      });
+      this.workers.push(slot);
+      return slot;
+    }
+    if (typeof globalThis.Worker === "function" && typeof globalThis.Blob === "function" && typeof globalThis.URL?.createObjectURL === "function") {
+      if (!this.webWorkerUrl) {
+        this.webWorkerUrl = globalThis.URL.createObjectURL(
+          new globalThis.Blob([COMPUTE_WEB_WORKER_SOURCE], { type: "application/javascript" }),
+        );
+      }
+      const w = new globalThis.Worker(this.webWorkerUrl, { type: "module" });
+      const slot = { kind: "web", worker: w, busy: null, dead: false };
+      w.onmessage = (event) => this.#onMessage(slot, event?.data);
+      w.onerror = (event) => this.#onCrash(slot, event?.error ?? new Error(event?.message ?? "Compute worker error"));
+      this.workers.push(slot);
+      return slot;
+    }
+    return null;
+  }
+
+  #cleanupTask(task) {
+    if (task.signal && task.onAbort) {
+      task.signal.removeEventListener("abort", task.onAbort);
+      task.onAbort = null;
+    }
+  }
+
+  #onMessage(slot, msg) {
+    const task = slot.busy;
+    if (!task || !msg || msg.id !== task.id) return;
+    slot.busy = null;
+    this.#cleanupTask(task);
+    if (msg.ok) task.resolve(msg.result);
+    else task.reject(reviveWorkerError(msg));
+    if (!slot.dead) {
+      this.idle.push(slot);
+      this.#pump();
+    }
+  }
+
+  #removeSlot(slot) {
+    slot.dead = true;
+    const wi = this.workers.indexOf(slot);
+    if (wi !== -1) this.workers.splice(wi, 1);
+    const ii = this.idle.indexOf(slot);
+    if (ii !== -1) this.idle.splice(ii, 1);
+  }
+
+  #terminateSlot(slot) {
+    this.#removeSlot(slot);
+    try {
+      slot.worker?.terminate?.();
+    } catch {}
+  }
+
+  #onCrash(slot, err) {
+    const task = slot.busy;
+    slot.busy = null;
+    this.#terminateSlot(slot);
+    if (task) {
+      this.#cleanupTask(task);
+      task.reject(err instanceof Error ? err : new Error(String(err)));
+    }
+    this.#pump();
+  }
+
+  #dispatch(slot, task) {
+    slot.busy = task;
+    const msg = { id: task.id, fnSource: task.fnSource, input: task.input };
+    try {
+      if (task.transfer && task.transfer.length > 0) slot.worker.postMessage(msg, task.transfer);
+      else slot.worker.postMessage(msg);
+    } catch (err) {
+      slot.busy = null;
+      this.#cleanupTask(task);
+      this.idle.push(slot);
+      task.reject(err instanceof Error ? err : new Error(String(err)));
+      this.#pump();
+    }
+  }
+
+  #pump() {
+    while (this.queue.length > 0) {
+      let slot = this.idle.pop();
+      if (!slot && this.workers.length < this.maxWorkers()) slot = this.spawnSlot();
+      if (!slot) break;
+      const task = this.queue.shift();
+      this.#dispatch(slot, task);
+    }
+  }
+
+  run(fn, input, options) {
+    if (typeof fn !== "function") return Promise.reject(new TypeError("compute requires a function"));
+    const signal = options?.signal ?? null;
+    if (signal?.aborted) return Promise.reject(makeAbortError(signal));
+
+    // When neither Worker nor worker_threads is available, fall back to a microtask so callers
+    // still get async settlement in minimal environments without breaking existing semantics.
+    if (!getWorkerThreadsModule()?.Worker && typeof globalThis.Worker !== "function") {
+      return new Promise((resolve, reject) => {
+        let settled = false;
+        const onAbort = () => {
+          if (settled) return;
+          settled = true;
+          reject(makeAbortError(signal));
+        };
+        if (signal) signal.addEventListener("abort", onAbort, { once: true });
+        Promise.resolve()
+          .then(() => fn(input))
+          .then(
+            (value) => {
+              if (settled) return;
+              settled = true;
+              if (signal) signal.removeEventListener("abort", onAbort);
+              resolve(value);
+            },
+            (err) => {
+              if (settled) return;
+              settled = true;
+              if (signal) signal.removeEventListener("abort", onAbort);
+              reject(err);
+            },
+          );
+      });
+    }
+
+    const fnSource = fn.toString();
+    const transfer = Array.isArray(options?.transfer) ? options.transfer : null;
+    return new Promise((resolve, reject) => {
+      const task = {
+        id: this.nextId++,
+        fnSource,
+        input,
+        transfer,
+        signal,
+        onAbort: null,
+        resolve,
+        reject,
+      };
+      if (signal) {
+        task.onAbort = () => {
+          const qi = this.queue.indexOf(task);
+          if (qi !== -1) {
+            this.queue.splice(qi, 1);
+            this.#cleanupTask(task);
+            reject(makeAbortError(signal));
+            return;
+          }
+          for (const slot of this.workers) {
+            if (slot.busy === task) {
+              slot.busy = null;
+              this.#cleanupTask(task);
+              this.#terminateSlot(slot);
+              reject(makeAbortError(signal));
+              this.#pump();
+              return;
+            }
+          }
+        };
+        signal.addEventListener("abort", task.onAbort, { once: true });
+      }
+      this.queue.push(task);
+      this.#pump();
+    });
+  }
+
+  terminate() {
+    while (this.queue.length > 0) {
+      const task = this.queue.shift();
+      this.#cleanupTask(task);
+      task.reject(makeAbortError(task.signal));
+    }
+    const copy = this.workers.slice();
+    for (const slot of copy) {
+      const task = slot.busy;
+      slot.busy = null;
+      this.#terminateSlot(slot);
+      if (task) {
+        this.#cleanupTask(task);
+        task.reject(makeAbortError(task.signal));
+      }
+    }
+    this.idle.length = 0;
+    if (this.webWorkerUrl && typeof globalThis.URL?.revokeObjectURL === "function") {
+      try {
+        globalThis.URL.revokeObjectURL(this.webWorkerUrl);
+      } catch {}
+      this.webWorkerUrl = null;
+    }
+  }
+}
+
+const computePool = new ComputePool();
+
+/**
+ * Runs a pure function off the Document Thread in a pooled bridge-less worker realm.
+ */
+export function compute(fn, input, options) {
+  return computePool.run(fn, input, options);
+}
+
+/**
+ * Terminates idle and active workers in `@silkui/core`'s pooled compute worker pool.
+ */
+export function terminateComputePool() {
+  computePool.terminate();
 }

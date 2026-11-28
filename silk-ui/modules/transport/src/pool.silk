@@ -1,0 +1,801 @@
+//! Dedicated QoS worker pools (`Engine`, `App`, `Io`) with per-group round-robin fairness,
+//! inline work-stealing [`ClaimHandle`], [`CancellationToken`] checkpoints, and caller-helps
+//! `runParallel`.
+import cancel { CancellationToken }
+import silk.collections.list { List }
+import silk.concurrency.atomic { Atomic, CompareExchange, MemoryOrder }
+import silk.concurrency.execution { Execution, TransferableExecution }
+import silk.concurrency.sync { Arc, Condition, Mutex }
+import silk.concurrency.thread { Concurrent, Transferable }
+import silk.concurrency.thread_native { SpawnError }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.ownership { Copy, Drop }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.mem.box { Box }
+import silk.mem.pointer { Pointer }
+import silk.num.i32
+import silk.num.u32
+import silk.num.usize
+import wake { Waiter, WakeHandle }
+
+static if Intrinsic.targetArchitecture() != "wasm32" {
+  import silk.concurrency.thread_native { JoinHandle, NativeThread }
+
+  static if Intrinsic.targetOperatingSystem() == "darwin" {
+    unsafe extern "C" fn pthread_set_qos_class_self_np(class: u32, relative: i32) -> i32
+  }
+
+  static if Intrinsic.targetOperatingSystem() == "windows" {
+    unsafe extern "C" fn GetCurrentThread() -> ?*mut u8
+    unsafe extern "C" fn SetThreadPriority(thread: ?*mut u8, priority: i32) -> i32
+  }
+}
+
+/// Quality-of-service class for a [`WorkPool`].
+pub enum PoolQos {
+  /// Reserved high-priority pool for engine layout, style, text shaping, and raster.
+  Engine,
+  /// Pool for application compute (`fn.async`, workers, codecs, Canvas2D offload).
+  App,
+  /// Pool for blocking I/O and network/file loads.
+  Io,
+}
+
+fn applyThreadQos(qos: PoolQos) -> () {
+  static if Intrinsic.targetOperatingSystem() == "darwin" {
+    let class: u32 = match qos {
+      PoolQos.Engine => 0x21
+      PoolQos.App => 0x19
+      PoolQos.Io => 0x11
+    }
+    let _ignored = unsafe pthread_set_qos_class_self_np(class, 0)
+  } else {
+    static if Intrinsic.targetOperatingSystem() == "windows" {
+      let priority: i32 = match qos {
+        PoolQos.Engine => 1
+        PoolQos.App => 0
+        PoolQos.Io => -1
+      }
+      let _ignored = unsafe SetThreadPriority(unsafe GetCurrentThread(), priority)
+    } else {
+      drop qos
+    }
+  }
+}
+
+effect fn runPoolWork<F: for<'a> once fn(&'a CancellationToken) -> ()>(
+  work: F,
+  cancel: CancellationToken,
+) -> () {
+  work(&cancel)
+  return ()
+}
+
+effect fn runPoolWorkWith<
+  T,
+  F: for<'a> once fn(T, &'a CancellationToken) -> ()
+>(
+  payload: T,
+  func: F,
+  cancel: CancellationToken,
+) -> () {
+  func(move payload, &cancel)
+  return ()
+}
+
+fn poolReady(state: &()) -> () {
+  drop state
+  return ()
+}
+
+fn poolCompleted(state: (), value: ()) -> () {
+  drop state
+  drop value
+  return ()
+}
+
+fn poolSuspended(state: (), execution: Intrinsic.Execution<()>) -> () {
+  drop state
+  drop execution
+  return ()
+}
+
+const CLAIM_QUEUED: u32 = 0
+const CLAIM_CLAIMED: u32 = 1
+const CLAIM_DONE: u32 = 2
+
+struct ClaimSlot {
+  stateStorage: Box<u32>,
+  statePtr: *mut u32,
+  task: Mutex<Option<TransferableExecution<()>>>,
+  doneLock: Mutex<bool>,
+  doneCond: Condition,
+  cancel: CancellationToken,
+  wake: WakeHandle,
+}
+
+impl Transferable for ClaimSlot {}
+impl Concurrent for ClaimSlot {}
+
+/// Handle to a submitted task that allows synchronous inline claiming (`tryClaimAndRun`) when a
+/// caller needs a result immediately without queuing behind busy pool workers.
+pub struct ClaimHandle {
+  slot: Arc<ClaimSlot>,
+}
+
+impl Transferable for ClaimHandle {}
+impl Concurrent for ClaimHandle {}
+
+fn executeClaimSlot(slot: &ClaimSlot) -> bool {
+  let won = match unsafe Atomic.compareExchange<u32>(
+    slot.statePtr,
+    CLAIM_QUEUED,
+    CLAIM_CLAIMED,
+    MemoryOrder.AcquireRelease,
+    MemoryOrder.Relaxed,
+  ) {
+    CompareExchange<u32>.Exchanged => true
+    CompareExchange<u32>.Observed { .. } => false
+  }
+  if !won {
+    return false
+  }
+  let mut taskGuard = slot.task.lock()
+  let taken = Intrinsic.replace(
+    taskGuard.getMut().*,
+    Option<TransferableExecution<()>>.None,
+  )
+  drop taskGuard
+  if !slot.cancel.check() {
+    if let Option<TransferableExecution<()>>.Some { value: exec } = move taken {
+      run Execution.drive(exec.local(), (), poolCompleted, poolSuspended)
+    }
+  } else {
+    drop taken
+  }
+  slot.cancel.finish()
+  let mut doneGuard = slot.doneLock.lock()
+  let done = doneGuard.getMut()
+  done.* = true
+  drop doneGuard
+  unsafe Atomic.store<u32>(slot.statePtr, CLAIM_DONE, MemoryOrder.Release)
+  slot.doneCond.notifyAll()
+  slot.wake.wake()
+  return true
+}
+
+fn abandonClaimSlot(slot: &ClaimSlot) -> () {
+  let won = match unsafe Atomic.compareExchange<u32>(
+    slot.statePtr,
+    CLAIM_QUEUED,
+    CLAIM_CLAIMED,
+    MemoryOrder.AcquireRelease,
+    MemoryOrder.Relaxed,
+  ) {
+    CompareExchange<u32>.Exchanged => true
+    CompareExchange<u32>.Observed { .. } => false
+  }
+  if !won {
+    return ()
+  }
+  let mut taskGuard = slot.task.lock()
+  drop Intrinsic.replace(
+    taskGuard.getMut().*,
+    Option<TransferableExecution<()>>.None,
+  )
+  drop taskGuard
+  slot.cancel.request()
+  drop slot.cancel.check()
+  slot.cancel.finish()
+  let mut doneGuard = slot.doneLock.lock()
+  let done = doneGuard.getMut()
+  done.* = true
+  drop doneGuard
+  unsafe Atomic.store<u32>(slot.statePtr, CLAIM_DONE, MemoryOrder.Release)
+  slot.doneCond.notifyAll()
+  slot.wake.wake()
+}
+
+impl ClaimHandle {
+  /// Returns another handle to the same task slot.
+  pub fn clone(self: &Self) -> ClaimHandle {
+    return ClaimHandle { slot: self.slot.clone() }
+  }
+
+  /// Requests cooperative cancellation of this task.
+  pub fn cancel(self: &Self) -> () {
+    self.slot.get().cancel.request()
+  }
+
+  /// Returns `true` if the task has completed (normally or cancelled).
+  pub fn isDone(self: &Self) -> bool {
+    return unsafe Atomic.load<u32>(self.slot.get().statePtr, MemoryOrder.Acquire) == CLAIM_DONE
+  }
+
+  /// Atomically claims the task if it has not yet started on a worker and runs it inline on the
+  /// calling thread. Returns `true` if this call ran it, or `false` if a worker already claimed it.
+  pub fn tryClaimAndRun(self: &Self) -> bool {
+    return executeClaimSlot(self.slot.get())
+  }
+
+  /// Blocks until the task has finished.
+  pub fn wait(self: &Self) -> () {
+    static if Intrinsic.targetArchitecture() == "wasm32" {
+      drop self.tryClaimAndRun()
+      return ()
+    } else {
+      let slot = self.slot.get()
+      let mut guard = slot.doneLock.lock()
+      while !guard.get().* {
+        slot.doneCond.wait(&mut guard)
+      }
+    }
+  }
+
+  /// Claims and executes the task inline if still queued, otherwise waits for the active worker
+  /// to finish.
+  pub fn runOrWait(self: &Self) -> () {
+    drop self.tryClaimAndRun()
+    self.wait()
+  }
+}
+
+struct GroupQueue {
+  groupId: u32,
+  items: List<Arc<ClaimSlot>>,
+}
+
+impl Transferable for GroupQueue {}
+
+struct PoolQueue {
+  groups: List<GroupQueue>,
+  cursor: usize,
+  stopped: bool,
+}
+
+impl Transferable for PoolQueue {}
+
+struct WorkPoolShared {
+  qos: PoolQos,
+  workers: usize,
+  queue: Mutex<PoolQueue>,
+  cond: Condition,
+}
+
+impl Transferable for WorkPoolShared {}
+impl Concurrent for WorkPoolShared {}
+
+fn findGroup(groups: &[GroupQueue], groupId: u32) -> Option<usize> {
+  let mut i: usize = 0
+  while i < groups.length {
+    if groups[i].groupId == groupId {
+      return Option<usize>.Some { value: i }
+    }
+    i = i + 1
+  }
+  return Option<usize>.None
+}
+
+effect fn enqueueSlot(shared: &WorkPoolShared, groupId: u32, slot: Arc<ClaimSlot>) -> bool
+  ! OutOfMemoryError {
+  let mut heap = Allocator.systemAllocatorProvider()
+  let mut guard = shared.queue.lock()
+  let q = guard.getMut()
+  if q.stopped {
+    drop guard
+    abandonClaimSlot(slot.get())
+    return false
+  }
+  match findGroup(q.groups.asSlice(), groupId) {
+    Option<usize>.Some { value: idx } => {
+      let list = q.groups.asMutSlice()
+      run list[idx].items.append(move slot) |> Effect.provideMut<Allocator>(&mut heap)
+    }
+    Option<usize>.None => {
+      let mut items = List<Arc<ClaimSlot>>.make()
+      run items.append(move slot) |> Effect.provideMut<Allocator>(&mut heap)
+      run q.groups.append(GroupQueue { groupId: groupId, items: move items })
+        |> Effect.provideMut<Allocator>(&mut heap)
+    }
+  }
+  drop guard
+  shared.cond.notifyOne()
+  return true
+}
+
+static if Intrinsic.targetArchitecture() != "wasm32" {
+  fn nextSlot(shared: &WorkPoolShared) -> Option<Arc<ClaimSlot>> {
+    let mut guard = shared.queue.lock()
+    while true {
+      let q = guard.getMut()
+      let count = q.groups.length()
+      if count != 0 {
+        let idx = q.cursor % count
+        let slice = q.groups.asMutSlice()
+        let taken = slice[idx].items.remove(0)
+        if slice[idx].items.length() == 0 {
+          drop q.groups.remove(idx)
+          let nextCount = q.groups.length()
+          q.cursor = if nextCount == 0 { 0 } else { idx % nextCount }
+        } else {
+          q.cursor = (idx + 1) % count
+        }
+        return Option<Arc<ClaimSlot>>.Some { value: move taken }
+      }
+      if q.stopped {
+        return Option<Arc<ClaimSlot>>.None
+      }
+      shared.cond.wait(&mut guard)
+    }
+    return Option<Arc<ClaimSlot>>.None
+  }
+
+  fn poolWorkerMain(shared: Arc<WorkPoolShared>) -> () {
+    let s = shared.get()
+    applyThreadQos(s.qos)
+    while true {
+      match move nextSlot(s) {
+        Option<Arc<ClaimSlot>>.Some { value: slot } => {
+          drop executeClaimSlot(slot.get())
+        }
+        Option<Arc<ClaimSlot>>.None => {
+          return ()
+        }
+      }
+    }
+  }
+}
+
+struct ParallelState<T> {
+  shared: Arc<T>,
+  count: usize,
+  nextStorage: Box<usize>,
+  nextPtr: *mut usize,
+  remStorage: Box<usize>,
+  remPtr: *mut usize,
+  doneWake: WakeHandle,
+}
+
+impl<T: Transferable + Concurrent> Transferable for ParallelState<T> {}
+impl<T: Transferable + Concurrent> Concurrent for ParallelState<T> {}
+
+fn runParallelLoop<
+  T: Transferable + Concurrent,
+  F: for<'a> fn(&'a T, usize) -> ()
+>(
+  state: &ParallelState<T>,
+  step: F,
+) -> () {
+  while true {
+    let idx = unsafe Atomic.fetchAdd<usize>(state.nextPtr, 1, MemoryOrder.Relaxed)
+    if idx >= state.count {
+      return ()
+    }
+    step(state.shared.get(), idx)
+    if unsafe Atomic.fetchSubtract<usize>(state.remPtr, 1, MemoryOrder.AcquireRelease) == 1 {
+      state.doneWake.wake()
+    }
+  }
+}
+
+effect fn runPoolParallel<
+  T: Transferable + Concurrent,
+  F: for<'a> fn(&'a T, usize) -> ()
+>(
+  state: Arc<ParallelState<T>>,
+  step: F,
+) -> () {
+  runParallelLoop<T, F>(state.get(), step)
+  return ()
+}
+
+effect fn enqueueExec(
+  shared: &WorkPoolShared,
+  groupId: u32,
+  exec: TransferableExecution<()>,
+  cancel: CancellationToken,
+  wake: WakeHandle,
+) -> ClaimHandle
+  ! OutOfMemoryError {
+  let mut heap = Allocator.systemAllocatorProvider()
+  let mut stateStorage = run Box<u32>.make(CLAIM_QUEUED)
+    |> Effect.provideMut<Allocator>(&mut heap)
+  let stateSlice = stateStorage.getMut()
+  let statePtr = Pointer.fromMutRef(&mut stateSlice[0])
+  drop stateSlice
+  let taskMutex = run Mutex<Option<TransferableExecution<()>>>.make(
+    Option<TransferableExecution<()>>.Some { value: move exec },
+  )
+    |> Effect.provideMut<Allocator>(&mut heap)
+  let doneLock = run Mutex<bool>.make(false) |> Effect.provideMut<Allocator>(&mut heap)
+  let doneCond = run Condition.make() |> Effect.provideMut<Allocator>(&mut heap)
+  let slot = run Arc<ClaimSlot>.make(
+    ClaimSlot {
+      stateStorage: move stateStorage,
+      statePtr: statePtr,
+      task: move taskMutex,
+      doneLock: move doneLock,
+      doneCond: move doneCond,
+      cancel: move cancel,
+      wake: move wake,
+    },
+  )
+    |> Effect.provideMut<Allocator>(&mut heap)
+  let handle = ClaimHandle { slot: slot.clone() }
+  let enqueued = run enqueueSlot(shared, groupId, move slot)
+  if enqueued {
+    static if Intrinsic.targetArchitecture() == "wasm32" {
+      drop handle.tryClaimAndRun()
+    }
+  }
+  return move handle
+}
+
+/// Shareable, `Transferable + Concurrent` handle to a [`WorkPool`].
+pub struct WorkPoolHandle {
+  shared: Arc<WorkPoolShared>,
+}
+
+impl Transferable for WorkPoolHandle {}
+impl Concurrent for WorkPoolHandle {}
+
+impl WorkPoolHandle {
+  /// Returns another handle to the same pool.
+  pub fn clone(self: &Self) -> WorkPoolHandle {
+    return WorkPoolHandle { shared: self.shared.clone() }
+  }
+
+  /// Returns the number of worker threads in this pool.
+  pub fn workerCount(self: &Self) -> usize {
+    return self.shared.get().workers
+  }
+
+  /// Returns the pool's QoS class.
+  pub fn qos(self: &Self) -> PoolQos {
+    return self.shared.get().qos
+  }
+
+  /// Submits a detached transferable closure under `groupId` for fair per-group round-robin
+  /// scheduling. Returns a [`ClaimHandle`] for waiting or inline claiming.
+  pub effect<'static> fn submit<
+    F: 'static + for<'a> once fn(&'a CancellationToken) -> () + Intrinsic.Detached + Transferable
+  >(
+    self: &Self,
+    groupId: u32,
+    cancel: CancellationToken,
+    wake: WakeHandle,
+    work: F,
+  ) -> ClaimHandle
+    ! OutOfMemoryError {
+    let mut heap = Allocator.systemAllocatorProvider()
+    let exec = run Execution.makeTransferable(
+      runPoolWork<F>(move work, cancel.clone()),
+      (),
+      poolReady,
+    )
+      |> Effect.provideMut<Allocator>(&mut heap)
+    return run enqueueExec(self.shared.get(), groupId, move exec, move cancel, move wake)
+  }
+
+  /// Submits a typed payload + stateless runner under `groupId`.
+  pub effect<'static> fn submitWith<
+    T: 'static + Transferable,
+    F: 'static + for<'a> once fn(T, &'a CancellationToken) -> () + Intrinsic.Detached + Transferable
+  >(
+    self: &Self,
+    groupId: u32,
+    payload: T,
+    func: F,
+    cancel: CancellationToken,
+    wake: WakeHandle,
+  ) -> ClaimHandle
+    ! OutOfMemoryError {
+    let mut heap = Allocator.systemAllocatorProvider()
+    let exec = run Execution.makeTransferable(
+      runPoolWorkWith<T, F>(move payload, move func, cancel.clone()),
+      (),
+      poolReady,
+    )
+      |> Effect.provideMut<Allocator>(&mut heap)
+    return run enqueueExec(self.shared.get(), groupId, move exec, move cancel, move wake)
+  }
+
+  /// Runs `step(shared.get(), index)` for all `index` in `0..count` using caller-helps
+  /// execution plus up to `workerCount()` pool helpers under `groupId`.
+  pub effect<'static> fn runParallel<
+    T: 'static + Transferable + Concurrent,
+    F: 'static + for<'a> fn(&'a T, usize) -> () + Intrinsic.Detached + Transferable + Copy
+  >(
+    self: &Self,
+    groupId: u32,
+    count: usize,
+    shared: Arc<T>,
+    step: F,
+  ) -> ()
+    ! OutOfMemoryError {
+    if count == 0 {
+      return ()
+    }
+    static if Intrinsic.targetArchitecture() == "wasm32" {
+      let mut i: usize = 0
+      while i < count {
+        step(shared.get(), i)
+        i = i + 1
+      }
+      return ()
+    } else {
+      if count == 1 {
+        step(shared.get(), 0)
+        return ()
+      }
+      let mut heap = Allocator.systemAllocatorProvider()
+      let waiter = run Waiter.make()
+      let mut nextStorage = run Box<usize>.make(0) |> Effect.provideMut<Allocator>(&mut heap)
+      let nextSlice = nextStorage.getMut()
+      let nextPtr = Pointer.fromMutRef(&mut nextSlice[0])
+      drop nextSlice
+      let mut remStorage = run Box<usize>.make(count) |> Effect.provideMut<Allocator>(&mut heap)
+      let remSlice = remStorage.getMut()
+      let remPtr = Pointer.fromMutRef(&mut remSlice[0])
+      drop remSlice
+      let state = run Arc<ParallelState<T>>.make(
+        ParallelState<T> {
+          shared: move shared,
+          count: count,
+          nextStorage: move nextStorage,
+          nextPtr: nextPtr,
+          remStorage: move remStorage,
+          remPtr: remPtr,
+          doneWake: waiter.handle(),
+        },
+      )
+        |> Effect.provideMut<Allocator>(&mut heap)
+      let maxHelpers = self.workerCount()
+      let helpers = if count - 1 < maxHelpers { count - 1 } else { maxHelpers }
+      let mut i: usize = 0
+      while i < helpers {
+        let cancel = run CancellationToken.make()
+        let exec = run Execution.makeTransferable(
+          runPoolParallel<T, F>(state.clone(), step),
+          (),
+          poolReady,
+        )
+          |> Effect.provideMut<Allocator>(&mut heap)
+        drop run enqueueExec(
+          self.shared.get(),
+          groupId,
+          move exec,
+          move cancel,
+          WakeHandle.noop(),
+        )
+        i = i + 1
+      }
+      // Caller helps so busy workers cannot deadlock parallel passes.
+      runParallelLoop<T, F>(state.get(), step)
+      while unsafe Atomic.load<usize>(state.get().remPtr, MemoryOrder.Acquire) > 0 {
+        waiter.wait()
+      }
+    }
+  }
+}
+
+/// Owned pool of native worker threads sharing a QoS class and per-group fair queue.
+pub struct WorkPool {
+  shared: Arc<WorkPoolShared>,
+  stopped: bool,
+  threads: List<NativeHandle>,
+}
+
+static if Intrinsic.targetArchitecture() == "wasm32" {
+  struct NativeHandle {
+    unused: u8,
+  }
+} else {
+  type NativeHandle = JoinHandle<()>
+}
+
+impl WorkPool {
+  /// Starts a pool of `max(1, workers)` native threads with `qos`.
+  pub effect fn make(qos: PoolQos, workers: usize) -> WorkPool
+    ! OutOfMemoryError | SpawnError {
+    let mut heap = Allocator.systemAllocatorProvider()
+    let count = if workers == 0 { usize.ONE } else { workers }
+    let queueMutex = run Mutex<PoolQueue>.make(
+      PoolQueue { groups: List<GroupQueue>.make(), cursor: 0, stopped: false },
+    )
+      |> Effect.provideMut<Allocator>(&mut heap)
+    let cond = run Condition.make() |> Effect.provideMut<Allocator>(&mut heap)
+    let shared = run Arc<WorkPoolShared>.make(
+      WorkPoolShared { qos: qos, workers: count, queue: move queueMutex, cond: move cond },
+    )
+      |> Effect.provideMut<Allocator>(&mut heap)
+    let mut pool = WorkPool {
+      shared: move shared,
+      stopped: false,
+      threads: List<NativeHandle>.make(),
+    }
+    static if Intrinsic.targetArchitecture() != "wasm32" {
+      let mut i: usize = 0
+      while i < count {
+        let workerShared = pool.shared.clone()
+        let thread = run NativeThread.spawn(
+          || -> () {
+            poolWorkerMain(move workerShared)
+          },
+        )
+          |> Effect.provideMut<Allocator>(&mut heap)
+        run pool.threads.append(move thread) |> Effect.provideMut<Allocator>(&mut heap)
+        i = i + 1
+      }
+    }
+    return move pool
+  }
+
+  /// Returns a shareable handle to this pool.
+  pub fn handle(self: &Self) -> WorkPoolHandle {
+    return WorkPoolHandle { shared: self.shared.clone() }
+  }
+
+  /// Returns the number of workers in this pool.
+  pub fn workerCount(self: &Self) -> usize {
+    return self.shared.get().workers
+  }
+
+  /// Submits a typed payload + runner under `groupId`.
+  pub effect<'static> fn submitWith<
+    T: 'static + Transferable,
+    F: 'static + for<'a> once fn(T, &'a CancellationToken) -> () + Intrinsic.Detached + Transferable
+  >(
+    self: &Self,
+    groupId: u32,
+    payload: T,
+    func: F,
+    cancel: CancellationToken,
+    wake: WakeHandle,
+  ) -> ClaimHandle
+    ! OutOfMemoryError {
+    return run self.handle().submitWith<T, F>(
+      groupId,
+      move payload,
+      move func,
+      move cancel,
+      move wake,
+    )
+  }
+
+  /// Submits a detached transferable closure under `groupId`.
+  pub effect<'static> fn submit<
+    F: 'static + for<'a> once fn(&'a CancellationToken) -> () + Intrinsic.Detached + Transferable
+  >(
+    self: &Self,
+    groupId: u32,
+    cancel: CancellationToken,
+    wake: WakeHandle,
+    work: F,
+  ) -> ClaimHandle
+    ! OutOfMemoryError {
+    return run self.handle().submit<F>(groupId, move cancel, move wake, move work)
+  }
+
+  /// Runs `step(shared.get(), index)` in parallel across `0..count`.
+  pub effect<'static> fn runParallel<
+    T: 'static + Transferable + Concurrent,
+    F: 'static + for<'a> fn(&'a T, usize) -> () + Intrinsic.Detached + Transferable + Copy
+  >(
+    self: &Self,
+    groupId: u32,
+    count: usize,
+    shared: Arc<T>,
+    step: F,
+  ) -> ()
+    ! OutOfMemoryError {
+    run self.handle().runParallel<T, F>(groupId, count, move shared, step)
+  }
+
+  /// Stops all worker threads, abandons queued work cleanly, and joins every worker.
+  pub fn stop(self: &mut Self) -> () {
+    if self.stopped {
+      return ()
+    }
+    self.stopped = true
+    let s = self.shared.get()
+    let mut guard = s.queue.lock()
+    let q = guard.getMut()
+    q.stopped = true
+    let mut leftover = Intrinsic.replace(q.groups, List<GroupQueue>.make())
+    drop guard
+    s.cond.notifyAll()
+    while leftover.length() != 0 {
+      let mut grp = leftover.remove(0)
+      while grp.items.length() != 0 {
+        let slot = grp.items.remove(0)
+        abandonClaimSlot(slot.get())
+      }
+    }
+    static if Intrinsic.targetArchitecture() != "wasm32" {
+      while self.threads.length() != 0 {
+        let last = self.threads.length() - 1
+        let thread = self.threads.remove(last)
+        thread.join()
+      }
+    }
+  }
+}
+
+impl Drop for WorkPool {
+  fn drop(self: &mut WorkPool) -> () {
+    self.stop()
+  }
+}
+
+/// Shareable handle bundle for [`Pools`].
+pub struct PoolHandles {
+  pub engine: WorkPoolHandle,
+  pub app: WorkPoolHandle,
+  pub io: WorkPoolHandle,
+}
+
+impl Transferable for PoolHandles {}
+impl Concurrent for PoolHandles {}
+
+impl PoolHandles {
+  /// Returns another copy of all three pool handles.
+  pub fn clone(self: &Self) -> PoolHandles {
+    return PoolHandles {
+      engine: self.engine.clone(),
+      app: self.app.clone(),
+      io: self.io.clone(),
+    }
+  }
+}
+
+/// Process-wide worker pool bundle separating Engine, App, and I/O work by QoS.
+pub struct Pools {
+  pub engine: WorkPool,
+  pub app: WorkPool,
+  pub io: WorkPool,
+}
+
+fn clampSize(value: usize, minVal: usize, maxVal: usize) -> usize {
+  if value < minVal {
+    return minVal
+  }
+  if value > maxVal {
+    return maxVal
+  }
+  return value
+}
+
+impl Pools {
+  /// Creates separated Engine, App, and I/O worker pools sized for the current machine.
+  pub effect fn make() -> Pools
+    ! OutOfMemoryError | SpawnError {
+    let mut cpus: usize = 1
+    static if Intrinsic.targetArchitecture() != "wasm32" {
+      cpus = NativeThread.processorCount()
+    }
+    let engineWorkers = clampSize(if cpus > 1 { cpus - 1 } else { 1 }, 2, 8)
+    let appWorkers = clampSize(cpus / 2, 2, 8)
+    let mut engine = run WorkPool.make(PoolQos.Engine, engineWorkers)
+    let mut app = run WorkPool.make(PoolQos.App, appWorkers)
+    let io = run WorkPool.make(PoolQos.Io, 4)
+    return Pools { engine: move engine, app: move app, io: move io }
+  }
+
+  /// Returns shareable handles for all three pools.
+  pub fn handles(self: &Self) -> PoolHandles {
+    return PoolHandles {
+      engine: self.engine.handle(),
+      app: self.app.handle(),
+      io: self.io.handle(),
+    }
+  }
+
+  /// Stops and joins all three pools.
+  pub fn stop(self: &mut Self) -> () {
+    self.engine.stop()
+    self.app.stop()
+    self.io.stop()
+  }
+}

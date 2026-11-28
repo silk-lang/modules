@@ -28,23 +28,38 @@ struct Varying { @builtin(position) position: vec4f, @location(0) @interpolate(f
 
 @vertex fn vs(@builtin(vertex_index) v: u32, @builtin(instance_index) index: u32) -> Varying {
   let r = runs[index];
-  let top = f32(r.y);
-  let x = f32(r.x);
-  let bounds = vec4f(x, top, x + f32(r.width), f32(min(r.y + 4, r.bottom)));
-  return Varying(corner(cover(bounds, paths[r.path].mask), v), index);
+  let path = paths[r.path];
+  let g = placements[u32(path.paint.stops.w)];
+  let dx = i32(g.offset.z);
+  let dy = i32(g.offset.w);
+  let rx = r.x + dx;
+  let ry = r.y + dy;
+  let rbottom = r.bottom + dy;
+  let own = path.mask + g.offset.xyxy;
+  let clipRect = vec4f(max(own.xy, g.clip.xy), min(own.zw, g.clip.zw));
+  let top = f32(ry);
+  let x = f32(rx);
+  let bounds = vec4f(x, top, x + f32(r.width), f32(min(ry + 4, rbottom)));
+  return Varying(corner(cover(bounds, clipRect), v), index);
 }
 
 @fragment fn fs(v: Varying) -> @location(0) vec4f {
   let r = runs[v.index];
   let path = paths[r.path];
+  let g = placements[u32(path.paint.stops.w)];
   let p = v.position.xy + globals.origin.xy;
-  let clip = areaIn(path.mask, p) * cornerCoverage(path.mask, path.maskRadii, p);
+  let own = path.mask + g.offset.xyxy;
+  let clipRect = vec4f(max(own.xy, g.clip.xy), min(own.zw, g.clip.zw));
+  let clip = areaIn(clipRect, p) * cornerCoverage(own, path.maskRadii, p)
+    * cornerCoverage(g.clip, g.clipRadii, p);
   if clip <= 0.0 { discard; }
+  let rx = r.x + i32(g.offset.z);
+  let ry = r.y + i32(g.offset.w);
   var alpha = 1.0;
   if r.alpha != SOLID {
-    let column = u32(i32(floor(p.x)) - r.x);
-    let row = u32(i32(floor(p.y)) - r.y);
+    let column = u32(i32(floor(p.x)) - rx);
+    let row = u32(i32(floor(p.y)) - ry);
     alpha = f32((alphas[r.alpha + column] >> (8u * row)) & 255u) / 255.0;
   }
-  return shade(path.paint, p) * (alpha * clip);
+  return shade(path.paint, p - g.offset.xy) * (alpha * clip);
 }

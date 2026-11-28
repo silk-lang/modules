@@ -1,0 +1,1165 @@
+//! Dedicated high-priority compositor thread owning [`InputRouter`] and non-blocking fast scroll.
+//!
+//! Reads platform events via [`PlatformInputSink`], hit-test surface commits via [`GroupToCompositor`],
+//! and present completions via [`GpuEvent`] without ever calling GPU present or surface acquisition.
+import input_router {
+  FrameCounters,
+  GestureAck,
+  GlobalShortcut,
+  HitRegion,
+  HitTestSurface,
+  InputRouter,
+  PlatformInput,
+  PlatformInputSink,
+  RoutedEvent,
+  RouterOutput,
+  ScrollUpdate,
+  WindowScrollPositions,
+  windowOf
+}
+import platform_thread { Nudge, PlatformClient }
+import render_thread { GpuCommand, GpuEvent, GpuHandle }
+import ui_transport.pool { PoolHandles }
+import ui_scene.scroll { ScrollPosition }
+import compositor_state {
+  CompositorAnimation,
+  ScrollerPhysicsConfig,
+  WindowCompositorState,
+}
+import layer_commit { CommitAck, LayerCommit }
+import clock { Clock }
+import ui_transport.channel {
+  TryRecvError,
+  UnboundedChannel,
+  UnboundedPair,
+  UnboundedReceiver,
+  UnboundedSender
+}
+import ui_transport.wake { Waiter, WakeHandle }
+import webgpu.runtime { GpuError }
+import window.event { Event }
+import window.types { WindowId }
+import silk.collections.list { List }
+import silk.concurrency.sync { Arc }
+import silk.concurrency.thread { Concurrent, Transferable }
+import silk.core.effect { Effect }
+import silk.core.equal { Equal }
+import silk.core.option { Option }
+import silk.core.ownership { Copy, Drop }
+import silk.core.result { Result }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f32
+import silk.num.f64
+import silk.num.i32
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+import console { StderrWriter }
+
+static if Intrinsic.targetArchitecture() != "wasm32" {
+  import silk.concurrency.thread_native { JoinHandle, NativeThread, SpawnError }
+}
+
+/// Reserved group identifier for the main application's window group.
+pub const PRIMARY_GROUP: u32 = 1
+
+/// Reserved group identifier for the isolated in-process DevTools window group.
+pub const DEVTOOLS_GROUP: u32 = 2
+
+/// Architecture role for a hosted window group (`Document` = JS + UiTree; `Engine` = retained UiTree; `DevTools` = inspector Loom UI).
+pub enum GroupKind {
+  Document,
+  Engine,
+  DevTools,
+}
+
+impl Equal for GroupKind {
+  fn equals(left: &Self, right: &Self) -> bool {
+    return match left.* {
+      GroupKind.Document => match right.* {
+        GroupKind.Document => true
+        _ => false
+      }
+      GroupKind.Engine => match right.* {
+        GroupKind.Engine => true
+        _ => false
+      }
+      GroupKind.DevTools => match right.* {
+        GroupKind.DevTools => true
+        _ => false
+      }
+    }
+  }
+}
+
+/// Process-wide handles handed to each `WindowClient` / `Companion` on startup.
+pub struct GroupServices {
+  pub groupId: u32,
+  pub kind: GroupKind,
+  pub pools: PoolHandles,
+  pub wake: Nudge,
+  pub compositor: Option<CompositorHandle>,
+  pub gpu: Option<GpuHandle>,
+  pub platform: Option<PlatformClient>,
+}
+
+impl Transferable for GroupServices {}
+impl Concurrent for GroupServices {}
+
+impl GroupServices {
+  pub fn clone(self: &Self) -> GroupServices {
+    return GroupServices {
+      groupId: self.groupId,
+      kind: self.kind,
+      pools: self.pools.clone(),
+      wake: self.wake.clone(),
+      compositor: match &self.compositor {
+        Option<CompositorHandle>.Some { value } => Option<CompositorHandle>.some(value.clone())
+        Option<CompositorHandle>.None => Option<CompositorHandle>.None
+      },
+      gpu: match &self.gpu {
+        Option<GpuHandle>.Some { value } => Option<GpuHandle>.some(value.clone())
+        Option<GpuHandle>.None => Option<GpuHandle>.None
+      },
+      platform: match &self.platform {
+        Option<PlatformClient>.Some { value } => Option<PlatformClient>.some(value.clone())
+        Option<PlatformClient>.None => Option<PlatformClient>.None
+      },
+    }
+  }
+}
+
+/// Wakes a UI window group thread without dropping pending-nudge flags in `PlatformProxy`.
+pub struct GroupWake {
+  nudge: Nudge,
+}
+
+impl Transferable for GroupWake {}
+impl Concurrent for GroupWake {}
+
+impl GroupWake {
+  pub fn make(nudge: Nudge) -> GroupWake {
+    return GroupWake { nudge: move nudge }
+  }
+
+  /// Constructs a `GroupWake` backed by a generic transferable `WakeHandle`.
+  pub fn fromHandle(wake: WakeHandle) -> GroupWake {
+    return GroupWake { nudge: Nudge.fromWake(move wake) }
+  }
+
+  pub fn clone(self: &Self) -> GroupWake {
+    return GroupWake { nudge: self.nudge.clone() }
+  }
+
+  pub fn wake(self: &Self) -> () {
+    self.nudge.nudge()
+  }
+}
+
+/// Dedicated inbox and waiter for a registered window group thread.
+pub struct GroupSubscription {
+  pub groupId: u32,
+  pub rx: UnboundedReceiver<CompositorToGroup>,
+  pub waiter: Waiter,
+}
+
+impl Transferable for GroupSubscription {}
+
+/// Surface lifecycle outcome forwarded to the owning window group.
+pub struct SurfaceNotice {
+  pub surface: u32,
+  pub window: WindowId,
+  pub made: bool,
+}
+
+impl Copy for SurfaceNotice {}
+impl Transferable for SurfaceNotice {}
+
+/// Presentation timing notification emitted by GPU and relayed by the compositor.
+pub struct PresentedNotice {
+  pub window: WindowId,
+  pub commitEpoch: u64,
+  pub painted: bool,
+  pub interval: f64,
+  pub dropped: u64,
+}
+
+impl Copy for PresentedNotice {}
+impl Transferable for PresentedNotice {}
+
+/// Messages pushed from the compositor thread to the window group thread.
+pub union CompositorToGroup {
+  Input { pub routed: RoutedEvent },
+  Scroll { pub update: ScrollUpdate },
+  SurfaceOpened { pub surface: u32, pub window: WindowId, pub made: bool },
+  SurfaceClosed { pub surface: u32, pub window: WindowId },
+  Presented { pub window: WindowId, pub commitEpoch: u64, pub painted: bool, pub interval: f64, pub dropped: u64 },
+  CommitInstalled { pub ack: CommitAck },
+  GpuFinished { pub window: WindowId, pub gpuFinishedEpoch: u64, pub atlasFrame: u64 },
+}
+
+impl Transferable for CompositorToGroup {}
+
+/// Messages pushed from the window group thread to the compositor thread.
+pub union GroupToCompositor {
+  RegisterGroup { pub groupId: u32, pub tx: UnboundedSender<CompositorToGroup>, pub wake: GroupWake },
+  UnregisterGroup { pub groupId: u32 },
+  RegisterSurface { pub window: WindowId, pub groupId: u32 },
+  RemoveSurface { pub window: WindowId },
+  CommitHitSurface { pub surface: HitTestSurface, pub immediate: bool },
+  CommitLayers { pub commit: LayerCommit },
+  SetAnimations { pub windowId: WindowId, pub animations: List<CompositorAnimation> },
+  SetScrollerPhysics { pub windowId: WindowId, pub configs: List<ScrollerPhysicsConfig> },
+  StartSmoothScroll { pub windowId: WindowId, pub node: u32, pub targetX: f32, pub targetY: f32, pub durationMs: f64 },
+  SetDockRegion { pub window: WindowId, pub region: Option<HitRegion> },
+  UpdateFocus { pub window: WindowId, pub root: u32, pub groupId: u32 },
+  UpdateCapture { pub window: WindowId, pub root: u32, pub node: u32, pub groupId: u32 },
+  SetShortcuts { pub shortcuts: List<GlobalShortcut> },
+  AckGesture { pub ack: GestureAck },
+  Stop,
+}
+
+impl Transferable for GroupToCompositor {}
+
+/// Multi-producer handle for sending hit-test commits and acks to the compositor thread.
+pub struct CompositorHandle {
+  groupTx: UnboundedSender<GroupToCompositor>,
+}
+
+impl Transferable for CompositorHandle {}
+impl Concurrent for CompositorHandle {}
+
+impl CompositorHandle {
+  pub fn clone(self: &Self) -> CompositorHandle {
+    return CompositorHandle { groupTx: self.groupTx.clone() }
+  }
+
+  fn send(self: &Self, msg: GroupToCompositor) -> () {
+    drop run Effect.result(self.groupTx.send(move msg))
+  }
+
+  /// Opens a dedicated compositor-to-group inbox and registers `groupId` with it.
+  pub effect fn openGroupChannel(self: &Self, groupId: u32) -> GroupSubscription
+    ! OutOfMemoryError {
+    let waiter = run Waiter.make()
+    let pair = run UnboundedChannel.make<CompositorToGroup>(WakeHandle.noop())
+    let UnboundedPair<CompositorToGroup> { sender: tx, receiver: rx } = move pair
+    self.send(
+      GroupToCompositor.RegisterGroup {
+        groupId: groupId,
+        tx: move tx,
+        wake: GroupWake.fromHandle(waiter.handle()),
+      },
+    )
+    return GroupSubscription { groupId: groupId, rx: move rx, waiter: move waiter }
+  }
+
+  pub fn unregisterGroup(self: &Self, groupId: u32) -> () {
+    self.send(GroupToCompositor.UnregisterGroup { groupId: groupId })
+  }
+
+  pub fn registerSurface(self: &Self, window: WindowId, groupId: u32) -> () {
+    self.send(GroupToCompositor.RegisterSurface { window: window, groupId: groupId })
+  }
+
+  pub fn removeSurface(self: &Self, window: WindowId) -> () {
+    self.send(GroupToCompositor.RemoveSurface { window: window })
+  }
+
+  pub fn commitHitSurface(self: &Self, surface: HitTestSurface, immediate: bool) -> () {
+    self.send(GroupToCompositor.CommitHitSurface { surface: move surface, immediate: immediate })
+  }
+
+  pub fn commitLayers(self: &Self, commit: LayerCommit) -> () {
+    self.send(GroupToCompositor.CommitLayers { commit: move commit })
+  }
+
+  pub effect fn setAnimations(self: &Self, windowId: WindowId, animations: &[CompositorAnimation]) -> ()
+    ! OutOfMemoryError {
+    let mut heap = Allocator.systemAllocatorProvider()
+    let mut list = List<CompositorAnimation>.make()
+    run list.appendSlice(animations) |> Effect.provideMut<Allocator>(&mut heap)
+    self.send(GroupToCompositor.SetAnimations { windowId: windowId, animations: move list })
+  }
+
+  pub effect fn setScrollerPhysics(self: &Self, windowId: WindowId, configs: &[ScrollerPhysicsConfig]) -> ()
+    ! OutOfMemoryError {
+    let mut heap = Allocator.systemAllocatorProvider()
+    let mut list = List<ScrollerPhysicsConfig>.make()
+    let mut i: usize = 0
+    while i < configs.length {
+      let cloned = run configs[i].clone() |> Effect.provideMut<Allocator>(&mut heap)
+      run list.append(move cloned) |> Effect.provideMut<Allocator>(&mut heap)
+      i = i + 1
+    }
+    self.send(GroupToCompositor.SetScrollerPhysics { windowId: windowId, configs: move list })
+  }
+
+  pub fn startSmoothScroll(self: &Self, windowId: WindowId, node: u32, targetX: f32, targetY: f32, durationMs: f64) -> () {
+    self.send(
+      GroupToCompositor.StartSmoothScroll {
+        windowId: windowId,
+        node: node,
+        targetX: targetX,
+        targetY: targetY,
+        durationMs: durationMs,
+      },
+    )
+  }
+
+  pub fn setDockRegion(self: &Self, window: WindowId, region: Option<HitRegion>) -> () {
+    self.send(GroupToCompositor.SetDockRegion { window: window, region: region })
+  }
+
+  pub fn updateFocus(self: &Self, window: WindowId, root: u32, groupId: u32) -> () {
+    self.send(GroupToCompositor.UpdateFocus { window: window, root: root, groupId: groupId })
+  }
+
+  pub fn updateCapture(self: &Self, window: WindowId, root: u32, node: u32, groupId: u32) -> () {
+    self.send(GroupToCompositor.UpdateCapture { window: window, root: root, node: node, groupId: groupId })
+  }
+
+  pub effect fn setShortcuts(self: &Self, shortcuts: &[GlobalShortcut]) -> ()
+    ! OutOfMemoryError {
+    let mut heap = Allocator.systemAllocatorProvider()
+    let mut list = List<GlobalShortcut>.make()
+    run list.appendSlice(shortcuts) |> Effect.provideMut<Allocator>(&mut heap)
+    self.send(GroupToCompositor.SetShortcuts { shortcuts: move list })
+  }
+
+  pub fn ackGesture(self: &Self, ack: GestureAck) -> () {
+    self.send(GroupToCompositor.AckGesture { ack: ack })
+  }
+}
+
+static if Intrinsic.targetArchitecture() != "wasm32" {
+  static if Intrinsic.targetOperatingSystem() == "darwin" {
+    unsafe extern "C" fn compositorThreadQos(class: u32, relative: i32) -> i32 as "pthread_set_qos_class_self_np"
+  }
+
+  /// Dedicated compositor thread handle owned by `host.silk`.
+  pub struct CompositorThread {
+    groupTx: UnboundedSender<GroupToCompositor>,
+    groupRx: UnboundedReceiver<CompositorToGroup>,
+    platformSink: PlatformInputSink,
+    gpuEventTx: UnboundedSender<GpuEvent>,
+    thread: Option<JoinHandle<i32>>,
+  }
+
+  impl CompositorThread {
+    pub effect fn start(gpu: GpuHandle, wake: GroupWake) -> CompositorThread
+      ! GpuError | OutOfMemoryError {
+      let mut heap = Allocator.systemAllocatorProvider()
+      let waiter = run Waiter.make()
+      let wakeHandle = waiter.handle()
+      let counters = run FrameCounters.make() |> Effect.provideMut<Allocator>(&mut heap)
+
+      let platformPair = run UnboundedChannel.make<PlatformInput>(wakeHandle.clone())
+      let UnboundedPair<PlatformInput> { sender: platformTx, receiver: platformRx } = move platformPair
+
+      let gpuPair = run UnboundedChannel.make<GpuEvent>(wakeHandle.clone())
+      let UnboundedPair<GpuEvent> { sender: gpuEventTx, receiver: gpuEventRx } = move gpuPair
+
+      let fromGroupPair = run UnboundedChannel.make<GroupToCompositor>(move wakeHandle)
+      let UnboundedPair<GroupToCompositor> { sender: groupTx, receiver: groupRx } = move fromGroupPair
+
+      let toGroupPair = run UnboundedChannel.make<CompositorToGroup>(WakeHandle.noop())
+      let UnboundedPair<CompositorToGroup> { sender: outTx, receiver: outRx } = move toGroupPair
+
+      let platformSink = PlatformInputSink.make(move platformTx, counters.clone())
+      let threadGpu = move gpu
+      let threadWake = move wake
+      let threadCounters = move counters
+      let threadWaiter = move waiter
+      let threadPlatformRx = move platformRx
+      let threadGpuRx = move gpuEventRx
+      let threadGroupRx = move groupRx
+      let threadOutTx = move outTx
+
+      let spawned = run Effect.result(
+        NativeThread.spawn(
+          || -> i32 {
+            let gpu = move threadGpu
+            let wake = move threadWake
+            let counters = move threadCounters
+            let waiter = move threadWaiter
+            let mut platformRx = move threadPlatformRx
+            let mut gpuEventRx = move threadGpuRx
+            let mut groupRx = move threadGroupRx
+            let outTx = move threadOutTx
+            return compositorMain(
+              &gpu,
+              &wake,
+              &counters,
+              &waiter,
+              &mut platformRx,
+              &mut gpuEventRx,
+              &mut groupRx,
+              &outTx,
+            )
+          },
+        ),
+      )
+        |> Effect.provideMut<Allocator>(&mut heap)
+
+      let handle = match move spawned {
+        Result.Success { value } => move value
+        Result.Failure { error } => match move error {
+          SpawnError failure => {
+            StderrWriter.print("ui-tree: the compositor thread could not start\n", &())
+            fail GpuError.status(i32.wrappingToU32(failure.code))
+          }
+          OutOfMemoryError failure => {
+            fail move failure
+          }
+        }
+      }
+
+      return CompositorThread {
+        groupTx: move groupTx,
+        groupRx: move outRx,
+        platformSink: move platformSink,
+        gpuEventTx: move gpuEventTx,
+        thread: Option<JoinHandle<i32>>.some(move handle),
+      }
+    }
+
+    pub fn platformInputSink(self: &Self) -> PlatformInputSink {
+      return self.platformSink.clone()
+    }
+
+    pub fn gpuEventSink(self: &Self) -> UnboundedSender<GpuEvent> {
+      return self.gpuEventTx.clone()
+    }
+
+    pub fn handle(self: &Self) -> CompositorHandle {
+      return CompositorHandle { groupTx: self.groupTx.clone() }
+    }
+
+    fn sendGroup(self: &Self, msg: GroupToCompositor) -> () {
+      drop run Effect.result(self.groupTx.send(move msg))
+    }
+
+    pub fn registerSurface(self: &Self, window: WindowId, groupId: u32) -> () {
+      self.sendGroup(GroupToCompositor.RegisterSurface { window: window, groupId: groupId })
+    }
+
+    pub effect fn openGroupChannel(self: &Self, groupId: u32) -> GroupSubscription
+      ! OutOfMemoryError {
+      return run self.handle().openGroupChannel(groupId)
+    }
+
+    pub fn unregisterGroup(self: &Self, groupId: u32) -> () {
+      self.sendGroup(GroupToCompositor.UnregisterGroup { groupId: groupId })
+    }
+
+    pub fn removeSurface(self: &Self, window: WindowId) -> () {
+      self.sendGroup(GroupToCompositor.RemoveSurface { window: window })
+    }
+
+    pub fn commitHitSurface(self: &Self, surface: HitTestSurface, immediate: bool) -> () {
+      self.sendGroup(GroupToCompositor.CommitHitSurface { surface: move surface, immediate: immediate })
+    }
+
+    pub fn setDockRegion(self: &Self, window: WindowId, region: Option<HitRegion>) -> () {
+      self.sendGroup(GroupToCompositor.SetDockRegion { window: window, region: region })
+    }
+
+    pub fn updateFocus(self: &Self, window: WindowId, root: u32, groupId: u32) -> () {
+      self.sendGroup(GroupToCompositor.UpdateFocus { window: window, root: root, groupId: groupId })
+    }
+
+    pub fn updateCapture(self: &Self, window: WindowId, root: u32, node: u32, groupId: u32) -> () {
+      self.sendGroup(GroupToCompositor.UpdateCapture { window: window, root: root, node: node, groupId: groupId })
+    }
+
+    pub effect fn setShortcuts(self: &Self, shortcuts: &[GlobalShortcut]) -> ()
+      ! OutOfMemoryError {
+      let mut heap = Allocator.systemAllocatorProvider()
+      let mut list = List<GlobalShortcut>.make()
+      run list.appendSlice(shortcuts) |> Effect.provideMut<Allocator>(&mut heap)
+      self.sendGroup(GroupToCompositor.SetShortcuts { shortcuts: move list })
+    }
+
+    pub fn ackGesture(self: &Self, ack: GestureAck) -> () {
+      self.sendGroup(GroupToCompositor.AckGesture { ack: ack })
+    }
+
+    pub fn commitLayers(self: &Self, commit: LayerCommit) -> () {
+      self.sendGroup(GroupToCompositor.CommitLayers { commit: move commit })
+    }
+
+    pub effect fn setAnimations(self: &Self, windowId: WindowId, animations: &[CompositorAnimation]) -> ()
+      ! OutOfMemoryError {
+      run self.handle().setAnimations(windowId, animations)
+    }
+
+    pub effect fn setScrollerPhysics(self: &Self, windowId: WindowId, configs: &[ScrollerPhysicsConfig]) -> ()
+      ! OutOfMemoryError {
+      run self.handle().setScrollerPhysics(windowId, configs)
+    }
+
+    pub fn startSmoothScroll(self: &Self, windowId: WindowId, node: u32, targetX: f32, targetY: f32, durationMs: f64) -> () {
+      self.sendGroup(
+        GroupToCompositor.StartSmoothScroll {
+          windowId: windowId,
+          node: node,
+          targetX: targetX,
+          targetY: targetY,
+          durationMs: durationMs,
+        },
+      )
+    }
+
+    /// Drains pending messages produced by the compositor for the UI window group.
+    pub effect fn poll(self: &mut Self, out: &mut List<CompositorToGroup>) -> usize
+      ! OutOfMemoryError
+      ? &mut Allocator {
+      return run self.groupRx.drain(&mut out, 0)
+    }
+
+    /// Stops the compositor thread cleanly and joins it.
+    pub fn stop(self: &mut Self) -> () {
+      self.sendGroup(GroupToCompositor.Stop)
+      self.groupTx.close()
+      self.gpuEventTx.close()
+      match move Intrinsic.replace(self.thread, Option<JoinHandle<i32>>.None) {
+        Option<JoinHandle<i32>>.Some { value } => {
+          drop value.join()
+        }
+        Option<JoinHandle<i32>>.None => ()
+      }
+    }
+  }
+
+  impl Drop for CompositorThread {
+    fn drop(self: &mut Self) -> () {
+      self.stop()
+    }
+  }
+
+  struct GroupEndpoint {
+    groupId: u32,
+    tx: UnboundedSender<CompositorToGroup>,
+    wake: GroupWake,
+    dirty: bool,
+  }
+
+  fn registerEndpoint(
+    groups: &mut List<GroupEndpoint>,
+    groupId: u32,
+    tx: UnboundedSender<CompositorToGroup>,
+    wake: GroupWake,
+  ) -> () {
+    let slice = groups.asMutSlice()
+    let mut i: usize = 0
+    while i < slice.length {
+      if slice[i].groupId == groupId {
+        slice[i].tx = move tx
+        slice[i].wake = move wake
+        slice[i].dirty = false
+        return ()
+      }
+      i = i + 1
+    }
+    let mut heap = Allocator.systemAllocatorProvider()
+    drop run Effect.result(
+      groups.append(
+        GroupEndpoint {
+          groupId: groupId,
+          tx: move tx,
+          wake: move wake,
+          dirty: false,
+        },
+      ),
+    )
+      |> Effect.provideMut<Allocator>(&mut heap)
+  }
+
+  fn unregisterEndpoint(groups: &mut List<GroupEndpoint>, groupId: u32) -> () {
+    let mut i: usize = 0
+    while i < groups.length() {
+      if groups.asSlice()[i].groupId == groupId {
+        drop groups.remove(i)
+      } else {
+        i = i + 1
+      }
+    }
+  }
+
+  fn sendToGroup(groups: &mut List<GroupEndpoint>, groupId: u32, msg: CompositorToGroup) -> () {
+    let mut targetIdx = usize.MAX
+    let mut fallbackIdx = usize.MAX
+    let slice = groups.asSlice()
+    let mut i: usize = 0
+    while i < slice.length {
+      let id = slice[i].groupId
+      if id == groupId {
+        targetIdx = i
+        break
+      }
+      if id == PRIMARY_GROUP {
+        fallbackIdx = i
+      }
+      i = i + 1
+    }
+    let idx = if targetIdx != usize.MAX {
+      targetIdx
+    } else if groupId == 0 {
+      fallbackIdx
+    } else {
+      usize.MAX
+    }
+    if idx == usize.MAX {
+      drop msg
+      return ()
+    }
+    let mutSlice = groups.asMutSlice()
+    if sendGroupMsg(&mutSlice[idx].tx, move msg) {
+      mutSlice[idx].dirty = true
+    }
+  }
+
+  fn flushWakes(groups: &mut List<GroupEndpoint>) -> () {
+    let slice = groups.asMutSlice()
+    let mut i: usize = 0
+    while i < slice.length {
+      if slice[i].dirty {
+        slice[i].dirty = false
+        slice[i].wake.wake()
+      }
+      i = i + 1
+    }
+  }
+
+  fn findOrCreateWinState(
+    states: &mut List<WindowCompositorState>,
+    window: WindowId,
+  ) -> usize {
+    let slice = states.asSlice()
+    let mut i: usize = 0
+    while i < slice.length {
+      if slice[i].windowId.value == window.value {
+        return i
+      }
+      i = i + 1
+    }
+    drop slice
+    let mut heap = Allocator.systemAllocatorProvider()
+    let idx = states.length()
+    drop run Effect.result(states.append(WindowCompositorState.make(window)))
+      |> Effect.provideMut<Allocator>(&mut heap)
+    return idx
+  }
+
+  fn removeWinState(states: &mut List<WindowCompositorState>, window: WindowId) -> () {
+    let mut i: usize = 0
+    while i < states.length() {
+      if states.asSlice()[i].windowId.value == window.value {
+        drop states.remove(i)
+      } else {
+        i = i + 1
+      }
+    }
+  }
+
+  fn pushWinProperties(gpu: &GpuHandle, state: &WindowCompositorState) -> () {
+    drop run Effect.result(
+      gpu.applyProperties(
+        state.windowId,
+        state.store.epochs.activeEpoch,
+        state.scrolls(),
+        state.overrides(),
+      ),
+    )
+  }
+
+  fn compositorMain(
+    gpu: &GpuHandle,
+    wake: &GroupWake,
+    counters: &Arc<FrameCounters>,
+    waiter: &Waiter,
+    platformRx: &mut UnboundedReceiver<PlatformInput>,
+    gpuEventRx: &mut UnboundedReceiver<GpuEvent>,
+    groupRx: &mut UnboundedReceiver<GroupToCompositor>,
+    outTx: &UnboundedSender<CompositorToGroup>,
+  ) -> i32 {
+    static if Intrinsic.targetOperatingSystem() == "darwin" {
+      let _qos = unsafe compositorThreadQos(0x21, 0)
+    }
+    let mut heap = Allocator.systemAllocatorProvider()
+    let mut clock = Clock.make()
+    let mut prevTickMs = (run clock.seconds()) * 1000.0
+    let mut router = InputRouter.make()
+    let mut out = RouterOutput.make()
+    let mut reconciled = List<ScrollPosition>.make()
+    let mut groups = List<GroupEndpoint>.make()
+    let mut winStates = List<WindowCompositorState>.make()
+    registerEndpoint(&mut groups, PRIMARY_GROUP, outTx.clone(), wake.clone())
+    let mut running = true
+
+    while running {
+      let mut didWork = false
+      let loopNowMs = (run clock.seconds()) * 1000.0
+
+      while running {
+        match groupRx.tryRecv() {
+          Result.Success { value: msg } => {
+            didWork = true
+            match move msg {
+              GroupToCompositor.RegisterGroup { groupId, tx, wake: endpointWake } => {
+                registerEndpoint(&mut groups, groupId, move tx, move endpointWake)
+              }
+              GroupToCompositor.UnregisterGroup { groupId } => {
+                unregisterEndpoint(&mut groups, groupId)
+              }
+              GroupToCompositor.RegisterSurface { window, groupId } => {
+                drop run Effect.result(router.registerSurface(window, groupId))
+                  |> Effect.provideMut<Allocator>(&mut heap)
+                if window.value != 0 {
+                  drop findOrCreateWinState(&mut winStates, window)
+                }
+              }
+              GroupToCompositor.RemoveSurface { window } => {
+                router.removeSurface(window)
+                removeWinState(&mut winStates, window)
+              }
+              GroupToCompositor.CommitHitSurface { surface, immediate } => {
+                let win = surface.window
+                reconciled.clear()
+                if immediate {
+                  drop run Effect.result(router.commitPresented(move surface, &mut reconciled))
+                    |> Effect.provideMut<Allocator>(&mut heap)
+                } else {
+                  drop run Effect.result(router.commitPending(move surface))
+                    |> Effect.provideMut<Allocator>(&mut heap)
+                }
+                if reconciled.length() != 0 {
+                  let mut copy = List<ScrollPosition>.make()
+                  drop run Effect.result(copy.appendSlice(reconciled.asSlice()))
+                    |> Effect.provideMut<Allocator>(&mut heap)
+                  gpu.send(
+                    GpuCommand.ApplyScroll {
+                      window: win,
+                      seq: router.lastInputSeq(),
+                      positions: move copy,
+                    },
+                  )
+                }
+              }
+              GroupToCompositor.CommitLayers { commit } => {
+                let win = commit.windowId
+                let gid = commit.groupId
+                let wIdx = findOrCreateWinState(&mut winStates, win)
+                let ackRes = run Effect.result(winStates.asMutSlice()[wIdx].applyCommit(&commit))
+                  |> Effect.provideMut<Allocator>(&mut heap)
+                match move ackRes {
+                  Result.Success { value: ack } => {
+                    if ack.applied {
+                      gpu.commitLayers(move commit)
+                      let stRef = &winStates.asSlice()[wIdx]
+                      if stRef.overrides().length > 0 || stRef.scrolls().length > 0 {
+                        pushWinProperties(gpu, stRef)
+                      }
+                    } else {
+                      drop commit
+                      sendToGroup(&mut groups, gid, CompositorToGroup.CommitInstalled { ack: ack })
+                    }
+                  }
+                  Result.Failure { .. } => {
+                    drop commit
+                  }
+                }
+              }
+              GroupToCompositor.SetAnimations { windowId, animations } => {
+                let wIdx = findOrCreateWinState(&mut winStates, windowId)
+                drop run Effect.result(winStates.asMutSlice()[wIdx].setAnimations(animations.asSlice(), loopNowMs))
+                  |> Effect.provideMut<Allocator>(&mut heap)
+                pushWinProperties(gpu, &winStates.asSlice()[wIdx])
+              }
+              GroupToCompositor.SetScrollerPhysics { windowId, configs } => {
+                let wIdx = findOrCreateWinState(&mut winStates, windowId)
+                drop run Effect.result(winStates.asMutSlice()[wIdx].setScrollerConfigs(configs.asSlice()))
+                  |> Effect.provideMut<Allocator>(&mut heap)
+              }
+              GroupToCompositor.StartSmoothScroll { windowId, node, targetX, targetY, durationMs } => {
+                let wIdx = findOrCreateWinState(&mut winStates, windowId)
+                drop run Effect.result(
+                  winStates.asMutSlice()[wIdx].startSmoothScroll(node, targetX, targetY, loopNowMs, durationMs),
+                )
+                  |> Effect.provideMut<Allocator>(&mut heap)
+              }
+              GroupToCompositor.SetDockRegion { window, region } => {
+                router.setDockRegion(window, region)
+              }
+              GroupToCompositor.UpdateFocus { window, root, groupId } => {
+                router.setFocus(window, root, groupId)
+              }
+              GroupToCompositor.UpdateCapture { window, root, node, groupId } => {
+                router.setCapture(window, root, node, groupId)
+              }
+              GroupToCompositor.SetShortcuts { shortcuts } => {
+                drop run Effect.result(router.setShortcuts(shortcuts.asSlice()))
+                  |> Effect.provideMut<Allocator>(&mut heap)
+              }
+              GroupToCompositor.AckGesture { ack } => {
+                out.clear()
+                drop run Effect.result(router.ackGesture(ack, &mut out))
+                  |> Effect.provideMut<Allocator>(&mut heap)
+                flushRouterOutput(gpu, &mut groups, &mut winStates, &mut out, router.lastInputSeq(), loopNowMs)
+              }
+              GroupToCompositor.Stop => {
+                running = false
+                break
+              }
+            }
+          }
+          Result.Failure { error } => match error {
+            TryRecvError.Empty => { break }
+            TryRecvError.Closed => {
+              running = false
+              break
+            }
+          }
+        }
+      }
+
+      if !running {
+        flushWakes(&mut groups)
+        break
+      }
+
+      while true {
+        match gpuEventRx.tryRecv() {
+          Result.Success { value: event } => {
+            didWork = true
+            match move event {
+              GpuEvent.FramePresented { window, commitEpoch, painted, report, dropped, atMs } => {
+                drop atMs
+                counters.get().recordPresent(painted)
+                if window.value != 0 {
+                  let wIdx = findOrCreateWinState(&mut winStates, window)
+                  winStates.asMutSlice()[wIdx].onPresented(commitEpoch)
+                }
+                reconciled.clear()
+                let promoted = run Effect.result(router.promoteCommit(window, commitEpoch, &mut reconciled))
+                  |> Effect.provideMut<Allocator>(&mut heap)
+                let didPromote = match move promoted {
+                  Result.Success { value } => value
+                  Result.Failure { .. } => false
+                }
+                if didPromote && reconciled.length() != 0 {
+                  let mut copy = List<ScrollPosition>.make()
+                  drop run Effect.result(copy.appendSlice(reconciled.asSlice()))
+                    |> Effect.provideMut<Allocator>(&mut heap)
+                  gpu.send(
+                    GpuCommand.ApplyScroll {
+                      window: window,
+                      seq: router.lastInputSeq(),
+                      positions: move copy,
+                    },
+                  )
+                }
+                let ownerGroup = router.groupOf(window)
+                sendToGroup(
+                  &mut groups,
+                  ownerGroup,
+                  CompositorToGroup.Presented {
+                    window: window,
+                    commitEpoch: commitEpoch,
+                    painted: painted,
+                    interval: report.interval,
+                    dropped: dropped,
+                  },
+                )
+              }
+              GpuEvent.CommitInstalled { ack } => {
+                let ownerGroup = router.groupOf(ack.windowId)
+                sendToGroup(&mut groups, ownerGroup, CompositorToGroup.CommitInstalled { ack: ack })
+              }
+              GpuEvent.GpuFinished { windowId, gpuFinishedEpoch, atlasFrame } => {
+                if windowId.value != 0 {
+                  let wIdx = findOrCreateWinState(&mut winStates, windowId)
+                  winStates.asMutSlice()[wIdx].onGpuFinished(gpuFinishedEpoch)
+                }
+                let ownerGroup = router.groupOf(windowId)
+                sendToGroup(
+                  &mut groups,
+                  ownerGroup,
+                  CompositorToGroup.GpuFinished {
+                    window: windowId,
+                    gpuFinishedEpoch: gpuFinishedEpoch,
+                    atlasFrame: atlasFrame,
+                  },
+                )
+              }
+              GpuEvent.SurfaceOpened { surface, window, made } => {
+                let ownerGroup = router.groupOf(window)
+                sendToGroup(
+                  &mut groups,
+                  ownerGroup,
+                  CompositorToGroup.SurfaceOpened { surface: surface, window: window, made: made },
+                )
+              }
+              GpuEvent.SurfaceClosed { surface, window } => {
+                let ownerGroup = router.groupOf(window)
+                router.removeSurface(window)
+                removeWinState(&mut winStates, window)
+                sendToGroup(
+                  &mut groups,
+                  ownerGroup,
+                  CompositorToGroup.SurfaceClosed { surface: surface, window: window },
+                )
+              }
+            }
+          }
+          Result.Failure { error } => match error {
+            TryRecvError.Empty => { break }
+            TryRecvError.Closed => { break }
+          }
+        }
+      }
+
+      while true {
+        match platformRx.tryRecv() {
+          Result.Success { value: item } => {
+            didWork = true
+            let PlatformInput { event, scale } = move item
+            let win = windowOf(&event)
+            let effScale: f32 = if scale > 0.0 { f64.toF32(scale) } else { 1.0 }
+            if win.value != 0 && scale > 0.0 {
+              router.setScale(win, effScale)
+            }
+            if let Event.MouseMoved { window: moveWin, position, .. } = &event {
+              if moveWin.value != 0 {
+                let wIdx = findOrCreateWinState(&mut winStates, moveWin)
+                let changed = run Effect.result(
+                  winStates.asMutSlice()[wIdx].onPointerMove(
+                    f64.toF32(position.x) * effScale,
+                    f64.toF32(position.y) * effScale,
+                    loopNowMs,
+                  ),
+                )
+                  |> Effect.provideMut<Allocator>(&mut heap)
+                if let Result.Success { value: moved } = move changed {
+                  if moved {
+                    pushWinProperties(gpu, &winStates.asSlice()[wIdx])
+                  }
+                }
+              }
+            }
+            out.clear()
+            drop run Effect.result(router.route(move event, &mut out))
+              |> Effect.provideMut<Allocator>(&mut heap)
+            flushRouterOutput(gpu, &mut groups, &mut winStates, &mut out, router.lastInputSeq(), loopNowMs)
+          }
+          Result.Failure { error } => match error {
+            TryRecvError.Empty => { break }
+            TryRecvError.Closed => { break }
+          }
+        }
+      }
+
+      let nowMs = (run clock.seconds()) * 1000.0
+      let dtSec = f64.toF32(f64.max(0.0, (nowMs - prevTickMs) / 1000.0))
+      prevTickMs = nowMs
+      let mut anyMotion = false
+      let mut wi: usize = 0
+      while wi < winStates.length() {
+        if winStates.asSlice()[wi].hasActiveMotion() {
+          anyMotion = true
+          let tickRes = run Effect.result(winStates.asMutSlice()[wi].tick(nowMs, dtSec))
+            |> Effect.provideMut<Allocator>(&mut heap)
+          if let Result.Success { value: ticked } = move tickRes {
+            if ticked {
+              pushWinProperties(gpu, &winStates.asSlice()[wi])
+              didWork = true
+            }
+          }
+          if !winStates.asSlice()[wi].hasActiveMotion() {
+            anyMotion = anyMotion
+          }
+        }
+        wi = wi + 1
+      }
+      anyMotion = false
+      wi = 0
+      while wi < winStates.length() {
+        if winStates.asSlice()[wi].hasActiveMotion() {
+          anyMotion = true
+          break
+        }
+        wi = wi + 1
+      }
+
+      flushWakes(&mut groups)
+      if !running {
+        break
+      }
+      if !didWork {
+        if anyMotion {
+          drop waiter.waitTimeout(8000000)
+        } else {
+          waiter.wait()
+        }
+      }
+    }
+    return 0
+  }
+
+  fn sendGroupMsg(tx: &UnboundedSender<CompositorToGroup>, msg: CompositorToGroup) -> bool {
+    let sent = run Effect.result(tx.send(move msg))
+    return match move sent {
+      Result.Success { value } => match move value {
+        Result.Success { .. } => true
+        Result.Failure { .. } => false
+      }
+      Result.Failure { .. } => false
+    }
+  }
+
+  fn flushRouterOutput(
+    gpu: &GpuHandle,
+    groups: &mut List<GroupEndpoint>,
+    winStates: &mut List<WindowCompositorState>,
+    out: &mut RouterOutput,
+    seq: u64,
+    nowMs: f64,
+  ) -> () {
+    while out.gpuScrolls.length() != 0 {
+      let item = out.gpuScrolls.remove(0)
+      let WindowScrollPositions { window, positions } = move item
+      if window.value != 0 {
+        let mut heap = Allocator.systemAllocatorProvider()
+        let wIdx = findOrCreateWinState(&mut winStates, window)
+        drop run Effect.result(winStates.asMutSlice()[wIdx].setScrollPositions(positions.asSlice(), nowMs))
+          |> Effect.provideMut<Allocator>(&mut heap)
+        if winStates.asSlice()[wIdx].overrides().length > 0 {
+          pushWinProperties(gpu, &winStates.asSlice()[wIdx])
+        }
+      }
+      gpu.send(GpuCommand.ApplyScroll { window: window, seq: seq, positions: move positions })
+    }
+    while out.scrolls.length() != 0 {
+      let update = out.scrolls.remove(0)
+      let gid = update.groupId
+      sendToGroup(&mut groups, gid, CompositorToGroup.Scroll { update: update })
+    }
+    while out.events.length() != 0 {
+      let routed = out.events.remove(0)
+      let gid = routed.target.groupId
+      sendToGroup(&mut groups, gid, CompositorToGroup.Input { routed: move routed })
+    }
+  }
+} else {
+  /// Browser (`wasm32`) stub: inline hosts route input on the single UI thread.
+  pub struct CompositorThread {}
+
+  impl CompositorThread {
+    pub effect fn start(gpu: GpuHandle, wake: GroupWake) -> CompositorThread
+      ! GpuError | OutOfMemoryError {
+      drop gpu
+      drop wake
+      return CompositorThread {}
+    }
+
+    pub fn platformInputSink(self: &Self) -> PlatformInputSink {
+      Intrinsic.trap("ui-tree-window: CompositorThread is unavailable on wasm32")
+    }
+
+    pub fn gpuEventSink(self: &Self) -> UnboundedSender<GpuEvent> {
+      Intrinsic.trap("ui-tree-window: CompositorThread is unavailable on wasm32")
+    }
+
+    pub fn handle(self: &Self) -> CompositorHandle {
+      Intrinsic.trap("ui-tree-window: CompositorThread is unavailable on wasm32")
+    }
+
+    pub effect fn openGroupChannel(self: &Self, groupId: u32) -> GroupSubscription
+      ! OutOfMemoryError {
+      let waiter = run Waiter.make()
+      let pair = run UnboundedChannel.make<CompositorToGroup>(WakeHandle.noop())
+      let UnboundedPair<CompositorToGroup> { sender: tx, receiver: rx } = move pair
+      drop tx
+      return GroupSubscription { groupId: groupId, rx: move rx, waiter: move waiter }
+    }
+
+    pub fn unregisterGroup(self: &Self, groupId: u32) -> () {
+      drop groupId
+    }
+
+    pub fn registerSurface(self: &Self, window: WindowId, groupId: u32) -> () {
+      drop window
+      drop groupId
+    }
+
+    pub fn removeSurface(self: &Self, window: WindowId) -> () {
+      drop window
+    }
+
+    pub fn commitHitSurface(self: &Self, surface: HitTestSurface, immediate: bool) -> () {
+      drop surface
+      drop immediate
+    }
+
+    pub fn setDockRegion(self: &Self, window: WindowId, region: Option<HitRegion>) -> () {
+      drop window
+      drop region
+    }
+
+    pub fn updateFocus(self: &Self, window: WindowId, root: u32, groupId: u32) -> () {
+      drop window
+      drop root
+      drop groupId
+    }
+
+    pub fn updateCapture(self: &Self, window: WindowId, root: u32, node: u32, groupId: u32) -> () {
+      drop window
+      drop root
+      drop node
+      drop groupId
+    }
+
+    pub effect fn setShortcuts(self: &Self, shortcuts: &[GlobalShortcut]) -> ()
+      ! OutOfMemoryError {
+      drop shortcuts
+    }
+
+    pub fn ackGesture(self: &Self, ack: GestureAck) -> () {
+      drop ack
+    }
+
+    pub fn commitLayers(self: &Self, commit: LayerCommit) -> () {
+      drop commit
+    }
+
+    pub effect fn setAnimations(self: &Self, windowId: WindowId, animations: &[CompositorAnimation]) -> ()
+      ! OutOfMemoryError {
+      drop windowId
+      drop animations
+    }
+
+    pub effect fn setScrollerPhysics(self: &Self, windowId: WindowId, configs: &[ScrollerPhysicsConfig]) -> ()
+      ! OutOfMemoryError {
+      drop windowId
+      drop configs
+    }
+
+    pub fn startSmoothScroll(self: &Self, windowId: WindowId, node: u32, targetX: f32, targetY: f32, durationMs: f64) -> () {
+      drop windowId
+      drop node
+      drop targetX
+      drop targetY
+      drop durationMs
+    }
+
+    pub effect fn poll(self: &mut Self, out: &mut List<CompositorToGroup>) -> usize
+      ! OutOfMemoryError
+      ? &mut Allocator {
+      drop out
+      return 0
+    }
+
+    pub fn stop(self: &mut Self) -> () {}
+  }
+}

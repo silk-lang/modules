@@ -1,0 +1,1788 @@
+//! Compositor-side property trees, animations, timelines, springs, and scroll physics.
+//!
+//! Runs lock-free on the Compositor thread (with full `wasm32` parity for tests/inline hosts):
+//! - Evaluates monotonic animations, `Scroll` timelines, `Pointer` timelines, and sub-stepped
+//!   [`SpringSpec`] physics into per-layer [`LayerOverride`] records.
+//! - Solves full scroll physics: touch pan velocity tracking, exponential fling decay,
+//!   `overscroll-behavior` (`Auto` chaining + rubber-band, `Contain` rubber-band, `None` hard clamp),
+//!   scroll snap (`Mandatory`, `Proximity`, `scroll-snap-stop: always`), smooth scroll with immediate
+//!   cancellation on user input, and scrollbar thumb drag.
+//! - Reports exact `hasActiveMotion()` / `nextWakeMs()` so idle compositor threads sleep with zero polling.
+
+import silk.collections.list { List }
+import silk.concurrency.thread { Transferable }
+import silk.core.equal { Equal }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.geometry.matrix { Matrix3 }
+import silk.geometry.rect { Rect }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f32
+import silk.num.f64
+import silk.num.u32
+import silk.num.usize
+import layer_commit { CommitAck, LayerCommit, RetainedLayerStore }
+import ui_scene.effects { LayerEffects, brightness }
+import ui_scene.primitives { ContentMask }
+import ui_scene.property_tree { LayerOverride, findLayerOverride, sameLayerOverrides, translationMatrix }
+import ui_scene.scroll { ScrollPosition }
+import window.types { WindowId }
+
+const PI_F32: f32 = 3.14159265
+const FLING_DECAY: f32 = 3.25
+const MIN_FLING_VELOCITY: f32 = 25.0
+const STOP_FLING_VELOCITY: f32 = 12.0
+const RUBBER_BAND_LIMIT: f32 = 140.0
+
+/// Easing curve for compositor animations and smooth scroll transitions.
+pub union EasingKind {
+  Linear,
+  CubicBezier { pub x1: f32, pub y1: f32, pub x2: f32, pub y2: f32 },
+  Steps { pub count: u32, pub jumpStart: bool },
+}
+
+impl Copy for EasingKind {}
+
+/// Layer property driven by a [`CompositorAnimation`].
+pub union AnimPropertyKind {
+  Opacity,
+  TranslateX,
+  TranslateY,
+  ScaleX,
+  ScaleY,
+  RotateDeg,
+  FilterBrightness,
+  FilterBlur,
+  ClipInsetTop,
+  ClipInsetRight,
+  ClipInsetBottom,
+  ClipInsetLeft,
+}
+
+impl Copy for AnimPropertyKind {}
+
+/// Timeline source driving animation progress: wall clock, scroll offset, or pointer coordinate.
+pub union TimelineKind {
+  Monotonic,
+  Scroll { pub scrollerNode: u32, pub horizontal: bool, pub startOffset: f32, pub endOffset: f32 },
+  Pointer { pub axisX: bool, pub minPos: f32, pub maxPos: f32 },
+}
+
+impl Copy for TimelineKind {}
+
+/// Spring parameters for physics-driven animations and overscroll bounce-back.
+pub struct SpringSpec {
+  pub stiffness: f32,
+  pub damping: f32,
+  pub mass: f32,
+  pub restDelta: f32,
+  pub restVelocity: f32,
+}
+
+impl Copy for SpringSpec {}
+
+impl SpringSpec {
+  pub fn default() -> SpringSpec {
+    return SpringSpec {
+      stiffness: 180.0,
+      damping: 22.0,
+      mass: 1.0,
+      restDelta: 0.001,
+      restVelocity: 0.01,
+    }
+  }
+
+  pub fn rubberBand() -> SpringSpec {
+    return SpringSpec {
+      stiffness: 320.0,
+      damping: 32.0,
+      mass: 1.0,
+      restDelta: 0.05,
+      restVelocity: 0.5,
+    }
+  }
+}
+
+/// Mutable spring integrator state.
+pub struct SpringState {
+  pub value: f32,
+  pub target: f32,
+  pub velocity: f32,
+  pub active: bool,
+}
+
+impl Copy for SpringState {}
+
+impl SpringState {
+  pub fn atRest(value: f32) -> SpringState {
+    return SpringState { value: value, target: value, velocity: 0.0, active: false }
+  }
+}
+
+/// Integrates `state` over `dtSec` using sub-stepped semi-implicit Euler for stability.
+pub fn stepSpring(spec: SpringSpec, state: SpringState, dtSec: f32) -> SpringState {
+  if !state.active || dtSec <= 0.0 {
+    return state
+  }
+  let clampedDt = f32.min(dtSec, 0.1)
+  let mass = f32.max(spec.mass, 0.001)
+  let maxSub: f32 = 1.0 / 240.0
+  let stepsRaw = f32.toU32(f32.ceil(clampedDt / maxSub))
+  let steps = if stepsRaw < 1 { 1 } else { stepsRaw }
+  let subDt = clampedDt / u32.toF32(steps)
+
+  let mut x = state.value
+  let mut v = state.velocity
+  let mut s: u32 = 0
+  while s < steps {
+    let accel = (-spec.stiffness * (x - state.target) - spec.damping * v) / mass
+    v = v + accel * subDt
+    x = x + v * subDt
+    s = s + 1
+  }
+  if f32.abs(x - state.target) <= spec.restDelta && f32.abs(v) <= spec.restVelocity {
+    return SpringState { value: state.target, target: state.target, velocity: 0.0, active: false }
+  }
+  return SpringState { value: x, target: state.target, velocity: v, active: true }
+}
+
+/// Evaluates `easing` at normalized progress `t` in `[0, 1]`.
+pub fn evalEasing(easing: EasingKind, rawT: f32) -> f32 {
+  let t = f32.max(0.0, f32.min(1.0, rawT))
+  return match easing {
+    EasingKind.Linear => t
+    EasingKind.CubicBezier { x1, y1, x2, y2 } => evalBezier(x1, y1, x2, y2, t)
+    EasingKind.Steps { count, jumpStart } => {
+      if count == 0 {
+        return t
+      }
+      let n = u32.toF32(count)
+      if jumpStart {
+        let step = f32.min(n, f32.floor(t * n) + 1.0)
+        return f32.min(1.0, step / n)
+      }
+      if t >= 1.0 {
+        return 1.0
+      }
+      return f32.min(1.0, f32.floor(t * n) / n)
+    }
+  }
+}
+
+fn bezierSample(p1: f32, p2: f32, u: f32) -> f32 {
+  let a = 1.0 - 3.0 * p2 + 3.0 * p1
+  let b = 3.0 * p2 - 6.0 * p1
+  let c = 3.0 * p1
+  return ((a * u + b) * u + c) * u
+}
+
+fn bezierSlope(p1: f32, p2: f32, u: f32) -> f32 {
+  let a = 1.0 - 3.0 * p2 + 3.0 * p1
+  let b = 3.0 * p2 - 6.0 * p1
+  let c = 3.0 * p1
+  return (3.0 * a * u + 2.0 * b) * u + c
+}
+
+fn evalBezier(x1: f32, y1: f32, x2: f32, y2: f32, x: f32) -> f32 {
+  if x <= 0.0 {
+    return 0.0
+  }
+  if x >= 1.0 {
+    return 1.0
+  }
+  let mut u = x
+  let mut i: u32 = 0
+  while i < 8 {
+    let err = bezierSample(x1, x2, u) - x
+    if f32.abs(err) < 0.0001 {
+      return bezierSample(y1, y2, u)
+    }
+    let d = bezierSlope(x1, x2, u)
+    if f32.abs(d) < 0.00001 {
+      break
+    }
+    u = f32.max(0.0, f32.min(1.0, u - err / d))
+    i = i + 1
+  }
+  let mut lo: f32 = 0.0
+  let mut hi: f32 = 1.0
+  u = x
+  let mut b: u32 = 0
+  while b < 12 {
+    let val = bezierSample(x1, x2, u)
+    if f32.abs(val - x) < 0.0001 {
+      return bezierSample(y1, y2, u)
+    }
+    if val < x {
+      lo = u
+    } else {
+      hi = u
+    }
+    u = (lo + hi) * 0.5
+    b = b + 1
+  }
+  return bezierSample(y1, y2, u)
+}
+
+/// Compositor-driven animation specification for a tagged [`LayerSprite`].
+pub struct CompositorAnimation {
+  pub id: u64,
+  pub layerId: u32,
+  pub property: AnimPropertyKind,
+  pub timeline: TimelineKind,
+  pub easing: EasingKind,
+  pub startMs: f64,
+  pub durationMs: f64,
+  pub delayMs: f64,
+  /// Repeat count (`<= 0.0` means repeat forever on `Monotonic` timelines).
+  pub iterations: f32,
+  pub alternate: bool,
+  pub fillForwards: bool,
+  pub fromValue: f32,
+  pub toValue: f32,
+  pub useSpring: bool,
+  pub spring: SpringSpec,
+  pub springState: SpringState,
+  pub originX: f32,
+  pub originY: f32,
+  pub baseBounds: Rect<f32>,
+  pub active: bool,
+}
+
+impl Copy for CompositorAnimation {}
+
+impl CompositorAnimation {
+  pub fn keyframed(
+    id: u64,
+    layerId: u32,
+    property: AnimPropertyKind,
+    timeline: TimelineKind,
+    easing: EasingKind,
+    startMs: f64,
+    durationMs: f64,
+    fromValue: f32,
+    toValue: f32,
+  ) -> CompositorAnimation {
+    return CompositorAnimation {
+      id: id,
+      layerId: layerId,
+      property: property,
+      timeline: timeline,
+      easing: easing,
+      startMs: startMs,
+      durationMs: durationMs,
+      delayMs: 0.0,
+      iterations: 1.0,
+      alternate: false,
+      fillForwards: true,
+      fromValue: fromValue,
+      toValue: toValue,
+      useSpring: false,
+      spring: SpringSpec.default(),
+      springState: SpringState.atRest(fromValue),
+      originX: 0.0,
+      originY: 0.0,
+      baseBounds: Rect<f32>.new(0.0, 0.0, 0.0, 0.0),
+      active: match timeline {
+        TimelineKind.Monotonic => true
+        TimelineKind.Scroll { .. } => false
+        TimelineKind.Pointer { .. } => false
+      },
+    }
+  }
+
+  pub fn springDriven(
+    id: u64,
+    layerId: u32,
+    property: AnimPropertyKind,
+    initialValue: f32,
+    initialVelocity: f32,
+    targetValue: f32,
+    spec: SpringSpec,
+  ) -> CompositorAnimation {
+    return CompositorAnimation {
+      id: id,
+      layerId: layerId,
+      property: property,
+      timeline: TimelineKind.Monotonic,
+      easing: EasingKind.Linear,
+      startMs: 0.0,
+      durationMs: 0.0,
+      delayMs: 0.0,
+      iterations: 1.0,
+      alternate: false,
+      fillForwards: true,
+      fromValue: initialValue,
+      toValue: targetValue,
+      useSpring: true,
+      spring: spec,
+      springState: SpringState {
+        value: initialValue,
+        target: targetValue,
+        velocity: initialVelocity,
+        active: true,
+      },
+      originX: 0.0,
+      originY: 0.0,
+      baseBounds: Rect<f32>.new(0.0, 0.0, 0.0, 0.0),
+      active: true,
+    }
+  }
+}
+
+/// CSS `overscroll-behavior` policy per scroll axis.
+pub union OverscrollBehavior {
+  Auto,
+  Contain,
+  None,
+}
+
+impl Copy for OverscrollBehavior {}
+
+impl Equal for OverscrollBehavior {
+  fn equals(left: &Self, right: &Self) -> bool {
+    return match left.* {
+      OverscrollBehavior.Auto => match right.* {
+        OverscrollBehavior.Auto => true
+        _ => false
+      }
+      OverscrollBehavior.Contain => match right.* {
+        OverscrollBehavior.Contain => true
+        _ => false
+      }
+      OverscrollBehavior.None => match right.* {
+        OverscrollBehavior.None => true
+        _ => false
+      }
+    }
+  }
+}
+
+/// CSS `scroll-snap-type` strictness per scroll axis.
+pub union SnapStrictness {
+  None,
+  Proximity,
+  Mandatory,
+}
+
+impl Copy for SnapStrictness {}
+
+impl Equal for SnapStrictness {
+  fn equals(left: &Self, right: &Self) -> bool {
+    return match left.* {
+      SnapStrictness.None => match right.* {
+        SnapStrictness.None => true
+        _ => false
+      }
+      SnapStrictness.Proximity => match right.* {
+        SnapStrictness.Proximity => true
+        _ => false
+      }
+      SnapStrictness.Mandatory => match right.* {
+        SnapStrictness.Mandatory => true
+        _ => false
+      }
+    }
+  }
+}
+
+/// Snap alignment target along one axis, optionally marking `scroll-snap-stop: always`.
+pub struct SnapPoint {
+  pub offset: f32,
+  pub stopAlways: bool,
+}
+
+impl Copy for SnapPoint {}
+
+/// Per-scroller physics configuration uploaded from UI layout commits.
+pub struct ScrollerPhysicsConfig {
+  pub node: u32,
+  pub parentNode: u32,
+  pub minX: f32,
+  pub maxX: f32,
+  pub minY: f32,
+  pub maxY: f32,
+  pub overscrollX: OverscrollBehavior,
+  pub overscrollY: OverscrollBehavior,
+  pub snapStrictnessX: SnapStrictness,
+  pub snapStrictnessY: SnapStrictness,
+  pub proximityThreshold: f32,
+  pub snapPointsX: List<SnapPoint>,
+  pub snapPointsY: List<SnapPoint>,
+  pub trackBounds: Rect<f32>,
+  pub thumbSize: f32,
+  pub verticalScrollbar: bool,
+}
+
+impl Transferable for ScrollerPhysicsConfig {}
+
+impl ScrollerPhysicsConfig {
+  pub fn basic(node: u32, minX: f32, maxX: f32, minY: f32, maxY: f32) -> ScrollerPhysicsConfig {
+    return ScrollerPhysicsConfig {
+      node: node,
+      parentNode: 0,
+      minX: minX,
+      maxX: maxX,
+      minY: minY,
+      maxY: maxY,
+      overscrollX: OverscrollBehavior.Auto,
+      overscrollY: OverscrollBehavior.Auto,
+      snapStrictnessX: SnapStrictness.None,
+      snapStrictnessY: SnapStrictness.None,
+      proximityThreshold: 40.0,
+      snapPointsX: List<SnapPoint>.make(),
+      snapPointsY: List<SnapPoint>.make(),
+      trackBounds: Rect<f32>.new(0.0, 0.0, 0.0, 0.0),
+      thumbSize: 20.0,
+      verticalScrollbar: true,
+    }
+  }
+
+  pub effect fn clone(self: &Self) -> ScrollerPhysicsConfig
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut out = ScrollerPhysicsConfig {
+      node: self.node,
+      parentNode: self.parentNode,
+      minX: self.minX,
+      maxX: self.maxX,
+      minY: self.minY,
+      maxY: self.maxY,
+      overscrollX: self.overscrollX,
+      overscrollY: self.overscrollY,
+      snapStrictnessX: self.snapStrictnessX,
+      snapStrictnessY: self.snapStrictnessY,
+      proximityThreshold: self.proximityThreshold,
+      snapPointsX: List<SnapPoint>.make(),
+      snapPointsY: List<SnapPoint>.make(),
+      trackBounds: self.trackBounds,
+      thumbSize: self.thumbSize,
+      verticalScrollbar: self.verticalScrollbar,
+    }
+    run out.snapPointsX.appendSlice(self.snapPointsX.asSlice())
+    run out.snapPointsY.appendSlice(self.snapPointsY.asSlice())
+    return move out
+  }
+}
+
+/// Live compositor physics state for a single scrollable node.
+pub struct ScrollerPhysicsState {
+  pub node: u32,
+  pub x: f32,
+  pub y: f32,
+  pub overscrollX: f32,
+  pub overscrollY: f32,
+  pub velX: f32,
+  pub velY: f32,
+  pub dragging: bool,
+  pub lastTouchX: f32,
+  pub lastTouchY: f32,
+  pub lastTouchMs: f64,
+  pub gestureStartX: f32,
+  pub gestureStartY: f32,
+  pub thumbDragging: bool,
+  pub lastThumbPointer: f32,
+  pub smoothActive: bool,
+  pub smoothStartX: f32,
+  pub smoothStartY: f32,
+  pub smoothTargetX: f32,
+  pub smoothTargetY: f32,
+  pub smoothStartMs: f64,
+  pub smoothDurationMs: f64,
+  pub bounceSpringX: SpringState,
+  pub bounceSpringY: SpringState,
+}
+
+impl Copy for ScrollerPhysicsState {}
+
+impl ScrollerPhysicsState {
+  pub fn at(node: u32, x: f32, y: f32) -> ScrollerPhysicsState {
+    return ScrollerPhysicsState {
+      node: node,
+      x: x,
+      y: y,
+      overscrollX: 0.0,
+      overscrollY: 0.0,
+      velX: 0.0,
+      velY: 0.0,
+      dragging: false,
+      lastTouchX: 0.0,
+      lastTouchY: 0.0,
+      lastTouchMs: 0.0,
+      gestureStartX: x,
+      gestureStartY: y,
+      thumbDragging: false,
+      lastThumbPointer: 0.0,
+      smoothActive: false,
+      smoothStartX: x,
+      smoothStartY: y,
+      smoothTargetX: x,
+      smoothTargetY: y,
+      smoothStartMs: 0.0,
+      smoothDurationMs: 0.0,
+      bounceSpringX: SpringState.atRest(0.0),
+      bounceSpringY: SpringState.atRest(0.0),
+    }
+  }
+
+  pub fn hasMotion(self: &Self) -> bool {
+    return self.velX != 0.0
+      || self.velY != 0.0
+      || self.smoothActive
+      || self.bounceSpringX.active
+      || self.bounceSpringY.active
+  }
+}
+
+/// Logarithmic rubber-band curve (`damped < |excess|`) preserving sign.
+pub fn rubberBand(excess: f32, limit: f32) -> f32 {
+  if excess == 0.0 {
+    return 0.0
+  }
+  let c = f32.max(limit, 1.0)
+  let mag = f32.abs(excess)
+  let damped = (1.0 - 1.0 / (mag * 0.55 / c + 1.0)) * c
+  return if excess < 0.0 { -damped } else { damped }
+}
+
+fn clampAxis(value: f32, minVal: f32, maxVal: f32) -> f32 {
+  let hi = f32.max(minVal, maxVal)
+  return f32.max(minVal, f32.min(hi, value))
+}
+
+/// Resolves scroll snap destination along one axis respecting `Mandatory`/`Proximity`/`stopAlways`.
+pub fn findSnapTarget(
+  startOffset: f32,
+  currentOffset: f32,
+  minOffset: f32,
+  maxOffset: f32,
+  strictness: SnapStrictness,
+  proximityThreshold: f32,
+  points: &[SnapPoint],
+) -> f32 {
+  let clamped = clampAxis(currentOffset, minOffset, maxOffset)
+  let isNone = match strictness {
+    SnapStrictness.None => true
+    _ => false
+  }
+  if isNone || points.length == 0 {
+    return clamped
+  }
+
+  // Honors `scroll-snap-stop: always`: never jump past an intermediate mandatory-stop point.
+  if f32.abs(clamped - startOffset) > 0.5 {
+    let forward = clamped > startOffset
+    let mut hasStop = false
+    let mut stopTarget = clamped
+    let mut bestStopDist: f32 = 0.0
+    let mut s: usize = 0
+    while s < points.length {
+      let pt = points[s]
+      if pt.stopAlways {
+        let p = clampAxis(pt.offset, minOffset, maxOffset)
+        let crossed = if forward {
+          p > startOffset + 0.5 && p < clamped - 0.5
+        } else {
+          p < startOffset - 0.5 && p > clamped + 0.5
+        }
+        if crossed {
+          let dist = f32.abs(p - startOffset)
+          if !hasStop || dist < bestStopDist {
+            hasStop = true
+            bestStopDist = dist
+            stopTarget = p
+          }
+        }
+      }
+      s = s + 1
+    }
+    if hasStop {
+      return stopTarget
+    }
+  }
+
+  let mut nearest = clampAxis(points[0].offset, minOffset, maxOffset)
+  let mut bestDist = f32.abs(nearest - clamped)
+  let mut i: usize = 1
+  while i < points.length {
+    let p = clampAxis(points[i].offset, minOffset, maxOffset)
+    let d = f32.abs(p - clamped)
+    if d < bestDist {
+      bestDist = d
+      nearest = p
+    }
+    i = i + 1
+  }
+
+  return match strictness {
+    SnapStrictness.Mandatory => nearest
+    SnapStrictness.Proximity => if bestDist <= proximityThreshold { nearest } else { clamped }
+    SnapStrictness.None => clamped
+  }
+}
+
+struct LayerCompAccum {
+  layerId: u32,
+  hasOpacity: bool,
+  opacity: f32,
+  hasTranslate: bool,
+  tx: f32,
+  ty: f32,
+  hasScale: bool,
+  sx: f32,
+  sy: f32,
+  hasRotate: bool,
+  rotDeg: f32,
+  originX: f32,
+  originY: f32,
+  hasClip: bool,
+  baseBounds: Rect<f32>,
+  insetTop: f32,
+  insetRight: f32,
+  insetBottom: f32,
+  insetLeft: f32,
+  hasBrightness: bool,
+  brightnessAmount: f32,
+  hasBlur: bool,
+  blurRadius: f32,
+}
+
+impl Copy for LayerCompAccum {}
+
+impl LayerCompAccum {
+  fn make(layerId: u32) -> LayerCompAccum {
+    return LayerCompAccum {
+      layerId: layerId,
+      hasOpacity: false,
+      opacity: 1.0,
+      hasTranslate: false,
+      tx: 0.0,
+      ty: 0.0,
+      hasScale: false,
+      sx: 1.0,
+      sy: 1.0,
+      hasRotate: false,
+      rotDeg: 0.0,
+      originX: 0.0,
+      originY: 0.0,
+      hasClip: false,
+      baseBounds: Rect<f32>.new(0.0, 0.0, 0.0, 0.0),
+      insetTop: 0.0,
+      insetRight: 0.0,
+      insetBottom: 0.0,
+      insetLeft: 0.0,
+      hasBrightness: false,
+      brightnessAmount: 1.0,
+      hasBlur: false,
+      blurRadius: 0.0,
+    }
+  }
+}
+
+/// Complete compositor state for one window: layer store, scroll physics, animations, overrides.
+pub struct WindowCompositorState {
+  pub windowId: WindowId,
+  pub store: RetainedLayerStore,
+  pub scrollPositions: List<ScrollPosition>,
+  pub scrollers: List<ScrollerPhysicsConfig>,
+  pub physics: List<ScrollerPhysicsState>,
+  pub animations: List<CompositorAnimation>,
+  pub pointerX: f32,
+  pub pointerY: f32,
+  pub resolvedOverrides: List<LayerOverride>,
+  prevOverridesScratch: List<LayerOverride>,
+  accumsScratch: List<LayerCompAccum>,
+}
+
+impl Transferable for WindowCompositorState {}
+
+impl WindowCompositorState {
+  pub fn make(windowId: WindowId) -> WindowCompositorState {
+    return WindowCompositorState {
+      windowId: windowId,
+      store: RetainedLayerStore.make(),
+      scrollPositions: List<ScrollPosition>.make(),
+      scrollers: List<ScrollerPhysicsConfig>.make(),
+      physics: List<ScrollerPhysicsState>.make(),
+      animations: List<CompositorAnimation>.make(),
+      pointerX: 0.0,
+      pointerY: 0.0,
+      resolvedOverrides: List<LayerOverride>.make(),
+      prevOverridesScratch: List<LayerOverride>.make(),
+      accumsScratch: List<LayerCompAccum>.make(),
+    }
+  }
+
+  /// Applies a keyframe or delta [`LayerCommit`] idempotently and reconciles committed scrolls.
+  pub effect fn applyCommit(self: &mut Self, commit: &LayerCommit) -> CommitAck
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let ack = run self.store.applyCommit(commit)
+    if ack.applied {
+      let mut s: usize = 0
+      while s < commit.scrolls.length() {
+        let sn = commit.scrolls.asSlice()[s]
+        run self.ensureScrollNode(sn.groupId, sn.scrollX, sn.scrollY, sn.minX, sn.maxX, sn.minY, sn.maxY)
+        s = s + 1
+      }
+      drop run self.rebuildOverrides(0.0)
+    }
+    return ack
+  }
+
+  pub fn onPresented(self: &mut Self, epoch: u64) -> () {
+    self.store.onPresented(epoch)
+  }
+
+  pub fn onGpuFinished(self: &mut Self, epoch: u64) -> () {
+    self.store.onGpuFinished(epoch)
+  }
+
+  pub effect fn setAnimations(self: &mut Self, animations: &[CompositorAnimation], nowMs: f64) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    self.animations.clear()
+    run self.animations.appendSlice(animations)
+    drop run self.rebuildOverrides(nowMs)
+  }
+
+  pub effect fn setScrollerConfigs(self: &mut Self, configs: &[ScrollerPhysicsConfig]) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    self.scrollers.clear()
+    let mut i: usize = 0
+    while i < configs.length {
+      let cloned = run configs[i].clone()
+      run self.scrollers.append(move cloned)
+      let c = &configs[i]
+      run self.ensureScrollNode(c.node, 0.0, 0.0, c.minX, c.maxX, c.minY, c.maxY)
+      i = i + 1
+    }
+  }
+
+  pub effect fn setScrollPositions(self: &mut Self, positions: &[ScrollPosition], nowMs: f64) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut i: usize = 0
+    while i < positions.length {
+      let p = positions[i]
+      run self.ensureScrollNode(p.node, p.x, p.y, p.minX, p.maxX, p.minY, p.maxY)
+      let pIdx = self.findPhysicsIndex(p.node)
+      if pIdx != usize.MAX {
+        let st = &mut self.physics.asMutSlice()[pIdx]
+        st.x = clampAxis(p.x, p.minX, p.maxX)
+        st.y = clampAxis(p.y, p.minY, p.maxY)
+      }
+      let sIdx = self.findScrollIndex(p.node)
+      if sIdx != usize.MAX {
+        let scrollSlice = self.scrollPositions.asMutSlice()
+        scrollSlice[sIdx] = p
+      }
+      i = i + 1
+    }
+    drop run self.rebuildOverrides(nowMs)
+  }
+
+  pub effect fn onPointerMove(self: &mut Self, x: f32, y: f32, nowMs: f64) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    self.pointerX = x
+    self.pointerY = y
+    let mut dragged = false
+    let slice = self.physics.asMutSlice()
+    let mut i: usize = 0
+    while i < slice.length {
+      if slice[i].thumbDragging {
+        let node = slice[i].node
+        drop slice
+        let vert = match self.findConfig(node) {
+          Option<ScrollerPhysicsConfig>.Some { value } => value.verticalScrollbar
+          Option<ScrollerPhysicsConfig>.None => true
+        }
+        let coord = if vert { y } else { x }
+        if run self.moveThumbDrag(node, coord, nowMs) {
+          dragged = true
+        }
+        return (run self.rebuildOverrides(nowMs)) || dragged
+      }
+      i = i + 1
+    }
+    drop slice
+    return run self.rebuildOverrides(nowMs)
+  }
+
+  /// Applies a user wheel scroll delta `(dx, dy)` in pixels to `node`, canceling smooth scroll.
+  pub effect fn applyWheel(self: &mut Self, node: u32, dx: f32, dy: f32, nowMs: f64) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let changed = run self.applyScrollDelta(node, dx, dy, true, 0)
+    if run self.rebuildOverrides(nowMs) {
+      return true
+    }
+    return changed
+  }
+
+  pub effect fn onTouchBegin(self: &mut Self, node: u32, x: f32, y: f32, nowMs: f64) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.ensureNodePresent(node)
+    let idx = self.findPhysicsIndex(node)
+    if idx == usize.MAX {
+      return ()
+    }
+    let st = &mut self.physics.asMutSlice()[idx]
+    st.smoothActive = false
+    st.velX = 0.0
+    st.velY = 0.0
+    st.bounceSpringX.active = false
+    st.bounceSpringY.active = false
+    st.dragging = true
+    st.lastTouchX = x
+    st.lastTouchY = y
+    st.lastTouchMs = nowMs
+    st.gestureStartX = st.x
+    st.gestureStartY = st.y
+  }
+
+  pub effect fn onTouchMove(self: &mut Self, node: u32, x: f32, y: f32, nowMs: f64) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let idx = self.findPhysicsIndex(node)
+    if idx == usize.MAX {
+      return false
+    }
+    let st = &mut self.physics.asMutSlice()[idx]
+    if !st.dragging {
+      return false
+    }
+    let dx = st.lastTouchX - x
+    let dy = st.lastTouchY - y
+    let dtSec = f64.toF32(f64.max((nowMs - st.lastTouchMs) / 1000.0, 0.001))
+    let instVx = dx / dtSec
+    let instVy = dy / dtSec
+    st.velX = st.velX * 0.4 + instVx * 0.6
+    st.velY = st.velY * 0.4 + instVy * 0.6
+    st.lastTouchX = x
+    st.lastTouchY = y
+    st.lastTouchMs = nowMs
+    drop st
+    let changed = run self.applyScrollDelta(node, dx, dy, true, 0)
+    let ovChanged = run self.rebuildOverrides(nowMs)
+    return changed || ovChanged
+  }
+
+  pub effect fn onTouchEnd(self: &mut Self, node: u32, nowMs: f64) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let idx = self.findPhysicsIndex(node)
+    if idx == usize.MAX {
+      return false
+    }
+    let st = &mut self.physics.asMutSlice()[idx]
+    st.dragging = false
+    let mut launchedBounce = false
+    if f32.abs(st.overscrollX) > 0.01 {
+      st.bounceSpringX = SpringState {
+        value: st.overscrollX,
+        target: 0.0,
+        velocity: 0.0,
+        active: true,
+      }
+      st.velX = 0.0
+      launchedBounce = true
+    } else if f32.abs(st.velX) < MIN_FLING_VELOCITY {
+      st.velX = 0.0
+    }
+    if f32.abs(st.overscrollY) > 0.01 {
+      st.bounceSpringY = SpringState {
+        value: st.overscrollY,
+        target: 0.0,
+        velocity: 0.0,
+        active: true,
+      }
+      st.velY = 0.0
+      launchedBounce = true
+    } else if f32.abs(st.velY) < MIN_FLING_VELOCITY {
+      st.velY = 0.0
+    }
+    let noFling = st.velX == 0.0 && st.velY == 0.0
+    drop st
+    if !launchedBounce && noFling {
+      return run self.snapScroller(node, nowMs, false)
+    }
+    return launchedBounce
+  }
+
+  /// Starts a smooth scroll transition toward `(targetX, targetY)`. Any user input cancels it.
+  pub effect fn startSmoothScroll(
+    self: &mut Self,
+    node: u32,
+    targetX: f32,
+    targetY: f32,
+    nowMs: f64,
+    durationMs: f64,
+  ) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.ensureNodePresent(node)
+    let idx = self.findPhysicsIndex(node)
+    let sIdx = self.findScrollIndex(node)
+    if idx == usize.MAX || sIdx == usize.MAX {
+      return ()
+    }
+    let pos = self.scrollPositions.get(sIdx)
+    let clampedX = clampAxis(targetX, pos.minX, pos.maxX)
+    let clampedY = clampAxis(targetY, pos.minY, pos.maxY)
+    let st = &mut self.physics.asMutSlice()[idx]
+    st.velX = 0.0
+    st.velY = 0.0
+    st.overscrollX = 0.0
+    st.overscrollY = 0.0
+    st.bounceSpringX.active = false
+    st.bounceSpringY.active = false
+    st.smoothStartX = st.x
+    st.smoothStartY = st.y
+    st.smoothTargetX = clampedX
+    st.smoothTargetY = clampedY
+    st.smoothStartMs = nowMs
+    st.smoothDurationMs = f64.max(durationMs, 1.0)
+    st.smoothActive = true
+  }
+
+  /// Begins dragging `node`'s scrollbar thumb, canceling any in-flight smooth scroll.
+  pub effect fn beginThumbDrag(self: &mut Self, node: u32, pointerCoord: f32) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.ensureNodePresent(node)
+    let idx = self.findPhysicsIndex(node)
+    if idx == usize.MAX {
+      return ()
+    }
+    let st = &mut self.physics.asMutSlice()[idx]
+    st.smoothActive = false
+    st.velX = 0.0
+    st.velY = 0.0
+    st.thumbDragging = true
+    st.lastThumbPointer = pointerCoord
+  }
+
+  pub effect fn moveThumbDrag(self: &mut Self, node: u32, pointerCoord: f32, nowMs: f64) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let idx = self.findPhysicsIndex(node)
+    let sIdx = self.findScrollIndex(node)
+    if idx == usize.MAX || sIdx == usize.MAX {
+      return false
+    }
+    let st = &mut self.physics.asMutSlice()[idx]
+    if !st.thumbDragging {
+      return false
+    }
+    let deltaPtr = pointerCoord - st.lastThumbPointer
+    st.lastThumbPointer = pointerCoord
+    st.smoothActive = false
+    st.velX = 0.0
+    st.velY = 0.0
+    drop st
+
+    let pos = self.scrollPositions.get(sIdx)
+    let mut trackLen: f32 = 100.0
+    let mut thumbSize: f32 = 20.0
+    let mut vert = true
+    let mut cIdx: usize = 0
+    while cIdx < self.scrollers.length() {
+      let c = &self.scrollers.asSlice()[cIdx]
+      if c.node == node {
+        vert = c.verticalScrollbar
+        trackLen = if vert {
+          c.trackBounds.yMax - c.trackBounds.yMin
+        } else {
+          c.trackBounds.xMax - c.trackBounds.xMin
+        }
+        thumbSize = c.thumbSize
+        break
+      }
+      cIdx = cIdx + 1
+    }
+    let travel = f32.max(trackLen - thumbSize, 1.0)
+    let scrollRange = if vert {
+      f32.max(0.0, pos.maxY - pos.minY)
+    } else {
+      f32.max(0.0, pos.maxX - pos.minX)
+    }
+    let deltaContent = deltaPtr * scrollRange / travel
+    let st2 = &mut self.physics.asMutSlice()[idx]
+    if vert {
+      st2.y = clampAxis(st2.y + deltaContent, pos.minY, pos.maxY)
+    } else {
+      st2.x = clampAxis(st2.x + deltaContent, pos.minX, pos.maxX)
+    }
+    let finalX = st2.x
+    let finalY = st2.y
+    drop st2
+    self.syncPublishedScroll(node, finalX, finalY, 0.0, 0.0)
+    drop run self.rebuildOverrides(nowMs)
+    return true
+  }
+
+  pub fn endThumbDrag(self: &mut Self, node: u32) -> () {
+    let idx = self.findPhysicsIndex(node)
+    if idx != usize.MAX {
+      let physSlice = self.physics.asMutSlice()
+      physSlice[idx].thumbDragging = false
+    }
+  }
+
+  /// Advances animations, springs, flings, bounce-backs, and smooth scrolls; returns true if
+  /// any scroll position or [`LayerOverride`] changed.
+  pub effect fn tick(self: &mut Self, nowMs: f64, dtSec: f32) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut anyChanged = false
+    let safeDt = f32.max(0.0, f32.min(dtSec, 0.1))
+
+    // 1. Advance active scroller physics (smooth scroll, exponential fling, overscroll bounce).
+    let mut i: usize = 0
+    while i < self.physics.length() {
+      let node = self.physics.asSlice()[i].node
+      let stSnapshot = self.physics.get(i)
+
+      if stSnapshot.smoothActive {
+        let rawT = f64.toF32((nowMs - stSnapshot.smoothStartMs) / f64.max(stSnapshot.smoothDurationMs, 1.0))
+        let eased = evalEasing(EasingKind.CubicBezier { x1: 0.25, y1: 0.1, x2: 0.25, y2: 1.0 }, rawT)
+        let nx = stSnapshot.smoothStartX + (stSnapshot.smoothTargetX - stSnapshot.smoothStartX) * eased
+        let ny = stSnapshot.smoothStartY + (stSnapshot.smoothTargetY - stSnapshot.smoothStartY) * eased
+        let st = &mut self.physics.asMutSlice()[i]
+        if nx != st.x || ny != st.y {
+          anyChanged = true
+        }
+        st.x = nx
+        st.y = ny
+        if rawT >= 1.0 {
+          st.x = stSnapshot.smoothTargetX
+          st.y = stSnapshot.smoothTargetY
+          st.smoothActive = false
+          anyChanged = true
+        }
+        let fx = st.x
+        let fy = st.y
+        drop st
+        self.syncPublishedScroll(node, fx, fy, 0.0, 0.0)
+      }
+
+      if self.physics.get(i).velX != 0.0 || self.physics.get(i).velY != 0.0 {
+        let cur = self.physics.get(i)
+        if safeDt > 0.0 {
+          let decay = f32.exp(-FLING_DECAY * safeDt)
+          let stepFactor = (1.0 - decay) / FLING_DECAY
+          let dx = cur.velX * stepFactor
+          let dy = cur.velY * stepFactor
+          let mut nvx = cur.velX * decay
+          let mut nvy = cur.velY * decay
+          if f32.abs(nvx) < STOP_FLING_VELOCITY {
+            nvx = 0.0
+          }
+          if f32.abs(nvy) < STOP_FLING_VELOCITY {
+            nvy = 0.0
+          }
+          let moved = run self.applyScrollDelta(node, dx, dy, false, 0)
+          if moved {
+            anyChanged = true
+          }
+          let stF = &mut self.physics.asMutSlice()[i]
+          stF.velX = nvx
+          stF.velY = nvy
+          if f32.abs(stF.overscrollX) > 0.01 {
+            stF.bounceSpringX = SpringState {
+              value: stF.overscrollX,
+              target: 0.0,
+              velocity: 0.0,
+              active: true,
+            }
+            stF.velX = 0.0
+            anyChanged = true
+          }
+          if f32.abs(stF.overscrollY) > 0.01 {
+            stF.bounceSpringY = SpringState {
+              value: stF.overscrollY,
+              target: 0.0,
+              velocity: 0.0,
+              active: true,
+            }
+            stF.velY = 0.0
+            anyChanged = true
+          }
+          let finishedFling = stF.velX == 0.0 && stF.velY == 0.0 && !stF.bounceSpringX.active && !stF.bounceSpringY.active
+          drop stF
+          if finishedFling {
+            if run self.snapScroller(node, nowMs, true) {
+              anyChanged = true
+            }
+          }
+        }
+      }
+
+      if self.physics.get(i).bounceSpringX.active || self.physics.get(i).bounceSpringY.active {
+        let stB = &mut self.physics.asMutSlice()[i]
+        let spec = SpringSpec.rubberBand()
+        if stB.bounceSpringX.active {
+          stB.bounceSpringX = stepSpring(spec, stB.bounceSpringX, safeDt)
+          stB.overscrollX = stB.bounceSpringX.value
+          anyChanged = true
+        }
+        if stB.bounceSpringY.active {
+          stB.bounceSpringY = stepSpring(spec, stB.bounceSpringY, safeDt)
+          stB.overscrollY = stB.bounceSpringY.value
+          anyChanged = true
+        }
+        let bx = stB.x
+        let by = stB.y
+        let ox = stB.overscrollX
+        let oy = stB.overscrollY
+        let settledBounce = !stB.bounceSpringX.active && !stB.bounceSpringY.active
+        drop stB
+        self.syncPublishedScroll(node, bx, by, ox, oy)
+        if settledBounce {
+          if run self.snapScroller(node, nowMs, true) {
+            anyChanged = true
+          }
+        }
+      }
+
+      i = i + 1
+    }
+
+    // 2. Advance active monotonic/spring compositor animations.
+    let anims = self.animations.asMutSlice()
+    let mut a: usize = 0
+    while a < anims.length {
+      let anim = &mut anims[a]
+      if anim.active {
+        match anim.timeline {
+          TimelineKind.Monotonic => {
+            if anim.useSpring {
+              anim.springState = stepSpring(anim.spring, anim.springState, safeDt)
+              if !anim.springState.active {
+                anim.active = false
+              }
+              anyChanged = true
+            } else {
+              let elapsed = nowMs - anim.startMs - anim.delayMs
+              if elapsed >= 0.0 {
+                if anim.iterations > 0.0 {
+                  let total = anim.durationMs * f32.toF64(anim.iterations)
+                  if elapsed >= total {
+                    anim.active = false
+                  }
+                }
+                anyChanged = true
+              }
+            }
+          }
+          TimelineKind.Scroll { .. } => {}
+          TimelineKind.Pointer { .. } => {}
+        }
+      }
+      a = a + 1
+    }
+    drop anims
+
+    if run self.rebuildOverrides(nowMs) {
+      anyChanged = true
+    }
+    return anyChanged
+  }
+
+  /// True only while continuous frame ticking (monotonic animations, springs, flings, smooth scroll)
+  /// is needed. Scroll/pointer timelines and static scenes return false (zero-poll idle).
+  pub fn hasActiveMotion(self: &Self) -> bool {
+    let phys = self.physics.asSlice()
+    let mut i: usize = 0
+    while i < phys.length {
+      if phys[i].hasMotion() {
+        return true
+      }
+      i = i + 1
+    }
+    let anims = self.animations.asSlice()
+    let mut a: usize = 0
+    while a < anims.length {
+      if anims[a].active {
+        match anims[a].timeline {
+          TimelineKind.Monotonic => {
+            return true
+          }
+          _ => {}
+        }
+      }
+      a = a + 1
+    }
+    return false
+  }
+
+  /// Next wake deadline in milliseconds when active motion exists; `None` when completely idle.
+  pub fn nextWakeMs(self: &Self, nowMs: f64) -> Option<f64> {
+    if !self.hasActiveMotion() {
+      return Option<f64>.None
+    }
+    return Option<f64>.some(nowMs + 8.333)
+  }
+
+  pub fn overrides(self: &Self) -> &[LayerOverride] {
+    return self.resolvedOverrides.asSlice()
+  }
+
+  pub fn scrolls(self: &Self) -> &[ScrollPosition] {
+    return self.scrollPositions.asSlice()
+  }
+
+  pub fn scrollPositionOf(self: &Self, node: u32) -> Option<ScrollPosition> {
+    let idx = self.findScrollIndex(node)
+    if idx == usize.MAX {
+      return Option<ScrollPosition>.None
+    }
+    return Option<ScrollPosition>.some(self.scrollPositions.get(idx))
+  }
+
+  pub fn overscrollOf(self: &Self, node: u32) -> [f32; 2] {
+    let idx = self.findPhysicsIndex(node)
+    if idx == usize.MAX {
+      return [0.0, 0.0]
+    }
+    let st = self.physics.get(idx)
+    return [st.overscrollX, st.overscrollY]
+  }
+
+  pub effect fn cloneScrolls(self: &Self) -> List<ScrollPosition>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut out = List<ScrollPosition>.make()
+    run out.appendSlice(self.scrollPositions.asSlice())
+    return move out
+  }
+
+  pub effect fn cloneOverrides(self: &Self) -> List<LayerOverride>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut out = List<LayerOverride>.make()
+    run out.appendSlice(self.resolvedOverrides.asSlice())
+    return move out
+  }
+
+  fn findScrollIndex(self: &Self, node: u32) -> usize {
+    let slice = self.scrollPositions.asSlice()
+    let mut i: usize = 0
+    while i < slice.length {
+      if slice[i].node == node {
+        return i
+      }
+      i = i + 1
+    }
+    return usize.MAX
+  }
+
+  fn findPhysicsIndex(self: &Self, node: u32) -> usize {
+    let slice = self.physics.asSlice()
+    let mut i: usize = 0
+    while i < slice.length {
+      if slice[i].node == node {
+        return i
+      }
+      i = i + 1
+    }
+    return usize.MAX
+  }
+
+  fn findConfigIndex(self: &Self, node: u32) -> usize {
+    let slice = self.scrollers.asSlice()
+    let mut i: usize = 0
+    while i < slice.length {
+      if slice[i].node == node {
+        return i
+      }
+      i = i + 1
+    }
+    return usize.MAX
+  }
+
+  fn findConfig(self: &Self, node: u32) -> Option<ScrollerPhysicsConfig> {
+    let idx = self.findConfigIndex(node)
+    if idx == usize.MAX {
+      return Option<ScrollerPhysicsConfig>.None
+    }
+    let c = &self.scrollers.asSlice()[idx]
+    return Option<ScrollerPhysicsConfig>.some(
+      ScrollerPhysicsConfig {
+        node: c.node,
+        parentNode: c.parentNode,
+        minX: c.minX,
+        maxX: c.maxX,
+        minY: c.minY,
+        maxY: c.maxY,
+        overscrollX: c.overscrollX,
+        overscrollY: c.overscrollY,
+        snapStrictnessX: c.snapStrictnessX,
+        snapStrictnessY: c.snapStrictnessY,
+        proximityThreshold: c.proximityThreshold,
+        snapPointsX: List<SnapPoint>.make(),
+        snapPointsY: List<SnapPoint>.make(),
+        trackBounds: c.trackBounds,
+        thumbSize: c.thumbSize,
+        verticalScrollbar: c.verticalScrollbar,
+      },
+    )
+  }
+
+  effect fn ensureNodePresent(self: &mut Self, node: u32) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if self.findConfigIndex(node) != usize.MAX {
+      let idx = self.findConfigIndex(node)
+      let minX = self.scrollers.asSlice()[idx].minX
+      let maxX = self.scrollers.asSlice()[idx].maxX
+      let minY = self.scrollers.asSlice()[idx].minY
+      let maxY = self.scrollers.asSlice()[idx].maxY
+      run self.ensureScrollNode(node, 0.0, 0.0, minX, maxX, minY, maxY)
+    }
+  }
+
+  effect fn ensureScrollNode(
+    self: &mut Self,
+    node: u32,
+    x: f32,
+    y: f32,
+    minX: f32,
+    maxX: f32,
+    minY: f32,
+    maxY: f32,
+  ) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let sIdx = self.findScrollIndex(node)
+    let cx = clampAxis(x, minX, maxX)
+    let cy = clampAxis(y, minY, maxY)
+    if sIdx == usize.MAX {
+      run self.scrollPositions.append(
+        ScrollPosition { node: node, x: cx, y: cy, minX: minX, maxX: maxX, minY: minY, maxY: maxY },
+      )
+    } else {
+      let slot = &mut self.scrollPositions.asMutSlice()[sIdx]
+      slot.minX = minX
+      slot.maxX = maxX
+      slot.minY = minY
+      slot.maxY = maxY
+    }
+    if self.findPhysicsIndex(node) == usize.MAX {
+      run self.physics.append(ScrollerPhysicsState.at(node, cx, cy))
+    }
+  }
+
+  fn syncPublishedScroll(self: &mut Self, node: u32, baseX: f32, baseY: f32, overX: f32, overY: f32) -> () {
+    let sIdx = self.findScrollIndex(node)
+    if sIdx == usize.MAX {
+      return ()
+    }
+    let bandX = rubberBand(overX, RUBBER_BAND_LIMIT)
+    let bandY = rubberBand(overY, RUBBER_BAND_LIMIT)
+    let slot = &mut self.scrollPositions.asMutSlice()[sIdx]
+    slot.x = baseX + bandX
+    slot.y = baseY + bandY
+  }
+
+  effect fn applyScrollDelta(
+    self: &mut Self,
+    node: u32,
+    dx: f32,
+    dy: f32,
+    fromUser: bool,
+    depth: u32,
+  ) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if depth > 16 || (dx == 0.0 && dy == 0.0) {
+      return false
+    }
+    let idx = self.findPhysicsIndex(node)
+    let sIdx = self.findScrollIndex(node)
+    if idx == usize.MAX || sIdx == usize.MAX {
+      return false
+    }
+    let pos = self.scrollPositions.get(sIdx)
+    let cIdx = self.findConfigIndex(node)
+    let mut parentNode: u32 = 0
+    let mut overBehX = OverscrollBehavior.Auto
+    let mut overBehY = OverscrollBehavior.Auto
+    if cIdx != usize.MAX {
+      let c = &self.scrollers.asSlice()[cIdx]
+      parentNode = c.parentNode
+      overBehX = c.overscrollX
+      overBehY = c.overscrollY
+    }
+
+    let st = &mut self.physics.asMutSlice()[idx]
+    let prevPubX = st.x + rubberBand(st.overscrollX, RUBBER_BAND_LIMIT)
+    let prevPubY = st.y + rubberBand(st.overscrollY, RUBBER_BAND_LIMIT)
+    if fromUser {
+      st.smoothActive = false
+      st.bounceSpringX.active = false
+      st.bounceSpringY.active = false
+    }
+
+    // Consume any active overscroll first if pulling back toward the clamped range.
+    let mut remDx = dx
+    if st.overscrollX > 0.0 && remDx < 0.0 {
+      let eat = f32.min(st.overscrollX, -remDx)
+      st.overscrollX = st.overscrollX - eat
+      remDx = remDx + eat
+    } else if st.overscrollX < 0.0 && remDx > 0.0 {
+      let eat = f32.min(-st.overscrollX, remDx)
+      st.overscrollX = st.overscrollX + eat
+      remDx = remDx - eat
+    }
+
+    let mut remDy = dy
+    if st.overscrollY > 0.0 && remDy < 0.0 {
+      let eat = f32.min(st.overscrollY, -remDy)
+      st.overscrollY = st.overscrollY - eat
+      remDy = remDy + eat
+    } else if st.overscrollY < 0.0 && remDy > 0.0 {
+      let eat = f32.min(-st.overscrollY, remDy)
+      st.overscrollY = st.overscrollY + eat
+      remDy = remDy - eat
+    }
+
+    let nextX = clampAxis(st.x + remDx, pos.minX, pos.maxX)
+    let overflowX = (st.x + remDx) - nextX
+    st.x = nextX
+
+    let nextY = clampAxis(st.y + remDy, pos.minY, pos.maxY)
+    let overflowY = (st.y + remDy) - nextY
+    st.y = nextY
+
+    let mut chainDx: f32 = 0.0
+    let mut chainDy: f32 = 0.0
+
+    if overflowX != 0.0 {
+      match overBehX {
+        OverscrollBehavior.None => {
+          st.overscrollX = 0.0
+        }
+        OverscrollBehavior.Contain => {
+          st.overscrollX = st.overscrollX + overflowX
+        }
+        OverscrollBehavior.Auto => {
+          if parentNode != 0 {
+            chainDx = overflowX
+          } else {
+            st.overscrollX = st.overscrollX + overflowX
+          }
+        }
+      }
+    }
+
+    if overflowY != 0.0 {
+      match overBehY {
+        OverscrollBehavior.None => {
+          st.overscrollY = 0.0
+        }
+        OverscrollBehavior.Contain => {
+          st.overscrollY = st.overscrollY + overflowY
+        }
+        OverscrollBehavior.Auto => {
+          if parentNode != 0 {
+            chainDy = overflowY
+          } else {
+            st.overscrollY = st.overscrollY + overflowY
+          }
+        }
+      }
+    }
+
+    let fx = st.x
+    let fy = st.y
+    let fox = st.overscrollX
+    let foy = st.overscrollY
+    let newPubX = fx + rubberBand(fox, RUBBER_BAND_LIMIT)
+    let newPubY = fy + rubberBand(foy, RUBBER_BAND_LIMIT)
+    drop st
+
+    self.syncPublishedScroll(node, fx, fy, fox, foy)
+    let mut changed = newPubX != prevPubX || newPubY != prevPubY
+
+    if parentNode != 0 && (chainDx != 0.0 || chainDy != 0.0) {
+      if run self.applyScrollDelta(parentNode, chainDx, chainDy, fromUser, depth + 1) {
+        changed = true
+      }
+    }
+    return changed
+  }
+
+  effect fn snapScroller(self: &mut Self, node: u32, nowMs: f64, animate: bool) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let idx = self.findPhysicsIndex(node)
+    let sIdx = self.findScrollIndex(node)
+    let cIdx = self.findConfigIndex(node)
+    if idx == usize.MAX || sIdx == usize.MAX || cIdx == usize.MAX {
+      return false
+    }
+    let pos = self.scrollPositions.get(sIdx)
+    let st = self.physics.get(idx)
+    let cfg = &self.scrollers.asSlice()[cIdx]
+    let targetX = findSnapTarget(
+      st.gestureStartX,
+      st.x,
+      pos.minX,
+      pos.maxX,
+      cfg.snapStrictnessX,
+      cfg.proximityThreshold,
+      cfg.snapPointsX.asSlice(),
+    )
+    let targetY = findSnapTarget(
+      st.gestureStartY,
+      st.y,
+      pos.minY,
+      pos.maxY,
+      cfg.snapStrictnessY,
+      cfg.proximityThreshold,
+      cfg.snapPointsY.asSlice(),
+    )
+    if f32.abs(targetX - st.x) < 0.01 && f32.abs(targetY - st.y) < 0.01 {
+      return false
+    }
+    if animate {
+      run self.startSmoothScroll(node, targetX, targetY, nowMs, 180.0)
+      return true
+    }
+    let stMut = &mut self.physics.asMutSlice()[idx]
+    stMut.x = targetX
+    stMut.y = targetY
+    let ox = stMut.overscrollX
+    let oy = stMut.overscrollY
+    drop stMut
+    self.syncPublishedScroll(node, targetX, targetY, ox, oy)
+    return true
+  }
+
+  fn evalAnimationValue(self: &Self, anim: &CompositorAnimation, nowMs: f64) -> Option<f32> {
+    match anim.timeline {
+      TimelineKind.Monotonic => {
+        if anim.useSpring {
+          return Option<f32>.some(anim.springState.value)
+        }
+        let elapsed = nowMs - anim.startMs - anim.delayMs
+        if elapsed < 0.0 {
+          return if anim.active { Option<f32>.some(anim.fromValue) } else { Option<f32>.None }
+        }
+        let dur = f64.max(anim.durationMs, 0.001)
+        if anim.iterations > 0.0 {
+          let total = dur * f32.toF64(anim.iterations)
+          if elapsed >= total {
+            if !anim.fillForwards {
+              return Option<f32>.None
+            }
+            let whole = f32.toU32(f32.floor(anim.iterations))
+            let endT: f32 = if anim.alternate && whole % 2 == 0 && f32.abs(anim.iterations - u32.toF32(whole)) < 0.001 {
+              0.0
+            } else {
+              1.0
+            }
+            let eased = evalEasing(anim.easing, endT)
+            return Option<f32>.some(anim.fromValue + (anim.toValue - anim.fromValue) * eased)
+          }
+        }
+        let iterPos = elapsed / dur
+        let cycle = f64.toU32(f64.floor(iterPos))
+        let mut frac = f64.toF32(iterPos - f64.floor(iterPos))
+        if anim.alternate && cycle % 2 == 1 {
+          frac = 1.0 - frac
+        }
+        let eased = evalEasing(anim.easing, frac)
+        return Option<f32>.some(anim.fromValue + (anim.toValue - anim.fromValue) * eased)
+      }
+      TimelineKind.Scroll { scrollerNode, horizontal, startOffset, endOffset } => {
+        let mut offset: f32 = 0.0
+        let sIdx = self.findScrollIndex(scrollerNode)
+        if sIdx != usize.MAX {
+          let p = self.scrollPositions.get(sIdx)
+          offset = if horizontal { p.x } else { p.y }
+        }
+        let span = endOffset - startOffset
+        let rawT: f32 = if f32.abs(span) < 0.0001 { 0.0 } else { (offset - startOffset) / span }
+        let eased = evalEasing(anim.easing, rawT)
+        return Option<f32>.some(anim.fromValue + (anim.toValue - anim.fromValue) * eased)
+      }
+      TimelineKind.Pointer { axisX, minPos, maxPos } => {
+        let coord = if axisX { self.pointerX } else { self.pointerY }
+        let span = maxPos - minPos
+        let rawT: f32 = if f32.abs(span) < 0.0001 { 0.0 } else { (coord - minPos) / span }
+        let eased = evalEasing(anim.easing, rawT)
+        return Option<f32>.some(anim.fromValue + (anim.toValue - anim.fromValue) * eased)
+      }
+    }
+  }
+
+  effect fn rebuildOverrides(self: &mut Self, nowMs: f64) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    self.prevOverridesScratch.clear()
+    run self.prevOverridesScratch.appendSlice(self.resolvedOverrides.asSlice())
+    self.resolvedOverrides.clear()
+    run self.resolvedOverrides.appendSlice(self.store.overrides.asSlice())
+
+    self.accumsScratch.clear()
+    let anims = self.animations.asSlice()
+    let mut a: usize = 0
+    while a < anims.length {
+      let anim = &anims[a]
+      if let Option<f32>.Some { value } = self.evalAnimationValue(anim, nowMs) {
+        let mut idx = usize.MAX
+        let accSlice = self.accumsScratch.asSlice()
+        let mut k: usize = 0
+        while k < accSlice.length {
+          if accSlice[k].layerId == anim.layerId {
+            idx = k
+            break
+          }
+          k = k + 1
+        }
+        if idx == usize.MAX {
+          idx = self.accumsScratch.length()
+          run self.accumsScratch.append(LayerCompAccum.make(anim.layerId))
+        }
+        let acc = &mut self.accumsScratch.asMutSlice()[idx]
+        match anim.property {
+          AnimPropertyKind.Opacity => {
+            acc.hasOpacity = true
+            acc.opacity = f32.max(0.0, f32.min(1.0, value))
+          }
+          AnimPropertyKind.TranslateX => {
+            acc.hasTranslate = true
+            acc.tx = value
+            acc.originX = anim.originX
+            acc.originY = anim.originY
+          }
+          AnimPropertyKind.TranslateY => {
+            acc.hasTranslate = true
+            acc.ty = value
+            acc.originX = anim.originX
+            acc.originY = anim.originY
+          }
+          AnimPropertyKind.ScaleX => {
+            acc.hasScale = true
+            acc.sx = value
+            acc.originX = anim.originX
+            acc.originY = anim.originY
+          }
+          AnimPropertyKind.ScaleY => {
+            acc.hasScale = true
+            acc.sy = value
+            acc.originX = anim.originX
+            acc.originY = anim.originY
+          }
+          AnimPropertyKind.RotateDeg => {
+            acc.hasRotate = true
+            acc.rotDeg = value
+            acc.originX = anim.originX
+            acc.originY = anim.originY
+          }
+          AnimPropertyKind.FilterBrightness => {
+            acc.hasBrightness = true
+            acc.brightnessAmount = value
+          }
+          AnimPropertyKind.FilterBlur => {
+            acc.hasBlur = true
+            acc.blurRadius = f32.max(0.0, value)
+          }
+          AnimPropertyKind.ClipInsetTop => {
+            acc.hasClip = true
+            acc.baseBounds = anim.baseBounds
+            acc.insetTop = f32.max(0.0, value)
+          }
+          AnimPropertyKind.ClipInsetRight => {
+            acc.hasClip = true
+            acc.baseBounds = anim.baseBounds
+            acc.insetRight = f32.max(0.0, value)
+          }
+          AnimPropertyKind.ClipInsetBottom => {
+            acc.hasClip = true
+            acc.baseBounds = anim.baseBounds
+            acc.insetBottom = f32.max(0.0, value)
+          }
+          AnimPropertyKind.ClipInsetLeft => {
+            acc.hasClip = true
+            acc.baseBounds = anim.baseBounds
+            acc.insetLeft = f32.max(0.0, value)
+          }
+        }
+      }
+      a = a + 1
+    }
+
+    let accs = self.accumsScratch.asSlice()
+    let mut c: usize = 0
+    while c < accs.length {
+      let acc = accs[c]
+      let mut ov = match findLayerOverride(self.resolvedOverrides.asSlice(), acc.layerId) {
+        Option<LayerOverride>.Some { value } => value
+        Option<LayerOverride>.None => LayerOverride.empty(acc.layerId)
+      }
+      if acc.hasOpacity {
+        ov.hasOpacity = true
+        ov.opacity = acc.opacity
+      }
+      if acc.hasTranslate || acc.hasScale || acc.hasRotate {
+        let rad = acc.rotDeg * PI_F32 / 180.0
+        let cosA = f32.cos(rad)
+        let sinA = f32.sin(rad)
+        let rotMat = Matrix3<f32>.new([cosA, sinA, 0.0, -sinA, cosA, 0.0, 0.0, 0.0, 1.0])
+        let scaleMat = Matrix3<f32>.new([acc.sx, 0.0, 0.0, 0.0, acc.sy, 0.0, 0.0, 0.0, 1.0])
+        let txMat = translationMatrix(acc.originX + acc.tx, acc.originY + acc.ty)
+          * rotMat
+          * scaleMat
+          * translationMatrix(-acc.originX, -acc.originY)
+        ov.hasTransform = true
+        ov.transform = txMat
+      }
+      if acc.hasBrightness || acc.hasBlur {
+        let mut eff = if ov.hasFilter { ov.filter } else { LayerEffects.none() }
+        if acc.hasBrightness {
+          eff.color = brightness(acc.brightnessAmount)
+        }
+        if acc.hasBlur {
+          eff.blur = acc.blurRadius
+        }
+        ov.hasFilter = true
+        ov.filter = eff
+      }
+      if acc.hasClip {
+        let b = acc.baseBounds
+        let x0 = b.xMin + acc.insetLeft
+        let y0 = b.yMin + acc.insetTop
+        let x1 = f32.max(x0, b.xMax - acc.insetRight)
+        let y1 = f32.max(y0, b.yMax - acc.insetBottom)
+        ov.hasClip = true
+        ov.clip = ContentMask.new(Rect<f32>.new(x0, y0, x1, y1))
+      }
+      run upsertOverride(&mut self.resolvedOverrides, ov)
+      c = c + 1
+    }
+
+    return !sameLayerOverrides(self.prevOverridesScratch.asSlice(), self.resolvedOverrides.asSlice())
+  }
+}
+
+effect fn upsertOverride(list: &mut List<LayerOverride>, ov: LayerOverride) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let slice = list.asMutSlice()
+  let mut i: usize = 0
+  while i < slice.length {
+    if slice[i].layerId == ov.layerId {
+      slice[i] = ov
+      return ()
+    }
+    i = i + 1
+  }
+  run list.append(ov)
+}

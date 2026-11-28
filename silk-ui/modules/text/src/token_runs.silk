@@ -1,0 +1,625 @@
+//! The runs of plain words, shaped once per font and kept.
+//!
+//! A line of plain text (printable ASCII words between spaces, one font, left to right, no
+//! spacing, transform or justification) is shaped by `shapeLine` into one `TextRun` per token.
+//! When no lookup of the face can involve the space glyph (`harfrust.separable`), shaping the
+//! whole line gives each token the glyphs it gets shaped on its own: no ligature, kerning pair
+//! or context can reach across a space. Each token's run is then a function of its font key,
+//! script and bytes, so [`TokenRuns`] keeps it by those and a line takes its runs from the
+//! table without itemizing, shaping, emitting or interning anything, the way browsers keep a
+//! cache of shaped words.
+//!
+//! Anything else (another script, a fallback face, bidi, letter-spacing, a partial token, two
+//! words without a space between them) goes the general way, and so does any face whose lookups
+//! mention the space glyph. `Shaping.reuse` off turns this off too, so a `fresh-` bench run
+//! checks that both ways give the same glyphs.
+import properties.census { Census }
+import properties.computed { TextTransform }
+import fonts { FontState, RawGlyph }
+import glyphs { GlyphStore, PositionedGlyph }
+import set { Link }
+import analysis { tokenLength }
+import font_collection.lib { Selection }
+import read_fonts.lib { FontRef }
+import harfrust.separable
+import layout.lib {
+  TextShapeRequest,
+  TextRun,
+  TextTokenKind,
+  WritingMode,
+}
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.text.string { String }
+import silk.text.unicode_script { Script }
+import silk.num.f64
+import silk.num.i32
+import silk.num.u32
+import silk.num.u64
+import silk.num.u8
+import silk.num.usize
+
+// A kept run: its key, where its text is in `TokenRuns.bytes`, and the run it interned to.
+struct Entry {
+  hash: u64,
+  fontKey: usize,
+  script: u32,
+  textStart: usize,
+  textLength: usize,
+  shapeKey: usize,
+  advance: f32,
+}
+
+impl Copy for Entry {}
+
+// What a font key of a token resolves to on the plain way. `state` is 0 before it is known,
+// 1 when its lines may take the plain way, 2 when they never do.
+struct Plain {
+  state: u8,
+  style: usize,
+  // The key the general way gives runs of the key's primary face, and that key's face.
+  key: usize,
+  instance: usize,
+  face: usize,
+  size: f32,
+  scale: f32,
+  // Per script (0 Latin, 1 Common), two words each over the ASCII characters: those whose
+  // face choice is known, and of those the ones that choose the primary face exactly.
+  known: [u64; 4],
+  primary: [u64; 4],
+}
+
+impl Copy for Plain {}
+
+fn unknownPlain() -> Plain {
+  return Plain {
+    state: 0, style: 0, key: 0, instance: 0, face: 0, size: 0.0, scale: 0.0,
+    known: [0, 0, 0, 0], primary: [0, 0, 0, 0],
+  }
+}
+
+// The table holds at most this many runs and text bytes, then starts over. Slots are twice the
+// runs, a power of two.
+const ENTRIES: usize = 65536
+const SLOTS: usize = 131072
+const BYTES: usize = 1048576
+
+/// Runs of plain tokens by font key, script and text.
+pub struct TokenRuns {
+  // Open addressing over `entries`: an entry's index plus one, or 0 when the slot is free.
+  slots: List<u32>,
+  entries: List<Entry>,
+  bytes: List<u8>,
+  // By font key.
+  plains: List<Plain>,
+  // By face index: 0 not checked, 1 separable, 2 not.
+  faces: List<u8>,
+  // The font set generation, glyph store epoch and store truncations the tables were filled at.
+  generation: u64,
+  epoch: usize,
+  truncations: usize,
+  // Counts the times the table started over.
+  forgets: usize,
+  chain: List<Link>,
+  raw: List<RawGlyph>,
+  glyphs: List<PositionedGlyph>,
+  // Per token of the line being shaped that carries text: its unit, whether it is a word and
+  // has a letter, the hash of its bytes, then the entry it took.
+  units: List<usize>,
+  words: List<bool>,
+  letters: List<bool>,
+  hashes: List<u64>,
+  taken: List<u32>,
+  /// Lines that took the plain way, runs they took from the table, and runs shaped for it.
+  pub lines: usize,
+  pub hits: usize,
+  pub misses: usize,
+}
+
+impl TokenRuns {
+  pub effect fn census(self: &Self, out: &mut Census) -> () ! OutOfMemoryError ? &mut Allocator {
+    run out.held("text.token-runs.entries", self.entries.length(), self.entries.capacity(), Intrinsic.layoutOf<Entry>().bytes)
+    run out.held("text.token-runs.slots", self.slots.length(), self.slots.capacity(), 4)
+    run out.held("text.token-runs.text-bytes", self.bytes.length(), self.bytes.capacity(), 1)
+    run out.work("text.token-runs.lines", self.lines)
+    run out.work("text.token-runs.hits", self.hits)
+    run out.work("text.token-runs.misses", self.misses)
+  }
+
+  pub fn make() -> TokenRuns {
+    return TokenRuns {
+      slots: List<u32>.make(),
+      entries: List<Entry>.make(),
+      bytes: List<u8>.make(),
+      plains: List<Plain>.make(),
+      faces: List<u8>.make(),
+      generation: 0,
+      epoch: 0,
+      truncations: 0,
+      forgets: 0,
+      chain: List<Link>.make(),
+      raw: List<RawGlyph>.make(),
+      glyphs: List<PositionedGlyph>.make(),
+      units: List<usize>.make(),
+      words: List<bool>.make(),
+      letters: List<bool>.make(),
+      hashes: List<u64>.make(),
+      taken: List<u32>.make(),
+      lines: 0,
+      hits: 0,
+      misses: 0,
+    }
+  }
+
+  fn forgetRuns(self: &mut Self) -> () {
+    let slots = self.slots.asMutSlice()
+    let mut index: usize = 0
+    while index < slots.length {
+      slots[index] = 0
+      index = index + 1
+    }
+    self.entries.clear()
+    self.bytes.clear()
+    self.forgets = self.forgets + 1
+  }
+
+  // The entry kept for `text` in `fontKey` and `script`, or u32.MAX.
+  fn find(self: &Self, hash: u64, fontKey: usize, script: u32, text: &[u8]) -> u32 {
+    if self.slots.length() == 0 {
+      return u32.MAX
+    }
+    let slots = self.slots.asSlice()
+    let entries = self.entries.asSlice()
+    let bytes = self.bytes.asSlice()
+    let mut slot = slotOf(hash)
+    while true {
+      let held = slots[slot]
+      if held == 0 {
+        return u32.MAX
+      }
+      let entry = &entries[u32.toUsize(held) - 1]
+      if entry.hash == hash && entry.fontKey == fontKey && entry.script == script
+        && entry.textLength == text.length && sameBytes(bytes, entry.textStart, text) {
+        return held - 1
+      }
+      slot = (slot + 1) % SLOTS
+    }
+    return u32.MAX
+  }
+
+  effect fn keep(self: &mut Self, entry: Entry, text: &[u8]) -> u32
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if self.slots.length() == 0 {
+      run self.slots.appendRepeated(0, SLOTS)
+    }
+    if self.entries.length() >= ENTRIES || self.bytes.length() + text.length > BYTES {
+      self.forgetRuns()
+    }
+    let mut kept = entry
+    kept.textStart = self.bytes.length()
+    run self.bytes.appendSlice(text)
+    let index = usize.toU32(self.entries.length())
+    run self.entries.append(kept)
+    let slots = self.slots.asMutSlice()
+    let mut slot = slotOf(entry.hash)
+    while slots[slot] != 0 {
+      slot = (slot + 1) % SLOTS
+    }
+    slots[slot] = index + 1
+    return index
+  }
+}
+
+fn slotOf(hash: u64) -> usize {
+  return u64.toUsize(u64.shiftRight(u64.wrappingMultiply(hash, 0x9E3779B97F4A7C15), 47))
+}
+
+fn sameBytes(held: &[u8], start: usize, text: &[u8]) -> bool {
+  let mut index: usize = 0
+  while index < text.length {
+    if held[start + index] != text[index] {
+      return false
+    }
+    index = index + 1
+  }
+  return true
+}
+
+fn finish(hash: u64, fontKey: usize, script: u32) -> u64 {
+  let mixed = u64.wrappingMultiply(hash ^ usize.toU64(fontKey), 0x100000001B3)
+  let both = u64.wrappingMultiply(mixed ^ u32.toU64(script), 0x100000001B3)
+  return both ^ u64.shiftRight(both, 29)
+}
+
+fn sameOption(left: Option<f64>, right: Option<f64>) -> bool {
+  if let Option<f64>.Some { value: a } = left {
+    if let Option<f64>.Some { value: b } = right {
+      return a == b
+    }
+    return false
+  }
+  return right.isNone()
+}
+
+fn sameSelection(left: Selection, right: Selection) -> bool {
+  return left.face == right.face && left.weight == right.weight && left.width == right.width
+    && sameOption(left.italic, right.italic) && sameOption(left.oblique, right.oblique)
+    && left.syntheticOblique == right.syntheticOblique && left.syntheticBold == right.syntheticBold
+}
+
+fn asciiLetter(byte: u8) -> bool {
+  let folded = byte | 0x20
+  return folded >= 0x61 && folded <= 0x7a
+}
+
+// Resolves font key `fontKey` for the plain way, once per font set generation.
+effect fn plainOf<'a>(runs: &mut TokenRuns, fonts: &mut FontState<'a>, fontKey: usize) -> Plain
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  while runs.plains.length() <= fontKey {
+    run runs.plains.append(unknownPlain())
+  }
+  let kept = runs.plains.get(fontKey)
+  if kept.state != 0 {
+    return kept
+  }
+  let mut plain = unknownPlain()
+  plain.state = 2
+  let info = fonts.key(fontKey)
+  if info.instance == usize.MAX || info.style == usize.MAX {
+    runs.plains.set(fontKey, plain)
+    return plain
+  }
+  let treatment = fonts.treatment(fontKey)
+  if treatment.transform != TextTransform.None || treatment.letterSpacing != 0.0
+    || treatment.wordSpacing != 0.0 {
+    runs.plains.set(fontKey, plain)
+    return plain
+  }
+  if let Option<Selection>.Some { value: primary } = fonts.primary(info.style) {
+    let key = run fonts.keyFor(info.style, primary)
+    let resolved = fonts.key(key)
+    if resolved.instance == usize.MAX {
+      runs.plains.set(fontKey, plain)
+      return plain
+    }
+    // The spacing and transform of the key the runs carry must be the token's too.
+    let used = fonts.treatment(key)
+    if used.transform != TextTransform.None || used.letterSpacing != 0.0 || used.wordSpacing != 0.0 {
+      runs.plains.set(fontKey, plain)
+      return plain
+    }
+    if !run faceSeparable(&mut runs, &fonts, resolved.face) {
+      runs.plains.set(fontKey, plain)
+      return plain
+    }
+    plain.state = 1
+    plain.style = info.style
+    plain.key = key
+    plain.instance = resolved.instance
+    plain.face = resolved.face
+    plain.size = resolved.size
+    plain.scale = fonts.scale(key)
+  }
+  runs.plains.set(fontKey, plain)
+  return plain
+}
+
+effect fn faceSeparable<'a>(runs: &mut TokenRuns, fonts: &FontState<'a>, face: usize) -> bool
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  while runs.faces.length() <= face {
+    run runs.faces.append(0)
+  }
+  let known = runs.faces.get(face)
+  if known != 0 {
+    return known == 1
+  }
+  let mut answer: u8 = 2
+  if let Option<FontRef<'a>>.Some { value: font } = fonts.set.font(face) {
+    if separable.spaceSeparable(&font) {
+      answer = 1
+    }
+  }
+  runs.faces.set(face, answer)
+  return answer == 1
+}
+
+// Whether every character of `seen` (a set over ASCII, two words) chooses the style's primary
+// face exactly under `script` (0 Latin, 1 Common), as `itemize` would choose it. Characters
+// not asked about before are asked now.
+effect fn primaryCovers<'a>(
+  runs: &mut TokenRuns,
+  fonts: &mut FontState<'a>,
+  fontKey: usize,
+  script: usize,
+  seen: [u64; 2],
+) -> bool
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut plain = runs.plains.get(fontKey)
+  let mut half: usize = 0
+  while half < 2 {
+    let word = script * 2 + half
+    let unknown = seen[half] & ~plain.known[word]
+    if unknown != 0 {
+      let primary = match fonts.primary(plain.style) {
+        Option<Selection>.Some { value } => value
+        Option<Selection>.None => {
+          return false
+        }
+      }
+      runs.chain.clear()
+      run runs.chain.appendSlice(fonts.chain(plain.style))
+      let request = fonts.request(plain.style)
+      let tag = if script == 0 { Script.of(0x61) } else { Script.common() }
+      let mut b: u64 = 0
+      while b < 64 {
+        let mask = u64.shiftLeft(1, b)
+        if (unknown & mask) != 0 {
+          let cp = u64.toU32(usize.toU64(half) * 64 + b)
+          if let Option<Selection>.Some { value } = run fonts.set.select(runs.chain.asSlice(), request, cp, tag) {
+            if sameSelection(value, primary) {
+              plain.primary[word] = plain.primary[word] | mask
+            }
+          }
+          plain.known[word] = plain.known[word] | mask
+        }
+        b = b + 1
+      }
+      runs.plains.set(fontKey, plain)
+    }
+    if (seen[half] & ~plain.primary[word]) != 0 {
+      return false
+    }
+    half = half + 1
+  }
+  return true
+}
+
+/// Shapes `request` the plain way if it can, appending one run per token to `output` and each
+/// run's `unsafeBefore` to `unsafeRuns`; false, having appended nothing, when it cannot.
+/// `wantSafety` is whether the request is a whole paragraph, whose cuts are judged.
+pub effect fn shapePlainLine<'a>(
+  runs: &mut TokenRuns,
+  fonts: &mut FontState<'a>,
+  store: &mut GlyphStore,
+  request: &TextShapeRequest<'_, '_>,
+  wantSafety: bool,
+  output: &mut List<TextRun>,
+  unsafeRuns: &mut List<bool>,
+) -> bool
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if request.hyphenated || request.ellipsis || request.justificationSpace != 0.0
+    || request.start.offset != 0 {
+    return false
+  }
+  let analysis = request.analysis
+  if analysis.level != 0 || analysis.paragraph.level != 0 || analysis.levels.length() != 0
+    || analysis.paragraphs.length() != 0 {
+    return false
+  }
+  if runs.generation != fonts.set.generation {
+    runs.plains.clear()
+    runs.faces.clear()
+    runs.forgetRuns()
+    runs.generation = fonts.set.generation
+  }
+  if runs.epoch != store.epoch() || runs.truncations != store.truncations() {
+    runs.forgetRuns()
+    runs.epoch = store.epoch()
+    runs.truncations = store.truncations()
+  }
+  let tokens = request.context.tokens
+  let mut unit = request.start.unit
+  // The font of the first token with text: box edges before it may carry another.
+  while unit < tokens.length && unit <= request.end.unit && tokens[unit].kind != TextTokenKind.Text
+    && tokens[unit].kind != TextTokenKind.Space && tokens[unit].kind != TextTokenKind.PreservedSpace {
+    unit = unit + 1
+  }
+  if unit >= tokens.length {
+    return false
+  }
+  let fontKey = tokens[unit].fontKey
+  unit = request.start.unit
+  if fontKey >= fonts.keyCount() {
+    return false
+  }
+  let plain = run plainOf(&mut runs, &mut fonts, fontKey)
+  if plain.state != 1 {
+    return false
+  }
+  runs.units.clear()
+  runs.words.clear()
+  runs.letters.clear()
+  runs.hashes.clear()
+  let mut letter = false
+  let mut lastWord = false
+  let mut seen: [u64; 2] = [0, 0]
+  while unit < tokens.length && unit <= request.end.unit {
+    let token = &tokens[unit]
+    let kind = token.kind
+    let word = kind == TextTokenKind.Text
+    if word || kind == TextTokenKind.Space || kind == TextTokenKind.PreservedSpace {
+      let length = tokenLength(token)
+      let end = if unit == request.end.unit { request.end.offset } else { length }
+      if end != 0 {
+        if end != length || token.fontKey != fontKey || token.writingMode != WritingMode.HorizontalTb {
+          return false
+        }
+        // Two words with nothing between them may kern or join across their edge.
+        if word && lastWord {
+          return false
+        }
+        let bytes = String.utf8Bytes(token.text)
+        if bytes.length < length {
+          return false
+        }
+        let mut hash: u64 = 0xCBF29CE484222325
+        let mut hasLetter = false
+        let mut at: usize = 0
+        if word {
+          while at < length {
+            let byte = bytes[at]
+            if byte <= 32 || byte >= 127 {
+              return false
+            }
+            hasLetter = hasLetter || asciiLetter(byte)
+            let half = u8.toUsize(byte) / 64
+            seen[half] = seen[half] | u64.shiftLeft(1, u8.toU64(byte) % 64)
+            hash = u64.wrappingMultiply(hash ^ u8.toU64(byte), 0x100000001B3)
+            at = at + 1
+          }
+        } else {
+          while at < length {
+            if bytes[at] != 32 {
+              return false
+            }
+            hash = u64.wrappingMultiply(hash ^ 32, 0x100000001B3)
+            at = at + 1
+          }
+          seen[0] = seen[0] | u64.shiftLeft(1, 32)
+        }
+        letter = letter || hasLetter
+        run runs.units.append(unit)
+        run runs.words.append(word)
+        run runs.letters.append(hasLetter)
+        run runs.hashes.append(hash)
+        lastWord = word
+      }
+    } else if kind == TextTokenKind.Open || kind == TextTokenKind.Close {
+      // A barrier ends the segment, and cuts are judged per segment.
+      if token.shapingBarrier {
+        return false
+      }
+    } else if unit != request.end.unit || request.end.offset != 0 {
+      return false
+    }
+    unit = unit + 1
+  }
+  if runs.units.length() == 0 {
+    return false
+  }
+  // ASCII itemizes as one run: Latin with a letter in it, Common without.
+  let scriptIndex: usize = if letter { 0 } else { 1 }
+  if !run primaryCovers(&mut runs, &mut fonts, fontKey, scriptIndex, seen) {
+    return false
+  }
+  let script = if letter { Script.of(0x61) } else { Script.common() }
+  runs.taken.clear()
+  let forgets = runs.forgets
+  let mut index: usize = 0
+  while index < runs.units.length() {
+    let token = &tokens[runs.units.get(index)]
+    let length = tokenLength(token)
+    let bytes = Slice.view(String.utf8Bytes(token.text), 0, length)
+    let hash = finish(runs.hashes.get(index), plain.key, script.value)
+    let mut found = runs.find(hash, plain.key, script.value, bytes)
+    if found != u32.MAX {
+      runs.hits = runs.hits + 1
+    } else {
+      runs.misses = runs.misses + 1
+      let features = fonts.treatment(plain.key).features
+      runs.raw.clear()
+      run fonts.shapeTextOriented(plain.instance, String.slice(token.text, 0, length), 0, length, false, script, false, &features, &mut runs.raw)
+      runs.glyphs.clear()
+      let mut pen: f32 = 0.0
+      let mut g: usize = 0
+      while g < runs.raw.length() {
+        let raw = runs.raw.get(g)
+        let advance = i32.toF32(raw.xAdvance) * plain.scale
+        run runs.glyphs.append(
+          PositionedGlyph {
+            glyph: raw.glyph,
+            cluster: raw.cluster,
+            upright: false,
+            x: pen + i32.toF32(raw.xOffset) * plain.scale,
+            y: i32.toF32(-raw.yOffset) * plain.scale,
+            advance: advance,
+          },
+        )
+        pen = pen + advance
+        g = g + 1
+      }
+      let shapeKey = run store.intern(plain.key, plain.face, plain.size, false, runs.glyphs.asSlice())
+      found = run runs.keep(
+        Entry {
+          hash: hash,
+          fontKey: plain.key,
+          script: script.value,
+          textStart: 0,
+          textLength: length,
+          shapeKey: shapeKey,
+          advance: store.glyphRun(shapeKey).advance,
+        },
+        bytes,
+      )
+    }
+    run runs.taken.append(found)
+    index = index + 1
+  }
+  // The table started over while the line kept a run, dropping entries it took before: the
+  // line goes the long way (nothing is appended yet).
+  if runs.forgets != forgets {
+    return false
+  }
+  // As `shaping.unsafeAt`: a key without shaping data has no cut judged safe.
+  let cuts = wantSafety && fonts.sliceable(plain.key)
+  // The letter state of the nearest word before each token, walking forward: 0 none yet.
+  let mut previous: u8 = 0
+  index = 0
+  while index < runs.units.length() {
+    let entry = runs.entries.get(u32.toUsize(runs.taken.get(index)))
+    let mut unsafeBefore = true
+    if cuts {
+      unsafeBefore = unsafeCut(&runs, letter, index, previous)
+    }
+    if runs.words.get(index) {
+      previous = if runs.letters.get(index) { 2 } else { 1 }
+    }
+    run unsafeRuns.append(unsafeBefore)
+    run output.append(
+      TextRun.Text {
+        unit: runs.units.get(index),
+        start: 0,
+        end: entry.textLength,
+        advance: entry.advance,
+        fontKey: plain.key,
+        bidiLevel: 0,
+        shapeKey: entry.shapeKey,
+        unsafeBefore: unsafeBefore,
+      },
+    )
+    index = index + 1
+  }
+  runs.lines = runs.lines + 1
+  return true
+}
+
+// `shaping.unsafeAt` for a cut before token `index` of a plain line: the segment is the whole
+// line, one item in one script, and the face keeps every space edge safe to cut (no lookup
+// reaches across a space), so only the rule that each side keep a letter remains. `previous`
+// is the nearest word before the token: 0 none, 1 without a letter, 2 with one.
+fn unsafeCut(runs: &TokenRuns, letter: bool, index: usize, previous: u8) -> bool {
+  if !letter {
+    return false
+  }
+  // The word after the cut, skipping spaces, must have a letter.
+  let mut after = index
+  while after < runs.words.length() && !runs.words.get(after) {
+    after = after + 1
+  }
+  if after == runs.words.length() || !runs.letters.get(after) {
+    return true
+  }
+  if index == 0 {
+    return false
+  }
+  // The word before it, skipping spaces, too.
+  return previous != 2
+}

@@ -1484,17 +1484,23 @@ unsafe fn allocNestedChild(env: *mut CompiledEnv, rt: *mut HeapHeader, descPtr: 
   let nk = desc.nestedKind
   let arrShapeOpt = desc.nestedArrayShape
   let innerRaw = desc.nestedDesc
-  let initCount = u8.toUsize(desc.nestedInitCount)
-  let initVals = desc.nestedInitVals
   drop desc
   if nk == NESTED_EMPTY_ARRAY {
     let arrShape = match Pointer.nonNullMut<HeapHeader>(arrShapeOpt) {
       Option<*mut HeapHeader>.Some { value } => value
       Option<*mut HeapHeader>.None => { return Pointer.null<HeapHeader>() }
     }
+    if let Option<*mut HeapHeader>.Some { value: recycled } = Pointer.nonNullMut<HeapHeader>(unsafe tryRecycleZeroArray(rt, arrShape)) {
+      return unsafe Intrinsic.pointerRequalify<*mut HeapHeader, ?*mut HeapHeader>(recycled)
+    }
     return unsafe emptyArrayCell(unsafe Intrinsic.pointerRequalify<*mut CompiledEnv, ?*mut CompiledEnv>(env), rt, arrShape)
   }
   if nk != NESTED_PLAIN { return Pointer.null<HeapHeader>() }
+  // Read past the Array case: the values are 128 bytes.
+  let plain = unsafe Pointer.borrow<(), ConstructDesc>(&anchor, descPtr)
+  let initCount = u8.toUsize(plain.nestedInitCount)
+  let initVals = plain.nestedInitVals
+  drop plain
   let innerDescPtr = match Pointer.nonNullMut<u8>(innerRaw) {
     Option<*mut u8>.Some { value } => unsafe Intrinsic.pointerReinterpret<*mut u8, *mut ConstructDesc>(value)
     Option<*mut u8>.None => { return Pointer.null<HeapHeader>() }
@@ -1702,6 +1708,151 @@ unsafe fn tryRecycleNestedPlain(rt: *mut HeapHeader, final: *mut HeapHeader, tai
   return unsafe Intrinsic.pointerRequalify<*mut HeapHeader, ?*mut HeapHeader>(chosen)
 }
 
+/// Elements a recycled Array may keep room for (its own storage, which it keeps).
+const RECYCLED_ARRAY_ROOM: usize = 256
+
+/// Whether child is an Array of arrayShape as `new Array()` made it (js_object_allocate.
+/// arrayInCell) but for its elements: pristine, with its one length slot in its own cell,
+/// and its elements there too or in storage of its own of at most RECYCLED_ARRAY_ROOM, so
+/// that emptying it in place (emptyArrayInPlace) leaves an empty Array.
+@inlineAlways
+unsafe fn emptiableArray(child: *mut HeapHeader, arrayShape: *mut HeapHeader) -> bool {
+  let anchor = ()
+  let cdata = unsafe HeapCell.payload<ObjectData, ()>(&anchor, child)
+  if cdata.classId() != classes.JS_CLASS_ARRAY || Pointer.address<HeapHeader>(cdata.shape) != Pointer.address<HeapHeader>(arrayShape) || !cdata.pristineArray()
+    || !cdata.slotsInCell() || cdata.slotCount() != 1 { return false }
+  return match &cdata.payload {
+    ObjectPayload.FastArray { array } => {
+      let items = array.values()
+      let owned = items.ownsStorage() && items.capacity() <= RECYCLED_ARRAY_ROOM
+      owned || (items.borrowsStorage() && Pointer.addressMany<ValueBits>(unsafe items.dataConst())
+        == usize.wrappingAdd(Pointer.address<u8>(unsafe HeapCell.tailAddress<ObjectData>(child)), Layout.of<SlotBits>().bytes))
+    }
+    _ => false
+  }
+}
+
+/// Empties an Array emptiableArray accepted, in place: its length slot 0 and no elements,
+/// plain, over the storage it had. The heap elements it held are released after.
+@inlineNever
+unsafe fn emptyArrayInPlace(child: *mut HeapHeader) -> () {
+  let mut cAnchor = ()
+  let cdata = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut cAnchor, child)
+  let mut values = ThinList<ValueBits>.make()
+  match &mut cdata.payload { ObjectPayload.FastArray { array } => { values = array.take() } _ => () }
+  let count = values.length()
+  let base = unsafe values.dataConst()
+  values.clear()
+  // take left the payload plain over no storage: the storage goes back, still plain.
+  match &mut cdata.payload {
+    ObjectPayload.FastArray { array } => { unsafe Pointer.put<ThinList<ValueBits>>(Pointer.fromMutRef<ThinList<ValueBits>>(unsafe array.plainMut()), move values) }
+    _ => ()
+  }
+  cdata.setSlotFresh(0, SlotBits.value(ValueBits.Int { value: 0 }))
+  drop cdata
+  // After: a release may run a drain. The storage below count still holds them.
+  let mut k: usize = 0
+  while k < count {
+    let old = unsafe Pointer.read<ValueBits>(unsafe Pointer.at<ValueBits>(base, k))
+    if old.tag() < 0 { unsafe gc.releaseDeferred(old) }
+    k = k + 1
+  }
+}
+
+/// Takes zeroStack[idx] off the stack (the top takes its place) and revives it: one
+/// reference, off the stack.
+@inlineAlways
+unsafe fn reviveZero(rt: *mut HeapHeader, idx: usize) -> *mut HeapHeader {
+  let mut stateAnchor = ()
+  let stateMut = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut stateAnchor, rt)
+  let topIdx = u16.toUsize(stateMut.zeroStackCount) - 1
+  let chosen = unsafe nonnullHeader(stateMut.zeroStack[idx])
+  if idx != topIdx { stateMut.zeroStack[idx] = stateMut.zeroStack[topIdx] }
+  stateMut.zeroStackCount = usize.toU16(topIdx)
+  drop stateMut
+  let mut hdrAnchor = ()
+  let hdr = unsafe Pointer.borrowMut<(), HeapHeader>(&mut hdrAnchor, chosen)
+  hdr.referenceCount = 1
+  hdr.mark = 0
+  drop hdr
+  return chosen
+}
+
+/// Fast in-place recycle for a `NESTED_EMPTY_ARRAY` constructor with one store (an
+/// `OrderedCollection`'s `this.elms = new Array()`): scans the top 6 entries of `zeroStack`
+/// for a dead young plain object of shape `final` whose one slot is a uniquely-owned
+/// (`rc == 1`) Array emptiableArray accepts. The Array is emptied in place and the revived
+/// outer object returned, with no allocation and nothing for the drain to destroy.
+@inlineAlways
+unsafe fn tryRecycleNestedArray(rt: *mut HeapHeader, final: *mut HeapHeader, tail: usize, arrayShape: *mut HeapHeader) -> ?*mut HeapHeader {
+  let anchor = ()
+  let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, rt)
+  let depth = u16.toUsize(state.zeroStackCount)
+  if depth == 0 || state.gcPhase != GcPhase.None { return Pointer.null<HeapHeader>() }
+  let finalAddr = Pointer.address<HeapHeader>(final)
+  let mut bestIdx = usize.MAX
+  let mut scan: usize = 0
+  let limit = if depth < 6 { depth } else { 6 }
+  while scan < limit {
+    let idx = depth - 1 - scan
+    scan = scan + 1
+    let candOpt = state.zeroStack[idx]
+    if Pointer.isNull<HeapHeader>(candOpt) { continue }
+    let cand = unsafe nonnullHeader(candOpt)
+    let hdr = unsafe Pointer.borrow<(), HeapHeader>(&anchor, cand)
+    if hdr.kind != HeapKind.Object { continue }
+    let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, cand)
+    if data.classId() != classes.JS_CLASS_OBJECT || Pointer.address<HeapHeader>(data.shape) != finalAddr || hdr.young != 1 || hdr.referenceCount != 0 || hdr.mark != 1
+      || !data.pristineFunction(false) || !data.slotsInCell() || data.slotCapacity() != tail || data.slotCount() != 1 { continue }
+    let emptyPayload = match &data.payload { ObjectPayload.Empty => true _ => false }
+    if !emptyPayload { continue }
+    let child = match (unsafe data.slotUnchecked(0)).valueBits() { ValueBits.Object { reference } => reference _ => { continue } }
+    let chdr = unsafe Pointer.borrow<(), HeapHeader>(&anchor, child)
+    if chdr.referenceCount != 1 || chdr.mark != 0 || chdr.kind != HeapKind.Object || chdr.young != 1 { continue }
+    if unsafe emptiableArray(child, arrayShape) { bestIdx = idx break }
+  }
+  drop state
+  if bestIdx == usize.MAX { return Pointer.null<HeapHeader>() }
+  let chosen = unsafe reviveZero(rt, bestIdx)
+  let child = match (unsafe (unsafe HeapCell.payload<ObjectData, ()>(&anchor, chosen)).slotUnchecked(0)).valueBits() {
+    ValueBits.Object { reference } => reference
+    _ => { Intrinsic.trap("tryRecycleNestedArray: slot 0 changed") }
+  }
+  unsafe emptyArrayInPlace(child)
+  unsafe census.censusBump(rt, census.CENSUS_OBJECTS_ALLOCATED, 2)
+  return unsafe Intrinsic.pointerRequalify<*mut HeapHeader, ?*mut HeapHeader>(chosen)
+}
+
+/// A dead Array of arrayShape from the top 6 entries of `zeroStack` that emptiableArray
+/// accepts (the elements of an object the drain destroyed die after it, on top of it),
+/// emptied in place and revived, or null.
+@inlineAlways
+unsafe fn tryRecycleZeroArray(rt: *mut HeapHeader, arrayShape: *mut HeapHeader) -> ?*mut HeapHeader {
+  let anchor = ()
+  let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, rt)
+  let depth = u16.toUsize(state.zeroStackCount)
+  if depth == 0 || state.gcPhase != GcPhase.None { return Pointer.null<HeapHeader>() }
+  let mut bestIdx = usize.MAX
+  let mut scan: usize = 0
+  let limit = if depth < 6 { depth } else { 6 }
+  while scan < limit {
+    let idx = depth - 1 - scan
+    scan = scan + 1
+    let candOpt = state.zeroStack[idx]
+    if Pointer.isNull<HeapHeader>(candOpt) { continue }
+    let cand = unsafe nonnullHeader(candOpt)
+    let hdr = unsafe Pointer.borrow<(), HeapHeader>(&anchor, cand)
+    if hdr.kind != HeapKind.Object || hdr.young != 1 || hdr.referenceCount != 0 || hdr.mark != 1 { continue }
+    if unsafe emptiableArray(cand, arrayShape) { bestIdx = idx break }
+  }
+  drop state
+  if bestIdx == usize.MAX { return Pointer.null<HeapHeader>() }
+  let chosen = unsafe reviveZero(rt, bestIdx)
+  unsafe emptyArrayInPlace(chosen)
+  unsafe census.censusBump(rt, census.CENSUS_OBJECTS_ALLOCATED, 1)
+  return unsafe Intrinsic.pointerRequalify<*mut HeapHeader, ?*mut HeapHeader>(chosen)
+}
+
 @inlineNever
 unsafe fn jitNewObjectNested(env: *mut CompiledEnv, descPtr: *mut ConstructDesc, out: *mut ValueBits) -> u32 {
   let mut finalOpt = Pointer.null<HeapHeader>()
@@ -1719,6 +1870,14 @@ unsafe fn jitNewObjectNested(env: *mut CompiledEnv, descPtr: *mut ConstructDesc,
     if let Option<*mut HeapHeader>.Some { value: reused } = Pointer.nonNullMut<HeapHeader>(unsafe tryRecycleNestedPlain(rt, final, tail, descPtr)) {
       unsafe Pointer.write<ValueBits>(out, ValueBits.Object { reference: reused })
       return 1
+    }
+  }
+  if nestedKind == NESTED_EMPTY_ARRAY && stores == 1 {
+    if let Option<*mut HeapHeader>.Some { value: arrayShape } = Pointer.nonNullMut<HeapHeader>((unsafe Pointer.borrow<(), ConstructDesc>(&anchor, descPtr)).nestedArrayShape) {
+      if let Option<*mut HeapHeader>.Some { value: reused } = Pointer.nonNullMut<HeapHeader>(unsafe tryRecycleNestedArray(rt, final, tail, arrayShape)) {
+        unsafe Pointer.write<ValueBits>(out, ValueBits.Object { reference: reused })
+        return 1
+      }
     }
   }
   let child = match Pointer.nonNullMut<HeapHeader>(unsafe allocNestedChild(env, rt, descPtr, 0)) {
